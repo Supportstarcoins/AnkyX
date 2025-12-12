@@ -566,6 +566,51 @@ def ensure_basic_note_type_id(conn: sqlite3.Connection | None = None) -> int:
     return note_type_id
 
 
+def ensure_generated_note_type_id(conn: sqlite3.Connection | None = None) -> int:
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM note_types WHERE name = 'Generated' LIMIT 1;")
+    row = cur.fetchone()
+    if row:
+        note_type_id = row["id"]
+    else:
+        fields = [
+            "front",
+            "back",
+            "word",
+            "translation",
+            "example",
+            "level",
+            "image",
+            "front_image_path",
+            "back_image_path",
+            "audio_path",
+        ]
+        templates = [
+            {
+                "name": "Front/Back",
+                "front": "{front}",
+                "back": "{back}",
+                "requires_image": False,
+            }
+        ]
+        cur.execute(
+            "INSERT OR IGNORE INTO note_types (name, fields_json, card_templates_json) VALUES (?, ?, ?);",
+            ("Generated", json.dumps(fields, ensure_ascii=False), json.dumps(templates, ensure_ascii=False)),
+        )
+        conn.commit()
+        cur.execute("SELECT id FROM note_types WHERE name = 'Generated' LIMIT 1;")
+        note_type_id = cur.fetchone()["id"]
+
+    if close_conn:
+        conn.close()
+    return note_type_id
+
+
 def _get_note_type(cur: sqlite3.Cursor, note_type_id: int):
     cur.execute(
         "SELECT id, name, fields_json, card_templates_json FROM note_types WHERE id = ?;",
@@ -597,6 +642,7 @@ def create_cards_from_note_templates(
     fields: dict,
     deck_id: int,
     skip_template_ords: set[int] | None = None,
+    audio_path: str | None = None,
 ):
     skip_template_ords = skip_template_ords or set()
     conn = get_connection()
@@ -608,33 +654,38 @@ def create_cards_from_note_templates(
 
     templates = json.loads(note_type_row["card_templates_json"])
     fields_default = collections.defaultdict(str, fields)
+    audio_value = audio_path if audio_path is not None else fields_default.get("audio_path")
 
+    created = 0
     for ord_idx, template in enumerate(templates):
         if ord_idx in skip_template_ords:
             continue
         requires_image = bool(template.get("requires_image"))
-        image_value = fields_default.get("image")
+        image_value = fields_default.get("image") or fields_default.get("front_image_path")
         if requires_image and not image_value:
             continue
 
         formatter = collections.defaultdict(str, fields_default)
         front = str(template.get("front", "")).format_map(formatter)
         back = str(template.get("back", "")).format_map(formatter)
-        front_image_path = image_value if requires_image else None
+        front_image_path = fields_default.get("front_image_path") or (image_value if requires_image else None)
+        back_image_path = fields_default.get("back_image_path") or None
 
         insert_card(
             deck_id,
             front,
             back,
             front_image_path=front_image_path,
-            back_image_path=None,
-            audio_path=None,
+            back_image_path=back_image_path,
+            audio_path=audio_value,
             level=1,
             note_id=note_id,
             template_ord=ord_idx,
         )
+        created += 1
 
     conn.close()
+    return created
 
 
 def ensure_note_for_card(
@@ -686,6 +737,88 @@ def ensure_note_for_card(
         )
 
     return card_dict
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1;",
+        (table,),
+    )
+    return cur.fetchone() is not None
+
+
+def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str]]):
+    conn = get_connection()
+    if not _table_exists(conn, "media"):
+        conn.close()
+        return
+
+    cur = conn.cursor()
+    ts = int(time.time())
+    for path, media_type in media_entries:
+        if not path:
+            continue
+        cur.execute(
+            "INSERT INTO media (note_id, path, media_type, created_at) VALUES (?, ?, ?, ?);",
+            (note_id, path, media_type, ts),
+        )
+    conn.commit()
+    conn.close()
+
+
+def create_note(
+    deck_id: int,
+    fields: dict,
+    note_type_id: int | None = None,
+    tags: str = "",
+) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    note_type = note_type_id or ensure_generated_note_type_id(conn)
+    cur.execute(
+        """
+        INSERT INTO notes (deck_id, note_type_id, fields_json, tags, created_at)
+        VALUES (?, ?, ?, ?, ?);
+        """,
+        (
+            deck_id,
+            note_type,
+            json.dumps(fields, ensure_ascii=False),
+            tags,
+            int(time.time()),
+        ),
+    )
+    note_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return note_id
+
+
+def create_note_with_cards(
+    deck_id: int,
+    fields: dict,
+    note_type_id: int | None = None,
+    tags: str = "",
+    skip_template_ords: set[int] | None = None,
+) -> tuple[int, int]:
+    note_id = create_note(deck_id, fields, note_type_id=note_type_id, tags=tags)
+    note_type = note_type_id or ensure_generated_note_type_id()
+    cards_created = create_cards_from_note_templates(
+        note_id,
+        note_type,
+        fields,
+        deck_id,
+        skip_template_ords=skip_template_ords,
+        audio_path=fields.get("audio_path"),
+    )
+    media_entries = [
+        (fields.get("image") or fields.get("front_image_path"), "image"),
+        (fields.get("back_image_path"), "image"),
+        (fields.get("audio_path"), "audio"),
+    ]
+    attach_media_to_note(note_id, media_entries)
+    return note_id, cards_created
 
 
 def ensure_notes_for_cards(cards: list[sqlite3.Row]) -> list[dict]:
@@ -1752,35 +1885,49 @@ def auto_generate_cards_from_text(deck_id: int,
             except Exception:
                 img_path_front = None
 
+        level_value = 1
+
         note_fields = {
             "word": target_word or sentence,
             "translation": translation,
             "example": sentence,
-            "level": level,
+            "level": level_value,
             "image": img_path_front or "",
+            "front_image_path": img_path_front or "",
+            "back_image_path": None,
+            "audio_path": audio_path,
+            "front": front,
+            "back": back,
         }
 
-        insert_card(deck_id, front, back,
-                    front_image_path=img_path_front,
-                    back_image_path=None,
-                    audio_path=audio_path,
-                    level=1,
-                    template_ord=0,
-                    ensure_note=True,
-                    note_fields=note_fields)
-        created += 1
+        _, cards_created = create_note_with_cards(
+            deck_id,
+            note_fields,
+            note_type_id=ensure_generated_note_type_id(),
+        )
+        created += cards_created
 
         # доп. карточки: синонимы
         syns = wiki_data.get("synonyms") or []
         for syn in syns[:3]:
             front_syn = f"Synonym für {target_word}: ____"
             back_syn = syn
-            insert_card(deck_id, front_syn, back_syn,
-                        front_image_path=None,
-                        back_image_path=None,
-                        audio_path=audio_path,
-                        level=1)
-            created += 1
+            syn_fields = {
+                "word": syn,
+                "translation": back_syn,
+                "example": front_syn,
+                "level": 1,
+                "image": "",
+                "front": front_syn,
+                "back": back_syn,
+                "audio_path": audio_path,
+            }
+            _, cards_created = create_note_with_cards(
+                deck_id,
+                syn_fields,
+                note_type_id=ensure_generated_note_type_id(),
+            )
+            created += cards_created
 
         # доп. карточки: примеры
         examples = wiki_data.get("examples") or []
@@ -1790,12 +1937,22 @@ def auto_generate_cards_from_text(deck_id: int,
             ex_gap = pattern.sub("____", ex_sentence, count=1)
             front_ex = ex_gap
             back_ex = ex_sentence
-            insert_card(deck_id, front_ex, back_ex,
-                        front_image_path=None,
-                        back_image_path=None,
-                        audio_path=audio_path,
-                        level=1)
-            created += 1
+            ex_fields = {
+                "word": target_word or ex_sentence,
+                "translation": back_ex,
+                "example": front_ex,
+                "level": 1,
+                "image": "",
+                "front": front_ex,
+                "back": back_ex,
+                "audio_path": audio_path,
+            }
+            _, cards_created = create_note_with_cards(
+                deck_id,
+                ex_fields,
+                note_type_id=ensure_generated_note_type_id(),
+            )
+            created += cards_created
 
     if one_sentence_one_card:
         # 1 предложение = 1 карточка
@@ -5630,9 +5787,9 @@ class AudioEditorWindow(tk.Toplevel):
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             audio_filename = f"sentence_{sentence['index']}_{timestamp}.wav"
             audio_path = os.path.join("video_sentences", audio_filename)
-            
+
             self.save_audio_segment(sentence['audio'], audio_path)
-            
+
             # Создать карточку
             front = sentence['text']  # Немецкое предложение
             
@@ -5646,11 +5803,25 @@ class AudioEditorWindow(tk.Toplevel):
 
 🔊 Произношение:
 [audio:{audio_path}]"""
-            
-            # Вставить карточку
-            insert_card(self.deck_id, front, back, 
-                       audio_path=audio_path, level=1)
-            
+
+            note_fields = {
+                "word": sentence['text'],
+                "translation": translation,
+                "example": sentence['text'],
+                "level": 1,
+                "image": "",
+                "front": front,
+                "back": back,
+                "front_image_path": None,
+                "back_image_path": None,
+                "audio_path": audio_path,
+            }
+            create_note_with_cards(
+                self.deck_id,
+                note_fields,
+                note_type_id=ensure_generated_note_type_id(),
+            )
+
         messagebox.showinfo("Успех", f"Создано {len(self.sentences)} карточек")
         self.destroy()
         
