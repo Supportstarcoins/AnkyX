@@ -2806,8 +2806,8 @@ class AnkiApp(tk.Tk):
         if not video_path:
             return
 
-        # Открыть окно аудио-редактора
-        AudioEditorWindow(self, video_path, self.selected_deck_id)
+        # Открыть окно видео-редактора
+        VideoEditorWindow(self, video_path, self.selected_deck_id)
 
     def open_video_clip_window(self):
         if self.selected_deck_id is None:
@@ -7010,6 +7010,13 @@ class AudioEditorWindow(tk.Toplevel):
         """Остановить аудио"""
         if WINSOUND_AVAILABLE:
             winsound.PlaySound(None, winsound.SND_PURGE)
+
+
+class VideoEditorWindow(AudioEditorWindow):
+    """Окно редактирования видео (использует аудио-редактор)."""
+
+    def __init__(self, parent, video_path, deck_id):
+        super().__init__(parent, video_path, deck_id)
 
 
 if __name__ == "__main__":
