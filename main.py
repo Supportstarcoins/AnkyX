@@ -41,6 +41,14 @@ from tkinter import ttk, messagebox, filedialog
 from db_migrations import run_migrations
 from srs import schedule_review
 from bg_tasks import start_background_task
+from deck_timer import (
+    DeckTimerController,
+    ensure_deck_settings_row,
+    ensure_deck_settings_table,
+    get_deck_timer_settings,
+    get_effective_timer,
+    update_deck_timer_settings,
+)
 
 # ==========================
 # OCR: pytesseract + автопоиск tesseract.exe
@@ -1098,6 +1106,8 @@ def init_db():
             UNIQUE(date, deck_id)
         );
     """)
+
+    ensure_deck_settings_table(conn)
 
     run_migrations(conn)
 
@@ -4023,25 +4033,30 @@ class AnkiApp(tk.Tk):
             name = entry_name.get().strip()
             desc = entry_desc.get().strip()
             icon_path = icon_path_var.get().strip() or None
-            
+
             if not name:
                 messagebox.showerror("Ошибка", "Название не может быть пустым.")
                 return
-                
+
             conn = get_connection()
             cur = conn.cursor()
+            deck_id = None
             try:
                 cur.execute(
-                    """INSERT INTO decks 
-                       (name, description, front_template, back_template, icon_path) 
+                    """INSERT INTO decks
+                       (name, description, front_template, back_template, icon_path)
                        VALUES (?, ?, ?, ?, ?);""",
                     (name, desc or None, self.front_template, self.back_template, icon_path)
                 )
+                deck_id = cur.lastrowid
             except sqlite3.OperationalError:
                 cur.execute(
                     "INSERT INTO decks (name, description, icon_path) VALUES (?, ?, ?);",
                     (name, desc or None, icon_path)
                 )
+                deck_id = cur.lastrowid
+            if deck_id:
+                ensure_deck_settings_row(deck_id, conn, inherit_default=1)
             conn.commit()
             conn.close()
             self.refresh_decks()
@@ -4060,7 +4075,7 @@ class AnkiApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Редактирование колоды")
-        win.geometry("400x280")
+        win.geometry("420x420")
         win.grab_set()
 
         # Получаем текущие данные колоды
@@ -4069,6 +4084,8 @@ class AnkiApp(tk.Tk):
         cur.execute("SELECT name, description, icon_path FROM decks WHERE id = ?;", (self.selected_deck_id,))
         deck_data = cur.fetchone()
         conn.close()
+
+        timer_settings = get_deck_timer_settings(self.selected_deck_id)
 
         ttk.Label(win, text="Название колоды:").pack(anchor="w", padx=10, pady=(10, 0))
         entry_name = ttk.Entry(win)
@@ -4108,20 +4125,60 @@ class AnkiApp(tk.Tk):
 
         ttk.Button(icon_frame, text="Выбрать", command=select_icon).pack(side=tk.RIGHT, padx=5)
 
+        timer_frame = ttk.LabelFrame(win, text="Таймер колоды")
+        timer_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Label(timer_frame, text="Секунды:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        timer_sec_var = tk.IntVar(value=timer_settings.get("timer_sec") or 0)
+        timer_spin = ttk.Spinbox(timer_frame, from_=0, to=3600, textvariable=timer_sec_var, width=10)
+        timer_spin.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+
+        ttk.Label(timer_frame, text="Режим:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        timer_mode_var = tk.StringVar(value=(timer_settings.get("timer_mode") or "reveal"))
+        mode_combo = ttk.Combobox(
+            timer_frame,
+            state="readonly",
+            values=["reveal", "fail", "notify"],
+            textvariable=timer_mode_var,
+            width=12,
+        )
+        mode_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+
+        inherit_var = tk.BooleanVar(value=bool(timer_settings.get("inherit_timer", 1)))
+        inherit_cb = ttk.Checkbutton(
+            timer_frame,
+            text="Наследовать от родителя, если свой таймер пуст",
+            variable=inherit_var,
+        )
+        inherit_cb.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="w")
+
         def save_changes():
             name = entry_name.get().strip()
             desc = entry_desc.get().strip()
             icon_path = icon_path_var.get().strip() or None
-            
+
             if not name:
                 messagebox.showerror("Ошибка", "Название не может быть пустым.")
                 return
-                
+
+            try:
+                timer_sec = int(timer_sec_var.get())
+            except tk.TclError:
+                messagebox.showerror("Ошибка", "Некорректное значение таймера.")
+                return
+
             conn = get_connection()
             cur = conn.cursor()
             cur.execute(
                 "UPDATE decks SET name = ?, description = ?, icon_path = ? WHERE id = ?;",
                 (name, desc or None, icon_path, self.selected_deck_id)
+            )
+            update_deck_timer_settings(
+                self.selected_deck_id,
+                timer_sec,
+                timer_mode_var.get(),
+                1 if inherit_var.get() else 0,
+                conn,
             )
             conn.commit()
             conn.close()
@@ -5837,6 +5894,13 @@ class ReviewWindow(tk.Toplevel):
         self.timer_left = 0
         self.timer_job = None
         self.timer_label = None
+        self.deck_timer = DeckTimerController(
+            self,
+            self.update_timer_label,
+            self.auto_show_answer,
+            self.mark_forgotten,
+            self.handle_timer_notify,
+        )
 
         # Прогресс
         self.progress_canvas = None
@@ -6034,6 +6098,7 @@ class ReviewWindow(tk.Toplevel):
         self.checkpoint_states[card_id][idx] = self.checkpoint_vars[idx].get()
 
     def cancel_timers(self):
+        self.deck_timer.cancel()
         if self.auto_flip_id is not None:
             try:
                 self.after_cancel(self.auto_flip_id)
@@ -6055,12 +6120,27 @@ class ReviewWindow(tk.Toplevel):
                 pass
             self.timer_job = None
 
-    def update_timer_label(self):
+    def update_timer_label(self, seconds: int | None = None):
         if self.timer_label is None:
             return
-        seconds = max(0, int(self.timer_left))
-        m, s = divmod(seconds, 60)
+        if seconds is None:
+            seconds = max(0, int(self.timer_left))
+        m, s = divmod(max(0, int(seconds)), 60)
         self.timer_label.config(text=f"⏰ {m:02d}:{s:02d}")
+
+    def handle_timer_notify(self):
+        if self.timer_label is None:
+            return
+        original_bg = self.timer_label.cget("bg")
+        self.timer_label.config(bg="yellow")
+
+        def reset_bg():
+            try:
+                self.timer_label.config(bg=original_bg)
+            except Exception:
+                pass
+
+        self.after(1500, reset_bg)
 
     def timer_tick(self):
         if self.timer_left <= 0:
@@ -6072,6 +6152,11 @@ class ReviewWindow(tk.Toplevel):
 
     def schedule_timers_for_card(self):
         self.cancel_timers()
+
+        timer_sec, timer_mode = get_effective_timer(getattr(self.master, "selected_deck_id", None))
+        if timer_sec and timer_sec > 0:
+            self.deck_timer.start(timer_sec, timer_mode)
+            return
 
         front = self.current_card.get("front") or ""
         back = self.current_card.get("back") or ""
