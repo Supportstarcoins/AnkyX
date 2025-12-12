@@ -938,12 +938,12 @@ def ensure_media_table(conn: sqlite3.Connection):
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS media (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY,
                 card_id INTEGER,
                 note_id INTEGER,
                 type TEXT NOT NULL,
                 path TEXT NOT NULL,
-                side TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT 'back',
                 source TEXT,
                 created_at INTEGER NOT NULL
             );
@@ -957,9 +957,9 @@ def ensure_media_table(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE media ADD COLUMN card_id INTEGER;")
     if "note_id" not in columns:
         cur.execute("ALTER TABLE media ADD COLUMN note_id INTEGER;")
-    if "media_type" not in columns:
-        cur.execute("ALTER TABLE media ADD COLUMN media_type TEXT;")
-    if "type" not in columns:
+    if "type" not in columns and "media_type" not in columns:
+        cur.execute("ALTER TABLE media ADD COLUMN type TEXT;")
+    elif "type" not in columns and "media_type" in columns:
         cur.execute("ALTER TABLE media ADD COLUMN type TEXT;")
     if "side" not in columns:
         cur.execute("ALTER TABLE media ADD COLUMN side TEXT NOT NULL DEFAULT 'back';")
@@ -972,82 +972,107 @@ def _media_type_column(columns: set[str]) -> str:
     return "media_type" if "media_type" in columns else "type"
 
 
-def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str, str | None, str | None]]):
-    conn = get_connection()
-    ensure_media_table(conn)
+def insert_media(
+    conn: sqlite3.Connection,
+    *,
+    card_id: int | None = None,
+    note_id: int | None = None,
+    type: str,
+    path: str,
+    side: str = "back",
+    source: str | None = None,
+    created_at: int | None = None,
+):
+    if card_id is None and note_id is None:
+        raise ValueError("Не указан card_id или note_id для медиа")
 
+    ensure_media_table(conn)
     cur = conn.cursor()
     columns = _get_media_columns(cur)
-    ts = int(time.time())
+    ts = int(created_at if created_at is not None else time.time())
     type_col = _media_type_column(columns)
-    for entry in media_entries:
-        if len(entry) == 2:
-            path, media_type = entry
-            side, source = "back", None
-        elif len(entry) == 3:
-            path, media_type, side = entry
-            source = None
-        else:
-            path, media_type, side, source = entry
-        if not path:
-            continue
-        cols = ["note_id", "card_id", type_col, "path", "created_at"]
-        vals = [note_id, None, media_type, path, ts]
-        placeholders = ["?", "?", "?", "?", "?"]
-        if "side" in columns:
-            cols.append("side")
-            vals.append(side or "back")
-            placeholders.append("?")
-        if "source" in columns:
-            cols.append("source")
-            vals.append(source)
-            placeholders.append("?")
 
-        cur.execute(
-            f"INSERT INTO media ({', '.join(cols)}) VALUES ({', '.join(placeholders)});",
-            vals,
-        )
-    conn.commit()
-    conn.close()
+    cols = ["note_id", "card_id", type_col, "path", "created_at"]
+    vals = [note_id, card_id, type, path, ts]
+    placeholders = ["?", "?", "?", "?", "?"]
+
+    if "side" in columns:
+        cols.append("side")
+        vals.append(side or "back")
+        placeholders.append("?")
+    if "source" in columns:
+        cols.append("source")
+        vals.append(source)
+        placeholders.append("?")
+
+    cur.execute(
+        f"INSERT INTO media ({', '.join(cols)}) VALUES ({', '.join(placeholders)});",
+        vals,
+    )
+
+
+def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str, str | None, str | None]]):
+    conn = get_connection()
+    ts = int(time.time())
+    try:
+        for entry in media_entries:
+            if len(entry) == 2:
+                path, media_type = entry
+                side, source = "back", None
+            elif len(entry) == 3:
+                path, media_type, side = entry
+                source = None
+            else:
+                path, media_type, side, source = entry
+            if not path:
+                continue
+            insert_media(
+                conn,
+                note_id=note_id,
+                type=media_type,
+                path=path,
+                side=side or "back",
+                source=source,
+                created_at=ts,
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        messagebox.showerror("Ошибка сохранения медиа", f"{type(e).__name__}: {e}")
+    finally:
+        conn.close()
 
 
 def attach_media_to_card(card_id: int, media_entries: list[tuple[str | None, str, str | None, str | None]]):
     conn = get_connection()
-    ensure_media_table(conn)
-
-    cur = conn.cursor()
-    columns = _get_media_columns(cur)
     ts = int(time.time())
-    type_col = _media_type_column(columns)
-    for entry in media_entries:
-        if len(entry) == 2:
-            path, media_type = entry
-            side, source = "back", None
-        elif len(entry) == 3:
-            path, media_type, side = entry
-            source = None
-        else:
-            path, media_type, side, source = entry
-        if not path:
-            continue
-        cols = ["note_id", "card_id", type_col, "path", "created_at"]
-        vals = [None, card_id, media_type, path, ts]
-        placeholders = ["?", "?", "?", "?", "?"]
-        if "side" in columns:
-            cols.append("side")
-            vals.append(side or "back")
-            placeholders.append("?")
-        if "source" in columns:
-            cols.append("source")
-            vals.append(source)
-            placeholders.append("?")
-
-        cur.execute(
-            f"INSERT INTO media ({', '.join(cols)}) VALUES ({', '.join(placeholders)});",
-            vals,
-        )
-    conn.commit()
-    conn.close()
+    try:
+        for entry in media_entries:
+            if len(entry) == 2:
+                path, media_type = entry
+                side, source = "back", None
+            elif len(entry) == 3:
+                path, media_type, side = entry
+                source = None
+            else:
+                path, media_type, side, source = entry
+            if not path:
+                continue
+            insert_media(
+                conn,
+                card_id=card_id,
+                type=media_type,
+                path=path,
+                side=side or "back",
+                source=source,
+                created_at=ts,
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        messagebox.showerror("Ошибка сохранения медиа", f"{type(e).__name__}: {e}")
+    finally:
+        conn.close()
 
 
 def get_media_for_card(card_id: int, note_id: int | None = None) -> list[dict]:
