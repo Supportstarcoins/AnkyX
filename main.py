@@ -2439,7 +2439,9 @@ def auto_generate_cards_from_speech(deck_id: int,
                                     front_template: str,
                                     back_template: str,
                                     mic_index: int | None,
-                                    one_sentence_one_card: bool = False) -> int:
+                                    one_sentence_one_card: bool = False,
+                                    progress_queue: queue.Queue | None = None,
+                                    cancel_check=None) -> int:
     if not SR_AVAILABLE:
         raise RuntimeError("SpeechRecognition не установлен.")
     r = sr.Recognizer()
@@ -2449,9 +2451,15 @@ def auto_generate_cards_from_speech(deck_id: int,
     else:
         source = sr.Microphone()
 
+    if progress_queue is not None:
+        progress_queue.put(("progress", 0, max(duration_sec, 1), "Запись"))
+
     with source as s:
         r.adjust_for_ambient_noise(s, duration=0.5)
         audio = r.record(s, duration=duration_sec)
+
+    if cancel_check and cancel_check():
+        return 0
 
     os.makedirs("recordings", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2459,10 +2467,16 @@ def auto_generate_cards_from_speech(deck_id: int,
     with open(audio_path, "wb") as f:
         f.write(audio.get_wav_data())
 
+    if progress_queue is not None:
+        progress_queue.put(("progress", duration_sec, max(duration_sec, 1), "Распознавание"))
+
     try:
         text = r.recognize_google(audio, language="de-DE")
     except Exception as e:
         raise RuntimeError(f"Не удалось распознать речь: {e}")
+
+    if cancel_check and cancel_check():
+        return 0
 
     return auto_generate_cards_from_text(
         deck_id, text, use_ai_images, api_key,
@@ -2471,6 +2485,8 @@ def auto_generate_cards_from_speech(deck_id: int,
         audio_path=audio_path,
         audio_source="digital_hearing",
         audio_side="back",
+        progress_queue=progress_queue,
+        cancel_check=cancel_check,
     )
 
 
@@ -5501,10 +5517,50 @@ class AnkiApp(tk.Tk):
             text="Переменные: {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
         ).pack(anchor="w", padx=5, pady=(5, 0))
 
-        lbl_status = ttk.Label(win, text="")
-        lbl_status.pack(anchor="w", padx=10, pady=(5, 0))
+        progress_frame = ttk.LabelFrame(win, text="Прогресс")
+        progress_frame.pack(fill=tk.X, padx=10, pady=5)
+        progress_var = tk.DoubleVar(value=0)
+        progress_label_var = tk.StringVar(value="0/0")
+        status_var = tk.StringVar(value="")
+        progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=1)
+        progress_bar.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(progress_frame, textvariable=progress_label_var).pack(anchor="w", padx=5)
+        lbl_status = ttk.Label(progress_frame, textvariable=status_var)
+        lbl_status.pack(anchor="w", padx=5, pady=(0, 5))
 
         dur = 0
+
+        task_holder = {"task": None}
+
+        def handle_event(event):
+            kind = event[0]
+            if kind == "progress":
+                done, total, label = event[1:]
+                progress_bar.config(maximum=max(total, 1))
+                progress_var.set(done)
+                progress_label_var.set(f"{int(done)}/{total}")
+                status_var.set(label)
+            elif kind == "log":
+                status_var.set(event[1])
+            elif kind == "done":
+                created = event[1] or 0
+                self.unregister_bg_handler(task_holder["task"].queue)
+                task_holder["task"] = None
+                btn_rec.config(state=tk.NORMAL)
+                btn_cancel.config(state=tk.DISABLED)
+                status_var.set("Готово")
+                if created == 0:
+                    messagebox.showinfo("Результат", "Новых слов/предложений не найдено.")
+                else:
+                    messagebox.showinfo("Результат", f"Создано карточек (включая синонимы/примеры): {created}")
+                win.destroy()
+            elif kind == "error":
+                self.unregister_bg_handler(task_holder["task"].queue)
+                task_holder["task"] = None
+                btn_rec.config(state=tk.NORMAL)
+                btn_cancel.config(state=tk.DISABLED)
+                status_var.set("")
+                messagebox.showerror("Ошибка", event[1])
 
         def run_generation_thread():
             nonlocal dur
@@ -5518,31 +5574,24 @@ class AnkiApp(tk.Tk):
             api_key = OPENAI_API_KEY if OPENAI_API_KEY else None
             one_sent = (split_mode_var.get() == "sentence")
 
-            try:
-                created = auto_generate_cards_from_speech(
+            def worker(task_obj):
+                return auto_generate_cards_from_speech(
                     self.selected_deck_id, dur,
                     use_ai_images, api_key,
                     front_t, back_t,
                     self.microphone_index,
-                    one_sentence_one_card=one_sent
+                    one_sentence_one_card=one_sent,
+                    progress_queue=task_obj.queue,
+                    cancel_check=task_obj.cancelled,
                 )
-            except Exception as e:
-                def _err():
-                    lbl_status.config(text="")
-                    messagebox.showerror("Ошибка", f"Не удалось сгенерировать карточки:\n{e}")
-                    btn_rec.config(state=tk.NORMAL)
-                self.after(0, _err)
-                return
 
-            def _done():
-                lbl_status.config(text="")
-                if created == 0:
-                    messagebox.showinfo("Результат", "Новых слов/предложений не найдено.")
-                else:
-                    messagebox.showinfo("Результат", f"Создано карточек (включая синонимы/примеры): {created}")
-                win.destroy()
-
-            self.after(0, _done)
+            progress_var.set(0)
+            progress_label_var.set("0/0")
+            status_var.set("Запись…")
+            btn_rec.config(state=tk.DISABLED)
+            btn_cancel.config(state=tk.NORMAL)
+            task_holder["task"] = start_background_task(worker)
+            self.register_bg_handler(task_holder["task"].queue, handle_event)
 
         def start_record():
             nonlocal dur
@@ -5555,26 +5604,32 @@ class AnkiApp(tk.Tk):
                 messagebox.showerror("Ошибка", "Длительность должна быть > 0.")
                 return
 
-            btn_rec.config(state=tk.DISABLED)
-
             remaining = dur
 
             def tick():
                 nonlocal remaining
-                if remaining <= 0:
-                    lbl_status.config(text="Обработка записи…")
+                if task_holder["task"] is None:
                     return
-                lbl_status.config(text=f"Запись: осталось {remaining} с")
+                if remaining <= 0:
+                    status_var.set("Обработка записи…")
+                    return
+                status_var.set(f"Запись: осталось {remaining} с")
                 remaining -= 1
                 win.after(1000, tick)
 
+            run_generation_thread()
             tick()
 
-            th = threading.Thread(target=run_generation_thread, daemon=True)
-            th.start()
+        def cancel_generation():
+            if task_holder["task"]:
+                task_holder["task"].cancel()
+                status_var.set("Отмена запрошена…")
+                btn_cancel.config(state=tk.DISABLED)
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        btn_cancel = ttk.Button(btn_frame, text="Стоп", command=cancel_generation, state=tk.DISABLED)
+        btn_cancel.pack(side=tk.RIGHT, padx=5)
         btn_rec = ttk.Button(btn_frame, text="Записать и сгенерировать", command=start_record)
         btn_rec.pack(side=tk.RIGHT)
 
