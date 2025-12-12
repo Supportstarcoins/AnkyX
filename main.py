@@ -2809,7 +2809,7 @@ class AnkiApp(tk.Tk):
             return
 
         # Открыть окно видео-редактора
-        self.audio_editor_window = VideoEditorWindow(self.root, video_path, self.selected_deck_id)
+        self.video_editor_window = VideoEditorWindow(self.root, video_path, self.selected_deck_id)
 
     def open_video_clip_window(self):
         if self.selected_deck_id is None:
@@ -7022,6 +7022,7 @@ class VideoEditorWindow(AudioEditorWindow):
 
     def __init__(self, parent, video_path, deck_id):
         super().__init__(parent, video_path, deck_id)
+        self.title("Видео → клипы → карточки")
 
 
 if __name__ == "__main__":
