@@ -3,13 +3,37 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-try:
+
+def _prepare_vlc_runtime():  # pragma: no cover - Windows-specific
+    if os.name != "nt":
+        return
+    common_paths = [
+        r"C:\\Program Files\\VideoLAN\\VLC",
+        r"C:\\Program Files (x86)\\VideoLAN\\VLC",
+    ]
+    for path in common_paths:
+        if os.path.isdir(path):
+            try:
+                os.add_dll_directory(path)
+            except Exception:
+                pass
+
+
+VLC_IMPORT_ERROR: Exception | None = None
+VLC_LOAD_ERROR: Exception | None = None
+VLC_IMPORTED = False
+
+try:  # pragma: no cover - optional dependency
+    _prepare_vlc_runtime()
     import vlc  # type: ignore
-    VLC_AVAILABLE = True
-except Exception as exc:  # pragma: no cover - diagnostic
-    print(f"[audio] python-vlc недоступен: {exc}")
+
+    VLC_IMPORTED = True
+except ImportError as exc:  # pragma: no cover - diagnostic
+    VLC_IMPORT_ERROR = exc
     vlc = None  # type: ignore
-    VLC_AVAILABLE = False
+except Exception as exc:  # pragma: no cover - diagnostic
+    VLC_LOAD_ERROR = exc
+    vlc = None  # type: ignore
 
 try:
     import winsound
@@ -29,12 +53,14 @@ class AudioPlayerWidget(ttk.Frame):
         self._volume = 70.0
         self._rate = 1.0
 
+        self._vlc_ready = False
         self._vlc_instance = None
         self._player = None
-        if VLC_AVAILABLE:
+        if VLC_IMPORTED and VLC_LOAD_ERROR is None:
             try:
                 self._vlc_instance = vlc.Instance()
                 self._player = self._vlc_instance.media_player_new()
+                self._vlc_ready = True
             except Exception as exc:  # pragma: no cover - defensive
                 self._handle_error("VLC не удалось инициализировать", exc)
                 print(f"[audio] Ошибка инициализации VLC: {exc}")
@@ -42,10 +68,17 @@ class AudioPlayerWidget(ttk.Frame):
         self._build_ui()
         self._set_controls_state(False)
 
-        if not VLC_AVAILABLE:
-            self._set_status(
-                "Установите python-vlc для расширенного плеера. Доступен упрощённый режим."
-            )
+        if not self._vlc_ready:
+            if VLC_IMPORT_ERROR:
+                self._set_status("Установите: pip install python-vlc")
+            elif VLC_LOAD_ERROR:
+                self._set_status(
+                    "Установите VLC Media Player или укажите путь к libvlc.dll"
+                )
+            else:
+                self._set_status(
+                    "Установите python-vlc для расширенного плеера. Доступен упрощённый режим."
+                )
 
     def _build_ui(self):
         control_frame = ttk.Frame(self)
@@ -110,8 +143,13 @@ class AudioPlayerWidget(ttk.Frame):
         for widget in (self.play_btn, self.stop_btn):
             widget.config(state=state)
 
-        advanced_state = state if VLC_AVAILABLE else tk.DISABLED
-        for widget in (self.pause_btn, self.volume_scale, self.rate_scale, self.seek_scale):
+        advanced_state = state if self._vlc_ready else tk.DISABLED
+        for widget in (
+            self.pause_btn,
+            self.volume_scale,
+            self.rate_scale,
+            self.seek_scale,
+        ):
             widget.config(state=advanced_state)
 
     def _start_seeking(self):
@@ -122,7 +160,7 @@ class AudioPlayerWidget(ttk.Frame):
         self._on_seek()
 
     def _on_seek(self):
-        if not self._player or not VLC_AVAILABLE:
+        if not self._player or not self._vlc_ready:
             return
         if self._duration_ms <= 0:
             return
@@ -138,7 +176,7 @@ class AudioPlayerWidget(ttk.Frame):
             return False
 
         self._loaded_path = path
-        if VLC_AVAILABLE and self._player:
+        if self._vlc_ready and self._player:
             try:
                 media = self._vlc_instance.media_new(path)
                 self._player.set_media(media)
@@ -166,7 +204,7 @@ class AudioPlayerWidget(ttk.Frame):
     def play(self):
         if not self.is_loaded():
             return
-        if VLC_AVAILABLE and self._player:
+        if self._vlc_ready and self._player:
             try:
                 self._player.play()
                 self._schedule_progress_update()
@@ -184,21 +222,15 @@ class AudioPlayerWidget(ttk.Frame):
             self._set_status("Установите python-vlc для воспроизведения")
 
     def pause(self):
-        if VLC_AVAILABLE and self._player:
+        if self._vlc_ready and self._player:
             try:
-                state = self._player.get_state()
-                if state == vlc.State.Paused:
-                    self._player.play()
-                    self._set_status("Продолжено")
-                    self._schedule_progress_update()
-                else:
-                    self._player.pause()
-                    self._set_status("Пауза")
+                self._player.pause()
+                self._set_status("Пауза")
             except Exception as exc:
                 self._handle_error("Не удалось поставить на паузу", exc)
 
     def stop(self):
-        if VLC_AVAILABLE and self._player:
+        if self._vlc_ready and self._player:
             try:
                 self._player.stop()
             except Exception:
@@ -214,7 +246,7 @@ class AudioPlayerWidget(ttk.Frame):
 
     def set_volume(self, value: float):
         self._volume = float(value)
-        if VLC_AVAILABLE and self._player:
+        if self._vlc_ready and self._player:
             try:
                 self._player.audio_set_volume(int(self._volume))
             except Exception:
@@ -222,7 +254,7 @@ class AudioPlayerWidget(ttk.Frame):
 
     def set_rate(self, value: float):
         self._rate = float(value)
-        if VLC_AVAILABLE and self._player:
+        if self._vlc_ready and self._player:
             try:
                 ok = self._player.set_rate(float(self._rate))
                 if ok is False:
@@ -234,7 +266,7 @@ class AudioPlayerWidget(ttk.Frame):
                 self._handle_error("Не удалось изменить скорость", exc)
 
     def seek(self, seconds: float):
-        if not (VLC_AVAILABLE and self._player):
+        if not (self._vlc_ready and self._player):
             return
         self._player.set_time(int(seconds * 1000))
 
@@ -249,7 +281,7 @@ class AudioPlayerWidget(ttk.Frame):
         self.time_label.config(text=f"{fmt(current_ms)} / {fmt(total_ms)}")
 
     def _update_progress(self):
-        if not (VLC_AVAILABLE and self._player):
+        if not (self._vlc_ready and self._player):
             return
         try:
             total = self._player.get_length()
