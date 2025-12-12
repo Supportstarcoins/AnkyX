@@ -2671,6 +2671,8 @@ class AnkiApp(tk.Tk):
         self.title("Leitner Anki (цифровой слух + Wiktionary + AI + русско-немецкий словарь)")
         self.geometry("1000x700")
 
+        self.root = self
+
         self.decks = []
         self.selected_deck_id = None
         self.selected_phase = None
@@ -2807,7 +2809,7 @@ class AnkiApp(tk.Tk):
             return
 
         # Открыть окно видео-редактора
-        VideoEditorWindow(self, video_path, self.selected_deck_id)
+        self.audio_editor_window = VideoEditorWindow(self.root, video_path, self.selected_deck_id)
 
     def open_video_clip_window(self):
         if self.selected_deck_id is None:
@@ -6715,8 +6717,9 @@ class AudioEditorWindow(tk.Toplevel):
         self.sample_rate = None
         self.duration = 0
         self.sentences = []  # [(start_time, end_time, text, audio_segment)]
-        
-        self.extract_audio_from_video()
+
+        if not self.extract_audio_from_video():
+            return
         self.create_widgets()
         
     def extract_audio_from_video(self):
@@ -6724,6 +6727,7 @@ class AudioEditorWindow(tk.Toplevel):
         try:
             import tempfile
             import moviepy.editor as mp
+            import librosa
             
             # Создаем временный файл для аудио
             temp_dir = tempfile.mkdtemp()
@@ -6734,21 +6738,22 @@ class AudioEditorWindow(tk.Toplevel):
             audio = video.audio
             audio.write_audiofile(self.audio_path)
             video.close()
-            
+
             # Загружаем аудио данные
-            import librosa
             self.audio_data, self.sample_rate = librosa.load(self.audio_path, sr=None)
             self.duration = len(self.audio_data) / self.sample_rate
-            
+
+            return True
+
         except ImportError:
             messagebox.showerror("Ошибка", "Для работы с видео установите moviepy и librosa:\n"
                                            "pip install moviepy librosa")
             self.destroy()
-            return
+            return False
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось извлечь аудио из видео: {e}")
+            messagebox.showerror("Ошибка", f"{type(e).__name__}: {e}")
             self.destroy()
-            return
+            return False
             
     def create_widgets(self):
         """Создать интерфейс редактора"""
