@@ -7,6 +7,7 @@ import threading
 import queue
 import json
 import csv
+import calendar
 import shutil
 csv.field_size_limit(10 * 1024 * 1024)
 import gzip
@@ -38,6 +39,12 @@ except ImportError:
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from stats_config import (
+    StatsSettings,
+    ensure_stats_settings_table,
+    load_stats_settings,
+    save_stats_settings,
+)
 from db_migrations import run_migrations
 from srs import schedule_review
 from bg_tasks import start_background_task
@@ -1115,6 +1122,7 @@ def init_db():
     """)
 
     ensure_deck_settings_table(conn)
+    ensure_stats_settings_table(conn)
 
     run_migrations(conn)
 
@@ -1561,75 +1569,79 @@ def update_overview_statistics(deck_id: int, increment: int = 1):
     conn.close()
 
 
-def get_statistics_for_period(deck_id: int, days: int = 30):
-    """
-    Получить статистику за последние N дней.
-    Возвращает словарь с датами и значениями.
-    """
+def get_statistics_for_dates(deck_id: int, date_list: list[date]):
+    """Получить статистику для заданного списка дат (date)."""
+    if not date_list:
+        return {"dates": [], "remembered": [], "forgotten": [], "reviewed": [], "overview": []}
+
+    iso_dates = [d.isoformat() for d in date_list]
     conn = get_connection()
     cur = conn.cursor()
-    
-    end_date = date.today()
-    start_date = end_date - timedelta(days=days-1)
-    
-    cur.execute("""
+
+    placeholders = ",".join("?" * len(iso_dates))
+
+    cur.execute(
+        f"""
         SELECT date, remembered_count, forgotten_count, reviewed_count
-        FROM statistics 
-        WHERE deck_id = ? AND date BETWEEN ? AND ?
-        ORDER BY date
-    """, (deck_id, start_date.isoformat(), end_date.isoformat()))
-    
+        FROM statistics
+        WHERE deck_id = ? AND date IN ({placeholders})
+        """,
+        [deck_id, *iso_dates],
+    )
     rows = cur.fetchall()
-    
-    # Получаем статистику ознакомления
-    cur.execute("""
+
+    cur.execute(
+        f"""
         SELECT date, overview_count
-        FROM overview_statistics 
-        WHERE deck_id = ? AND date BETWEEN ? AND ?
-        ORDER BY date
-    """, (deck_id, start_date.isoformat(), end_date.isoformat()))
-    
+        FROM overview_statistics
+        WHERE deck_id = ? AND date IN ({placeholders})
+        """,
+        [deck_id, *iso_dates],
+    )
     overview_rows = cur.fetchall()
     conn.close()
-    
-    # Создаем полный диапазон дат
-    date_range = []
-    current_date = start_date
-    while current_date <= end_date:
-        date_range.append(current_date.isoformat())
-        current_date += timedelta(days=1)
-    
-    # Заполняем данные
-    remembered_data = collections.OrderedDict()
-    forgotten_data = collections.OrderedDict()
-    reviewed_data = collections.OrderedDict()
-    overview_data = collections.OrderedDict()
-    
-    # Инициализируем все даты нулями
-    for d in date_range:
-        remembered_data[d] = 0
-        forgotten_data[d] = 0
-        reviewed_data[d] = 0
-        overview_data[d] = 0
-    
-    # Заполняем реальными данными
+
+    remembered_data = collections.OrderedDict((d, 0) for d in iso_dates)
+    forgotten_data = collections.OrderedDict((d, 0) for d in iso_dates)
+    reviewed_data = collections.OrderedDict((d, 0) for d in iso_dates)
+    overview_data = collections.OrderedDict((d, 0) for d in iso_dates)
+
     for row in rows:
         date_str = row["date"]
-        remembered_data[date_str] = row["remembered_count"]
-        forgotten_data[date_str] = row["forgotten_count"]
-        reviewed_data[date_str] = row["reviewed_count"]
-    
+        if date_str in remembered_data:
+            remembered_data[date_str] = row["remembered_count"]
+            forgotten_data[date_str] = row["forgotten_count"]
+            reviewed_data[date_str] = row["reviewed_count"]
+
     for row in overview_rows:
         date_str = row["date"]
-        overview_data[date_str] = row["overview_count"]
-    
+        if date_str in overview_data:
+            overview_data[date_str] = row["overview_count"]
+
     return {
         "dates": list(remembered_data.keys()),
         "remembered": list(remembered_data.values()),
         "forgotten": list(forgotten_data.values()),
         "reviewed": list(reviewed_data.values()),
-        "overview": list(overview_data.values())
+        "overview": list(overview_data.values()),
     }
+
+
+def get_statistics_for_period(deck_id: int, days: int = 30):
+    """
+    Получить статистику за последние N дней.
+    Возвращает словарь с датами и значениями.
+    """
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days - 1)
+
+    date_range = []
+    current_date = start_date
+    while current_date <= end_date:
+        date_range.append(current_date)
+        current_date += timedelta(days=1)
+
+    return get_statistics_for_dates(deck_id, date_range)
 
 
 def get_monthly_summary(deck_id: int):
@@ -3531,35 +3543,139 @@ class AnkiApp(tk.Tk):
         settings_frame = ttk.LabelFrame(main_frame, text="Настройки диаграмм")
         settings_frame.pack(fill=tk.X, pady=5)
 
-        ttk.Label(settings_frame, text="Количество дней:").grid(row=0, column=0, padx=5, pady=5)
-        days_var = tk.IntVar(value=30)
-        days_spin = ttk.Spinbox(settings_frame, from_=7, to=365, textvariable=days_var, width=10)
-        days_spin.grid(row=0, column=1, padx=5, pady=5)
+        stored_settings = load_stats_settings(deck_id)
 
-        ttk.Label(settings_frame, text="Максимум на оси Y:").grid(row=0, column=2, padx=5, pady=5)
-        max_y_var = tk.IntVar(value=1000)
-        max_y_spin = ttk.Spinbox(settings_frame, from_=50, to=10000, textvariable=max_y_var, width=10)
-        max_y_spin.grid(row=0, column=3, padx=5, pady=5)
+        ttk.Label(settings_frame, text="Режим оси X:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        x_mode_var = tk.StringVar(value=stored_settings.x_mode)
+        x_mode_combo = ttk.Combobox(
+            settings_frame,
+            values=["range", "month_days", "custom_dates"],
+            textvariable=x_mode_var,
+            state="readonly",
+            width=15,
+        )
+        x_mode_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+
+        ttk.Label(settings_frame, text="Дней (если диапазон пустой):").grid(row=0, column=2, padx=5, pady=5, sticky="w")
+        days_var = tk.IntVar(value=30)
+        days_spin = ttk.Spinbox(settings_frame, from_=7, to=365, textvariable=days_var, width=8)
+        days_spin.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+
+        ttk.Label(settings_frame, text="Дата от (YYYY-MM-DD):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        date_from_var = tk.StringVar(value=stored_settings.date_from or "")
+        ttk.Entry(settings_frame, textvariable=date_from_var, width=16).grid(row=1, column=1, padx=5, pady=5, sticky="w")
+
+        ttk.Label(settings_frame, text="Дата до (YYYY-MM-DD):").grid(row=1, column=2, padx=5, pady=5, sticky="w")
+        date_to_var = tk.StringVar(value=stored_settings.date_to or "")
+        ttk.Entry(settings_frame, textvariable=date_to_var, width=16).grid(row=1, column=3, padx=5, pady=5, sticky="w")
+
+        ttk.Label(settings_frame, text="Кастомные даты (по строкам):").grid(row=2, column=0, padx=5, pady=5, sticky="nw")
+        custom_dates_text = tk.Text(settings_frame, height=3, width=25)
+        custom_dates_text.grid(row=2, column=1, columnspan=3, padx=5, pady=5, sticky="we")
+        if stored_settings.custom_dates:
+            custom_dates_text.insert("1.0", "\n".join(stored_settings.custom_dates))
+
+        ttk.Label(settings_frame, text="Максимум Y (0 - авто):").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        max_y_var = tk.IntVar(value=stored_settings.y_max)
+        max_y_spin = ttk.Spinbox(settings_frame, from_=0, to=10000, textvariable=max_y_var, width=10)
+        max_y_spin.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+
+        ttk.Label(settings_frame, text="Норма (горизонталь):").grid(row=3, column=2, padx=5, pady=5, sticky="w")
+        norm_var = tk.IntVar(value=stored_settings.norm_value)
+        norm_spin = ttk.Spinbox(settings_frame, from_=0, to=20000, textvariable=norm_var, width=10)
+        norm_spin.grid(row=3, column=3, padx=5, pady=5, sticky="w")
+
+        ttk.Label(settings_frame, text="Тип графика:").grid(row=4, column=0, padx=5, pady=5, sticky="w")
+        chart_type_var = tk.StringVar(value=stored_settings.chart_type)
+        chart_combo = ttk.Combobox(
+            settings_frame, values=["bar", "line"], textvariable=chart_type_var, state="readonly", width=10
+        )
+        chart_combo.grid(row=4, column=1, padx=5, pady=5, sticky="w")
+
+        show_grid_var = tk.BooleanVar(value=bool(stored_settings.show_grid))
+        ttk.Checkbutton(settings_frame, text="Показывать сетку", variable=show_grid_var).grid(
+            row=4, column=2, padx=5, pady=5, sticky="w"
+        )
 
         # Фрейм для графиков
         charts_frame = ttk.Frame(main_frame)
         charts_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
+        def _safe_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def collect_settings() -> StatsSettings:
+            settings = StatsSettings(
+                deck_id=deck_id,
+                x_mode=x_mode_var.get() or "range",
+                date_from=date_from_var.get().strip() or None,
+                date_to=date_to_var.get().strip() or None,
+                y_max=_safe_int(max_y_var.get(), 0),
+                norm_value=_safe_int(norm_var.get(), 0),
+                chart_type=chart_type_var.get() or "bar",
+                show_grid=1 if show_grid_var.get() else 0,
+            )
+            custom_lines = custom_dates_text.get("1.0", "end").splitlines()
+            settings.update_custom_dates(custom_lines)
+            return settings
+
+        def parse_date_safe(value: str | None):
+            if not value:
+                return None
+            try:
+                return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                return None
+
+        def build_date_list(settings: StatsSettings) -> list[date]:
+            mode = settings.x_mode or "range"
+            if mode == "month_days":
+                today = date.today()
+                last_day = calendar.monthrange(today.year, today.month)[1]
+                return [date(today.year, today.month, d) for d in range(1, last_day + 1)]
+            if mode == "custom_dates":
+                dates: list[date] = []
+                for line in custom_dates_text.get("1.0", "end").splitlines():
+                    parsed = parse_date_safe(line)
+                    if parsed:
+                        dates.append(parsed)
+                return sorted(set(dates))
+
+            start = parse_date_safe(settings.date_from)
+            end = parse_date_safe(settings.date_to)
+            if not end:
+                end = date.today()
+            if not start:
+                start = end - timedelta(days=max(1, days_var.get()) - 1)
+            if start > end:
+                start, end = end, start
+
+            dates: list[date] = []
+            current = start
+            while current <= end:
+                dates.append(current)
+                current += timedelta(days=1)
+            return dates
+
         def update_charts():
             if not MATPLOTLIB_AVAILABLE:
                 for widget in charts_frame.winfo_children():
                     widget.destroy()
-                ttk.Label(charts_frame, 
+                ttk.Label(charts_frame,
                          text="Matplotlib не установлен. Установите: pip install matplotlib",
                          foreground="red").pack(pady=20)
                 return
-            
-            days = days_var.get()
-            max_y = max_y_var.get()
-            
+
+            current_settings = collect_settings()
+            save_stats_settings(current_settings)
+
             # Получаем данные
-            data = get_statistics_for_period(deck_id, days)
-            
+            date_list = build_date_list(current_settings)
+            data = get_statistics_for_dates(deck_id, date_list)
+
             # Очищаем фрейм
             for widget in charts_frame.winfo_children():
                 widget.destroy()
@@ -3568,105 +3684,95 @@ class AnkiApp(tk.Tk):
                 ttk.Label(charts_frame, text="Нет данных для отображения").pack(pady=20)
                 return
 
+            from matplotlib import dates as mdates
+
+            grid_enabled = bool(show_grid_var.get())
+            y_limit = current_settings.y_max if current_settings.y_max and current_settings.y_max > 0 else None
+
             # Создаем фигуру с четырьмя подграфиками
             fig = Figure(figsize=(14, 16), dpi=100)
-            
-            # Подграфик 1: Общая статистика повторений
             ax1 = fig.add_subplot(411)
-            
-            dates = data["dates"]
+            ax2 = fig.add_subplot(412, sharex=ax1)
+            ax3 = fig.add_subplot(413, sharex=ax1)
+            ax4 = fig.add_subplot(414)
+
+            # Подготовка оси X
+            x_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in data["dates"]]
+            x_numeric = mdates.date2num(x_dates)
+
+            def apply_common_axis(ax):
+                locator = mdates.AutoDateLocator()
+                formatter = mdates.DateFormatter("%d.%m")
+                ax.xaxis.set_major_locator(locator)
+                ax.xaxis.set_major_formatter(formatter)
+                if current_settings.x_mode == "custom_dates":
+                    ax.set_xticks(x_numeric)
+                if y_limit:
+                    ax.set_ylim(0, y_limit)
+                if grid_enabled:
+                    ax.grid(True, alpha=0.3)
+
+            # Подграфик 1: Общая статистика повторений
             reviewed = data["reviewed"]
-            
-            # Преобразуем даты в числовой формат для оси X
-            x = range(len(dates))
-            
-            # Создаем ступенчатую диаграмму
-            ax1.step(x, reviewed, where='mid', linewidth=2, color='blue', label='Просмотрено карточек')
-            ax1.fill_between(x, reviewed, alpha=0.3, color='blue', step='mid')
-            
-            ax1.set_xlabel('Дни')
+            if current_settings.chart_type == "line":
+                ax1.plot(x_dates, reviewed, marker="o", linewidth=2, color="blue", label="Просмотрено карточек")
+            else:
+                ax1.bar(x_numeric, reviewed, width=0.6, color="blue", alpha=0.6, label="Просмотрено карточек")
+
+            if current_settings.norm_value:
+                ax1.axhline(current_settings.norm_value, linestyle="--", color="gray", linewidth=1, label="Норма")
+
             ax1.set_ylabel('Количество карточек')
             ax1.set_title(f'Общая статистика повторений - {deck_name}')
-            ax1.set_ylim(0, max_y)
-            
-            # Настраиваем метки оси X
-            x_labels = []
-            for i, date_str in enumerate(dates):
-                if i % 3 == 0:  # Показываем каждую 3-ю дату
-                    x_labels.append(f"{i+1}\n({date_str[5:]})")
-                else:
-                    x_labels.append(str(i+1))
-            
-            ax1.set_xticks(x)
-            ax1.set_xticklabels(x_labels, rotation=0, fontsize=8)
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-            
-            # Добавляем значения в точках
-            for i, val in enumerate(reviewed):
-                if val > 0:
-                    ax1.text(i, val, str(val), ha='center', va='bottom', fontsize=8)
-            
+            apply_common_axis(ax1)
+            ax1.legend(loc='upper left')
+
             # Подграфик 2: Сравнение "помню" и "забыл"
-            ax2 = fig.add_subplot(412)
-            
             remembered = data["remembered"]
             forgotten = data["forgotten"]
-            
-            width = 0.35
-            bars1 = ax2.bar([i - width/2 for i in x], remembered, width, label='Помню', color='green', alpha=0.7)
-            bars2 = ax2.bar([i + width/2 for i in x], forgotten, width, label='Забыл', color='red', alpha=0.7)
-            
-            ax2.set_xlabel('Дни')
+            if current_settings.chart_type == "line":
+                ax2.plot(x_dates, remembered, marker="o", color='green', label='Помню')
+                ax2.plot(x_dates, forgotten, marker="o", color='red', label='Забыл')
+            else:
+                width = 0.35
+                bars1 = ax2.bar(x_numeric - width/2, remembered, width, label='Помню', color='green', alpha=0.7)
+                bars2 = ax2.bar(x_numeric + width/2, forgotten, width, label='Забыл', color='red', alpha=0.7)
+                for bar in list(bars1) + list(bars2):
+                    height = bar.get_height()
+                    if height > 0:
+                        ax2.text(bar.get_x() + bar.get_width()/2., height, f'{int(height)}', ha='center', va='bottom', fontsize=8)
+
+            if current_settings.norm_value:
+                ax2.axhline(current_settings.norm_value, linestyle="--", color="gray", linewidth=1)
+
             ax2.set_ylabel('Количество карточек')
             ax2.set_title('Сравнение запомненных и забытых карточек')
-            ax2.set_ylim(0, max_y)
-            
-            ax2.set_xticks(x)
-            ax2.set_xticklabels(x_labels, rotation=0, fontsize=8)
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-            
-            # Добавляем значения на столбцы
-            for bar in bars1:
-                height = bar.get_height()
-                if height > 0:
-                    ax2.text(bar.get_x() + bar.get_width()/2., height,
-                            f'{int(height)}', ha='center', va='bottom', fontsize=8)
-            
-            for bar in bars2:
-                height = bar.get_height()
-                if height > 0:
-                    ax2.text(bar.get_x() + bar.get_width()/2., height,
-                            f'{int(height)}', ha='center', va='bottom', fontsize=8)
-            
+            apply_common_axis(ax2)
+            ax2.legend(loc='upper left')
+
             # Подграфик 3: Ознакомление
-            ax3 = fig.add_subplot(413)
-            
             overview = data["overview"]
-            
-            bars3 = ax3.bar(x, overview, width=0.6, label='Ознакомлено карточек', color='orange', alpha=0.7)
-            
-            ax3.set_xlabel('Дни')
+            if current_settings.chart_type == "line":
+                ax3.plot(x_dates, overview, marker="o", color='orange', label='Ознакомлено карточек')
+            else:
+                bars3 = ax3.bar(x_numeric, overview, width=0.6, label='Ознакомлено карточек', color='orange', alpha=0.7)
+                for bar in bars3:
+                    height = bar.get_height()
+                    if height > 0:
+                        ax3.text(bar.get_x() + bar.get_width()/2., height, f'{int(height)}', ha='center', va='bottom', fontsize=8)
+
+            if current_settings.norm_value:
+                ax3.axhline(current_settings.norm_value, linestyle="--", color="gray", linewidth=1)
+
             ax3.set_ylabel('Количество карточек')
             ax3.set_title('Ознакомление с карточками')
-            ax3.set_ylim(0, max_y)
-            
-            ax3.set_xticks(x)
-            ax3.set_xticklabels(x_labels, rotation=0, fontsize=8)
-            ax3.legend()
-            ax3.grid(True, alpha=0.3)
-            
-            # Добавляем значения на столбцы
-            for bar in bars3:
-                height = bar.get_height()
-                if height > 0:
-                    ax3.text(bar.get_x() + bar.get_width()/2., height,
-                            f'{int(height)}', ha='center', va='bottom', fontsize=8)
-            
+            ax3.set_xlabel('Дата')
+            apply_common_axis(ax3)
+            ax3.legend(loc='upper left')
+
+            fig.autofmt_xdate(rotation=30)
+
             # Подграфик 4: Прогресс по фазам
-            ax4 = fig.add_subplot(414)
-            
             # Получаем статистику по фазам
             stats = get_deck_stats(deck_id)
             phases = list(range(1, 11))
@@ -3679,26 +3785,28 @@ class AnkiApp(tk.Tk):
             ax4.set_title('Распределение карточек по фазам')
             ax4.set_xticks(phases)
             ax4.set_xticklabels([f'Фаза {p}' for p in phases], rotation=45, fontsize=8)
-            ax4.grid(True, alpha=0.3)
-            
+            if grid_enabled:
+                ax4.grid(True, alpha=0.3)
+
             # Добавляем значения на столбцы
             for bar in bars4:
                 height = bar.get_height()
                 if height > 0:
                     ax4.text(bar.get_x() + bar.get_width()/2., height,
                             f'{int(height)}', ha='center', va='bottom', fontsize=8)
+
+            fig.tight_layout(pad=2.0)
             
             # Размещаем график в Tkinter
             canvas = FigureCanvasTkAgg(fig, charts_frame)
             canvas.draw()
             canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-            
+
             # Добавляем функцию обновления в объект
             charts_frame.update_charts = update_charts
-            
-            # Кнопка обновления
-            btn_update = ttk.Button(settings_frame, text="Обновить графики", command=update_charts)
-            btn_update.grid(row=0, column=4, padx=10, pady=5)
+
+        btn_update = ttk.Button(settings_frame, text="Сохранить и обновить", command=update_charts)
+        btn_update.grid(row=0, column=4, padx=10, pady=5)
 
         # Инициализируем диаграммы
         update_charts()
