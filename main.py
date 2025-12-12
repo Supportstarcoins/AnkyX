@@ -4,6 +4,7 @@ import base64
 import sqlite3
 import re
 import threading
+import queue
 import json
 import csv
 import shutil
@@ -39,6 +40,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from db_migrations import run_migrations
 from srs import schedule_review
+from bg_tasks import start_background_task
 
 # ==========================
 # OCR: pytesseract + автопоиск tesseract.exe
@@ -1969,7 +1971,9 @@ def auto_generate_cards_from_text(deck_id: int,
                                   front_template: str,
                                   back_template: str,
                                   one_sentence_one_card: bool = False,
-                                  audio_path: str | None = None) -> int:
+                                  audio_path: str | None = None,
+                                  progress_queue: queue.Queue | None = None,
+                                  cancel_check=None) -> int:
     """
     Если one_sentence_one_card = True:
         1 предложение = 1 карточка (длинный текст -> много карточек).
@@ -1977,6 +1981,9 @@ def auto_generate_cards_from_text(deck_id: int,
         классический режим: каждое новое слово = карточка.
     """
     sentences = split_into_sentences(text)
+    total_progress = len(sentences)
+    if progress_queue is not None:
+        progress_queue.put(("progress", 0, max(total_progress, 1), "Разбивка текста"))
     if not sentences:
         return 0
 
@@ -2137,11 +2144,16 @@ def auto_generate_cards_from_text(deck_id: int,
             new_in_sentence = {w for w in words if w not in known}
             all_new_words.update(new_in_sentence)
 
+            if cancel_check and cancel_check():
+                break
+
             translation, ipa, gender, plural = enrich_german_word_info(target_word, api_key) \
                 if target_word else ("", "", "?", "?")
             wiki_data = get_wiktionary_data(target_word) if target_word else {}
 
             make_base_card(sentence, target_word, translation, ipa, gender, plural, wiki_data)
+            if progress_queue is not None:
+                progress_queue.put(("progress", created, max(total_progress, 1), "Генерация предложений"))
     else:
         # старый режим: каждое новое слово = карточка
         all_words = extract_words_from_text(text)
@@ -2149,7 +2161,11 @@ def auto_generate_cards_from_text(deck_id: int,
         if not new_words:
             return 0
 
+        total_progress = len(new_words)
+        processed = 0
         for word in sorted(new_words):
+            if cancel_check and cancel_check():
+                break
             sentence_for_word = None
             for s in sentences:
                 if normalize_word(word) in [normalize_word(w) for w in extract_words_from_text(s)]:
@@ -2162,10 +2178,15 @@ def auto_generate_cards_from_text(deck_id: int,
             wiki_data = get_wiktionary_data(word)
 
             make_base_card(sentence_for_word, word, translation, ipa, gender, plural, wiki_data)
+            processed += 1
+            if progress_queue is not None:
+                progress_queue.put(("progress", processed, max(total_progress, 1), "Генерация слов"))
 
         all_new_words.update(new_words)
 
     add_new_words(all_new_words)
+    if progress_queue is not None:
+        progress_queue.put(("log", f"Создано карточек: {created}"))
     return created
 
 
@@ -2548,6 +2569,8 @@ class AnkiApp(tk.Tk):
 
         self.image_import_watch_job = None
 
+        self._bg_listeners: list[tuple[queue.Queue, callable]] = []
+
         # отображение id-элементов Treeview -> (deck_id, phase)
         self.deck_items = {}
 
@@ -2559,6 +2582,7 @@ class AnkiApp(tk.Tk):
         self.refresh_decks()
 
         self.after(500, self.warn_if_no_tesseract)
+        self.after(50, self.poll_bg_queues)
 
     # --------- предупреждение ---------
 
@@ -2569,6 +2593,25 @@ class AnkiApp(tk.Tk):
                 "Режим генерации из изображений (OCR) пока недоступен.\n"
                 "Установи Tesseract OCR или пропиши путь."
             )
+
+    def register_bg_handler(self, queue_obj: queue.Queue, handler):
+        self._bg_listeners.append((queue_obj, handler))
+
+    def unregister_bg_handler(self, queue_obj: queue.Queue):
+        self._bg_listeners = [item for item in self._bg_listeners if item[0] is not queue_obj]
+
+    def poll_bg_queues(self):
+        for q_obj, handler in list(self._bg_listeners):
+            while True:
+                try:
+                    event = q_obj.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    handler(event)
+                except Exception:
+                    pass
+        self.after(50, self.poll_bg_queues)
 
     # --------- меню ---------
 
@@ -2674,11 +2717,50 @@ class AnkiApp(tk.Tk):
         else:
             note_type_var.set(str(ensure_basic_note_type_id()))
 
+        progress_var = tk.DoubleVar(value=0)
+        progress_label_var = tk.StringVar(value="")
+        processing_task = {"task": None}
+        running_watch_mode = {"value": False}
+
         def log_msg(msg: str):
             log_text.configure(state="normal")
             log_text.insert(tk.END, msg + "\n")
             log_text.see(tk.END)
             log_text.configure(state="disabled")
+
+        def handle_import_event(event):
+            kind = event[0]
+            if kind == "progress":
+                done, total, label = event[1:]
+                progress_bar.configure(maximum=max(total, 1))
+                progress_var.set(done)
+                progress_label_var.set(f"{label}: {done}/{total}")
+            elif kind == "log":
+                log_msg(event[1])
+            elif kind == "done":
+                summary = event[1] or {"total": 0, "imported": 0, "updated": 0, "skipped": 0, "errors": 0}
+                self.unregister_bg_handler(processing_task["task"].queue)
+                processing_task["task"] = None
+                btn_check.config(state=tk.NORMAL)
+                btn_import.config(state=tk.NORMAL)
+                btn_stop.config(state=tk.NORMAL)
+                msg = (
+                    f"Всего: {summary['total']}\n"
+                    f"Создано: {summary['imported']}\n"
+                    f"Обновлено: {summary['updated']}\n"
+                    f"Пропущено: {summary['skipped']}\n"
+                    f"Ошибки: {summary['errors']}"
+                )
+                messagebox.showinfo("Импорт завершен", msg)
+                if running_watch_mode["value"] and watch_var.get() and not stop_flag.get("stop"):
+                    self.image_import_watch_job = win.after(interval_var.get() * 1000, lambda: process_files(False, True))
+            elif kind == "error":
+                self.unregister_bg_handler(processing_task["task"].queue)
+                processing_task["task"] = None
+                btn_check.config(state=tk.NORMAL)
+                btn_import.config(state=tk.NORMAL)
+                btn_stop.config(state=tk.NORMAL)
+                messagebox.showerror("Ошибка", event[1])
 
         def browse_csv():
             path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")])
@@ -2783,7 +2865,11 @@ class AnkiApp(tk.Tk):
             return result
 
         def process_files(dry_run=False, watch_mode=False):
+            if processing_task["task"]:
+                messagebox.showinfo("Занято", "Импорт уже выполняется")
+                return
             stop_flag["stop"] = False
+            running_watch_mode["value"] = watch_mode
             csv_path = csv_path_var.get().strip()
             folder = folder_var.get().strip()
             if not csv_path or not os.path.exists(csv_path):
@@ -2809,6 +2895,10 @@ class AnkiApp(tk.Tk):
             except ValueError:
                 note_type_id = ensure_basic_note_type_id()
 
+            if id_mode_var.get() == "semi":
+                messagebox.showwarning("Режим semi", "Полуавто режим не поддерживает фоновый импорт")
+                return
+
             imported_files = get_imported_files() if watch_mode else set()
             files = [
                 os.path.join(folder, f)
@@ -2817,120 +2907,109 @@ class AnkiApp(tk.Tk):
             ]
             files.sort()
 
-            summary = {"total": 0, "imported": 0, "updated": 0, "skipped": 0, "errors": 0}
-
-            for fp in files:
-                if stop_flag.get("stop"):
-                    break
-                if watch_mode and fp in imported_files:
-                    continue
-
-                summary["total"] += 1
-                id_val = None
-                if id_mode_var.get() in ("filename", "semi"):
-                    id_val = extract_id_from_filename(fp)
-                if id_val is None and id_mode_var.get() in ("ocr", "semi"):
-                    id_val = extract_id_with_ocr(fp)
-
-                entry = csv_data.get(id_val) if id_val is not None else None
-                chosen = None
-
-                if id_mode_var.get() == "semi":
-                    choice = ask_semi_confirmation(fp, id_val, entry)
-                    if choice["action"] == "stop":
-                        stop_flag["stop"] = True
+            def worker(task_obj):
+                summary = {"total": 0, "imported": 0, "updated": 0, "skipped": 0, "errors": 0}
+                total_files = len(files)
+                for idx, fp in enumerate(files, start=1):
+                    if stop_flag.get("stop") or task_obj.cancelled():
                         break
-                    if choice["action"] == "skip" or choice.get("data", {}).get("id") is None:
+                    if watch_mode and fp in imported_files:
+                        continue
+
+                    summary["total"] += 1
+                    id_val = None
+                    if id_mode_var.get() == "filename":
+                        id_val = extract_id_from_filename(fp)
+                    if id_val is None and id_mode_var.get() == "ocr":
+                        id_val = extract_id_with_ocr(fp)
+
+                    if id_val is None:
+                        task_obj.queue.put(("log", f"[ошибка] Не найден ID для {os.path.basename(fp)}"))
+                        summary["errors"] += 1
+                        continue
+
+                    entry = csv_data.get(id_val) if id_val is not None else None
+
+                    if entry is None:
+                        task_obj.queue.put(("log", f"[пропуск] ID {id_val} отсутствует в CSV"))
                         summary["skipped"] += 1
                         continue
-                    auto_confirm_var.set(choice.get("auto", auto_confirm_var.get()))
-                    id_val = choice["data"].get("id")
-                    entry = {
-                        "word": choice["data"].get("word", ""),
-                        "translation": choice["data"].get("translation", ""),
-                        "example": choice["data"].get("example", ""),
-                        "level": choice["data"].get("level", ""),
+
+                    existing = find_note_by_source_id(deck_id_int, id_val)
+                    if existing and not update_existing_var.get():
+                        task_obj.queue.put(("log", f"[пропуск] ID {id_val} уже существует"))
+                        summary["skipped"] += 1
+                        continue
+
+                    media_path = copy_image_to_media(fp, id_val, move_files_var.get()) if not dry_run else fp
+
+                    fields = {
+                        "word": entry.get("word", ""),
+                        "translation": entry.get("translation", ""),
+                        "example": entry.get("example", ""),
+                        "level": entry.get("level", ""),
+                        "image": media_path,
+                        "source_id": str(id_val),
                     }
 
-                if id_val is None:
-                    log_msg(f"[ошибка] Не найден ID для {os.path.basename(fp)}")
-                    summary["errors"] += 1
-                    continue
-
-                if entry is None:
-                    log_msg(f"[пропуск] ID {id_val} отсутствует в CSV")
-                    summary["skipped"] += 1
-                    continue
-
-                existing = find_note_by_source_id(deck_id_int, id_val)
-                if existing and not update_existing_var.get() and id_mode_var.get() != "semi":
-                    log_msg(f"[пропуск] ID {id_val} уже существует")
-                    summary["skipped"] += 1
-                    continue
-
-                media_path = copy_image_to_media(fp, id_val, move_files_var.get()) if not dry_run else fp
-
-                fields = {
-                    "word": entry.get("word", ""),
-                    "translation": entry.get("translation", ""),
-                    "example": entry.get("example", ""),
-                    "level": entry.get("level", ""),
-                    "image": media_path,
-                    "source_id": str(id_val),
-                }
-
-                if dry_run:
-                    log_msg(f"[проверка] готова карточка ID {id_val}: {fields['word']} -> {fields['translation']}")
-                    summary["imported"] += 1
-                    continue
-
-                if existing:
-                    try:
-                        conn = get_connection()
-                        cur = conn.cursor()
-                        cur.execute(
-                            "UPDATE notes SET fields_json = ? WHERE id = ?;",
-                            (json.dumps(fields, ensure_ascii=False), existing["id"]),
-                        )
-                        conn.commit()
-                        conn.close()
-                        attach_media_to_note(existing["id"], [(media_path, "image")])
-                        summary["updated"] += 1
-                        log_msg(f"[обновлено] ID {id_val}")
-                    except Exception as e:
-                        summary["errors"] += 1
-                        log_msg(f"[ошибка] Не удалось обновить ID {id_val}: {e}")
-                else:
-                    try:
-                        _, created_cards = create_note_with_cards(
-                            deck_id_int,
-                            fields,
-                            note_type_id=note_type_id,
-                            tags="import:image_id",
-                        )
+                    if dry_run:
+                        task_obj.queue.put(("log", f"[проверка] готова карточка ID {id_val}: {fields['word']} -> {fields['translation']}"))
                         summary["imported"] += 1
-                        log_msg(f"[создано] ID {id_val} (карточек: {created_cards})")
-                    except Exception as e:
-                        summary["errors"] += 1
-                        log_msg(f"[ошибка] Не удалось создать ID {id_val}: {e}")
+                        task_obj.queue.put(("progress", idx, max(total_files, 1), "Импорт"))
+                        continue
 
-                if watch_mode:
-                    log_imported_file(fp)
+                    if existing:
+                        try:
+                            conn = get_connection()
+                            cur = conn.cursor()
+                            cur.execute(
+                                "UPDATE notes SET fields_json = ? WHERE id = ?;",
+                                (json.dumps(fields, ensure_ascii=False), existing["id"]),
+                            )
+                            conn.commit()
+                            conn.close()
+                            attach_media_to_note(existing["id"], [(media_path, "image")])
+                            summary["updated"] += 1
+                            task_obj.queue.put(("log", f"[обновлено] ID {id_val}"))
+                        except Exception as e:
+                            summary["errors"] += 1
+                            task_obj.queue.put(("log", f"[ошибка] Не удалось обновить ID {id_val}: {e}"))
+                    else:
+                        try:
+                            _, created_cards = create_note_with_cards(
+                                deck_id_int,
+                                fields,
+                                note_type_id=note_type_id,
+                                tags="import:image_id",
+                            )
+                            summary["imported"] += 1
+                            task_obj.queue.put(("log", f"[создано] ID {id_val} (карточек: {created_cards})"))
+                        except Exception as e:
+                            summary["errors"] += 1
+                            task_obj.queue.put(("log", f"[ошибка] Не удалось создать ID {id_val}: {e}"))
 
-                self.refresh_decks()
-                self.update()
+                    if watch_mode:
+                        log_imported_file(fp)
 
-            messagebox.showinfo(
-                "Импорт завершен",
-                f"Всего: {summary['total']}\n"
-                f"Создано: {summary['imported']}\n"
-                f"Обновлено: {summary['updated']}\n"
-                f"Пропущено: {summary['skipped']}\n"
-                f"Ошибки: {summary['errors']}",
-            )
+                    task_obj.queue.put(("progress", idx, max(total_files, 1), "Импорт"))
+
+                return summary
+
+            progress_var.set(0)
+            progress_label_var.set("")
+            btn_check.config(state=tk.DISABLED)
+            btn_import.config(state=tk.DISABLED)
+            btn_stop.config(state=tk.DISABLED)
+            processing_task["task"] = start_background_task(worker)
+            self.register_bg_handler(processing_task["task"].queue, handle_import_event)
 
         def stop_processing():
             stop_flag["stop"] = True
+            if processing_task["task"]:
+                processing_task["task"].cancel()
+            btn_check.config(state=tk.NORMAL)
+            btn_import.config(state=tk.NORMAL)
+            btn_stop.config(state=tk.NORMAL)
             if self.image_import_watch_job:
                 try:
                     win.after_cancel(self.image_import_watch_job)
@@ -2942,8 +3021,6 @@ class AnkiApp(tk.Tk):
         def start_watch_loop():
             stop_flag["stop"] = False
             process_files(dry_run=False, watch_mode=True)
-            if not stop_flag.get("stop") and watch_var.get():
-                self.image_import_watch_job = win.after(interval_var.get() * 1000, start_watch_loop)
 
         # Layout
         main_frame = ttk.Frame(win)
@@ -2989,11 +3066,20 @@ class AnkiApp(tk.Tk):
         options_frame.columnconfigure(1, weight=1)
         options_frame.columnconfigure(3, weight=1)
 
+        progress_frame = ttk.Frame(main_frame)
+        progress_frame.pack(fill=tk.X, pady=5)
+        progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=1)
+        progress_bar.pack(fill=tk.X, expand=True, padx=5)
+        ttk.Label(progress_frame, textvariable=progress_label_var).pack(anchor="w", padx=5)
+
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=5)
-        ttk.Button(btn_frame, text="Проверить", command=lambda: process_files(dry_run=True)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Импортировать", command=lambda: (start_watch_loop() if watch_var.get() else process_files(dry_run=False))).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Остановить", command=stop_processing).pack(side=tk.LEFT, padx=5)
+        btn_check = ttk.Button(btn_frame, text="Проверить", command=lambda: process_files(dry_run=True))
+        btn_check.pack(side=tk.LEFT, padx=5)
+        btn_import = ttk.Button(btn_frame, text="Импортировать", command=lambda: (start_watch_loop() if watch_var.get() else process_files(dry_run=False)))
+        btn_import.pack(side=tk.LEFT, padx=5)
+        btn_stop = ttk.Button(btn_frame, text="Остановить", command=stop_processing)
+        btn_stop.pack(side=tk.LEFT, padx=5)
 
         log_text = tk.Text(main_frame, height=15, state="disabled")
         log_text.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -4504,6 +4590,25 @@ class AnkiApp(tk.Tk):
             text="Переменные: {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
         ).pack(anchor="w", padx=5, pady=(5, 0))
 
+        progress_frame = ttk.LabelFrame(win, text="Прогресс")
+        progress_frame.pack(fill=tk.X, padx=10, pady=5)
+        progress_var = tk.DoubleVar(value=0)
+        progress_label_var = tk.StringVar(value="")
+        progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=1)
+        progress_bar.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(progress_frame, textvariable=progress_label_var).pack(anchor="w", padx=5)
+
+        log_box = tk.Text(win, height=6, state="disabled")
+        log_box.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 10))
+
+        def append_log(message: str):
+            log_box.configure(state="normal")
+            log_box.insert(tk.END, message + "\n")
+            log_box.see(tk.END)
+            log_box.configure(state="disabled")
+
+        task_holder = {"task": None}
+
         def run_generation():
             text = txt.get("1.0", tk.END).strip()
             if not text:
@@ -4521,27 +4626,67 @@ class AnkiApp(tk.Tk):
             api_key = OPENAI_API_KEY if OPENAI_API_KEY else None
             one_sent = one_sent_var.get()
 
-            try:
-                created = auto_generate_cards_from_text(
+            progress_var.set(0)
+            progress_label_var.set("")
+            log_box.configure(state="normal")
+            log_box.delete("1.0", tk.END)
+            log_box.configure(state="disabled")
+
+            def handle_event(event):
+                kind = event[0]
+                if kind == "progress":
+                    done, total, label = event[1:]
+                    progress_bar.config(maximum=max(total, 1))
+                    progress_var.set(done)
+                    progress_label_var.set(f"{label}: {done}/{total}")
+                elif kind == "log":
+                    append_log(event[1])
+                elif kind == "done":
+                    result = event[1] or 0
+                    self.unregister_bg_handler(task_holder["task"].queue)
+                    task_holder["task"] = None
+                    btn_generate.config(state=tk.NORMAL)
+                    btn_cancel.config(state=tk.DISABLED)
+                    if result == 0:
+                        messagebox.showinfo("Результат", "Новых слов/предложений не найдено.")
+                    else:
+                        messagebox.showinfo("Результат", f"Создано карточек (включая синонимы/примеры): {result}")
+                    win.destroy()
+                elif kind == "error":
+                    self.unregister_bg_handler(task_holder["task"].queue)
+                    task_holder["task"] = None
+                    btn_generate.config(state=tk.NORMAL)
+                    btn_cancel.config(state=tk.DISABLED)
+                    messagebox.showerror("Ошибка", event[1])
+
+            def worker(task_obj):
+                return auto_generate_cards_from_text(
                     self.selected_deck_id, text,
                     use_ai_images, api_key,
                     front_t, back_t,
                     one_sentence_one_card=one_sent,
-                    audio_path=None
+                    audio_path=None,
+                    progress_queue=task_obj.queue,
+                    cancel_check=task_obj.cancelled,
                 )
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось сгенерировать карточки:\n{e}")
-                return
 
-            if created == 0:
-                messagebox.showinfo("Результат", "Новых слов/предложений не найдено.")
-            else:
-                messagebox.showinfo("Результат", f"Создано карточек (включая синонимы/примеры): {created}")
-            win.destroy()
+            btn_generate.config(state=tk.DISABLED)
+            btn_cancel.config(state=tk.NORMAL)
+            task_holder["task"] = start_background_task(worker)
+            self.register_bg_handler(task_holder["task"].queue, handle_event)
+
+        def cancel_generation():
+            if task_holder["task"]:
+                task_holder["task"].cancel()
+                append_log("Отмена запрошена…")
+                btn_cancel.config(state=tk.DISABLED)
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Button(btn_frame, text="Сгенерировать", command=run_generation).pack(side=tk.RIGHT)
+        btn_cancel = ttk.Button(btn_frame, text="Отмена", command=cancel_generation, state=tk.DISABLED)
+        btn_cancel.pack(side=tk.RIGHT, padx=5)
+        btn_generate = ttk.Button(btn_frame, text="Сгенерировать", command=run_generation)
+        btn_generate.pack(side=tk.RIGHT)
 
     # --------- генерация из изображения ---------
 
@@ -4648,6 +4793,25 @@ class AnkiApp(tk.Tk):
             text="Переменные: {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
         ).pack(anchor="w", padx=10, pady=(0, 5))
 
+        progress_frame = ttk.LabelFrame(main_frame, text="Прогресс")
+        progress_frame.pack(fill=tk.X, pady=(0, 10))
+        progress_var = tk.DoubleVar(value=0)
+        progress_label_var = tk.StringVar(value="")
+        progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=1)
+        progress_bar.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(progress_frame, textvariable=progress_label_var).pack(anchor="w", padx=10)
+
+        log_box = tk.Text(main_frame, height=6, state="disabled")
+        log_box.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 10))
+
+        def append_log(message: str):
+            log_box.configure(state="normal")
+            log_box.insert(tk.END, message + "\n")
+            log_box.see(tk.END)
+            log_box.configure(state="disabled")
+
+        task_holder = {"task": None}
+
         def run_generation():
             text = txt_ocr.get("1.0", tk.END).strip()
             if not text:
@@ -4665,23 +4829,60 @@ class AnkiApp(tk.Tk):
             api_key = OPENAI_API_KEY if OPENAI_API_KEY else None
             one_sent = (split_mode_var.get() == "sentence")
 
-            try:
-                created = auto_generate_cards_from_text(
+            progress_var.set(0)
+            progress_label_var.set("")
+            log_box.configure(state="normal")
+            log_box.delete("1.0", tk.END)
+            log_box.configure(state="disabled")
+
+            def handle_event(event):
+                kind = event[0]
+                if kind == "progress":
+                    done, total, label = event[1:]
+                    progress_bar.config(maximum=max(total, 1))
+                    progress_var.set(done)
+                    progress_label_var.set(f"{label}: {done}/{total}")
+                elif kind == "log":
+                    append_log(event[1])
+                elif kind == "done":
+                    result = event[1] or 0
+                    self.unregister_bg_handler(task_holder["task"].queue)
+                    task_holder["task"] = None
+                    btn_generate.config(state=tk.NORMAL)
+                    btn_cancel.config(state=tk.DISABLED)
+                    if result == 0:
+                        messagebox.showinfo("Результат", "Новых слов/предложений не найдено.")
+                    else:
+                        messagebox.showinfo("Результат", f"Создано карточек (включая синонимы/примеры): {result}")
+                    win.destroy()
+                elif kind == "error":
+                    self.unregister_bg_handler(task_holder["task"].queue)
+                    task_holder["task"] = None
+                    btn_generate.config(state=tk.NORMAL)
+                    btn_cancel.config(state=tk.DISABLED)
+                    messagebox.showerror("Ошибка", event[1])
+
+            def worker(task_obj):
+                return auto_generate_cards_from_text(
                     self.selected_deck_id, text,
                     use_ai_images, api_key,
                     front_t, back_t,
                     one_sentence_one_card=one_sent,
-                    audio_path=None
+                    audio_path=None,
+                    progress_queue=task_obj.queue,
+                    cancel_check=task_obj.cancelled,
                 )
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось сгенерировать карточки:\n{e}")
-                return
 
-            if created == 0:
-                messagebox.showinfo("Результат", "Новых слов/предложений не найдено.")
-            else:
-                messagebox.showinfo("Результат", f"Создано карточек (включая синонимы/примеры): {created}")
-            win.destroy()
+            btn_generate.config(state=tk.DISABLED)
+            btn_cancel.config(state=tk.NORMAL)
+            task_holder["task"] = start_background_task(worker)
+            self.register_bg_handler(task_holder["task"].queue, handle_event)
+
+        def cancel_generation():
+            if task_holder["task"]:
+                task_holder["task"].cancel()
+                append_log("Отмена запрошена…")
+                btn_cancel.config(state=tk.DISABLED)
 
         # Кнопки
         btn_frame = ttk.Frame(main_frame)
