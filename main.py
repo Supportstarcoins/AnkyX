@@ -67,6 +67,7 @@ from video_tools import (
     is_vlc_available,
     open_in_external_player,
 )
+from audio_player_widget import AudioPlayerWidget
 
 # ==========================
 # OCR: pytesseract + автопоиск tesseract.exe
@@ -1100,6 +1101,32 @@ def get_media_for_card(card_id: int, note_id: int | None = None) -> list[dict]:
     rows = cur.fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def get_card_audio_path(card: dict, prefer_side: str | None = "back") -> str | None:
+    card_id = card.get("id")
+    note_id = card.get("note_id")
+    preferred = prefer_side.lower() if prefer_side else None
+
+    audio_candidate = None
+    for item in get_media_for_card(card_id, note_id):
+        media_type = (item.get("media_type") or item.get("type") or "").lower()
+        if media_type != "audio":
+            continue
+        path = item.get("path")
+        if not path or not os.path.exists(path):
+            continue
+        side = (item.get("side") or "back").lower()
+        if preferred and side == preferred:
+            return path
+        if audio_candidate is None:
+            audio_candidate = path
+
+    fallback = card.get("audio_path")
+    if fallback and os.path.exists(fallback):
+        return fallback
+
+    return audio_candidate
 
 
 def update_media_side(media_id: int, side: str):
@@ -5812,6 +5839,9 @@ class OverviewWindow(tk.Toplevel):
         # Аудио кнопка
         audio_frame = ttk.Frame(content)
         audio_frame.pack(fill=tk.X, pady=(10, 0))
+        audio_frame.audio_widget = AudioPlayerWidget(audio_frame, on_error_callback=self._show_audio_error)
+        audio_frame.audio_widget.pack(fill=tk.X)
+        audio_frame.audio_widget.pack_forget()
 
         video_frame = ttk.Frame(content)
         video_frame.pack(fill=tk.X, pady=(5, 0))
@@ -5881,7 +5911,7 @@ class OverviewWindow(tk.Toplevel):
             self.front_image_label.config(image="", text="(Нет изображения)")
         
         # Обновляем аудио плеер для лицевой стороны
-        self.update_audio_player(self.front_audio_frame, c)
+        self.update_audio_player(self.front_audio_frame, c, prefer_side="front")
         self.update_video_player(self.front_video_frame, c)
         
         # Создаем виджеты для задней стороны
@@ -5912,21 +5942,30 @@ class OverviewWindow(tk.Toplevel):
             self.back_image_label.config(image="", text="(Нет изображения)")
         
         # Обновляем аудио плеер для задней стороны
-        self.update_audio_player(self.back_audio_frame, c)
+        self.update_audio_player(self.back_audio_frame, c, prefer_side="back")
         self.update_video_player(self.back_video_frame, c)
     
-    def update_audio_player(self, audio_frame, card):
+    def update_audio_player(self, audio_frame, card, prefer_side: str = "back"):
         """Обновить аудио плеер"""
-        # Очищаем текущие аудио фреймы
-        for widget in audio_frame.winfo_children():
-            widget.destroy()
-        
-        # Добавляем аудио плеер
-        audio_path = card.get("audio_path")
-        if audio_path and os.path.exists(audio_path):
-            ttk.Label(audio_frame, text="Аудио:").pack(side=tk.LEFT, padx=(0, 5))
-            ttk.Button(audio_frame, text="▶ Воспроизвести",
-                      command=lambda: self.play_audio_file(audio_path)).pack(side=tk.LEFT)
+        audio_widget = getattr(audio_frame, "audio_widget", None)
+        if audio_widget is None:
+            audio_widget = AudioPlayerWidget(audio_frame, on_error_callback=self._show_audio_error)
+            audio_frame.audio_widget = audio_widget
+            audio_widget.pack(fill=tk.X)
+
+        audio_path = get_card_audio_path(card, prefer_side=prefer_side)
+        if audio_path:
+            audio_widget.load(audio_path)
+            audio_widget.pack(fill=tk.X)
+        else:
+            audio_widget.load(None)
+            audio_widget.pack_forget()
+
+    def _show_audio_error(self, title: str, message: str):
+        try:
+            messagebox.showerror(title, message)
+        except Exception:
+            pass
 
     def update_video_player(self, video_frame, card):
         """Показать плеер или кнопку открытия видео клипа."""
@@ -5969,8 +6008,15 @@ class OverviewWindow(tk.Toplevel):
     
     def play_audio(self):
         """Озвучить текущую карточку"""
-        # Пытаемся воспроизвести аудио файл
-        audio_path = self.current_card.get("audio_path")
+        for widget in [
+            getattr(self.front_audio_frame, "audio_widget", None),
+            getattr(self.back_audio_frame, "audio_widget", None),
+        ]:
+            if widget and widget.is_loaded():
+                widget.play()
+                return
+
+        audio_path = get_card_audio_path(self.current_card, prefer_side="back")
         if audio_path and os.path.exists(audio_path) and WINSOUND_AVAILABLE:
             try:
                 winsound.PlaySound(audio_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
@@ -6069,7 +6115,7 @@ class RepeatWindow(tk.Toplevel):
             bd=2,
             relief="solid",
             width=800,
-            height=400
+            height=520
         )
         self.card_frame.pack(pady=10)
         self.card_frame.pack_propagate(False)
@@ -6130,7 +6176,7 @@ class RepeatWindow(tk.Toplevel):
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
         self.checkpoint_frame = tk.Frame(self.card_frame, bg="white")
-        self.checkpoint_frame.place(x=250, y=350, width=300, height=40)
+        self.checkpoint_frame.place(x=250, y=470, width=300, height=40)
         
         # Создаем 6 чекбоксов в ряд
         self.checkpoint_vars = []
@@ -6180,39 +6226,24 @@ class RepeatWindow(tk.Toplevel):
         self.btn_sound.grid(row=0, column=6, padx=5)
 
         # Добавить аудио-плеер
-        self.audio_frame = None
+        self.audio_widget = AudioPlayerWidget(self.card_frame, on_error_callback=self._show_audio_error)
         self.update_audio_player()
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
-        if self.audio_frame is not None:
-            try:
-                self.audio_frame.destroy()
-            except Exception:
-                pass
-            self.audio_frame = None
+        audio_path = get_card_audio_path(self.current_card, prefer_side="back" if self.show_back else "front")
+        if audio_path:
+            self.audio_widget.load(audio_path)
+            self.audio_widget.place(x=10, y=350, width=780, height=110)
+        else:
+            self.audio_widget.load(None)
+            self.audio_widget.place_forget()
 
-        audio_entries = self.get_audio_entries()
-        target_side = "back" if self.show_back else "front"
-        selected_entry = None
-        for entry in audio_entries:
-            if (entry.get("side") or "back").lower() == target_side:
-                selected_entry = entry
-                break
-        if not selected_entry and audio_entries:
-            selected_entry = audio_entries[0]
-
-        audio_path = selected_entry.get("path") if selected_entry else None
-        if audio_path and os.path.exists(audio_path):
-            self.audio_frame = ttk.Frame(self.card_frame, bg="white")
-            self.audio_frame.place(x=10, y=310, width=780, height=40)
-
-            ttk.Label(self.audio_frame, text=os.path.basename(audio_path)).pack(side=tk.LEFT, padx=5)
-            ttk.Button(
-                self.audio_frame,
-                text="🔊 Воспроизвести аудио",
-                command=lambda p=audio_path: self.play_audio_file(p),
-            ).pack(side=tk.LEFT)
+    def _show_audio_error(self, title: str, message: str):
+        try:
+            messagebox.showerror(title, message)
+        except Exception:
+            pass
 
     def get_audio_entries(self) -> list[dict]:
         entries = []
@@ -6474,7 +6505,11 @@ class RepeatWindow(tk.Toplevel):
             self.update_view()
 
     def play_word(self):
-        audio_path = self.current_card["audio_path"]
+        target_side = "back" if self.show_back else "front"
+        audio_path = get_card_audio_path(self.current_card, prefer_side=target_side)
+        if getattr(self, "audio_widget", None) and self.audio_widget.is_loaded():
+            self.audio_widget.play()
+            return
         if audio_path and os.path.exists(audio_path) and WINSOUND_AVAILABLE:
             try:
                 winsound.PlaySound(audio_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
@@ -6557,7 +6592,7 @@ class ReviewWindow(tk.Toplevel):
             bd=2,
             relief="solid",
             width=700,
-            height=320
+            height=420
         )
         self.card_frame.pack(pady=10)
         self.card_frame.pack_propagate(False)
@@ -6636,6 +6671,9 @@ class ReviewWindow(tk.Toplevel):
         )
         self.btn_progress_plus.pack(side=tk.LEFT, padx=(4, 10))
 
+        self.audio_widget = AudioPlayerWidget(self.card_frame, on_error_callback=self._show_audio_error)
+        self.audio_widget.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
+
         # Панель кнопок
         bottom_frame = tk.Frame(self.card_frame, bg="white")
         bottom_frame.pack(side=tk.BOTTOM, pady=8)
@@ -6670,17 +6708,20 @@ class ReviewWindow(tk.Toplevel):
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
-        # Добавляем аудио-плеер под текстом карточки
-        audio_path = self.current_card.get("audio_path")
-        if audio_path and os.path.exists(audio_path):
-            # Создаем фрейм для аудио-плеера
-            audio_frame = ttk.Frame(self.card_frame, bg="white")
-            audio_frame.place(x=10, y=240, width=680, height=40)
-            
-            # Кнопка воспроизведения аудио
-            self.audio_btn = ttk.Button(audio_frame, text="🔊 Воспроизвести предложение", 
-                                       command=lambda: self.play_audio_file(audio_path))
-            self.audio_btn.pack()
+        audio_path = get_card_audio_path(self.current_card, prefer_side="back" if self.show_back else "front")
+        if audio_path:
+            self.audio_widget.load(audio_path)
+            if not self.audio_widget.winfo_ismapped():
+                self.audio_widget.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
+        else:
+            self.audio_widget.load(None)
+            self.audio_widget.pack_forget()
+
+    def _show_audio_error(self, title: str, message: str):
+        try:
+            messagebox.showerror(title, message)
+        except Exception:
+            pass
     
     def play_audio_file(self, path):
         """Воспроизвести аудио файл"""
@@ -6949,7 +6990,11 @@ class ReviewWindow(tk.Toplevel):
         self.load_checkpoint_state()
 
     def play_word(self):
-        audio_path = self.current_card["audio_path"]
+        target_side = "back" if self.show_back else "front"
+        audio_path = get_card_audio_path(self.current_card, prefer_side=target_side)
+        if getattr(self, "audio_widget", None) and self.audio_widget.is_loaded():
+            self.audio_widget.play()
+            return
         if audio_path and os.path.exists(audio_path) and WINSOUND_AVAILABLE:
             try:
                 winsound.PlaySound(audio_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
