@@ -1,16 +1,21 @@
 import os
 import re
 import csv
-import requests
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from PIL import Image
 from io import BytesIO
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
+from PIL import Image
 
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
+USER_AGENT = "AnkyX/1.0 (Wikimedia image fetcher)"
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": USER_AGENT})
 
 
 def _read_csv_rows(path: str) -> List[Dict[str, str]]:
-    encodings = ["utf-8", "cp1251", "latin-1"]
+    encodings = ["utf-8-sig", "cp1251", "cp1252"]
     last_err: Optional[Exception] = None
     for enc in encodings:
         try:
@@ -26,47 +31,35 @@ def _read_csv_rows(path: str) -> List[Dict[str, str]]:
     raise Exception(f"Не удалось прочитать CSV: {last_err}")
 
 
-def search_pages(query: str) -> List[Dict[str, Any]]:
+def _request_json(params: Dict[str, Any]) -> Dict[str, Any]:
+    resp = SESSION.get(WIKIMEDIA_API, params=params, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def search_files(query: str) -> List[Dict[str, Any]]:
     params = {
         "action": "query",
         "list": "search",
+        "srnamespace": 6,
+        "srlimit": 5,
         "srsearch": query,
         "format": "json",
     }
-    resp = requests.get(WIKIMEDIA_API, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _request_json(params)
     return data.get("query", {}).get("search", [])
 
 
-def page_images(pageid: int) -> List[Dict[str, Any]]:
+def _get_imageinfo(title: str) -> Optional[Dict[str, Any]]:
     params = {
         "action": "query",
-        "prop": "images",
-        "pageids": pageid,
-        "format": "json",
-    }
-    resp = requests.get(WIKIMEDIA_API, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    pages = data.get("query", {}).get("pages", {})
-    page = pages.get(str(pageid), {})
-    return page.get("images", []) or []
-
-
-def file_url(filename: str) -> Optional[Dict[str, Any]]:
-    params = {
-        "action": "query",
-        "titles": f"File:{filename}",
+        "titles": title,
         "prop": "imageinfo",
         "iiprop": "url|mime|size",
         "format": "json",
     }
-    resp = requests.get(WIKIMEDIA_API, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _request_json(params)
     pages = data.get("query", {}).get("pages", {})
-    allowed_ext = {".png", ".jpg", ".jpeg"}
     for page in pages.values():
         info_list = page.get("imageinfo", [])
         if not info_list:
@@ -76,100 +69,83 @@ def file_url(filename: str) -> Optional[Dict[str, Any]]:
         mime = info.get("mime", "")
         width = info.get("width")
         height = info.get("height")
-        if not url:
+        if not url or not mime:
             continue
-        if mime.startswith("image/svg"):
+        if not mime.startswith("image/"):
             continue
-        ext = os.path.splitext(url)[1].lower()
-        if ext == ".svg" or ext not in allowed_ext:
+        if mime == "image/svg+xml":
             continue
-        if width and height:
-            if max(width, height) < 200:
-                continue
+        if width is not None and height is not None and max(width, height) < 200:
+            continue
         return {"url": url, "mime": mime, "width": width, "height": height}
     return None
 
 
-def _is_concrete(notes: str, translation: str) -> Optional[bool]:
-    notes_low = notes.lower()
-    translation_low = translation.lower()
-    noun_markers = [" m", " f", " n", " der", " die", " das", "noun"]
-    verb_markers = [" vt", " vi", "verb"]
-    if any(marker in notes_low for marker in noun_markers):
-        return True
-    if any(marker in notes_low for marker in verb_markers):
-        return False
-    if translation_low.startswith("(") or any(word in translation_low for word in ["действие", "процесс", "качество"]):
-        return False
-    return None
+def _normalize_word(raw_word: str) -> str:
+    word = (raw_word or "").strip()
+    word = word.replace("|", " ").replace("*", " ")
+    word = re.sub(r"[\"']", "", word)
+    word = re.split(r"\s*\|\s*|;|,|\(", word)[0].strip()
+    word = re.sub(r"[\.,]+$", "", word).strip()
+    word = re.sub(r"^(der|die|das)\s+", "", word, flags=re.IGNORECASE)
+    word = re.sub(r"\s+", " ", word)
+    return word
 
 
-def _build_queries(word: str, translation: str, priority: str) -> Iterable[Tuple[str, str]]:
-    word = word.strip()
-    translation = translation.strip()
-    photo_query = f"{word} {translation} photo".strip()
-    meaning_parts = [word, "icon", "illustration"]
-    if translation:
-        extra = " ".join(translation.split()[:2])
-        meaning_parts.append(extra)
-    meaning_query = " ".join(part for part in meaning_parts if part)
-
-    if priority == "photo_first":
-        yield (photo_query, "PHOTO")
-        yield (meaning_query, "MEANING")
-    else:
-        yield (meaning_query, "MEANING")
-        yield (photo_query, "PHOTO")
+def _build_queries(word: str) -> Iterable[Tuple[str, str]]:
+    word_clean = _normalize_word(word)
+    if not word_clean:
+        return []
+    photo_query = f"{word_clean} photo"
+    meaning_query = f"{word_clean} icon illustration"
+    return [(photo_query, "PHOTO"), (meaning_query, "MEANING")]
 
 
 def _download_image(url: str) -> bytes:
-    resp = requests.get(url, timeout=15)
+    resp = SESSION.get(url, timeout=20)
     resp.raise_for_status()
     return resp.content
 
 
-def _sanitize_filename(name: str) -> str:
-    return re.sub(r"^File:", "", name)
-
-
-def fetch_best_image_for_row(row: Dict[str, str]) -> Tuple[Optional[bytes], Optional[str]]:
+def fetch_best_image_for_row(row: Dict[str, str]) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     word = (row.get("word") or "").strip()
-    translation = (row.get("translation") or "").strip()
-    notes = (row.get("notes") or "").strip()
+    last_error: Optional[str] = None
 
-    priority = _is_concrete(notes, translation)
-    priority_key = "photo_first" if priority is not False else "meaning_first"
-
-    if priority is None:
-        priority_key = "photo_first"
-
-    for query, kind in _build_queries(word, translation, priority_key):
+    for query, kind in _build_queries(word):
         try:
-            pages = search_pages(query)
-        except Exception:
+            pages = search_files(query)
+        except requests.RequestException as exc:  # noqa: PERF203
+            return None, None, f"HTTP error {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return None, None, f"error: {type(exc).__name__}: {exc}"
+
+        if not pages:
             continue
+
         for page in pages:
-            pageid = page.get("pageid")
-            if not pageid:
+            title = page.get("title")
+            if not title:
                 continue
             try:
-                images = page_images(pageid)
-            except Exception:
+                info = _get_imageinfo(title)
+            except requests.RequestException as exc:  # noqa: PERF203
+                last_error = f"HTTP error {exc}"
                 continue
-            for img in images:
-                title = img.get("title")
-                if not title:
-                    continue
-                filename = _sanitize_filename(title)
-                info = file_url(filename)
-                if not info:
-                    continue
-                try:
-                    data = _download_image(info["url"])
-                    return data, kind
-                except Exception:
-                    continue
-    return None, None
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"error: {type(exc).__name__}: {exc}"
+                continue
+
+            if not info:
+                continue
+            try:
+                data = _download_image(info["url"])
+                return data, kind, None
+            except requests.RequestException as exc:  # noqa: PERF203
+                last_error = f"HTTP error {exc}"
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"error: {type(exc).__name__}: {exc}"
+
+    return None, None, last_error
 
 
 def save_png(data: bytes, out_path: str) -> None:
@@ -183,7 +159,7 @@ def save_png(data: bytes, out_path: str) -> None:
     image.save(out_path, format="PNG")
 
 
-def process_csv_file(csv_path: str, images_dir: str = "images", stop_checker=lambda: False, progress_callback=None):
+def process_csv_file(csv_path: str, images_dir: str = "images", stop_checker=lambda: False, progress_callback=None, overwrite: bool = False):
     rows = _read_csv_rows(csv_path)
     os.makedirs(images_dir, exist_ok=True)
     total = len(rows)
@@ -199,14 +175,23 @@ def process_csv_file(csv_path: str, images_dir: str = "images", stop_checker=lam
             if progress_callback:
                 progress_callback(done, total, f"[пропуск] некорректный ID '{id_raw}'")
             continue
-        data, kind = fetch_best_image_for_row(row)
+        out_path = os.path.join(images_dir, f"{entry_id}.png")
+        if os.path.exists(out_path) and not overwrite:
+            status = f"ID {entry_id}: уже скачан"
+            done += 1
+            if progress_callback:
+                progress_callback(done, total, status)
+            continue
+
+        data, kind, err = fetch_best_image_for_row(row)
         if data:
-            out_path = os.path.join(images_dir, f"{entry_id}.png")
             try:
                 save_png(data, out_path)
                 status = f"ID {entry_id}: OK ({kind})"
-            except Exception:
-                status = f"ID {entry_id}: ошибка сохранения"
+            except Exception as exc:  # noqa: BLE001
+                status = f"ID {entry_id}: error: {type(exc).__name__}: {exc}"
+        elif err:
+            status = f"ID {entry_id}: {err}"
         else:
             status = f"ID {entry_id}: not found"
         done += 1
