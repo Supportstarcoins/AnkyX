@@ -526,6 +526,172 @@ def get_connection():
     return conn
 
 
+def ensure_basic_note_type_id(conn: sqlite3.Connection | None = None) -> int:
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM note_types WHERE name = 'Basic' LIMIT 1;")
+    row = cur.fetchone()
+    if row:
+        note_type_id = row["id"]
+    else:
+        fields = ["word", "translation", "example", "level", "image"]
+        templates = [
+            {
+                "name": "Word→Translation",
+                "front": "{word}",
+                "back": "{translation}\n\n{example}",
+                "requires_image": False,
+            },
+            {
+                "name": "Image→Word",
+                "front": "{image}",
+                "back": "{word}\n{translation}",
+                "requires_image": True,
+            },
+        ]
+        cur.execute(
+            "INSERT OR IGNORE INTO note_types (name, fields_json, card_templates_json) VALUES (?, ?, ?);",
+            ("Basic", json.dumps(fields, ensure_ascii=False), json.dumps(templates, ensure_ascii=False)),
+        )
+        conn.commit()
+        cur.execute("SELECT id FROM note_types WHERE name = 'Basic' LIMIT 1;")
+        note_type_id = cur.fetchone()["id"]
+
+    if close_conn:
+        conn.close()
+    return note_type_id
+
+
+def _get_note_type(cur: sqlite3.Cursor, note_type_id: int):
+    cur.execute(
+        "SELECT id, name, fields_json, card_templates_json FROM note_types WHERE id = ?;",
+        (note_type_id,),
+    )
+    return cur.fetchone()
+
+
+def _extract_note_fields(card_row: dict, note_fields: dict | None = None) -> dict:
+    if note_fields:
+        return dict(note_fields)
+
+    fields = {
+        "word": card_row.get("word") or card_row.get("target_word") or card_row.get("front") or "",
+        "translation": card_row.get("translation") or card_row.get("back") or "",
+        "example": card_row.get("example") or card_row.get("front") or "",
+        "level": card_row.get("leitner_level", 1),
+        "image": card_row.get("image_path")
+        or card_row.get("front_image_path")
+        or card_row.get("back_image_path")
+        or "",
+    }
+    return fields
+
+
+def create_cards_from_note_templates(
+    note_id: int,
+    note_type_id: int,
+    fields: dict,
+    deck_id: int,
+    skip_template_ords: set[int] | None = None,
+):
+    skip_template_ords = skip_template_ords or set()
+    conn = get_connection()
+    cur = conn.cursor()
+    note_type_row = _get_note_type(cur, note_type_id)
+    if not note_type_row:
+        conn.close()
+        return
+
+    templates = json.loads(note_type_row["card_templates_json"])
+    fields_default = collections.defaultdict(str, fields)
+
+    for ord_idx, template in enumerate(templates):
+        if ord_idx in skip_template_ords:
+            continue
+        requires_image = bool(template.get("requires_image"))
+        image_value = fields_default.get("image")
+        if requires_image and not image_value:
+            continue
+
+        formatter = collections.defaultdict(str, fields_default)
+        front = str(template.get("front", "")).format_map(formatter)
+        back = str(template.get("back", "")).format_map(formatter)
+        front_image_path = image_value if requires_image else None
+
+        insert_card(
+            deck_id,
+            front,
+            back,
+            front_image_path=front_image_path,
+            back_image_path=None,
+            audio_path=None,
+            level=1,
+            note_id=note_id,
+            template_ord=ord_idx,
+        )
+
+    conn.close()
+
+
+def ensure_note_for_card(
+    card_row: sqlite3.Row | dict,
+    note_fields: dict | None = None,
+    create_cards: bool = False,
+    skip_template_ords: set[int] | None = None,
+) -> dict:
+    card_dict = dict(card_row)
+    if card_dict.get("note_id"):
+        return card_dict
+
+    conn = get_connection()
+    note_type_id = ensure_basic_note_type_id(conn)
+    cur = conn.cursor()
+    fields = _extract_note_fields(card_dict, note_fields)
+    cur.execute(
+        """
+        INSERT INTO notes (deck_id, note_type_id, fields_json, tags, created_at)
+        VALUES (?, ?, ?, ?, ?);
+        """,
+        (
+            card_dict.get("deck_id"),
+            note_type_id,
+            json.dumps(fields, ensure_ascii=False),
+            "",
+            int(time.time()),
+        ),
+    )
+    note_id = cur.lastrowid
+    cur.execute(
+        "UPDATE cards SET note_id = ?, template_ord = ? WHERE id = ?;",
+        (note_id, 0, card_dict.get("id")),
+    )
+    conn.commit()
+    conn.close()
+
+    card_dict["note_id"] = note_id
+    card_dict["template_ord"] = 0
+
+    if create_cards:
+        skip = skip_template_ords if skip_template_ords is not None else {0}
+        create_cards_from_note_templates(
+            note_id,
+            note_type_id,
+            fields,
+            card_dict.get("deck_id"),
+            skip_template_ords=skip,
+        )
+
+    return card_dict
+
+
+def ensure_notes_for_cards(cards: list[sqlite3.Row]) -> list[dict]:
+    return [ensure_note_for_card(card) for card in cards]
+
+
 def init_db():
     conn = get_connection()
     cur = conn.cursor()
@@ -563,6 +729,8 @@ def init_db():
             back_image_path TEXT,
             image_path TEXT,
             audio_path TEXT,
+            note_id INTEGER,
+            template_ord INTEGER,
             progress INTEGER NOT NULL DEFAULT 0,
             translation_shown BOOLEAN DEFAULT 1,
             overview_added BOOLEAN DEFAULT 0,
@@ -710,14 +878,14 @@ def get_cards_in_deck(deck_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, front, back, next_review, leitner_level,
+        SELECT id, deck_id, front, back, next_review, leitner_level,
                front_image_path, back_image_path, image_path,
-               audio_path, progress, translation_shown
+               audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
         ORDER BY id;
     """, (deck_id,))
-    cards = cur.fetchall()
+    cards = ensure_notes_for_cards(cur.fetchall())
     conn.close()
     return cards
 
@@ -728,15 +896,15 @@ def get_due_cards(deck_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, front, back, next_review, leitner_level,
+        SELECT id, deck_id, front, back, next_review, leitner_level,
                front_image_path, back_image_path, image_path,
-               audio_path, progress, translation_shown
+               audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
           AND date(next_review) <= date(?)
         ORDER BY next_review, id;
     """, (deck_id, today))
-    cards = cur.fetchall()
+    cards = ensure_notes_for_cards(cur.fetchall())
     conn.close()
     return cards
 
@@ -751,9 +919,9 @@ def get_cards_for_repeat(deck_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, front, back, next_review, leitner_level,
+        SELECT id, deck_id, front, back, next_review, leitner_level,
                front_image_path, back_image_path, image_path,
-               audio_path, progress, translation_shown
+               audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
         ORDER BY
@@ -761,7 +929,7 @@ def get_cards_for_repeat(deck_id):
             date(next_review),
             id;
     """, (deck_id, today))
-    cards = cur.fetchall()
+    cards = ensure_notes_for_cards(cur.fetchall())
     conn.close()
     return cards
 
@@ -775,16 +943,16 @@ def get_cards_for_playback(deck_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, front, back, next_review, leitner_level,
+        SELECT id, deck_id, front, back, next_review, leitner_level,
                front_image_path, back_image_path, image_path,
-               audio_path, progress, translation_shown
+               audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
         ORDER BY progress ASC,
                  date(next_review) ASC,
                  id ASC;
     """, (deck_id,))
-    cards = cur.fetchall()
+    cards = ensure_notes_for_cards(cur.fetchall())
     conn.close()
     return cards
 
@@ -797,14 +965,14 @@ def get_overview_cards(deck_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, front, back, next_review, leitner_level,
+        SELECT id, deck_id, front, back, next_review, leitner_level,
                front_image_path, back_image_path, image_path,
-               audio_path, progress, translation_shown
+               audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
         ORDER BY id;
     """, (deck_id,))
-    cards = cur.fetchall()
+    cards = ensure_notes_for_cards(cur.fetchall())
     conn.close()
     return cards
 
@@ -842,7 +1010,7 @@ def get_card_by_id(card_id: int):
     cur.execute("SELECT * FROM cards WHERE id = ?;", (card_id,))
     row = cur.fetchone()
     conn.close()
-    return row
+    return ensure_note_for_card(row) if row else None
 
 
 def apply_srs_update(card_id: int, rating: int):
@@ -1405,13 +1573,19 @@ def enrich_german_word_info(word: str, api_key: str | None):
 # ==========================
 # Вставка карточки
 # ==========================
-def insert_card(deck_id: int,
-                front: str,
-                back: str,
-                front_image_path: str | None = None,
-                back_image_path: str | None = None,
-                audio_path: str | None = None,
-                level: int = 1):
+def insert_card(
+    deck_id: int,
+    front: str,
+    back: str,
+    front_image_path: str | None = None,
+    back_image_path: str | None = None,
+    audio_path: str | None = None,
+    level: int = 1,
+    note_id: int | None = None,
+    template_ord: int | None = None,
+    ensure_note: bool = False,
+    note_fields: dict | None = None,
+):
     """
     Вставка карточки в БД.
     """
@@ -1442,15 +1616,50 @@ def insert_card(deck_id: int,
             # Удалить тег из текста для чистого отображения
             back = re.sub(r'\[audio:.+?\]', '', back).strip()
 
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO cards (deck_id, front, back, next_review, leitner_level,
-                           front_image_path, back_image_path, audio_path, translation_shown, overview_added)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1);
-    """, (deck_id, front, back, next_dt, level,
-          front_image_path, back_image_path, actual_audio_path))
+                           front_image_path, back_image_path, audio_path,
+                           note_id, template_ord, translation_shown, overview_added)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1);
+    """,
+        (
+            deck_id,
+            front,
+            back,
+            next_dt,
+            level,
+            front_image_path,
+            back_image_path,
+            actual_audio_path,
+            note_id,
+            template_ord,
+        ),
+    )
 
+    card_id = cur.lastrowid
     conn.commit()
     conn.close()
+
+    if ensure_note and note_id is None:
+        card_stub = {
+            "id": card_id,
+            "deck_id": deck_id,
+            "front": front,
+            "back": back,
+            "leitner_level": level,
+            "front_image_path": front_image_path,
+            "back_image_path": back_image_path,
+            "image_path": None,
+        }
+        ensure_note_for_card(
+            card_stub,
+            note_fields=note_fields,
+            create_cards=True,
+            skip_template_ords={template_ord} if template_ord is not None else {0},
+        )
+
+    return card_id
 
 # ==========================
 # Авто-генерация
@@ -1543,11 +1752,22 @@ def auto_generate_cards_from_text(deck_id: int,
             except Exception:
                 img_path_front = None
 
+        note_fields = {
+            "word": target_word or sentence,
+            "translation": translation,
+            "example": sentence,
+            "level": level,
+            "image": img_path_front or "",
+        }
+
         insert_card(deck_id, front, back,
                     front_image_path=img_path_front,
                     back_image_path=None,
                     audio_path=audio_path,
-                    level=1)
+                    level=1,
+                    template_ord=0,
+                    ensure_note=True,
+                    note_fields=note_fields)
         created += 1
 
         # доп. карточки: синонимы
