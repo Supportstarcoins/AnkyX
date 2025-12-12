@@ -6698,18 +6698,18 @@ class ReviewWindow(tk.Toplevel):
         speak_text(word)
 
 
-class AudioEditorWindow(tk.Toplevel):
+class AudioEditorWindow:
     """Окно для нарезки аудио из видео на предложения"""
-    
+
     def __init__(self, master, video_path, deck_id):
-        super().__init__(master)
         self.master = master
         self.video_path = video_path
         self.deck_id = deck_id
-        
-        self.title("Аудио-редактор: нарезка видео на предложения")
-        self.geometry("1000x600")
-        self.grab_set()
+
+        self.win = tk.Toplevel(master)
+        self.win.title("Аудио-редактор: нарезка видео на предложения")
+        self.win.geometry("1000x600")
+        self.win.grab_set()
         
         # Загружаем аудио из видео
         self.audio_path = None
@@ -6748,17 +6748,17 @@ class AudioEditorWindow(tk.Toplevel):
         except ImportError:
             messagebox.showerror("Ошибка", "Для работы с видео установите moviepy и librosa:\n"
                                            "pip install moviepy librosa")
-            self.destroy()
+            self.win.destroy()
             return False
         except Exception as e:
             messagebox.showerror("Ошибка", f"{type(e).__name__}: {e}")
-            self.destroy()
+            self.win.destroy()
             return False
-            
+
     def create_widgets(self):
         """Создать интерфейс редактора"""
         # Основной фрейм
-        main_frame = ttk.Frame(self)
+        main_frame = ttk.Frame(self.win)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # Верхняя панель: информация о видео
@@ -6985,7 +6985,7 @@ class AudioEditorWindow(tk.Toplevel):
             )
 
         messagebox.showinfo("Успех", f"Создано {len(self.sentences)} карточек")
-        self.destroy()
+        self.win.destroy()
         
     def save_audio_segment(self, audio_data, path):
         """Сохранить аудио сегмент в файл"""
@@ -7022,7 +7022,7 @@ class VideoEditorWindow(AudioEditorWindow):
 
     def __init__(self, parent, video_path, deck_id):
         super().__init__(parent, video_path, deck_id)
-        self.title("Видео → клипы → карточки")
+        self.win.title("Видео → клипы → карточки")
 
 
 if __name__ == "__main__":
