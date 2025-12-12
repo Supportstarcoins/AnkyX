@@ -47,7 +47,7 @@ from stats_config import (
 )
 from db_migrations import run_migrations
 from srs import schedule_review
-from bg_tasks import start_background_task
+from bg_tasks import BackgroundTask, start_background_task
 from overdue_badges import (
     PhaseOverdueBadges,
     ensure_due_column,
@@ -2933,6 +2933,8 @@ class AnkiApp(tk.Tk):
                              command=self.open_video_clip_window)
         gen_menu.add_command(label="Импорт картинок по ID (CSV)…",
                              command=self.open_image_id_import_window)
+        gen_menu.add_command(label="Картинки по CSV (Wikimedia)",
+                             command=self.open_wikimedia_csv_window)
         menubar.add_cascade(label="Режим генерации", menu=gen_menu)
 
         modes_menu = tk.Menu(menubar, tearoff=0)
@@ -3460,6 +3462,142 @@ class AnkiApp(tk.Tk):
 
         log_text = tk.Text(main_frame, height=15, state="disabled")
         log_text.pack(fill=tk.BOTH, expand=True, pady=5)
+
+    def open_wikimedia_csv_window(self):
+        if not PIL_AVAILABLE:
+            messagebox.showerror("Pillow не установлен", "Для режима нужен пакет Pillow")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Картинки по CSV (Wikimedia)")
+        win.geometry("720x520")
+        win.grab_set()
+
+        csv_path_var = tk.StringVar()
+        status_var = tk.StringVar(value="Готово")
+        progress_var = tk.DoubleVar(value=0)
+        progress_label_var = tk.StringVar(value="0/0")
+
+        task_holder: dict[str, BackgroundTask | None] = {"task": None}
+
+        def log_msg(msg: str):
+            log_box.configure(state="normal")
+            log_box.insert(tk.END, msg + "\n")
+            log_box.see(tk.END)
+            log_box.configure(state="disabled")
+
+        def handle_event(event):
+            kind = event[0]
+            if kind == "progress":
+                done, total, label = event[1:]
+                progress_bar.configure(maximum=max(total, 1))
+                progress_var.set(done)
+                progress_label_var.set(f"{done}/{total}")
+                status_var.set(label)
+                log_msg(label)
+            elif kind == "done":
+                summary = event[1] or {}
+                status_var.set("Готово")
+                progress_label_var.set(f"{summary.get('done', 0)}/{summary.get('total', 0)}")
+                log_msg("Завершено")
+                _finish_task()
+            elif kind == "cancelled":
+                status_var.set("Отменено пользователем")
+                log_msg("[остановлено] Пользователь отменил загрузку")
+                _finish_task()
+            elif kind == "error":
+                status_var.set(event[1])
+                messagebox.showerror("Ошибка", event[1])
+                _finish_task()
+
+        def _finish_task():
+            if task_holder["task"]:
+                self.unregister_bg_handler(task_holder["task"].queue)
+                task_holder["task"] = None
+            btn_start.config(state=tk.NORMAL)
+            btn_cancel.config(state=tk.DISABLED)
+
+        def browse_csv():
+            path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")])
+            if path:
+                csv_path_var.set(path)
+
+        def start_fetch():
+            if task_holder["task"]:
+                return
+            csv_path = csv_path_var.get().strip()
+            if not csv_path:
+                messagebox.showerror("Ошибка", "Укажите CSV-файл")
+                return
+            status_var.set("Начинаю загрузку…")
+            progress_var.set(0)
+            progress_label_var.set("0/0")
+
+            from wiki_image_fetcher import process_csv_file
+
+            def worker(task_obj: BackgroundTask, csv_file: str):
+                def progress_cb(done: int, total: int, label: str):
+                    task_obj.queue.put(("progress", done, total, label))
+
+                try:
+                    done, total = process_csv_file(
+                        csv_file,
+                        images_dir="images",
+                        stop_checker=task_obj.cancelled,
+                        progress_callback=progress_cb,
+                    )
+                    if task_obj.cancelled():
+                        task_obj.queue.put(("cancelled",))
+                    else:
+                        task_obj.queue.put(("done", {"done": done, "total": total}))
+                except Exception as exc:  # noqa: BLE001
+                    task_obj.queue.put(("error", str(exc)))
+
+            task = start_background_task(worker, csv_path)
+            task_holder["task"] = task
+            self.register_bg_handler(task.queue, handle_event)
+            btn_start.config(state=tk.DISABLED)
+            btn_cancel.config(state=tk.NORMAL)
+
+        def cancel_fetch():
+            if task_holder["task"]:
+                task_holder["task"].cancel()
+                status_var.set("Остановка…")
+                btn_cancel.config(state=tk.DISABLED)
+
+        def on_close():
+            cancel_fetch()
+            if task_holder["task"]:
+                self.unregister_bg_handler(task_holder["task"].queue)
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+        top_frame = ttk.Frame(win)
+        top_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Label(top_frame, text="CSV файл:").grid(row=0, column=0, sticky="w", padx=5)
+        entry = ttk.Entry(top_frame, textvariable=csv_path_var)
+        entry.grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(top_frame, text="Выбрать", command=browse_csv).grid(row=0, column=2, padx=5)
+        top_frame.columnconfigure(1, weight=1)
+
+        progress_frame = ttk.Frame(win)
+        progress_frame.pack(fill=tk.X, padx=10, pady=5)
+        progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=1)
+        progress_bar.pack(fill=tk.X, expand=True, padx=5)
+        ttk.Label(progress_frame, textvariable=progress_label_var).pack(anchor="w", padx=5)
+        ttk.Label(progress_frame, textvariable=status_var, foreground="gray").pack(anchor="w", padx=5)
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        btn_start = ttk.Button(btn_frame, text="Старт", command=start_fetch)
+        btn_start.pack(side=tk.LEFT, padx=5)
+        btn_cancel = ttk.Button(btn_frame, text="Отмена", command=cancel_fetch, state=tk.DISABLED)
+        btn_cancel.pack(side=tk.LEFT, padx=5)
+
+        log_box = tk.Text(win, height=15, state="disabled")
+        log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     # --------- режим ознакомления ---------
 
