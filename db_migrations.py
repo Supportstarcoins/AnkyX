@@ -2,6 +2,10 @@ import json
 import sqlite3
 
 
+import json
+import sqlite3
+
+
 def _column_exists(cursor: sqlite3.Cursor, table: str, column: str) -> bool:
     cursor.execute(f"PRAGMA table_info({table});")
     return any(row[1] == column for row in cursor.fetchall())
@@ -76,6 +80,20 @@ def run_migrations(conn: sqlite3.Connection):
 
     _add_column_if_missing(cur, "cards", "note_id", "INTEGER")
     _add_column_if_missing(cur, "cards", "template_ord", "INTEGER")
+
+    # Медиа привязанные к заметкам
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            media_type TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(note_id) REFERENCES notes(id)
+        );
+        """
+    )
 
     # Добавляем дефолтный тип заметки "Basic"
     cur.execute(
