@@ -36,6 +36,8 @@ except ImportError:
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from db_migrations import run_migrations
+from srs import schedule_review
 
 # ==========================
 # OCR: pytesseract + автопоиск tesseract.exe
@@ -564,6 +566,14 @@ def init_db():
             progress INTEGER NOT NULL DEFAULT 0,
             translation_shown BOOLEAN DEFAULT 1,
             overview_added BOOLEAN DEFAULT 0,
+            state TEXT,
+            due INTEGER,
+            interval INTEGER,
+            ease INTEGER,
+            reps INTEGER,
+            lapses INTEGER,
+            step_index INTEGER,
+            last_review INTEGER,
             FOREIGN KEY (deck_id) REFERENCES decks(id)
         );
     """)
@@ -621,6 +631,8 @@ def init_db():
             UNIQUE(date, deck_id)
         );
     """)
+
+    run_migrations(conn)
 
     conn.commit()
     conn.close()
@@ -822,6 +834,66 @@ def update_card_leitner(card_id: int, new_level: int):
     """, (new_level, next_dt, card_id))
     conn.commit()
     conn.close()
+
+
+def get_card_by_id(card_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM cards WHERE id = ?;", (card_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def apply_srs_update(card_id: int, rating: int):
+    row = get_card_by_id(card_id)
+    if not row:
+        return None
+    card_data = dict(row)
+    card_data.setdefault("phase", card_data.get("leitner_level", 1))
+    now_ts = int(time.time())
+    result = schedule_review(card_data, rating, now_ts)
+    next_review_value = datetime.fromtimestamp(result["due"]).isoformat()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE cards
+           SET state = ?, due = ?, interval = ?, ease = ?, reps = ?, lapses = ?,
+               step_index = ?, last_review = ?, leitner_level = ?, next_review = ?
+         WHERE id = ?;
+        """,
+        (
+            result["state"], result["due"], result["interval"], result["ease"],
+            result["reps"], result["lapses"], result["step_index"],
+            result["last_review"], result["phase"], next_review_value, card_id
+        ),
+    )
+    cur.execute(
+        """
+        INSERT INTO reviews (
+            card_id, reviewed_at, rating,
+            interval_before, interval_after,
+            ease_before, ease_after,
+            phase_before, phase_after
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            card_id,
+            now_ts,
+            rating,
+            result.get("interval_before"),
+            result.get("interval_after"),
+            result.get("ease_before"),
+            result.get("ease_after"),
+            result.get("phase_before"),
+            result.get("phase_after"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return result
 
 
 def update_card_progress(card_id: int, new_progress: int):
@@ -4581,40 +4653,30 @@ class RepeatWindow(tk.Toplevel):
 
     def mark_forgotten(self):
         card_id = self.current_card["id"]
-        update_card_leitner(card_id, 1)
+        result = apply_srs_update(card_id, 0)
         update_statistics(self.master.selected_deck_id, remembered=False, forgotten=True, reviewed=True)
-        
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT leitner_level, next_review FROM cards WHERE id = ?;", (card_id,))
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            self.current_card["leitner_level"] = row["leitner_level"]
-            self.current_card["next_review"] = row["next_review"]
+
+        if result:
+            self.current_card["leitner_level"] = result.get("phase")
+            self.current_card["next_review"] = datetime.fromtimestamp(result.get("due", time.time())).isoformat()
+            self.current_card["state"] = result.get("state")
             self.update_view()
         self.master.update_overdue_badge()
         messagebox.showinfo("Лейтнер", "Карточка отправлена в 1-й уровень (режим заучивания).")
 
     def mark_remembered(self):
-        level = self.current_card["leitner_level"]
         card_id = self.current_card["id"]
-        new_level = min(10, level + 1)
 
-        update_card_leitner(card_id, new_level)
+        result = apply_srs_update(card_id, 2)
         update_statistics(self.master.selected_deck_id, remembered=True, forgotten=False, reviewed=True)
 
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT leitner_level, next_review FROM cards WHERE id = ?;", (card_id,))
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            self.current_card["leitner_level"] = row["leitner_level"]
-            self.current_card["next_review"] = row["next_review"]
+        if result:
+            self.current_card["leitner_level"] = result.get("phase")
+            self.current_card["next_review"] = datetime.fromtimestamp(result.get("due", time.time())).isoformat()
+            self.current_card["state"] = result.get("state")
             self.update_view()
         self.master.update_overdue_badge()
-        messagebox.showinfo("Лейтнер", f"Отлично! Уровень карточки теперь: {new_level}")
+        messagebox.showinfo("Лейтнер", f"Отлично! Уровень карточки теперь: {self.current_card['leitner_level']}")
 
     def next_card(self):
         self.current_index += 1
@@ -4946,14 +5008,10 @@ class ReviewWindow(tk.Toplevel):
         self.cancel_timers()
         card_id = self.current_card["id"]
         try:
-            update_card_leitner(card_id, 1)
+            apply_srs_update(card_id, 0)
             update_statistics(self.master.selected_deck_id, remembered=False, forgotten=True, reviewed=True)
-            
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT leitner_level, next_review FROM cards WHERE id = ?;", (card_id,))
-            row = cur.fetchone()
-            conn.close()
+
+            row = get_card_by_id(card_id)
             if row:
                 self.current_card["leitner_level"] = row["leitner_level"]
                 self.current_card["next_review"] = row["next_review"]
@@ -5035,17 +5093,13 @@ class ReviewWindow(tk.Toplevel):
     def mark_forgotten(self):
         self.cancel_timers()
         card_id = self.current_card["id"]
-        update_card_leitner(card_id, 1)
+        result = apply_srs_update(card_id, 0)
         update_statistics(self.master.selected_deck_id, remembered=False, forgotten=True, reviewed=True)
-        
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT leitner_level, next_review FROM cards WHERE id = ?;", (card_id,))
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            self.current_card["leitner_level"] = row["leitner_level"]
-            self.current_card["next_review"] = row["next_review"]
+
+        if result:
+            self.current_card["leitner_level"] = result.get("phase")
+            self.current_card["next_review"] = datetime.fromtimestamp(result.get("due", time.time())).isoformat()
+            self.current_card["state"] = result.get("state")
             self.update_view()
         self.master.update_overdue_badge()
         messagebox.showinfo("Лейтнер", "Карточка отправлена в 1-й уровень (режим заучивания).")
@@ -5053,24 +5107,18 @@ class ReviewWindow(tk.Toplevel):
 
     def mark_remembered(self):
         self.cancel_timers()
-        level = self.current_card["leitner_level"]
         card_id = self.current_card["id"]
-        new_level = min(10, level + 1)
 
-        update_card_leitner(card_id, new_level)
+        result = apply_srs_update(card_id, 2)
         update_statistics(self.master.selected_deck_id, remembered=True, forgotten=False, reviewed=True)
 
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT leitner_level, next_review FROM cards WHERE id = ?;", (card_id,))
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            self.current_card["leitner_level"] = row["leitner_level"]
-            self.current_card["next_review"] = row["next_review"]
+        if result:
+            self.current_card["leitner_level"] = result.get("phase")
+            self.current_card["next_review"] = datetime.fromtimestamp(result.get("due", time.time())).isoformat()
+            self.current_card["state"] = result.get("state")
             self.update_view()
         self.master.update_overdue_badge()
-        messagebox.showinfo("Лейтнер", f"Отлично! Уровень карточки теперь: {new_level}")
+        messagebox.showinfo("Лейтнер", f"Отлично! Уровень карточки теперь: {self.current_card['leitner_level']}")
         self.goto_next_card()
 
     def increment_progress(self):
