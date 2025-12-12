@@ -6,6 +6,7 @@ import re
 import threading
 import json
 import csv
+import shutil
 csv.field_size_limit(10 * 1024 * 1024)
 import gzip
 import pickle
@@ -154,6 +155,117 @@ MIC_DEVICE_INDEX = None
 
 DEFAULT_FRONT_TEMPLATE = "{sentence_with_gap}"
 DEFAULT_BACK_TEMPLATE = "{word} [{ipa}] ({gender}; pl. {plural})\n\n{sentence}\n\n{translation}"
+MEDIA_FOLDER = "media"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+
+CSV_COLUMN_ALIASES = {
+    "id": ["id", "ID", "word_id", "uid"],
+    "word": ["word", "de", "german", "term"],
+    "translation": ["translation", "ru", "russian", "meaning"],
+    "example": ["example", "sentence", "beispiel"],
+    "level": ["level", "cefr"],
+}
+
+
+def _find_column(header: list[str], aliases: list[str]) -> int | None:
+    lowered = [h.lower() for h in header]
+    for alt in aliases:
+        if alt.lower() in lowered:
+            return lowered.index(alt.lower())
+    return None
+
+
+def read_csv_dictionary(path: str) -> dict[int, dict]:
+    """Читает CSV-словарь и возвращает словарь id -> запись."""
+    encodings = ["utf-8", "cp1251"]
+    last_error = None
+    for enc in encodings:
+        try:
+            with open(path, "r", encoding=enc, newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if not header:
+                    return {}
+                col_map = {}
+                for key, variants in CSV_COLUMN_ALIASES.items():
+                    idx = _find_column(header, variants)
+                    if idx is not None:
+                        col_map[key] = idx
+
+                if "id" not in col_map:
+                    raise ValueError("В CSV нет колонки с ID")
+
+                records: dict[int, dict] = {}
+                for row in reader:
+                    try:
+                        raw_id = row[col_map["id"]].strip()
+                        if not raw_id:
+                            continue
+                        entry_id = int(re.search(r"\d+", raw_id).group(0))
+                    except Exception:
+                        continue
+
+                    def get_field(name: str) -> str:
+                        idx = col_map.get(name)
+                        return row[idx].strip() if idx is not None and idx < len(row) else ""
+
+                    records[entry_id] = {
+                        "word": get_field("word"),
+                        "translation": get_field("translation"),
+                        "example": get_field("example"),
+                        "level": get_field("level"),
+                    }
+                return records
+        except Exception as e:
+            last_error = e
+            continue
+    raise Exception(f"Не удалось прочитать CSV: {last_error}")
+
+
+def extract_id_from_filename(filename: str) -> int | None:
+    match = re.search(r"(\d+)", os.path.basename(filename))
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def extract_id_with_ocr(image_path: str) -> int | None:
+    if not (OCR_AVAILABLE and PIL_AVAILABLE and is_tesseract_available()):
+        return None
+    try:
+        img = Image.open(image_path)
+        gray = ImageOps.grayscale(img)
+        enhanced = ImageOps.autocontrast(gray)
+        text = pytesseract.image_to_string(enhanced)
+        match = re.search(r"(\d+)", text)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        return None
+    return None
+
+
+def ensure_media_dir() -> str:
+    os.makedirs(MEDIA_FOLDER, exist_ok=True)
+    return MEDIA_FOLDER
+
+
+def copy_image_to_media(src: str, target_id: int, move: bool = False) -> str:
+    ensure_media_dir()
+    ext = os.path.splitext(src)[1].lower() or ".png"
+    target_name = f"id_{target_id}{ext}"
+    dest_path = os.path.join(MEDIA_FOLDER, target_name)
+    try:
+        if move:
+            shutil.move(src, dest_path)
+        else:
+            shutil.copy2(src, dest_path)
+    except Exception:
+        dest_path = src
+    return dest_path
 
 # ==========================
 # НАСТРОЙКИ ПЕРЕВОДА И СЛОВАРИ
@@ -619,6 +731,15 @@ def _get_note_type(cur: sqlite3.Cursor, note_type_id: int):
     return cur.fetchone()
 
 
+def list_note_types() -> list[sqlite3.Row]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM note_types ORDER BY name;")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 def _extract_note_fields(card_row: dict, note_fields: dict | None = None) -> dict:
     if note_fields:
         return dict(note_fields)
@@ -748,6 +869,32 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return cur.fetchone() is not None
 
 
+def log_imported_file(path: str):
+    conn = get_connection()
+    if not _table_exists(conn, "import_log"):
+        conn.close()
+        return
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO import_log (file_path, imported_at) VALUES (?, ?);",
+        (path, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_imported_files() -> set[str]:
+    conn = get_connection()
+    if not _table_exists(conn, "import_log"):
+        conn.close()
+        return set()
+    cur = conn.cursor()
+    cur.execute("SELECT file_path FROM import_log;")
+    files = {row[0] for row in cur.fetchall()}
+    conn.close()
+    return files
+
+
 def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str]]):
     conn = get_connection()
     if not _table_exists(conn, "media"):
@@ -823,6 +970,23 @@ def create_note_with_cards(
 
 def ensure_notes_for_cards(cards: list[sqlite3.Row]) -> list[dict]:
     return [ensure_note_for_card(card) for card in cards]
+
+
+def find_note_by_source_id(deck_id: int, source_id: int) -> sqlite3.Row | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM notes WHERE deck_id = ?;", (deck_id,))
+    rows = cur.fetchall()
+    for row in rows:
+        try:
+            fields = json.loads(row["fields_json"])
+        except Exception:
+            continue
+        if str(fields.get("source_id")) == str(source_id):
+            conn.close()
+            return row
+    conn.close()
+    return None
 
 
 def init_db():
@@ -2382,6 +2546,8 @@ class AnkiApp(tk.Tk):
         self.overdue_canvas = None
         self.overdue_badge_text_id = None
 
+        self.image_import_watch_job = None
+
         # отображение id-элементов Treeview -> (deck_id, phase)
         self.deck_items = {}
 
@@ -2427,6 +2593,8 @@ class AnkiApp(tk.Tk):
                              command=self.open_generate_from_speech_window)
         gen_menu.add_command(label="Генерация из видео (цифровой слух)…",
                              command=self.open_generate_from_video_window)
+        gen_menu.add_command(label="Импорт картинок по ID (CSV)…",
+                             command=self.open_image_id_import_window)
         menubar.add_cascade(label="Режим генерации", menu=gen_menu)
 
         modes_menu = tk.Menu(menubar, tearoff=0)
@@ -2464,12 +2632,371 @@ class AnkiApp(tk.Tk):
             title="Выберите видео файл",
             filetypes=filetypes
         )
-        
+
         if not video_path:
             return
-            
+
         # Открыть окно аудио-редактора
         AudioEditorWindow(self, video_path, self.selected_deck_id)
+
+    def open_image_id_import_window(self):
+        if not PIL_AVAILABLE:
+            messagebox.showerror("Pillow не установлен", "Для режима импорта картинок нужен пакет Pillow")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Импорт картинок по ID (CSV)")
+        win.geometry("820x680")
+        win.grab_set()
+
+        # variables
+        csv_path_var = tk.StringVar()
+        folder_var = tk.StringVar()
+        deck_var = tk.StringVar()
+        note_type_var = tk.StringVar()
+        id_mode_var = tk.StringVar(value="filename")
+        update_existing_var = tk.BooleanVar(value=False)
+        move_files_var = tk.BooleanVar(value=False)
+        watch_var = tk.BooleanVar(value=False)
+        auto_confirm_var = tk.BooleanVar(value=True)
+        interval_var = tk.IntVar(value=5)
+        stop_flag = {"stop": False}
+
+        decks = list_decks()
+        if self.selected_deck_id:
+            deck_var.set(str(self.selected_deck_id))
+        elif decks:
+            deck_var.set(str(decks[0]["id"]))
+
+        note_types = list_note_types()
+        if note_types:
+            note_type_var.set(str(note_types[0]["id"]))
+        else:
+            note_type_var.set(str(ensure_basic_note_type_id()))
+
+        def log_msg(msg: str):
+            log_text.configure(state="normal")
+            log_text.insert(tk.END, msg + "\n")
+            log_text.see(tk.END)
+            log_text.configure(state="disabled")
+
+        def browse_csv():
+            path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")])
+            if path:
+                csv_path_var.set(path)
+
+        def browse_folder():
+            path = filedialog.askdirectory()
+            if path:
+                folder_var.set(path)
+
+        def ask_semi_confirmation(image_path: str, detected_id: int | None, csv_entry: dict | None):
+            result = {"action": "skip", "data": None, "auto": auto_confirm_var.get()}
+            if auto_confirm_var.get() and detected_id is not None and csv_entry:
+                result["action"] = "create"
+                result["data"] = {
+                    "id": detected_id,
+                    "word": csv_entry.get("word", ""),
+                    "translation": csv_entry.get("translation", ""),
+                    "example": csv_entry.get("example", ""),
+                    "level": csv_entry.get("level", ""),
+                }
+                return result
+
+            dialog = tk.Toplevel(win)
+            dialog.title("Подтверждение импорта")
+            dialog.geometry("640x520")
+            dialog.grab_set()
+
+            img_label = tk.Label(dialog)
+            img_label.pack(pady=5)
+
+            if os.path.exists(image_path):
+                try:
+                    img = Image.open(image_path)
+                    img.thumbnail((360, 260))
+                    photo = ImageTk.PhotoImage(img)
+                    img_label.configure(image=photo)
+                    img_label.image = photo
+                except Exception:
+                    img_label.configure(text="(не удалось загрузить картинку)")
+
+            form = ttk.Frame(dialog)
+            form.pack(fill=tk.X, padx=10, pady=10)
+
+            id_var = tk.StringVar(value=str(detected_id) if detected_id is not None else "")
+            word_var = tk.StringVar(value=(csv_entry or {}).get("word", ""))
+            tr_var = tk.StringVar(value=(csv_entry or {}).get("translation", ""))
+            ex_var = tk.StringVar(value=(csv_entry or {}).get("example", ""))
+            lvl_var = tk.StringVar(value=(csv_entry or {}).get("level", ""))
+            auto_apply_var = tk.BooleanVar(value=auto_confirm_var.get())
+
+            for idx, (lbl, var) in enumerate([
+                ("ID", id_var),
+                ("Word", word_var),
+                ("Translation", tr_var),
+                ("Example", ex_var),
+                ("Level", lvl_var),
+            ]):
+                ttk.Label(form, text=lbl + ":").grid(row=idx, column=0, sticky="w", pady=3)
+                ttk.Entry(form, textvariable=var).grid(row=idx, column=1, sticky="ew", padx=5)
+            form.columnconfigure(1, weight=1)
+
+            ttk.Checkbutton(dialog, text="Автоподтверждать далее", variable=auto_apply_var).pack(anchor="w", padx=10)
+
+            actions = ttk.Frame(dialog)
+            actions.pack(fill=tk.X, pady=10)
+
+            result_var = tk.StringVar(value="skip")
+
+            def do_create():
+                result_var.set("create")
+                dialog.destroy()
+
+            def do_skip():
+                result_var.set("skip")
+                dialog.destroy()
+
+            def do_stop():
+                result_var.set("stop")
+                dialog.destroy()
+
+            ttk.Button(actions, text="Создать/Обновить", command=do_create).pack(side=tk.LEFT, padx=5)
+            ttk.Button(actions, text="Пропустить", command=do_skip).pack(side=tk.LEFT, padx=5)
+            ttk.Button(actions, text="Стоп", command=do_stop).pack(side=tk.LEFT, padx=5)
+
+            dialog.bind("<Return>", lambda e: do_create())
+            dialog.bind("<Escape>", lambda e: do_skip())
+
+            dialog.wait_variable(result_var)
+
+            result["action"] = result_var.get()
+            result["data"] = {
+                "id": int(id_var.get()) if id_var.get().isdigit() else None,
+                "word": word_var.get().strip(),
+                "translation": tr_var.get().strip(),
+                "example": ex_var.get().strip(),
+                "level": lvl_var.get().strip(),
+            }
+            result["auto"] = auto_apply_var.get()
+            auto_confirm_var.set(auto_apply_var.get())
+            return result
+
+        def process_files(dry_run=False, watch_mode=False):
+            stop_flag["stop"] = False
+            csv_path = csv_path_var.get().strip()
+            folder = folder_var.get().strip()
+            if not csv_path or not os.path.exists(csv_path):
+                messagebox.showerror("Ошибка", "Укажите CSV-файл")
+                return
+            if not folder or not os.path.isdir(folder):
+                messagebox.showerror("Ошибка", "Укажите папку с изображениями")
+                return
+            try:
+                csv_data = read_csv_dictionary(csv_path)
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
+                return
+
+            deck_id = deck_var.get()
+            if not deck_id:
+                messagebox.showerror("Ошибка", "Выберите колоду")
+                return
+            deck_id_int = int(deck_id)
+
+            try:
+                note_type_id = int(note_type_var.get())
+            except ValueError:
+                note_type_id = ensure_basic_note_type_id()
+
+            imported_files = get_imported_files() if watch_mode else set()
+            files = [
+                os.path.join(folder, f)
+                for f in os.listdir(folder)
+                if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
+            ]
+            files.sort()
+
+            summary = {"total": 0, "imported": 0, "updated": 0, "skipped": 0, "errors": 0}
+
+            for fp in files:
+                if stop_flag.get("stop"):
+                    break
+                if watch_mode and fp in imported_files:
+                    continue
+
+                summary["total"] += 1
+                id_val = None
+                if id_mode_var.get() in ("filename", "semi"):
+                    id_val = extract_id_from_filename(fp)
+                if id_val is None and id_mode_var.get() in ("ocr", "semi"):
+                    id_val = extract_id_with_ocr(fp)
+
+                entry = csv_data.get(id_val) if id_val is not None else None
+                chosen = None
+
+                if id_mode_var.get() == "semi":
+                    choice = ask_semi_confirmation(fp, id_val, entry)
+                    if choice["action"] == "stop":
+                        stop_flag["stop"] = True
+                        break
+                    if choice["action"] == "skip" or choice.get("data", {}).get("id") is None:
+                        summary["skipped"] += 1
+                        continue
+                    auto_confirm_var.set(choice.get("auto", auto_confirm_var.get()))
+                    id_val = choice["data"].get("id")
+                    entry = {
+                        "word": choice["data"].get("word", ""),
+                        "translation": choice["data"].get("translation", ""),
+                        "example": choice["data"].get("example", ""),
+                        "level": choice["data"].get("level", ""),
+                    }
+
+                if id_val is None:
+                    log_msg(f"[ошибка] Не найден ID для {os.path.basename(fp)}")
+                    summary["errors"] += 1
+                    continue
+
+                if entry is None:
+                    log_msg(f"[пропуск] ID {id_val} отсутствует в CSV")
+                    summary["skipped"] += 1
+                    continue
+
+                existing = find_note_by_source_id(deck_id_int, id_val)
+                if existing and not update_existing_var.get() and id_mode_var.get() != "semi":
+                    log_msg(f"[пропуск] ID {id_val} уже существует")
+                    summary["skipped"] += 1
+                    continue
+
+                media_path = copy_image_to_media(fp, id_val, move_files_var.get()) if not dry_run else fp
+
+                fields = {
+                    "word": entry.get("word", ""),
+                    "translation": entry.get("translation", ""),
+                    "example": entry.get("example", ""),
+                    "level": entry.get("level", ""),
+                    "image": media_path,
+                    "source_id": str(id_val),
+                }
+
+                if dry_run:
+                    log_msg(f"[проверка] готова карточка ID {id_val}: {fields['word']} -> {fields['translation']}")
+                    summary["imported"] += 1
+                    continue
+
+                if existing:
+                    try:
+                        conn = get_connection()
+                        cur = conn.cursor()
+                        cur.execute(
+                            "UPDATE notes SET fields_json = ? WHERE id = ?;",
+                            (json.dumps(fields, ensure_ascii=False), existing["id"]),
+                        )
+                        conn.commit()
+                        conn.close()
+                        attach_media_to_note(existing["id"], [(media_path, "image")])
+                        summary["updated"] += 1
+                        log_msg(f"[обновлено] ID {id_val}")
+                    except Exception as e:
+                        summary["errors"] += 1
+                        log_msg(f"[ошибка] Не удалось обновить ID {id_val}: {e}")
+                else:
+                    try:
+                        _, created_cards = create_note_with_cards(
+                            deck_id_int,
+                            fields,
+                            note_type_id=note_type_id,
+                            tags="import:image_id",
+                        )
+                        summary["imported"] += 1
+                        log_msg(f"[создано] ID {id_val} (карточек: {created_cards})")
+                    except Exception as e:
+                        summary["errors"] += 1
+                        log_msg(f"[ошибка] Не удалось создать ID {id_val}: {e}")
+
+                if watch_mode:
+                    log_imported_file(fp)
+
+                self.refresh_decks()
+                self.update()
+
+            messagebox.showinfo(
+                "Импорт завершен",
+                f"Всего: {summary['total']}\n"
+                f"Создано: {summary['imported']}\n"
+                f"Обновлено: {summary['updated']}\n"
+                f"Пропущено: {summary['skipped']}\n"
+                f"Ошибки: {summary['errors']}",
+            )
+
+        def stop_processing():
+            stop_flag["stop"] = True
+            if self.image_import_watch_job:
+                try:
+                    win.after_cancel(self.image_import_watch_job)
+                except Exception:
+                    pass
+                self.image_import_watch_job = None
+            log_msg("[остановлено] Импорт остановлен пользователем")
+
+        def start_watch_loop():
+            stop_flag["stop"] = False
+            process_files(dry_run=False, watch_mode=True)
+            if not stop_flag.get("stop") and watch_var.get():
+                self.image_import_watch_job = win.after(interval_var.get() * 1000, start_watch_loop)
+
+        # Layout
+        main_frame = ttk.Frame(win)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        file_frame = ttk.LabelFrame(main_frame, text="Исходные данные")
+        file_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(file_frame, text="CSV словарь:").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        ttk.Entry(file_frame, textvariable=csv_path_var, width=60).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(file_frame, text="Выбрать", command=browse_csv).grid(row=0, column=2, padx=5)
+
+        ttk.Label(file_frame, text="Папка с картинками:").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        ttk.Entry(file_frame, textvariable=folder_var, width=60).grid(row=1, column=1, sticky="ew", padx=5)
+        ttk.Button(file_frame, text="Выбрать", command=browse_folder).grid(row=1, column=2, padx=5)
+        file_frame.columnconfigure(1, weight=1)
+
+        options_frame = ttk.LabelFrame(main_frame, text="Настройки")
+        options_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(options_frame, text="Колода:").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        deck_combo = ttk.Combobox(options_frame, textvariable=deck_var, state="readonly")
+        deck_combo['values'] = [str(d["id"]) for d in decks]
+        deck_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(options_frame, text="Note type:").grid(row=0, column=2, sticky="w", padx=5)
+        note_combo = ttk.Combobox(options_frame, textvariable=note_type_var, state="readonly")
+        note_combo['values'] = [str(nt["id"]) for nt in note_types]
+        note_combo.grid(row=0, column=3, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(options_frame, text="Режим ID:").grid(row=1, column=0, sticky="w", padx=5)
+        ttk.Radiobutton(options_frame, text="Имя файла", variable=id_mode_var, value="filename").grid(row=1, column=1, sticky="w")
+        ttk.Radiobutton(options_frame, text="OCR", variable=id_mode_var, value="ocr").grid(row=1, column=2, sticky="w")
+        ttk.Radiobutton(options_frame, text="Полуавто", variable=id_mode_var, value="semi").grid(row=1, column=3, sticky="w")
+
+        ttk.Checkbutton(options_frame, text="Обновлять существующие", variable=update_existing_var).grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        ttk.Checkbutton(options_frame, text="Перемещать файлы", variable=move_files_var).grid(row=2, column=1, sticky="w", padx=5, pady=3)
+        ttk.Checkbutton(options_frame, text="Следить за папкой (watch)", variable=watch_var).grid(row=2, column=2, sticky="w", padx=5, pady=3)
+        ttk.Checkbutton(options_frame, text="Автоподтверждать при совпадении (semi)", variable=auto_confirm_var).grid(row=2, column=3, sticky="w", padx=5, pady=3)
+
+        ttk.Label(options_frame, text="Интервал watch (сек)").grid(row=3, column=0, sticky="w", padx=5)
+        ttk.Spinbox(options_frame, from_=2, to=60, textvariable=interval_var, width=5).grid(row=3, column=1, sticky="w", padx=5)
+        options_frame.columnconfigure(1, weight=1)
+        options_frame.columnconfigure(3, weight=1)
+
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(btn_frame, text="Проверить", command=lambda: process_files(dry_run=True)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Импортировать", command=lambda: (start_watch_loop() if watch_var.get() else process_files(dry_run=False))).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Остановить", command=stop_processing).pack(side=tk.LEFT, padx=5)
+
+        log_text = tk.Text(main_frame, height=15, state="disabled")
+        log_text.pack(fill=tk.BOTH, expand=True, pady=5)
 
     # --------- режим ознакомления ---------
 
