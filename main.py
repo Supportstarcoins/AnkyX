@@ -792,6 +792,8 @@ def create_cards_from_note_templates(
     deck_id: int,
     skip_template_ords: set[int] | None = None,
     audio_path: str | None = None,
+    audio_side: str = "back",
+    audio_source: str | None = None,
 ):
     skip_template_ords = skip_template_ords or set()
     conn = get_connection()
@@ -830,6 +832,8 @@ def create_cards_from_note_templates(
             level=1,
             note_id=note_id,
             template_ord=ord_idx,
+            audio_side=audio_side,
+            audio_source=audio_source,
         )
         created += 1
 
@@ -935,11 +939,12 @@ def ensure_media_table(conn: sqlite3.Connection):
             """
             CREATE TABLE IF NOT EXISTS media (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                note_id INTEGER,
                 card_id INTEGER,
-                media_type TEXT,
-                type TEXT,
+                note_id INTEGER,
+                type TEXT NOT NULL,
                 path TEXT NOT NULL,
+                side TEXT NOT NULL,
+                source TEXT,
                 created_at INTEGER NOT NULL
             );
             """
@@ -956,6 +961,10 @@ def ensure_media_table(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE media ADD COLUMN media_type TEXT;")
     if "type" not in columns:
         cur.execute("ALTER TABLE media ADD COLUMN type TEXT;")
+    if "side" not in columns:
+        cur.execute("ALTER TABLE media ADD COLUMN side TEXT NOT NULL DEFAULT 'back';")
+    if "source" not in columns:
+        cur.execute("ALTER TABLE media ADD COLUMN source TEXT;")
     conn.commit()
 
 
@@ -963,7 +972,7 @@ def _media_type_column(columns: set[str]) -> str:
     return "media_type" if "media_type" in columns else "type"
 
 
-def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str]]):
+def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str, str | None, str | None]]):
     conn = get_connection()
     ensure_media_table(conn)
 
@@ -971,18 +980,38 @@ def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str
     columns = _get_media_columns(cur)
     ts = int(time.time())
     type_col = _media_type_column(columns)
-    for path, media_type in media_entries:
+    for entry in media_entries:
+        if len(entry) == 2:
+            path, media_type = entry
+            side, source = "back", None
+        elif len(entry) == 3:
+            path, media_type, side = entry
+            source = None
+        else:
+            path, media_type, side, source = entry
         if not path:
             continue
+        cols = ["note_id", "card_id", type_col, "path", "created_at"]
+        vals = [note_id, None, media_type, path, ts]
+        placeholders = ["?", "?", "?", "?", "?"]
+        if "side" in columns:
+            cols.append("side")
+            vals.append(side or "back")
+            placeholders.append("?")
+        if "source" in columns:
+            cols.append("source")
+            vals.append(source)
+            placeholders.append("?")
+
         cur.execute(
-            f"INSERT INTO media (note_id, card_id, {type_col}, path, created_at) VALUES (?, ?, ?, ?, ?);",
-            (note_id, None, media_type, path, ts),
+            f"INSERT INTO media ({', '.join(cols)}) VALUES ({', '.join(placeholders)});",
+            vals,
         )
     conn.commit()
     conn.close()
 
 
-def attach_media_to_card(card_id: int, media_entries: list[tuple[str | None, str]]):
+def attach_media_to_card(card_id: int, media_entries: list[tuple[str | None, str, str | None, str | None]]):
     conn = get_connection()
     ensure_media_table(conn)
 
@@ -990,12 +1019,32 @@ def attach_media_to_card(card_id: int, media_entries: list[tuple[str | None, str
     columns = _get_media_columns(cur)
     ts = int(time.time())
     type_col = _media_type_column(columns)
-    for path, media_type in media_entries:
+    for entry in media_entries:
+        if len(entry) == 2:
+            path, media_type = entry
+            side, source = "back", None
+        elif len(entry) == 3:
+            path, media_type, side = entry
+            source = None
+        else:
+            path, media_type, side, source = entry
         if not path:
             continue
+        cols = ["note_id", "card_id", type_col, "path", "created_at"]
+        vals = [None, card_id, media_type, path, ts]
+        placeholders = ["?", "?", "?", "?", "?"]
+        if "side" in columns:
+            cols.append("side")
+            vals.append(side or "back")
+            placeholders.append("?")
+        if "source" in columns:
+            cols.append("source")
+            vals.append(source)
+            placeholders.append("?")
+
         cur.execute(
-            f"INSERT INTO media (note_id, card_id, {type_col}, path, created_at) VALUES (?, ?, ?, ?, ?);",
-            (None, card_id, media_type, path, ts),
+            f"INSERT INTO media ({', '.join(cols)}) VALUES ({', '.join(placeholders)});",
+            vals,
         )
     conn.commit()
     conn.close()
@@ -1026,6 +1075,21 @@ def get_media_for_card(card_id: int, note_id: int | None = None) -> list[dict]:
     rows = cur.fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def update_media_side(media_id: int, side: str):
+    conn = get_connection()
+    if not _table_exists(conn, "media"):
+        conn.close()
+        return
+    cur = conn.cursor()
+    columns = _get_media_columns(cur)
+    if "side" not in columns:
+        conn.close()
+        return
+    cur.execute("UPDATE media SET side = ? WHERE id = ?;", (side, media_id))
+    conn.commit()
+    conn.close()
 
 
 def find_video_media_path(card: dict) -> str | None:
@@ -1075,6 +1139,8 @@ def create_note_with_cards(
 ) -> tuple[int, int]:
     note_id = create_note(deck_id, fields, note_type_id=note_type_id, tags=tags)
     note_type = note_type_id or ensure_generated_note_type_id()
+    audio_side = fields.get("audio_side", "back") if isinstance(fields, dict) else "back"
+    audio_source = fields.get("audio_source") if isinstance(fields, dict) else None
     cards_created = create_cards_from_note_templates(
         note_id,
         note_type,
@@ -1082,11 +1148,13 @@ def create_note_with_cards(
         deck_id,
         skip_template_ords=skip_template_ords,
         audio_path=fields.get("audio_path"),
+        audio_side=audio_side,
+        audio_source=audio_source,
     )
     media_entries = [
-        (fields.get("image") or fields.get("front_image_path"), "image"),
-        (fields.get("back_image_path"), "image"),
-        (fields.get("audio_path"), "audio"),
+        (fields.get("image") or fields.get("front_image_path"), "image", "front", None),
+        (fields.get("back_image_path"), "image", "back", None),
+        (fields.get("audio_path"), "audio", audio_side, audio_source),
     ]
     attach_media_to_note(note_id, media_entries)
     return note_id, cards_created
@@ -1116,6 +1184,8 @@ def find_note_by_source_id(deck_id: int, source_id: int) -> sqlite3.Row | None:
 def init_db():
     conn = get_connection()
     cur = conn.cursor()
+
+    os.makedirs(MEDIA_FOLDER, exist_ok=True)
 
     # Колоды с сохранением шаблонов FRONT/BACK и иконкой
     cur.execute("""
@@ -1225,6 +1295,7 @@ def init_db():
 
     ensure_deck_settings_table(conn)
     ensure_stats_settings_table(conn)
+    ensure_media_table(conn)
 
     run_migrations(conn)
 
@@ -2007,6 +2078,8 @@ def insert_card(
     template_ord: int | None = None,
     ensure_note: bool = False,
     note_fields: dict | None = None,
+    audio_side: str = "back",
+    audio_source: str | None = None,
 ):
     """
     Вставка карточки в БД.
@@ -2060,8 +2133,25 @@ def insert_card(
     )
 
     card_id = cur.lastrowid
+
+    stored_audio_path = actual_audio_path
+    if actual_audio_path and os.path.exists(actual_audio_path):
+        os.makedirs(MEDIA_FOLDER, exist_ok=True)
+        ext = os.path.splitext(actual_audio_path)[1] or ".wav"
+        filename = f"audio_card_{card_id}_{int(time.time())}{ext}"
+        dest_path = os.path.join(MEDIA_FOLDER, filename)
+        try:
+            shutil.copy(actual_audio_path, dest_path)
+            stored_audio_path = dest_path
+            cur.execute("UPDATE cards SET audio_path = ? WHERE id = ?;", (stored_audio_path, card_id))
+        except Exception:
+            stored_audio_path = actual_audio_path
+
     conn.commit()
     conn.close()
+
+    if stored_audio_path:
+        attach_media_to_card(card_id, [(stored_audio_path, "audio", audio_side, audio_source)])
 
     if ensure_note and note_id is None:
         card_stub = {
@@ -2095,6 +2185,8 @@ def auto_generate_cards_from_text(deck_id: int,
                                   back_template: str,
                                   one_sentence_one_card: bool = False,
                                   audio_path: str | None = None,
+                                  audio_source: str | None = None,
+                                  audio_side: str = "back",
                                   progress_queue: queue.Queue | None = None,
                                   cancel_check=None) -> int:
     """
@@ -2190,6 +2282,8 @@ def auto_generate_cards_from_text(deck_id: int,
             "front_image_path": img_path_front or "",
             "back_image_path": None,
             "audio_path": audio_path,
+            "audio_side": audio_side,
+            "audio_source": audio_source,
             "front": front,
             "back": back,
         }
@@ -2374,7 +2468,9 @@ def auto_generate_cards_from_speech(deck_id: int,
         deck_id, text, use_ai_images, api_key,
         front_template, back_template,
         one_sentence_one_card=one_sentence_one_card,
-        audio_path=audio_path
+        audio_path=audio_path,
+        audio_source="digital_hearing",
+        audio_side="back",
     )
 
 
@@ -2431,7 +2527,9 @@ def auto_generate_cards_from_video(deck_id: int,
             deck_id, text, use_ai_images, api_key,
             front_template, back_template,
             one_sentence_one_card=True,
-            audio_path=audio_filename
+            audio_path=audio_filename,
+            audio_source="digital_hearing",
+            audio_side="back",
         )
         
     except Exception as e:
@@ -2462,7 +2560,7 @@ def play_audio_file(path):
         except Exception:
             messagebox.showerror("Ошибка", "Не удалось воспроизвести аудио")
     elif TTS_AVAILABLE:
-        speak_text(text)
+        speak_text(os.path.splitext(os.path.basename(path))[0])
     else:
         messagebox.showinfo("Ошибка", "Аудио система недоступна")
 
@@ -4851,6 +4949,58 @@ class AnkiApp(tk.Tk):
             ttk.Button(frame_img, text="Выбрать...",
                        command=select_back_img).grid(row=1, column=2, padx=5, pady=(3, 0))
 
+            audio_entries = [
+                m for m in get_media_for_card(c["id"], c.get("note_id"))
+                if (m.get("media_type") or m.get("type") or "").lower() == "audio"
+            ]
+
+            audio_frame = ttk.LabelFrame(card_frame, text="Аудио")
+            audio_frame.pack(fill=tk.X, padx=5, pady=5)
+
+            if not audio_entries and c.get("audio_path"):
+                audio_entries.append({
+                    "id": None,
+                    "path": c.get("audio_path"),
+                    "side": "back",
+                })
+
+            if audio_entries:
+                for idx, entry in enumerate(audio_entries):
+                    side_var = tk.StringVar(value=(entry.get("side") or "back"))
+                    row_frame = ttk.Frame(audio_frame)
+                    row_frame.pack(fill=tk.X, pady=2)
+
+                    ttk.Label(row_frame, text=os.path.basename(entry.get("path") or ""))\
+                        .pack(side=tk.LEFT, padx=5)
+                    ttk.Button(
+                        row_frame,
+                        text="▶", 
+                        command=lambda p=entry.get("path"): play_audio_file(p) if p else None,
+                    ).pack(side=tk.LEFT, padx=5)
+
+                    def make_side_updater(media_id, var):
+                        def updater():
+                            if media_id is not None:
+                                update_media_side(media_id, var.get())
+                        return updater
+
+                    ttk.Radiobutton(
+                        row_frame,
+                        text="Front",
+                        variable=side_var,
+                        value="front",
+                        command=make_side_updater(entry.get("id"), side_var),
+                    ).pack(side=tk.LEFT, padx=2)
+                    ttk.Radiobutton(
+                        row_frame,
+                        text="Back",
+                        variable=side_var,
+                        value="back",
+                        command=make_side_updater(entry.get("id"), side_var),
+                    ).pack(side=tk.LEFT, padx=2)
+            else:
+                ttk.Label(audio_frame, text="(Нет аудио)").pack(anchor="w", padx=5, pady=3)
+
             def make_save_handler(card_id, tf, tb, fimg_var, bimg_var):
                 def handler():
                     f = tf.get("1.0", tk.END).strip()
@@ -5948,23 +6098,61 @@ class RepeatWindow(tk.Toplevel):
         # Кнопка звука
         self.btn_sound = ttk.Button(self.btn_frame, text="🔊 Слово", command=self.play_word)
         self.btn_sound.grid(row=0, column=6, padx=5)
-        
+
         # Добавить аудио-плеер
+        self.audio_frame = None
         self.update_audio_player()
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
-        # Добавляем аудио-плеер под текстом карточки
-        audio_path = self.current_card.get("audio_path")
+        if self.audio_frame is not None:
+            try:
+                self.audio_frame.destroy()
+            except Exception:
+                pass
+            self.audio_frame = None
+
+        audio_entries = self.get_audio_entries()
+        target_side = "back" if self.show_back else "front"
+        selected_entry = None
+        for entry in audio_entries:
+            if (entry.get("side") or "back").lower() == target_side:
+                selected_entry = entry
+                break
+        if not selected_entry and audio_entries:
+            selected_entry = audio_entries[0]
+
+        audio_path = selected_entry.get("path") if selected_entry else None
         if audio_path and os.path.exists(audio_path):
-            # Создаем фрейм для аудио-плеера
-            audio_frame = ttk.Frame(self.card_frame, bg="white")
-            audio_frame.place(x=10, y=310, width=780, height=40)
-            
-            # Кнопка воспроизведения аудио
-            self.audio_btn = ttk.Button(audio_frame, text="🔊 Воспроизвести предложение", 
-                                       command=lambda: self.play_audio_file(audio_path))
-            self.audio_btn.pack()
+            self.audio_frame = ttk.Frame(self.card_frame, bg="white")
+            self.audio_frame.place(x=10, y=310, width=780, height=40)
+
+            ttk.Label(self.audio_frame, text=os.path.basename(audio_path)).pack(side=tk.LEFT, padx=5)
+            ttk.Button(
+                self.audio_frame,
+                text="🔊 Воспроизвести аудио",
+                command=lambda p=audio_path: self.play_audio_file(p),
+            ).pack(side=tk.LEFT)
+
+    def get_audio_entries(self) -> list[dict]:
+        entries = []
+        media = get_media_for_card(self.current_card.get("id"), self.current_card.get("note_id"))
+        for item in media:
+            media_type = (item.get("media_type") or item.get("type") or "").lower()
+            if media_type != "audio":
+                continue
+            entries.append(
+                {
+                    "path": item.get("path"),
+                    "side": (item.get("side") or "back").lower(),
+                    "source": item.get("source"),
+                }
+            )
+
+        fallback_path = self.current_card.get("audio_path")
+        if fallback_path:
+            entries.append({"path": fallback_path, "side": "back", "source": None})
+        return entries
     
     def play_audio_file(self, path):
         """Воспроизвести аудио файл"""
