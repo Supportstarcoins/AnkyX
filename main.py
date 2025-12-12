@@ -61,6 +61,12 @@ from deck_timer import (
     get_effective_timer,
     update_deck_timer_settings,
 )
+from video_tools import (
+    VlcPlayerWidget,
+    cut_video_clip,
+    is_vlc_available,
+    open_in_external_player,
+)
 
 # ==========================
 # OCR: pytesseract + автопоиск tesseract.exe
@@ -917,23 +923,119 @@ def get_imported_files() -> set[str]:
     return files
 
 
-def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str]]):
-    conn = get_connection()
+def _get_media_columns(cursor: sqlite3.Cursor) -> set[str]:
+    cursor.execute("PRAGMA table_info(media);")
+    return {row[1] for row in cursor.fetchall()}
+
+
+def ensure_media_table(conn: sqlite3.Connection):
+    cur = conn.cursor()
     if not _table_exists(conn, "media"):
-        conn.close()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_id INTEGER,
+                card_id INTEGER,
+                media_type TEXT,
+                type TEXT,
+                path TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            """
+        )
+        conn.commit()
         return
 
+    columns = _get_media_columns(cur)
+    if "card_id" not in columns:
+        cur.execute("ALTER TABLE media ADD COLUMN card_id INTEGER;")
+    if "note_id" not in columns:
+        cur.execute("ALTER TABLE media ADD COLUMN note_id INTEGER;")
+    if "media_type" not in columns:
+        cur.execute("ALTER TABLE media ADD COLUMN media_type TEXT;")
+    if "type" not in columns:
+        cur.execute("ALTER TABLE media ADD COLUMN type TEXT;")
+    conn.commit()
+
+
+def _media_type_column(columns: set[str]) -> str:
+    return "media_type" if "media_type" in columns else "type"
+
+
+def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str]]):
+    conn = get_connection()
+    ensure_media_table(conn)
+
     cur = conn.cursor()
+    columns = _get_media_columns(cur)
     ts = int(time.time())
+    type_col = _media_type_column(columns)
     for path, media_type in media_entries:
         if not path:
             continue
         cur.execute(
-            "INSERT INTO media (note_id, path, media_type, created_at) VALUES (?, ?, ?, ?);",
-            (note_id, path, media_type, ts),
+            f"INSERT INTO media (note_id, card_id, {type_col}, path, created_at) VALUES (?, ?, ?, ?, ?);",
+            (note_id, None, media_type, path, ts),
         )
     conn.commit()
     conn.close()
+
+
+def attach_media_to_card(card_id: int, media_entries: list[tuple[str | None, str]]):
+    conn = get_connection()
+    ensure_media_table(conn)
+
+    cur = conn.cursor()
+    columns = _get_media_columns(cur)
+    ts = int(time.time())
+    type_col = _media_type_column(columns)
+    for path, media_type in media_entries:
+        if not path:
+            continue
+        cur.execute(
+            f"INSERT INTO media (note_id, card_id, {type_col}, path, created_at) VALUES (?, ?, ?, ?, ?);",
+            (None, card_id, media_type, path, ts),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_media_for_card(card_id: int, note_id: int | None = None) -> list[dict]:
+    conn = get_connection()
+    if not _table_exists(conn, "media"):
+        conn.close()
+        return []
+
+    cur = conn.cursor()
+    columns = _get_media_columns(cur)
+    clauses = []
+    params: list[int] = []
+    if "card_id" in columns:
+        clauses.append("card_id = ?")
+        params.append(card_id)
+    if note_id is not None and "note_id" in columns:
+        clauses.append("note_id = ?")
+        params.append(note_id)
+
+    if not clauses:
+        conn.close()
+        return []
+
+    cur.execute(f"SELECT * FROM media WHERE {' OR '.join(clauses)};", params)
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def find_video_media_path(card: dict) -> str | None:
+    media_entries = get_media_for_card(card.get("id"), card.get("note_id"))
+    for entry in media_entries:
+        media_type = (entry.get("media_type") or entry.get("type") or "").lower()
+        path = entry.get("path")
+        if media_type == "video" and path and os.path.exists(path):
+            return path
+    return None
 
 
 def create_note(
@@ -2659,6 +2761,8 @@ class AnkiApp(tk.Tk):
                              command=self.open_generate_from_speech_window)
         gen_menu.add_command(label="Генерация из видео (цифровой слух)…",
                              command=self.open_generate_from_video_window)
+        gen_menu.add_command(label="Видео → клипы → карточки",
+                             command=self.open_video_clip_window)
         gen_menu.add_command(label="Импорт картинок по ID (CSV)…",
                              command=self.open_image_id_import_window)
         menubar.add_cascade(label="Режим генерации", menu=gen_menu)
@@ -2704,6 +2808,88 @@ class AnkiApp(tk.Tk):
 
         # Открыть окно аудио-редактора
         AudioEditorWindow(self, video_path, self.selected_deck_id)
+
+    def open_video_clip_window(self):
+        if self.selected_deck_id is None:
+            messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Видео → клипы → карточки")
+        win.geometry("520x260")
+        win.grab_set()
+
+        video_path_var = tk.StringVar()
+        start_var = tk.StringVar(value="00:00:00")
+        end_var = tk.StringVar(value="00:00:10")
+
+        ttk.Label(win, text="Видео файл:").pack(anchor="w", padx=10, pady=(10, 0))
+        video_frame = ttk.Frame(win)
+        video_frame.pack(fill=tk.X, padx=10)
+
+        entry_video = ttk.Entry(video_frame, textvariable=video_path_var)
+        entry_video.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def browse_video():
+            path = filedialog.askopenfilename(
+                title="Выберите видео файл",
+                filetypes=[("Видео", "*.mp4 *.mkv *.avi *.mov *.wmv *.flv"), ("Все файлы", "*.*")],
+            )
+            if path:
+                video_path_var.set(path)
+
+        ttk.Button(video_frame, text="…", width=4, command=browse_video).pack(side=tk.LEFT, padx=(5, 0))
+
+        time_frame = ttk.Frame(win)
+        time_frame.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(time_frame, text="Начало (HH:MM:SS):").grid(row=0, column=0, sticky="w")
+        ttk.Label(time_frame, text="Конец (HH:MM:SS):").grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+        ttk.Entry(time_frame, textvariable=start_var, width=12).grid(row=0, column=1, padx=5, sticky="w")
+        ttk.Entry(time_frame, textvariable=end_var, width=12).grid(row=1, column=1, padx=5, sticky="w", pady=(5, 0))
+
+        status_var = tk.StringVar(value="Клип сохраняется в папку media/")
+        ttk.Label(win, textvariable=status_var, foreground="gray").pack(anchor="w", padx=10)
+
+        def cut_and_attach():
+            video_path = video_path_var.get().strip()
+            if not video_path:
+                messagebox.showerror("Ошибка", "Выберите видео файл.")
+                return
+
+            ok, result = cut_video_clip(video_path, start_var.get(), end_var.get(), MEDIA_FOLDER)
+            if not ok:
+                messagebox.showerror("FFmpeg", result)
+                return
+
+            clip_path = result
+            clip_name = os.path.basename(clip_path)
+            clip_info = f"{start_var.get()} → {end_var.get()}"
+
+            note_fields = {
+                "word": clip_name,
+                "translation": "",
+                "example": clip_info,
+                "level": 1,
+                "image": "",
+                "front": f"🎬 Клип {clip_info}\n{clip_name}",
+                "back": f"Смотри клип {clip_info}\n{clip_name}",
+                "front_image_path": None,
+                "back_image_path": None,
+                "audio_path": None,
+            }
+
+            note_id, _ = create_note_with_cards(
+                self.selected_deck_id,
+                note_fields,
+                note_type_id=ensure_generated_note_type_id(),
+                tags="video clip",
+            )
+            attach_media_to_note(note_id, [(clip_path, "video")])
+            status_var.set(f"Создан клип {clip_name}")
+            messagebox.showinfo("Готово", f"Клип сохранен в {clip_path}\nКарточка добавлена в колоду.")
+
+        ttk.Button(win, text="Нарезать клип", command=cut_and_attach).pack(anchor="e", padx=10, pady=10)
 
     def open_image_id_import_window(self):
         if not PIL_AVAILABLE:
@@ -5346,13 +5532,13 @@ class OverviewWindow(tk.Toplevel):
         
         self.btn_sound = ttk.Button(btn_frame, text="🔊 Озвучить", command=self.play_audio)
         self.btn_sound.pack(side=tk.RIGHT, padx=10)
-        
+
         self.btn_toggle_view = ttk.Button(btn_frame, text="Свернуть карточку", command=self.toggle_view)
         self.btn_toggle_view.pack(side=tk.RIGHT, padx=10)
-        
+
         self.btn_next = ttk.Button(btn_frame, text="Следующий →", command=self.next_card)
         self.btn_next.pack(side=tk.RIGHT, padx=10)
-    
+
     def create_card_widgets(self, parent_frame, is_front=True):
         """Создать виджеты для карточки"""
         # Очищаем фрейм
@@ -5390,12 +5576,15 @@ class OverviewWindow(tk.Toplevel):
             bd=1
         )
         image_label.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-        
+
         # Аудио кнопка
         audio_frame = ttk.Frame(content)
         audio_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        return text_widget, image_label, audio_frame
+
+        video_frame = ttk.Frame(content)
+        video_frame.pack(fill=tk.X, pady=(5, 0))
+
+        return text_widget, image_label, audio_frame, video_frame
     
     def mark_as_learned(self):
         """Отметить карточку как изученную"""
@@ -5444,7 +5633,7 @@ class OverviewWindow(tk.Toplevel):
         self.progress_var.set((idx / total) * 100)
         
         # Создаем виджеты для лицевой стороны
-        self.front_text, self.front_image_label, self.front_audio_frame = self.create_card_widgets(self.left_frame, is_front=True)
+        self.front_text, self.front_image_label, self.front_audio_frame, self.front_video_frame = self.create_card_widgets(self.left_frame, is_front=True)
         
         # Обновляем лицевую сторону (FRONT)
         front_content = c["front"]
@@ -5461,9 +5650,10 @@ class OverviewWindow(tk.Toplevel):
         
         # Обновляем аудио плеер для лицевой стороны
         self.update_audio_player(self.front_audio_frame, c)
+        self.update_video_player(self.front_video_frame, c)
         
         # Создаем виджеты для задней стороны
-        self.back_text, self.back_image_label, self.back_audio_frame = self.create_card_widgets(self.right_frame, is_front=False)
+        self.back_text, self.back_image_label, self.back_audio_frame, self.back_video_frame = self.create_card_widgets(self.right_frame, is_front=False)
         
         # Обновляем заднюю сторону (BACK)
         back_content = c["back"]
@@ -5491,6 +5681,7 @@ class OverviewWindow(tk.Toplevel):
         
         # Обновляем аудио плеер для задней стороны
         self.update_audio_player(self.back_audio_frame, c)
+        self.update_video_player(self.back_video_frame, c)
     
     def update_audio_player(self, audio_frame, card):
         """Обновить аудио плеер"""
@@ -5502,9 +5693,36 @@ class OverviewWindow(tk.Toplevel):
         audio_path = card.get("audio_path")
         if audio_path and os.path.exists(audio_path):
             ttk.Label(audio_frame, text="Аудио:").pack(side=tk.LEFT, padx=(0, 5))
-            ttk.Button(audio_frame, text="▶ Воспроизвести", 
+            ttk.Button(audio_frame, text="▶ Воспроизвести",
                       command=lambda: self.play_audio_file(audio_path)).pack(side=tk.LEFT)
-    
+
+    def update_video_player(self, video_frame, card):
+        """Показать плеер или кнопку открытия видео клипа."""
+        for widget in video_frame.winfo_children():
+            widget.destroy()
+
+        video_path = find_video_media_path(card)
+        if not video_path:
+            return
+
+        ttk.Label(video_frame, text="Видео:").pack(side=tk.LEFT, padx=(0, 5))
+
+        if is_vlc_available():
+            try:
+                player = VlcPlayerWidget(video_frame, video_path, width=320, height=200)
+                player.pack(side=tk.LEFT, padx=(0, 10))
+                video_frame.vlc_player = player  # сохраняем ссылку, чтобы VLC не выгружался
+                ttk.Button(video_frame, text="⏹ Стоп", command=player.stop).pack(side=tk.LEFT)
+                return
+            except Exception:
+                pass
+
+        ttk.Button(
+            video_frame,
+            text="Открыть во внешнем плеере",
+            command=lambda: open_in_external_player(video_path)
+        ).pack(side=tk.LEFT)
+
     def play_audio_file(self, path):
         """Воспроизвести аудио файл"""
         if WINSOUND_AVAILABLE and os.path.exists(path):
