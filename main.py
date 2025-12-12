@@ -41,6 +41,11 @@ from tkinter import ttk, messagebox, filedialog
 from db_migrations import run_migrations
 from srs import schedule_review
 from bg_tasks import start_background_task
+from overdue_badges import (
+    PhaseOverdueBadges,
+    ensure_due_column,
+    fetch_overdue_counts_by_phase,
+)
 from deck_timer import (
     DeckTimerController,
     ensure_deck_settings_row,
@@ -1053,6 +1058,8 @@ def init_db():
         );
     """)
 
+    ensure_due_column(conn)
+
     # Миграции для старых БД (cards)
     for col in ("leitner_level", "front_image_path", "back_image_path",
                 "image_path", "audio_path", "progress", "translation_shown", "overview_added"):
@@ -1409,22 +1416,14 @@ def delete_card(card_id: int):
 
 
 def count_overdue_for_deck(deck_id: int) -> int:
-    """
-    Кол-во карточек, у которых дата повторения < сегодня
-    (т.е. они просрочены).
-    """
-    today = date.today().isoformat()
+    """Кол-во просроченных карточек по колонке ``due`` (с учётом подколод)."""
+
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM cards
-        WHERE deck_id = ?
-          AND date(next_review) < date(?);
-    """, (deck_id, today))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else 0
+    try:
+        counts = fetch_overdue_counts_by_phase(conn, deck_id)
+        return counts.total
+    finally:
+        conn.close()
 
 
 def get_deck_stats(deck_id: int):
@@ -2576,6 +2575,8 @@ class AnkiApp(tk.Tk):
 
         self.overdue_canvas = None
         self.overdue_badge_text_id = None
+        self.phase_badge_manager: PhaseOverdueBadges | None = None
+        self.overdue_update_job = None
 
         self.image_import_watch_job = None
 
@@ -3738,6 +3739,7 @@ class AnkiApp(tk.Tk):
         self.decks_tree = ttk.Treeview(frame_top, show="tree", selectmode="browse")
         self.decks_tree.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
         self.decks_tree.bind("<<TreeviewSelect>>", self.on_deck_select)
+        self.phase_badge_manager = PhaseOverdueBadges(self.decks_tree)
 
         frame_buttons = ttk.Frame(left_frame)
         frame_buttons.pack(fill=tk.X, padx=10, pady=10)
@@ -3937,24 +3939,40 @@ class AnkiApp(tk.Tk):
         )
 
     def update_overdue_badge(self):
-        """Обновить красный кружок с числом просроченных карточек (по всей колоде)."""
-        if self.overdue_canvas is None:
-            return
-        self.overdue_canvas.delete("all")
+        """Обновить бейджи просрочек для выбранной колоды и фаз."""
 
-        if self.selected_deck_id is None:
-            count = 0
-        else:
-            count = count_overdue_for_deck(self.selected_deck_id)
+        deck_ids = {deck_id for deck_id, _ in self.deck_items.values() if deck_id is not None}
+        counts_by_deck = {}
+        timestamp = int(time.time())
+        for deck_id in deck_ids:
+            conn = get_connection()
+            try:
+                counts_by_deck[deck_id] = fetch_overdue_counts_by_phase(
+                    conn, deck_id, now_ts=timestamp
+                )
+            finally:
+                conn.close()
 
-        if count <= 0:
-            return
+        selected_counts = counts_by_deck.get(self.selected_deck_id)
+        total_count = selected_counts.total if selected_counts else 0
 
-        # Рисуем красный кружок и белое число внутри
-        self.overdue_canvas.create_oval(2, 2, 22, 22, fill="red", outline="red")
-        self.overdue_badge_text_id = self.overdue_canvas.create_text(
-            12, 12, text=str(count), fill="white", font=("Arial", 9, "bold")
-        )
+        if self.overdue_canvas is not None:
+            self.overdue_canvas.delete("all")
+            if total_count > 0:
+                self.overdue_canvas.create_oval(2, 2, 22, 22, fill="red", outline="red")
+                self.overdue_badge_text_id = self.overdue_canvas.create_text(
+                    12, 12, text=str(total_count), fill="white", font=("Arial", 9, "bold")
+                )
+
+        if self.phase_badge_manager:
+            self.phase_badge_manager.update(self.deck_items, counts_by_deck)
+
+        self.schedule_overdue_badges_refresh()
+
+    def schedule_overdue_badges_refresh(self):
+        if self.overdue_update_job is not None:
+            self.after_cancel(self.overdue_update_job)
+        self.overdue_update_job = self.after(60_000, self.update_overdue_badge)
 
     def on_deck_select(self, event):
         sel = self.decks_tree.selection()
