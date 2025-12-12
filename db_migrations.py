@@ -37,6 +37,16 @@ def run_migrations(conn: sqlite3.Connection):
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS import_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT NOT NULL UNIQUE,
+            imported_at INTEGER NOT NULL
+        );
+        """
+    )
+
     srs_columns = {
         "state": "TEXT",
         "due": "INTEGER",
