@@ -11,8 +11,6 @@ import requests
 from PIL import Image
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
-COMMONS_MEDIASEARCH = "https://commons.wikimedia.org/w/rest.php/v1/search/title"
-DE_WIKI_API = "https://de.wikipedia.org/w/api.php"
 USER_AGENT = "AnkyX/1.0 (commons api)"
 MAX_RETRIES = 3
 RETRY_BACKOFF = [0.5, 1.0, 2.0]
@@ -31,6 +29,9 @@ STOPWORDS = {
     "press",
     "festival",
 }
+
+SCORE_THRESHOLD_STRICT = 4
+SCORE_THRESHOLD_RELAXED = 1
 
 RU_HINTS = {
     "падаль": "carrion",
@@ -95,6 +96,7 @@ class ImageCandidate:
     title: str
     description: str
     score: int
+    stage: str = ""
 
 
 SESSION = requests.Session()
@@ -255,24 +257,27 @@ def _word_hits(word_clean: str, text: str) -> bool:
     return re.search(rf"\b{re.escape(word_clean)}\b", text, flags=re.IGNORECASE) is not None
 
 
-def _calc_score(word_clean: str, title: str, description: str, file_name: str) -> int:
+def _calc_score(
+    word_clean: str,
+    title: str,
+    description: str,
+    file_name: str,
+    *,
+    language_hint: bool = False,
+    soften_stopwords: bool = False,
+) -> int:
     score = 0
     combined = " ".join([title or "", description or ""]).lower()
-    if _word_hits(word_clean, title) or _word_hits(word_clean, description):
-        score += 5
     if _word_hits(word_clean, file_name):
         score += 3
+    if _word_hits(word_clean, description) or _word_hits(word_clean, title):
+        score += 2
+    if language_hint:
+        score += 1
     for stop in STOPWORDS:
-        if stop in combined or stop in file_name.lower():
-            score -= 5
+        if stop in combined or stop in (file_name or "").lower():
+            score -= 3 if soften_stopwords else 5
     return score
-
-
-def _detect_pos(notes: str) -> str:
-    lowered = (notes or "").lower()
-    if any(marker in lowered for marker in ("verb", "vi", "vt")):
-        return "verb"
-    return "noun"
 
 
 def _translation_hint(translation: str) -> Optional[str]:
@@ -286,20 +291,11 @@ def _translation_hint(translation: str) -> Optional[str]:
 def _build_query(word_clean: str, translation: str, notes: str, kind: str) -> str:
     if not word_clean:
         return ""
-    pos = _detect_pos(notes)
-    hint = _translation_hint(translation)
-    context: List[str] = []
-
-    if pos == "verb" or kind == "MEANING":
-        context.extend(["icon", "diagram", "symbol"])
-    else:
-        context.extend(["photo", "object", "nature"])
-
-    terms = [word_clean]
-    if hint:
-        terms.append(hint)
-    terms.extend(context)
-    return " ".join(terms)
+    _ = translation  # reserved for future language hints
+    _ = notes
+    if kind == "MEANING":
+        return f"{word_clean} icon"
+    return word_clean
 
 
 # ==========================
@@ -332,103 +328,185 @@ def file_imageinfo(file_title: str) -> Optional[Dict[str, Any]]:
             continue
         if not mime.startswith("image/") or mime.startswith("image/svg"):
             continue
+        if mime not in {"image/jpeg", "image/png"}:
+            continue
         if width is not None and height is not None and max(width, height) < 200:
             continue
         return {"url": url, "mime": mime, "width": width, "height": height}
     return None
 
 
-def _wikipedia_pageimage(word_clean: str) -> Optional[ImageCandidate]:
+def _language_hint_present(translation: str, notes: str) -> bool:
+    combined = " ".join([translation or "", notes or ""]).lower()
+    return any(token in combined for token in (" german", "[de]", "(de)", " de"))
+
+
+def _commons_file_search(
+    word_clean: str,
+    query: str,
+    *,
+    limit: int,
+    threshold: int,
+    stage_label: str,
+    entry_id: int,
+    language_hint: bool,
+    soften_stopwords: bool,
+) -> Tuple[List[ImageCandidate], str]:
     params = {
-        "action": "opensearch",
-        "search": word_clean,
-        "limit": 1,
-        "namespace": 0,
+        "action": "query",
+        "list": "search",
+        "srnamespace": 6,
+        "srlimit": limit,
+        "srsearch": query,
         "format": "json",
     }
-    _log_detail(f"dewiki opensearch '{word_clean}'")
-    data = _perform_get(params, base_url=DE_WIKI_API).json()
-    titles = data[1] if isinstance(data, list) and len(data) > 1 else []
-    if not titles:
-        return None
-    page_title = titles[0]
+    _log_detail(f"ID {entry_id}: {stage_label} search '{query}'")
+    data = _perform_get(params).json()
+    search_results = data.get("query", {}).get("search", [])
+    candidates: List[ImageCandidate] = []
+    for item in search_results:
+        title = item.get("title", "")
+        snippet = item.get("snippet", "") or ""
+        file_title = title if title.startswith("File:") else f"File:{title}"
+        file_name = os.path.basename(file_title)
+        score = _calc_score(
+            word_clean,
+            title,
+            snippet,
+            file_name,
+            language_hint=language_hint,
+            soften_stopwords=soften_stopwords,
+        )
+        if score < threshold:
+            continue
+        info = file_imageinfo(file_title)
+        if not info or not info.get("url"):
+            continue
+        candidates.append(
+            ImageCandidate(
+                url=info["url"],
+                title=file_title,
+                description=snippet,
+                score=score,
+                stage=stage_label,
+            )
+        )
+    log_msg = f"ID {entry_id}: {stage_label} candidates={len(search_results)}, passed={len(candidates)}"
+    if not candidates and search_results:
+        log_msg += f" (score<{threshold})"
+    return sorted(candidates, key=lambda c: c.score, reverse=True), log_msg
 
+
+def _commons_pageimage_fallback(
+    word_clean: str, *, entry_id: int, language_hint: bool
+) -> Tuple[List[ImageCandidate], str]:
+    params = {
+        "action": "query",
+        "list": "search",
+        "srnamespace": 0,
+        "srlimit": 10,
+        "srsearch": word_clean,
+        "format": "json",
+    }
+    _log_detail(f"ID {entry_id}: page search '{word_clean}'")
+    data = _perform_get(params).json()
+    search_results = data.get("query", {}).get("search", [])
+    if not search_results:
+        return [], f"ID {entry_id}: page fallback no_results"
+
+    top = search_results[0]
+    pageid = top.get("pageid")
+    title = top.get("title", "")
     page_params = {
         "action": "query",
-        "titles": page_title,
-        "prop": "pageimages|description",
+        "prop": "pageimages",
         "pithumbsize": 800,
         "format": "json",
+        "piprop": "thumbnail|name|mime",
     }
-    page_data = _perform_get(page_params, base_url=DE_WIKI_API).json()
+    if pageid is not None:
+        page_params["pageids"] = pageid
+    else:
+        page_params["titles"] = title
+    page_data = _perform_get(page_params).json()
     pages = page_data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        thumb = page.get("thumbnail", {})
-        url = thumb.get("source")
-        if not url:
-            continue
-        title = page.get("title", "")
-        description = page.get("description", "") or page.get("terms", {}).get(
-            "description", [""]
-        )[0]
-        score = _calc_score(word_clean, title, description, title)
-        if score >= 3:
-            return ImageCandidate(url=url, title=title, description=description, score=score)
-    return None
+    if isinstance(pageid, int) and str(pageid) in pages:
+        page = pages.get(str(pageid), {})
+    else:
+        page = next(iter(pages.values()), {}) if pages else {}
+    thumb = page.get("thumbnail") or {}
+    url = thumb.get("source")
+    mime = thumb.get("mime", "")
+    description = top.get("snippet", "")
+    if not url:
+        return [], f"ID {entry_id}: page fallback used (no thumbnail)"
+    if mime and not mime.startswith("image/"):
+        return [], f"ID {entry_id}: page fallback skipped non-image"
+
+    score = _calc_score(
+        word_clean,
+        title,
+        description,
+        title,
+        language_hint=language_hint,
+        soften_stopwords=True,
+    )
+    if score < SCORE_THRESHOLD_RELAXED:
+        return [], f"ID {entry_id}: page fallback used (score<{SCORE_THRESHOLD_RELAXED})"
+
+    candidate = ImageCandidate(
+        url=url,
+        title=title,
+        description=description,
+        score=score,
+        stage="page-fallback",
+    )
+    return [candidate], f"ID {entry_id}: page fallback used"
 
 
-def _commons_media_candidates(word_clean: str, query: str) -> List[ImageCandidate]:
-    params = {"q": query, "limit": 10}
-    _log_detail(f"commons media search '{query}'")
-    data = _perform_get(params, base_url=COMMONS_MEDIASEARCH).json()
-    pages = data.get("pages", []) if isinstance(data, dict) else []
-    candidates: List[ImageCandidate] = []
-    for page in pages:
-        title = page.get("title") or page.get("key") or ""
-        desc = page.get("description") or page.get("extract") or ""
-        thumb = None
-        thumb_info = page.get("thumbnail") or {}
-        if isinstance(thumb_info, dict):
-            thumb = thumb_info.get("url") or thumb_info.get("src")
-        if not thumb:
-            continue
-        file_name = page.get("key") or title
-        score = _calc_score(word_clean, title or "", desc or "", file_name or "")
-        candidates.append(
-            ImageCandidate(url=thumb, title=title or "", description=desc or "", score=score)
-        )
-    return candidates
-
-
-def _select_best_candidate(candidates: Iterable[ImageCandidate]) -> Optional[ImageCandidate]:
-    best: Optional[ImageCandidate] = None
-    for candidate in candidates:
-        if candidate.score < 3:
-            continue
-        if best is None or candidate.score > best.score:
-            best = candidate
-    return best
-
-
-def fetch_kind(word_clean: str, translation: str, notes: str, kind: str) -> Optional[str]:
+def fetch_candidates(
+    word_clean: str, translation: str, notes: str, kind: str, entry_id: int
+) -> Tuple[List[ImageCandidate], List[str]]:
     if not word_clean:
-        return None
+        return [], [f"ID {entry_id}: empty_query"]
 
-    wiki_candidate = _wikipedia_pageimage(word_clean)
-    if wiki_candidate:
-        return wiki_candidate.url
-
+    language_hint = _language_hint_present(translation, notes) or bool(_translation_hint(translation))
     query = _build_query(word_clean, translation, notes, kind)
-    media_candidates = _commons_media_candidates(word_clean, query)
-    best = _select_best_candidate(media_candidates)
-    if best:
-        if best.title.startswith("File:"):
-            info = file_imageinfo(best.title)
-            if info and info.get("url"):
-                return info["url"]
-        return best.url
+    logs: List[str] = []
 
-    return None
+    strict_candidates, strict_log = _commons_file_search(
+        word_clean,
+        query,
+        limit=10,
+        threshold=SCORE_THRESHOLD_STRICT,
+        stage_label="strict",
+        entry_id=entry_id,
+        language_hint=language_hint,
+        soften_stopwords=False,
+    )
+    logs.append(strict_log)
+    if strict_candidates:
+        return strict_candidates, logs
+
+    relaxed_candidates, relaxed_log = _commons_file_search(
+        word_clean,
+        query,
+        limit=20,
+        threshold=SCORE_THRESHOLD_RELAXED,
+        stage_label="relaxed",
+        entry_id=entry_id,
+        language_hint=language_hint,
+        soften_stopwords=True,
+    )
+    logs.append(relaxed_log)
+    if relaxed_candidates:
+        return relaxed_candidates, logs
+
+    fallback_candidates, fallback_log = _commons_pageimage_fallback(
+        word_clean, entry_id=entry_id, language_hint=language_hint
+    )
+    logs.append(fallback_log)
+    return fallback_candidates, logs
 
 
 # ==========================
@@ -459,6 +537,21 @@ def download_to_png(url: str, out_path: str, entry_id: Optional[int]) -> bool:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     image.save(out_path, format="PNG")
     return True
+
+
+def _try_download_candidates(
+    candidates: Iterable[ImageCandidate], out_path: str, entry_id: Optional[int]
+) -> Tuple[bool, Optional[ImageCandidate]]:
+    for cand in candidates:
+        if download_to_png(cand.url, out_path, entry_id):
+            _log_detail(
+                f"ID {entry_id}: saved '{cand.title}' stage={cand.stage} score={cand.score}"
+            )
+            return True, cand
+        _log_detail(
+            f"ID {entry_id}: candidate failed '{cand.title}' stage={cand.stage} url={cand.url}"
+        )
+    return False, None
 
 
 # ==========================
@@ -503,23 +596,44 @@ def process_csv_file(
                 progress_callback(done, total, status)
             continue
 
-        word_clean = clean_word(row.get("word", ""))
+        raw_word = row.get("word", "")
+        word_clean = clean_word(raw_word)
         translation = (row.get("translation") or row.get("ru") or "").strip()
         notes = (row.get("notes") or row.get("comment") or "").strip()
         statuses: List[str] = []
+        reason_messages: List[str] = []
+        _log_detail(f"ID {entry_id} raw_word='{raw_word}' -> clean_word='{word_clean}'")
+
+        if not word_clean or len(word_clean) < 2:
+            reason_messages.append("empty_query")
+            statuses.append("NOT FOUND (P) [empty_query]")
+            statuses.append("NOT FOUND (M) [empty_query]")
+            status = f"ID {entry_id}: {', '.join(statuses)}"
+            if reason_messages:
+                status = f"{status} | {' | '.join(reason_messages)}"
+            done += 1
+            if progress_callback:
+                progress_callback(done, total, status)
+            continue
 
         # PHOTO
         if existing_photo and not overwrite:
             statuses.append("OK (P)")
         else:
             try:
-                url = fetch_kind(word_clean, translation, notes, "PHOTO")
-                if url and download_to_png(url, path_photo, entry_id):
-                    statuses.append("OK (P)")
-                elif url:
-                    statuses.append("ERROR: BAD IMAGE (P)")
+                candidates, logs = fetch_candidates(
+                    word_clean, translation, notes, "PHOTO", entry_id
+                )
+                reason_messages.extend(logs)
+                if candidates:
+                    ok, picked = _try_download_candidates(candidates, path_photo, entry_id)
+                    if ok:
+                        statuses.append(f"OK (P) [{picked.stage}]")
+                    else:
+                        statuses.append("ERROR: BAD IMAGE (P)")
                 else:
-                    statuses.append("NOT FOUND (P)")
+                    last_reason = logs[-1] if logs else "no_results"
+                    statuses.append(f"NOT FOUND (P) [{last_reason}]")
             except requests.HTTPError as exc:
                 statuses.append(f"ERROR: HTTP {getattr(exc.response, 'status_code', '?')}")
             except Exception as exc:  # noqa: BLE001
@@ -537,19 +651,28 @@ def process_csv_file(
             statuses.append("OK (M)")
         else:
             try:
-                url = fetch_kind(word_clean, translation, notes, "MEANING")
-                if url and download_to_png(url, path_meaning, entry_id):
-                    statuses.append("OK (M)")
-                elif url:
-                    statuses.append("ERROR: BAD IMAGE (M)")
+                candidates, logs = fetch_candidates(
+                    word_clean, translation, notes, "MEANING", entry_id
+                )
+                reason_messages.extend(logs)
+                if candidates:
+                    ok, picked = _try_download_candidates(candidates, path_meaning, entry_id)
+                    if ok:
+                        statuses.append(f"OK (M) [{picked.stage}]")
+                    else:
+                        statuses.append("ERROR: BAD IMAGE (M)")
                 else:
-                    statuses.append("NOT FOUND (M)")
+                    last_reason = logs[-1] if logs else "no_results"
+                    statuses.append(f"NOT FOUND (M) [{last_reason}]")
             except requests.HTTPError as exc:
                 statuses.append(f"ERROR: HTTP {getattr(exc.response, 'status_code', '?')}")
             except Exception as exc:  # noqa: BLE001
                 statuses.append(f"ERROR: {type(exc).__name__}")
 
+        reason_messages = list(dict.fromkeys(reason_messages))
         status = f"ID {entry_id}: {', '.join(statuses)}"
+        if reason_messages:
+            status = f"{status} | {' | '.join(reason_messages)}"
         done += 1
         if progress_callback:
             progress_callback(done, total, status)
