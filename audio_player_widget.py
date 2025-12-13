@@ -4,28 +4,47 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 
-def configure_vlc_windows():  # pragma: no cover - Windows-specific
-    if os.name != "nt":
-        return None
+base_dir = os.path.dirname(os.path.abspath(__file__))
+VLC_IMPORT_ERROR: Exception | None = None
+VLC_LOAD_ERROR: Exception | None = None
+VLC_AVAILABLE = False
+VLC_DIR: str | None = None
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+if os.name == "nt":  # pragma: no cover - Windows-specific
     candidates = [
         r"C:\\Program Files\\VideoLAN\\VLC",
         r"C:\\Program Files (x86)\\VideoLAN\\VLC",
         os.path.join(base_dir, "VLC"),
     ]
 
-    for vlc_dir in candidates:
-        if os.path.isfile(os.path.join(vlc_dir, "libvlc.dll")):
+    for candidate in candidates:
+        if os.path.isfile(os.path.join(candidate, "libvlc.dll")) and os.path.isdir(
+            os.path.join(candidate, "plugins")
+        ):
+            VLC_DIR = candidate
             try:
-                os.add_dll_directory(vlc_dir)
+                os.add_dll_directory(VLC_DIR)
             except Exception:
                 pass
-            os.environ["PATH"] = vlc_dir + ";" + os.environ.get("PATH", "")
-            os.environ["VLC_PLUGIN_PATH"] = os.path.join(vlc_dir, "plugins")
-            print("[VLC] using dir:", vlc_dir)
-            return vlc_dir
-    return None
+            os.environ["PATH"] = VLC_DIR + ";" + os.environ.get("PATH", "")
+            os.environ["VLC_PLUGIN_PATH"] = os.path.join(VLC_DIR, "plugins")
+            print("[VLC] using dir:", VLC_DIR)
+            break
+
+    if VLC_DIR is None:
+        VLC_LOAD_ERROR = FileNotFoundError("Установите VLC x64")
+
+try:  # pragma: no cover - optional dependency
+    import vlc  # type: ignore
+
+    _ = vlc.Instance()
+    VLC_AVAILABLE = True
+except ImportError as exc:  # pragma: no cover - diagnostic
+    VLC_IMPORT_ERROR = exc
+    vlc = None  # type: ignore
+except Exception as exc:  # pragma: no cover - diagnostic
+    VLC_LOAD_ERROR = exc
+    vlc = None  # type: ignore
 
 
 def _log_audio_error(message: str):
@@ -37,32 +56,6 @@ def _log_audio_error(message: str):
         # Логирование ошибок не должно ломать основную логику
         pass
 
-
-VLC_IMPORT_ERROR: Exception | None = None
-VLC_LOAD_ERROR: Exception | None = None
-VLC_IMPORTED = False
-VLC_DIR: str | None = None
-
-try:  # pragma: no cover - optional dependency
-    VLC_DIR = configure_vlc_windows()
-    if os.name == "nt" and VLC_DIR is None:
-        raise FileNotFoundError("VLC directory with libvlc.dll not found")
-    import vlc  # type: ignore
-
-    VLC_IMPORTED = True
-except FileNotFoundError as exc:  # pragma: no cover - missing VLC runtime
-    VLC_LOAD_ERROR = exc
-    vlc = None  # type: ignore
-    try:
-        messagebox.showerror("Аудио", "VLC не найден. Установите VLC x64 и повторите.")
-    except Exception:
-        pass
-except ImportError as exc:  # pragma: no cover - diagnostic
-    VLC_IMPORT_ERROR = exc
-    vlc = None  # type: ignore
-except Exception as exc:  # pragma: no cover - diagnostic
-    VLC_LOAD_ERROR = exc
-    vlc = None  # type: ignore
 
 try:
     import winsound
@@ -86,7 +79,7 @@ class AudioPlayerWidget(ttk.Frame):
         self._vlc_ready = False
         self._vlc_instance = None
         self._player = None
-        if VLC_IMPORTED and VLC_LOAD_ERROR is None:
+        if VLC_AVAILABLE and VLC_LOAD_ERROR is None:
             try:
                 self._vlc_instance = vlc.Instance()
                 self._player = self._vlc_instance.media_player_new()
@@ -100,16 +93,12 @@ class AudioPlayerWidget(ttk.Frame):
         self._set_controls_state(False)
 
         if not self._vlc_ready:
-            if VLC_IMPORT_ERROR:
+            if VLC_LOAD_ERROR:
+                self._set_status("Установите VLC x64")
+            elif VLC_IMPORT_ERROR:
                 self._set_status("Установите: pip install python-vlc")
-            elif VLC_LOAD_ERROR:
-                self._set_status(
-                    "Установите VLC Media Player или укажите путь к libvlc.dll"
-                )
             else:
-                self._set_status(
-                    "Установите python-vlc для расширенного плеера. Доступен упрощённый режим."
-                )
+                self._set_status("Установите VLC x64")
 
     def _build_ui(self):
         control_frame = ttk.Frame(self)
@@ -304,6 +293,13 @@ class AudioPlayerWidget(ttk.Frame):
             if not self._resolved_path or not os.path.exists(self._resolved_path):
                 messagebox.showerror("Аудио", "Файл аудио не найден")
                 _log_audio_error(f"Файл аудио не найден: {self._loaded_path}")
+                return
+
+            if not VLC_AVAILABLE:
+                messagebox.showerror(
+                    "Аудио", "VLC не настроен. Установите VLC и перезапустите."
+                )
+                _log_audio_error("VLC не настроен для воспроизведения")
                 return
 
             if self._vlc_ready and self._player:
