@@ -4,6 +4,16 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 
+def _log_audio_error(message: str):
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open(os.path.join("logs", "audio.log"), "a", encoding="utf-8") as fh:
+            fh.write(message + "\n")
+    except Exception:
+        # Логирование ошибок не должно ломать основную логику
+        pass
+
+
 def _prepare_vlc_runtime():  # pragma: no cover - Windows-specific
     if os.name != "nt":
         return
@@ -50,6 +60,7 @@ class AudioPlayerWidget(ttk.Frame):
         self._duration_ms = 0
         self._seeking = False
         self._loaded_path: str | None = None
+        self._resolved_path: str | None = None
         self._volume = 70.0
         self._rate = 1.0
 
@@ -64,6 +75,7 @@ class AudioPlayerWidget(ttk.Frame):
             except Exception as exc:  # pragma: no cover - defensive
                 self._handle_error("VLC не удалось инициализировать", exc)
                 print(f"[audio] Ошибка инициализации VLC: {exc}")
+                _log_audio_error(f"Ошибка инициализации VLC: {exc}")
 
         self._build_ui()
         self._set_controls_state(False)
@@ -134,6 +146,40 @@ class AudioPlayerWidget(ttk.Frame):
         if self.on_error_callback:
             detail = f"{msg}: {exc}" if exc else msg
             self.on_error_callback("Аудио", detail)
+        if exc:
+            _log_audio_error(f"{msg}: {exc}")
+        else:
+            _log_audio_error(msg)
+
+    def _resolve_audio_path(self, audio_path: str | None) -> str | None:
+        if not audio_path:
+            return None
+
+        cleaned = audio_path.strip()
+        if cleaned.lower().startswith("[sound:") and cleaned.endswith("]"):
+            cleaned = cleaned[len("[sound:") : -1]
+
+        cleaned = cleaned.replace("\\", os.sep).replace("/", os.sep)
+        cleaned = os.path.normpath(cleaned)
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates: list[str] = []
+
+        if os.path.isabs(cleaned):
+            candidates.append(cleaned)
+        else:
+            candidates.extend(
+                [
+                    os.path.join(base_dir, cleaned),
+                    os.path.join(base_dir, "media", cleaned),
+                    os.path.join(base_dir, "media", "anki_import", cleaned),
+                ]
+            )
+
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return None
 
     def _set_status(self, text: str):
         self.status_label.config(text=text)
@@ -169,16 +215,36 @@ class AudioPlayerWidget(ttk.Frame):
 
     def load(self, path: str | None):
         self.stop()
-        if not path or not os.path.exists(path):
+        self._loaded_path = path
+        self._resolved_path = self._resolve_audio_path(path)
+
+        print("[AUDIO] requested=", path)
+        print(
+            "[AUDIO] resolved =",
+            self._resolved_path,
+            "exists=",
+            os.path.exists(self._resolved_path) if self._resolved_path else False,
+        )
+
+        if not path:
             self._loaded_path = None
+            self._resolved_path = None
             self._set_controls_state(False)
             self._set_status("Аудио не найдено")
             return False
 
-        self._loaded_path = path
+        if not self._resolved_path or not os.path.exists(self._resolved_path):
+            self._loaded_path = None
+            self._resolved_path = None
+            self._set_controls_state(False)
+            self._set_status("Аудио не найдено")
+            messagebox.showerror("Аудио", "Файл аудио не найден")
+            _log_audio_error(f"Аудио не найдено: {path}")
+            return False
+
         if self._vlc_ready and self._player:
             try:
-                media = self._vlc_instance.media_new(path)
+                media = self._vlc_instance.media_new(self._resolved_path)
                 self._player.set_media(media)
                 media.parse_with_options(vlc.MediaParseFlag.local, timeout=1)
                 duration = media.get_duration()
@@ -202,24 +268,54 @@ class AudioPlayerWidget(ttk.Frame):
         return self._loaded_path is not None
 
     def play(self):
-        if not self.is_loaded():
-            return
-        if self._vlc_ready and self._player:
-            try:
-                self._player.play()
-                self._schedule_progress_update()
-                self._set_status(os.path.basename(self._loaded_path))
-            except Exception as exc:
-                self._handle_error("Не удалось воспроизвести", exc)
-        elif WINSOUND_AVAILABLE and os.path.exists(self._loaded_path):
-            threading.Thread(
-                target=lambda: winsound.PlaySound(
-                    self._loaded_path, winsound.SND_FILENAME | winsound.SND_ASYNC
-                ),
-                daemon=True,
-            ).start()
-        else:
-            self._set_status("Установите python-vlc для воспроизведения")
+        try:
+            if not self.is_loaded():
+                messagebox.showerror("Аудио", "Аудио не загружено")
+                _log_audio_error("Попытка воспроизведения без загруженного аудио")
+                return
+
+            print("[AUDIO] requested=", self._loaded_path)
+            print(
+                "[AUDIO] resolved =",
+                self._resolved_path,
+                "exists=",
+                os.path.exists(self._resolved_path) if self._resolved_path else False,
+            )
+
+            if not self._resolved_path or not os.path.exists(self._resolved_path):
+                messagebox.showerror("Аудио", "Файл аудио не найден")
+                _log_audio_error(f"Файл аудио не найден: {self._loaded_path}")
+                return
+
+            if self._vlc_ready and self._player:
+                try:
+                    self._player.play()
+                    self._schedule_progress_update()
+                    self._set_status(os.path.basename(self._resolved_path))
+                except Exception as exc:
+                    self._handle_error("Не удалось воспроизвести", exc)
+                    messagebox.showerror("Аудио", f"Не удалось воспроизвести: {exc}")
+                return
+
+            if WINSOUND_AVAILABLE and self._resolved_path.lower().endswith(".wav"):
+                threading.Thread(
+                    target=lambda: winsound.PlaySound(
+                        self._resolved_path, winsound.SND_FILENAME | winsound.SND_ASYNC
+                    ),
+                    daemon=True,
+                ).start()
+                return
+
+            messagebox.showerror(
+                "Аудио",
+                "Не удаётся воспроизвести файл: требуется python-vlc или WAV для winsound",
+            )
+            _log_audio_error(
+                f"Нет доступного аудио движка для воспроизведения: {self._resolved_path}"
+            )
+        except Exception as exc:  # noqa: BLE001 - обработка ошибок воспроизведения
+            _log_audio_error(f"Необработанная ошибка воспроизведения: {exc}")
+            messagebox.showerror("Аудио", f"Ошибка воспроизведения: {exc}")
 
     def pause(self):
         if self._vlc_ready and self._player:
