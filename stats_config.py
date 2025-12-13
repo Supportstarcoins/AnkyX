@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Iterable, List, Optional
 
-DB_NAME = "anki.db"
+from db_path import connect_to_db
 
 
 @dataclass
@@ -41,9 +41,7 @@ class StatsSettings:
 def _ensure_connection(conn: sqlite3.Connection | None) -> sqlite3.Connection:
     if conn is not None:
         return conn
-    new_conn = sqlite3.connect(DB_NAME)
-    new_conn.row_factory = sqlite3.Row
-    return new_conn
+    return connect_to_db(timeout=None)
 
 
 def ensure_stats_settings_table(conn: sqlite3.Connection | None = None) -> None:

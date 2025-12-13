@@ -1,14 +1,13 @@
 import sqlite3
 from typing import Callable, Optional, Set, Tuple
 
-DB_NAME = "anki.db"
+from db_path import connect_to_db
 
 
 def _prepare_connection(conn: Optional[sqlite3.Connection]) -> tuple[sqlite3.Connection, bool]:
     if conn is not None:
         return conn, False
-    connection = sqlite3.connect(DB_NAME, timeout=5)
-    connection.row_factory = sqlite3.Row
+    connection = connect_to_db(timeout=5)
     return connection, True
 
 
