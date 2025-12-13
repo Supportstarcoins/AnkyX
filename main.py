@@ -1137,13 +1137,21 @@ def _normalize_sound_name(sound_name: str) -> str:
 
 
 def resolve_sound_file(sound_name: str) -> str | None:
-    normalized = _normalize_sound_name(sound_name)
+    cleaned = sound_name.strip()
+    if cleaned.lower().startswith("[sound:") and cleaned.endswith("]"):
+        cleaned = cleaned[len("[sound:") : -1]
+
+    normalized = _normalize_sound_name(cleaned)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = []
     if os.path.isabs(normalized):
         candidates.append(normalized)
     else:
         candidates.extend(
             [
+                os.path.join(base_dir, normalized),
+                os.path.join(base_dir, MEDIA_FOLDER, normalized),
+                os.path.join(base_dir, MEDIA_FOLDER, MEDIA_IMPORT_SUBDIR, normalized),
                 normalized,
                 os.path.join(MEDIA_FOLDER, normalized),
                 os.path.join(MEDIA_FOLDER, MEDIA_IMPORT_SUBDIR, normalized),
@@ -2840,15 +2848,48 @@ def speak_text(text: str):
 
 def play_audio_file(path):
     """Воспроизвести аудио файл"""
-    if WINSOUND_AVAILABLE and os.path.exists(path):
+    audio_path = path or ""
+    resolved = resolve_sound_file(audio_path)
+    print("[AUDIO] requested=", audio_path)
+    print("[AUDIO] resolved =", resolved, "exists=", os.path.exists(resolved) if resolved else False)
+
+    if not resolved or not os.path.exists(resolved):
+        msg = f"Файл аудио не найден: {audio_path}"
+        os.makedirs("logs", exist_ok=True)
+        with open(os.path.join("logs", "audio.log"), "a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+        messagebox.showerror("Аудио", msg)
+        return
+
+    try:
         try:
-            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-        except Exception:
-            messagebox.showerror("Ошибка", "Не удалось воспроизвести аудио")
-    elif TTS_AVAILABLE:
-        speak_text(os.path.splitext(os.path.basename(path))[0])
-    else:
-        messagebox.showinfo("Ошибка", "Аудио система недоступна")
+            import vlc  # type: ignore
+
+            instance = vlc.Instance()
+            player = instance.media_player_new()
+            media = instance.media_new(resolved)
+            player.set_media(media)
+            player.play()
+            return
+        except Exception as exc:  # noqa: BLE001
+            os.makedirs("logs", exist_ok=True)
+            with open(os.path.join("logs", "audio.log"), "a", encoding="utf-8") as fh:
+                fh.write(f"VLC недоступен: {exc}\n")
+
+        if WINSOUND_AVAILABLE and resolved.lower().endswith(".wav"):
+            winsound.PlaySound(resolved, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return
+
+        if TTS_AVAILABLE:
+            speak_text(os.path.splitext(os.path.basename(resolved))[0])
+            return
+
+        messagebox.showerror("Аудио", "Нет доступного аудио движка для воспроизведения")
+    except Exception as exc:  # noqa: BLE001 - не допускаем незахваченных исключений
+        os.makedirs("logs", exist_ok=True)
+        with open(os.path.join("logs", "audio.log"), "a", encoding="utf-8") as fh:
+            fh.write(f"Ошибка воспроизведения: {exc}\n")
+        messagebox.showerror("Аудио", f"Ошибка воспроизведения: {exc}")
 
 # ==========================
 # Устройства записи
