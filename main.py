@@ -22,6 +22,7 @@ from csv_importer import (
     render_card_faces,
     upsert_note_and_cards,
 )
+from anki_apkg_importer import import_apkg
 
 # В начале main() или init_db()
 os.makedirs("sentence_audio", exist_ok=True)
@@ -2919,6 +2920,10 @@ class AnkiApp(tk.Tk):
     def create_menu(self):
         menubar = tk.Menu(self)
 
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Импорт Anki (.apkg)", command=self.open_apkg_import_window)
+        menubar.add_cascade(label="Файл", menu=file_menu)
+
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(label="OpenAI API ключ", command=self.open_settings_window)
         settings_menu.add_command(label="Аудиоустройство (цифровой слух)",
@@ -2992,7 +2997,6 @@ class AnkiApp(tk.Tk):
         if self.selected_deck_id is None:
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
             return
-
         win = tk.Toplevel(self)
         win.title("Видео → клипы → карточки")
         win.geometry("520x260")
@@ -3069,6 +3073,131 @@ class AnkiApp(tk.Tk):
             messagebox.showinfo("Готово", f"Клип сохранен в {clip_path}\nКарточка добавлена в колоду.")
 
         ttk.Button(win, text="Нарезать клип", command=cut_and_attach).pack(anchor="e", padx=10, pady=10)
+
+    def open_apkg_import_window(self):
+        win = tk.Toplevel(self)
+        win.title("Импорт Anki (.apkg)")
+        win.geometry("720x520")
+        win.grab_set()
+
+        file_var = tk.StringVar()
+        keep_schedule_var = tk.BooleanVar(value=False)
+        restart_var = tk.BooleanVar(value=True)
+        media_var = tk.BooleanVar(value=True)
+        revlog_var = tk.BooleanVar(value=False)
+
+        progress_var = tk.DoubleVar(value=0)
+        progress_label_var = tk.StringVar(value="0/0")
+        processing_task: dict[str, BackgroundTask | None] = {"task": None}
+
+        def log_msg(msg: str):
+            log_box.configure(state="normal")
+            log_box.insert(tk.END, msg + "\n")
+            log_box.see(tk.END)
+            log_box.configure(state="disabled")
+
+        def handle_event(event):
+            kind = event[0]
+            if kind == "progress":
+                done, total, label = event[1:]
+                progress_bar.configure(maximum=max(int(total), 1))
+                progress_var.set(int(done))
+                progress_label_var.set(f"{done}/{total} {label}")
+            elif kind == "log":
+                log_msg(str(event[1]))
+            elif kind == "done":
+                summary = event[1] or {}
+                if processing_task["task"]:
+                    self.unregister_bg_handler(processing_task["task"].queue)
+                    processing_task["task"] = None
+                messagebox.showinfo(
+                    "Импорт завершен",
+                    (
+                        f"Заметок: {summary.get('notes', 0)}\n"
+                        f"Карточек: {summary.get('cards', 0)}\n"
+                        f"Медиа: {summary.get('media', 0)}\n"
+                        f"Ошибок: {summary.get('errors', 0)}"
+                    ),
+                )
+                self.refresh_decks()
+            elif kind == "error":
+                if processing_task["task"]:
+                    self.unregister_bg_handler(processing_task["task"].queue)
+                    processing_task["task"] = None
+                messagebox.showerror("Ошибка импорта", event[1])
+
+        def browse_file():
+            path = filedialog.askopenfilename(filetypes=[("Anki .apkg", "*.apkg"), ("Все файлы", "*.*")])
+            if path:
+                file_var.set(path)
+
+        def sync_modes():
+            if keep_schedule_var.get():
+                restart_var.set(False)
+            elif not restart_var.get():
+                restart_var.set(True)
+
+        def start_import():
+            if processing_task["task"]:
+                messagebox.showinfo("Занято", "Импорт уже выполняется")
+                return
+
+            apkg_path = file_var.get().strip()
+            if not apkg_path or not os.path.exists(apkg_path):
+                messagebox.showerror("Ошибка", "Укажите существующий .apkg файл")
+                return
+
+            options = {
+                "keep_schedule": keep_schedule_var.get(),
+                "start_fresh": restart_var.get(),
+                "import_media": media_var.get(),
+                "import_revlog": revlog_var.get(),
+            }
+
+            def worker(task_obj: BackgroundTask):
+                return import_apkg(
+                    apkg_path,
+                    target_parent_deck_id=self.selected_deck_id,
+                    options=options,
+                    progress_cb=lambda *ev: task_obj.queue.put(ev),
+                    cancel_flag=task_obj.cancelled,
+                )
+
+            task = start_background_task(worker)
+            processing_task["task"] = task
+            self.register_bg_handler(task.queue, handle_event)
+            log_msg("Старт импорта…")
+
+        def cancel_import():
+            if processing_task["task"]:
+                processing_task["task"].cancel()
+                log_msg("Отмена запрошена")
+
+        top_frame = ttk.Frame(win)
+        top_frame.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(top_frame, text="Файл .apkg:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(top_frame, textvariable=file_var).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(top_frame, text="…", width=4, command=browse_file).grid(row=0, column=2)
+        top_frame.columnconfigure(1, weight=1)
+
+        options_frame = ttk.LabelFrame(win, text="Опции")
+        options_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Checkbutton(options_frame, text="Сохранить расписание Anki", variable=keep_schedule_var, command=sync_modes).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(options_frame, text="Начать заново в SRS", variable=restart_var).grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(options_frame, text="Импортировать медиа", variable=media_var).grid(row=2, column=0, sticky="w")
+        ttk.Checkbutton(options_frame, text="Импортировать revlog (позже)", variable=revlog_var).grid(row=3, column=0, sticky="w")
+
+        progress_bar = ttk.Progressbar(win, variable=progress_var, maximum=1)
+        progress_bar.pack(fill=tk.X, padx=10, pady=(10, 0))
+        ttk.Label(win, textvariable=progress_label_var).pack(anchor="e", padx=10)
+
+        log_box = tk.Text(win, height=12, state="disabled")
+        log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btn_frame, text="Импортировать", command=start_import).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Отмена", command=cancel_import).pack(side=tk.RIGHT)
 
     def open_image_id_import_window(self):
         if not PIL_AVAILABLE:
