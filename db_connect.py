@@ -2,19 +2,13 @@ import sqlite3
 import threading
 import time
 
-from db_path import get_db_path
+from db_path import connect_to_db
 
 DB_WRITE_LOCK = threading.Lock()
 
 
 def open_db() -> sqlite3.Connection:
-    con = sqlite3.connect(get_db_path(), timeout=30, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
-    con.execute("PRAGMA busy_timeout=5000;")
-    con.execute("PRAGMA foreign_keys=ON;")
-    return con
+    return connect_to_db(timeout=30)
 
 
 def commit_with_retry(conn: sqlite3.Connection, operation):
