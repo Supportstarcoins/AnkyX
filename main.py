@@ -3132,7 +3132,11 @@ class AnkiApp(tk.Tk):
                 if processing_task["task"]:
                     self.unregister_bg_handler(processing_task["task"].queue)
                     processing_task["task"] = None
-                messagebox.showerror("Ошибка импорта", event[1])
+                msg = str(event[1])
+                if "Неподдерживаемый формат Anki пакета" in msg:
+                    messagebox.showerror("Неподдерживаемый формат", msg)
+                else:
+                    messagebox.showerror("Ошибка импорта", msg)
 
         def browse_file():
             path = filedialog.askopenfilename(filetypes=[("Anki .apkg", "*.apkg"), ("Все файлы", "*.*")])

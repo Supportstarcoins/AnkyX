@@ -12,6 +12,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Any
 
+
+class UnsupportedAnkiPackageError(Exception):
+    """Raised when an Anki package cannot be parsed by the importer."""
+
 from db_migrations import ensure_schema_for_import
 from db_path import connect_to_db
 MEDIA_ROOT = "media"
@@ -22,6 +26,55 @@ LOG_PATH = os.path.join("logs", "anki_import.log")
 
 def get_connection() -> sqlite3.Connection:
     return connect_to_db(timeout=5)
+
+
+def _select_collection_file(members: list[str]) -> str | None:
+    candidates: list[tuple[int, str]] = []
+    for name in members:
+        base = os.path.basename(name.rstrip("/"))
+        if base == "collection.anki21":
+            candidates.append((0, name))
+        elif base == "collection.anki2":
+            candidates.append((1, name))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], len(item[1])))
+    return candidates[0][1]
+
+
+def inspect_package(path: str) -> dict:
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    with zipfile.ZipFile(path, "r") as zf:
+        members = zf.namelist()
+
+    has_dirs = any("/" in name.strip("/") for name in members if name.strip("/"))
+    has_collection_anki21 = any(os.path.basename(m.rstrip("/")) == "collection.anki21" for m in members)
+    has_collection_anki2 = any(os.path.basename(m.rstrip("/")) == "collection.anki2" for m in members)
+    has_wal = any(os.path.basename(m.rstrip("/")) == "collection.anki2-wal" for m in members)
+    has_shm = any(os.path.basename(m.rstrip("/")) == "collection.anki2-shm" for m in members)
+    has_media = any(os.path.basename(m.rstrip("/")) == "media" for m in members)
+
+    selected_collection = _select_collection_file(members)
+
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as log_fh:
+            log_fh.write(
+                f"[{datetime.now().isoformat()}] Inspecting {path}\n"
+                f"Files: {members}\n"
+            )
+    except Exception:
+        pass
+
+    return {
+        "files": members,
+        "has_dirs": has_dirs,
+        "has_collection_anki21": has_collection_anki21,
+        "has_collection_anki2": has_collection_anki2,
+        "has_wal": has_wal,
+        "has_shm": has_shm,
+        "has_media": has_media,
+        "collection_member": selected_collection,
+    }
 
 
 def parse_models(col_models_json: str) -> dict:
@@ -305,17 +358,26 @@ def import_apkg(
     temp_dir = tempfile.mkdtemp(prefix="apkg_import_")
     summary = {"notes": 0, "cards": 0, "media": 0, "errors": 0, "missing_note_refs": 0}
     done_cards = 0
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+
+    inspection = inspect_package(apkg_path)
+    collection_member = inspection.get("collection_member")
+    if not collection_member:
+        raise UnsupportedAnkiPackageError(
+            "Неподдерживаемый формат Anki пакета. Похоже на .colpkg/новый формат. "
+            "Экспортируйте колоду в старый .apkg (Anki Deck Package) и попробуйте снова."
+        )
+
     conn_target = get_connection()
     ensure_schema_for_import(conn_target)
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
     try:
         with zipfile.ZipFile(apkg_path, "r") as zf:
             zf.extractall(temp_dir)
 
-        collection_path = os.path.join(temp_dir, "collection.anki2")
+        collection_path = os.path.join(temp_dir, collection_member)
         if not os.path.exists(collection_path):
-            raise FileNotFoundError("В архиве нет collection.anki2")
+            raise FileNotFoundError(f"Не найден файл коллекции {collection_member}")
 
         ankiconn = sqlite3.connect(collection_path)
         ankiconn.row_factory = sqlite3.Row
