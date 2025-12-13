@@ -13,6 +13,9 @@ from tkinter import ttk
 
 from db_path import connect_to_db
 
+_PRINTED_ENV = False
+_OVERDUE_CACHE: dict[int, tuple[int, "OverdueCounts"]] = {}
+
 
 @dataclass
 class OverdueCounts:
@@ -71,7 +74,12 @@ def get_descendant_deck_ids(conn: sqlite3.Connection, deck_id: int) -> List[int]
 
 
 def _connect_with_logging(timeout: Optional[int] = 5) -> sqlite3.Connection:
-    print("[DB] CWD=", os.getcwd())
+    global _PRINTED_ENV
+    if not _PRINTED_ENV:
+        print("[DB] CWD=", os.getcwd())
+        temp_vars = {key: os.environ.get(key) for key in ("TEMP", "TMP")}
+        print("[DB] TEMP=", temp_vars.get("TEMP"), "TMP=", temp_vars.get("TMP"))
+        _PRINTED_ENV = True
     try:
         conn = connect_to_db(timeout=timeout)
         return conn
@@ -84,6 +92,11 @@ def fetch_overdue_counts_by_phase(
 ) -> OverdueCounts:
     """Возвращает количество просроченных карточек по фазам."""
 
+    timestamp = now_ts if now_ts is not None else int(time.time())
+    cached = _OVERDUE_CACHE.get(deck_id)
+    if cached and timestamp - cached[0] <= 2:
+        return cached[1]
+
     close_conn = False
     if conn is None:
         conn = _connect_with_logging()
@@ -91,7 +104,6 @@ def fetch_overdue_counts_by_phase(
 
     try:
         ensure_due_column(conn)
-        timestamp = now_ts if now_ts is not None else int(time.time())
         deck_ids = get_descendant_deck_ids(conn, deck_id)
 
         placeholders = ",".join("?" for _ in deck_ids)
@@ -104,7 +116,9 @@ def fetch_overdue_counts_by_phase(
         cursor = conn.cursor()
         cursor.execute(query, (*deck_ids, timestamp))
         counts = {int(row[0]): int(row[1]) for row in cursor.fetchall() if row[0] is not None}
-        return OverdueCounts(by_phase=counts)
+        result = OverdueCounts(by_phase=counts)
+        _OVERDUE_CACHE[deck_id] = (timestamp, result)
+        return result
     finally:
         if close_conn:
             conn.close()
