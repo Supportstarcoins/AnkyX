@@ -3175,6 +3175,10 @@ class AnkiApp(tk.Tk):
 
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Импорт Anki (.apkg)", command=self.open_apkg_import_window)
+        file_menu.add_separator()
+        file_menu.add_command(label="Новая колода", command=self.add_deck_window)
+        file_menu.add_command(label="Редактировать колоду", command=self.edit_deck_window)
+        file_menu.add_command(label="Удалить выбранную колоду", command=self.delete_selected_deck)
         menubar.add_cascade(label="Файл", menu=file_menu)
 
         settings_menu = tk.Menu(menubar, tearoff=0)
@@ -5052,6 +5056,8 @@ class AnkiApp(tk.Tk):
             .pack(side=tk.LEFT, padx=5)
         ttk.Button(frame_buttons, text="Редактировать колоду", command=self.edit_deck_window)\
             .pack(side=tk.LEFT, padx=5)
+        ttk.Button(frame_buttons, text="Удалить колоду", command=self.delete_selected_deck)\
+            .pack(side=tk.LEFT, padx=5)
         ttk.Button(frame_buttons, text="Добавить карточку вручную", command=self.add_card_window)\
             .pack(side=tk.LEFT, padx=5)
         ttk.Button(frame_buttons, text="Режим повторения", command=self.start_repeat_mode)\
@@ -5519,6 +5525,101 @@ class AnkiApp(tk.Tk):
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
         ttk.Button(btn_frame, text="Сохранить", command=save_changes).pack(side=tk.RIGHT)
+
+    def delete_selected_deck(self):
+        if self.selected_deck_id is None:
+            messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
+            return
+
+        conn = open_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id, name FROM decks WHERE id = ?;", (self.selected_deck_id,))
+            deck_row = cur.fetchone()
+            if not deck_row:
+                messagebox.showerror("Ошибка", "Не удалось найти выбранную колоду.")
+                return
+
+            deck_name = deck_row["name"] or "Без названия"
+
+            cur.execute("PRAGMA table_info(decks);")
+            deck_columns = {row["name"] for row in cur.fetchall()}
+            has_parent_column = "parent_id" in deck_columns
+
+            def collect_child_decks(parent_id: int) -> list[int]:
+                if not has_parent_column:
+                    return []
+                cur.execute("SELECT id FROM decks WHERE parent_id = ?;", (parent_id,))
+                children = [row["id"] for row in cur.fetchall()]
+                result: list[int] = []
+                for child_id in children:
+                    result.append(child_id)
+                    result.extend(collect_child_decks(child_id))
+                return result
+
+            child_deck_ids = collect_child_decks(self.selected_deck_id)
+            if child_deck_ids:
+                confirm_children = messagebox.askyesno(
+                    "Есть подкалоды",
+                    "У выбранной колоды есть подкалоды. Удалить их тоже?",
+                )
+                if not confirm_children:
+                    messagebox.showwarning("Подколоды", "Сначала удалите подкалоды.")
+                    return
+
+            confirm = messagebox.askyesno(
+                "Удалить колоду",
+                (
+                    f"Удалить колоду '{deck_name}'? Это удалит все карточки/ноты/медиа "
+                    "этой колоды. Отменить нельзя."
+                ),
+            )
+            if not confirm:
+                return
+
+            deck_ids_to_delete = [self.selected_deck_id, *child_deck_ids]
+            media_table_exists = _table_exists(conn, "media")
+
+            try:
+                with DB_WRITE_LOCK:
+                    conn.execute("BEGIN;")
+                    for deck_id in deck_ids_to_delete:
+                        cur.execute("SELECT id FROM notes WHERE deck_id = ?;", (deck_id,))
+                        note_ids = [row["id"] for row in cur.fetchall()]
+                        cur.execute("SELECT id FROM cards WHERE deck_id = ?;", (deck_id,))
+                        card_ids = [row["id"] for row in cur.fetchall()]
+
+                        if media_table_exists:
+                            if note_ids:
+                                placeholders = ",".join("?" * len(note_ids))
+                                cur.execute(
+                                    f"DELETE FROM media WHERE note_id IN ({placeholders});",
+                                    note_ids,
+                                )
+                            if card_ids:
+                                placeholders = ",".join("?" * len(card_ids))
+                                cur.execute(
+                                    f"DELETE FROM media WHERE card_id IN ({placeholders});",
+                                    card_ids,
+                                )
+
+                        cur.execute("DELETE FROM cards WHERE deck_id = ?;", (deck_id,))
+                        cur.execute("DELETE FROM notes WHERE deck_id = ?;", (deck_id,))
+                        cur.execute("DELETE FROM decks WHERE id = ?;", (deck_id,))
+
+                    conn.commit()
+            except Exception as e:
+                conn.rollback()
+                messagebox.showerror("Ошибка", f"Не удалось удалить колоду: {e}")
+                return
+
+            self.selected_deck_id = None
+            self.refresh_decks()
+            self.update_deck_preview()
+            self.update_overdue_badge()
+            messagebox.showinfo("Готово", "Колода удалена.")
+        finally:
+            conn.close()
 
     # --------- ручная карточка ---------
 
