@@ -55,7 +55,7 @@ from stats_config import (
     save_stats_settings,
 )
 from db_migrations import ensure_schema_for_import, run_migrations
-from db_path import get_db_path
+from db_path import connect_to_db
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
 from overdue_badges import (
@@ -670,17 +670,7 @@ def get_next_review_for_level(level: int) -> datetime:
 # ==========================
 
 def get_connection():
-    db_path = get_db_path()
-    try:
-        conn = sqlite3.connect(db_path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        return conn
-    except Exception as exc:
-        try:
-            messagebox.showerror("Ошибка БД", f"Не удалось открыть БД:\n{db_path}\n{exc}")
-        except Exception:
-            print(f"Не удалось открыть БД: {db_path}\n{exc}")
-        raise
+    return connect_to_db(timeout=5)
 
 
 def ensure_basic_note_type_id(conn: sqlite3.Connection | None = None) -> int:
