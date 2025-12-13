@@ -135,6 +135,13 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+# OpenCV (опционально для улучшенного OCR)
+try:
+    import cv2  # type: ignore
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
 # TTS (озвучка)
 try:
     import pyttsx3
@@ -187,6 +194,15 @@ except ImportError:
     plt = None
     FigureCanvasTkAgg = None
     Figure = None
+
+if CV2_AVAILABLE:
+    try:
+        from ocr_photo import ocr_photo_document
+    except Exception:
+        ocr_photo_document = None
+        CV2_AVAILABLE = False
+else:
+    ocr_photo_document = None
 
 
 # OpenAI key только в памяти
@@ -6321,41 +6337,107 @@ class AnkiApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("OCR - Распознавание текста из изображения")
-        win.geometry("800x600")
+        win.geometry("900x650")
         win.grab_set()
 
-        # Получаем текст через OCR
-        try:
-            img = Image.open(img_path)
-            ocr_text = pytesseract.image_to_string(img)
-        except Exception as e:
-            messagebox.showerror("Ошибка OCR", f"Не удалось распознать текст: {e}")
-            return
-
-        # Основной фрейм с прокруткой
         main_frame = ttk.Frame(win)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Настройки OCR
+        ocr_opts = ttk.LabelFrame(main_frame, text="OCR настройки")
+        ocr_opts.pack(fill=tk.X, pady=(0, 10))
+
+        photo_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            ocr_opts,
+            text="Фото (тени/перспектива)",
+            variable=photo_mode_var,
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+
+        ttk.Label(ocr_opts, text="Языки OCR:").grid(row=0, column=1, sticky="e")
+        ocr_lang_var = tk.StringVar(value="deu+rus")
+        lang_choices = ("deu+rus", "deu+rus+eng")
+        ocr_lang_combo = ttk.Combobox(ocr_opts, textvariable=ocr_lang_var, values=lang_choices, state="readonly", width=15)
+        ocr_lang_combo.grid(row=0, column=2, sticky="w", padx=5)
+
+        ocr_progress_var = tk.DoubleVar(value=0)
+        ocr_progress_label = tk.StringVar(value="Ожидание запуска…")
+        ocr_status_frame = ttk.LabelFrame(main_frame, text="OCR прогресс")
+        ocr_status_frame.pack(fill=tk.X, pady=(0, 10))
+        ocr_bar = ttk.Progressbar(ocr_status_frame, variable=ocr_progress_var, maximum=5)
+        ocr_bar.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(ocr_status_frame, textvariable=ocr_progress_label).pack(anchor="w", padx=10)
+
+        ocr_task_holder = {"task": None}
 
         # Фрейм для текста OCR
         ocr_frame = ttk.LabelFrame(main_frame, text="Распознанный текст (редактируйте перед генерацией)")
         ocr_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
-        # Текстовая область с прокруткой
         text_frame = ttk.Frame(ocr_frame)
         text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         txt_ocr = tk.Text(text_frame, height=15, wrap=tk.WORD)
-        txt_ocr.insert("1.0", ocr_text)
-        create_context_menu(txt_ocr)  # Добавляем контекстное меню
-
+        create_context_menu(txt_ocr)
         scrollbar = ttk.Scrollbar(text_frame, command=txt_ocr.yview)
         txt_ocr.configure(yscrollcommand=scrollbar.set)
-
         txt_ocr.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Панель инструментов для форматирования
         attach_simple_toolbar(ocr_frame, txt_ocr)
+
+        def handle_ocr_event(event):
+            kind = event[0]
+            if kind == "ocr_progress":
+                step, total, label = event[1:]
+                ocr_bar.config(maximum=max(total, 1))
+                ocr_progress_var.set(step)
+                ocr_progress_label.set(label)
+            elif kind == "done":
+                ocr_text = (event[1] or "")
+                if ocr_task_holder["task"]:
+                    self.unregister_bg_handler(ocr_task_holder["task"].queue)
+                ocr_task_holder["task"] = None
+                ocr_progress_label.set("Готово")
+                ocr_button.config(state=tk.NORMAL)
+                txt_ocr.delete("1.0", tk.END)
+                txt_ocr.insert("1.0", str(ocr_text))
+            elif kind == "error":
+                if ocr_task_holder["task"]:
+                    self.unregister_bg_handler(ocr_task_holder["task"].queue)
+                ocr_task_holder["task"] = None
+                ocr_progress_label.set("Ошибка")
+                ocr_button.config(state=tk.NORMAL)
+                messagebox.showerror("Ошибка OCR", event[1])
+
+        def run_ocr():
+            if photo_mode_var.get() and not CV2_AVAILABLE:
+                messagebox.showerror("OCR (фото)", "Нужно: pip install opencv-python")
+                photo_mode_var.set(False)
+                return
+            if ocr_task_holder["task"] is not None:
+                return
+
+            ocr_progress_var.set(0)
+            ocr_progress_label.set("Запуск…")
+            ocr_button.config(state=tk.DISABLED)
+
+            def worker(task_obj):
+                def progress_cb(step, total, label):
+                    task_obj.queue.put(("ocr_progress", step, total, label))
+
+                if photo_mode_var.get() and ocr_photo_document:
+                    return ocr_photo_document(img_path, ocr_lang_var.get(), progress_cb)
+                task_obj.queue.put(("ocr_progress", 0, 1, "Загрузка изображения"))
+                with Image.open(img_path) as img:
+                    task_obj.queue.put(("ocr_progress", 1, 1, "OCR стандартный режим"))
+                    return pytesseract.image_to_string(img, lang=ocr_lang_var.get())
+
+            ocr_task_holder["task"] = start_background_task(worker)
+            self.register_bg_handler(ocr_task_holder["task"].queue, handle_ocr_event)
+
+        ocr_button = ttk.Button(ocr_opts, text="Запустить OCR", command=run_ocr)
+        ocr_button.grid(row=0, column=3, padx=10)
 
         # Фрейм с настройками генерации
         settings_frame = ttk.LabelFrame(main_frame, text="Настройки генерации карточек")
@@ -6368,7 +6450,6 @@ class AnkiApp(tk.Tk):
             variable=use_ai_var
         ).pack(anchor="w", padx=10, pady=5)
 
-        # Выбор способа разбиения текста
         ttk.Label(settings_frame, text="Как делить длинный текст:")\
             .pack(anchor="w", padx=10, pady=(5, 0))
         split_mode_var = tk.StringVar(value="sentence")
@@ -6385,7 +6466,6 @@ class AnkiApp(tk.Tk):
             value="word"
         ).pack(anchor="w", padx=25)
 
-        # Шаблоны
         ttk.Label(settings_frame, text="Шаблон FRONT:").pack(anchor="w", padx=10, pady=(5, 0))
         entry_front = tk.Text(settings_frame, height=2)
         entry_front.pack(fill=tk.X, padx=10, pady=(0, 5))
@@ -6494,24 +6574,25 @@ class AnkiApp(tk.Tk):
                 append_log("Отмена запрошена…")
                 btn_cancel.config(state=tk.DISABLED)
 
-        # Кнопки
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X)
 
-        ttk.Button(btn_frame, text="Копировать текст", 
+        ttk.Button(btn_frame, text="Копировать текст",
                    command=lambda: win.clipboard_clear() or win.clipboard_append(txt_ocr.get("1.0", tk.END)))\
             .pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(btn_frame, text="Вставить из буфера", 
+
+        ttk.Button(btn_frame, text="Вставить из буфера",
                    command=lambda: txt_ocr.insert(tk.END, win.clipboard_get()))\
             .pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(btn_frame, text="Очистить", 
+
+        ttk.Button(btn_frame, text="Очистить",
                    command=lambda: txt_ocr.delete("1.0", tk.END))\
             .pack(side=tk.LEFT, padx=5)
-        
+
         ttk.Button(btn_frame, text="OCR + генерация", command=run_generation)\
             .pack(side=tk.RIGHT, padx=5)
+
+        run_ocr()
 
     # --------- генерация через цифровой слух ---------
 
