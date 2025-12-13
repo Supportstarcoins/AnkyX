@@ -4,6 +4,30 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 
+def configure_vlc_windows():  # pragma: no cover - Windows-specific
+    if os.name != "nt":
+        return None
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        r"C:\\Program Files\\VideoLAN\\VLC",
+        r"C:\\Program Files (x86)\\VideoLAN\\VLC",
+        os.path.join(base_dir, "VLC"),
+    ]
+
+    for vlc_dir in candidates:
+        if os.path.isfile(os.path.join(vlc_dir, "libvlc.dll")):
+            try:
+                os.add_dll_directory(vlc_dir)
+            except Exception:
+                pass
+            os.environ["PATH"] = vlc_dir + ";" + os.environ.get("PATH", "")
+            os.environ["VLC_PLUGIN_PATH"] = os.path.join(vlc_dir, "plugins")
+            print("[VLC] using dir:", vlc_dir)
+            return vlc_dir
+    return None
+
+
 def _log_audio_error(message: str):
     try:
         os.makedirs("logs", exist_ok=True)
@@ -14,30 +38,25 @@ def _log_audio_error(message: str):
         pass
 
 
-def _prepare_vlc_runtime():  # pragma: no cover - Windows-specific
-    if os.name != "nt":
-        return
-    common_paths = [
-        r"C:\\Program Files\\VideoLAN\\VLC",
-        r"C:\\Program Files (x86)\\VideoLAN\\VLC",
-    ]
-    for path in common_paths:
-        if os.path.isdir(path):
-            try:
-                os.add_dll_directory(path)
-            except Exception:
-                pass
-
-
 VLC_IMPORT_ERROR: Exception | None = None
 VLC_LOAD_ERROR: Exception | None = None
 VLC_IMPORTED = False
+VLC_DIR: str | None = None
 
 try:  # pragma: no cover - optional dependency
-    _prepare_vlc_runtime()
+    VLC_DIR = configure_vlc_windows()
+    if os.name == "nt" and VLC_DIR is None:
+        raise FileNotFoundError("VLC directory with libvlc.dll not found")
     import vlc  # type: ignore
 
     VLC_IMPORTED = True
+except FileNotFoundError as exc:  # pragma: no cover - missing VLC runtime
+    VLC_LOAD_ERROR = exc
+    vlc = None  # type: ignore
+    try:
+        messagebox.showerror("Аудио", "VLC не найден. Установите VLC x64 и повторите.")
+    except Exception:
+        pass
 except ImportError as exc:  # pragma: no cover - diagnostic
     VLC_IMPORT_ERROR = exc
     vlc = None  # type: ignore
