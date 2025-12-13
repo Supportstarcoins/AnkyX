@@ -776,15 +776,29 @@ def list_note_types() -> list[sqlite3.Row]:
 
 
 def _extract_note_fields(card_row: dict, note_fields: dict | None = None) -> dict:
-    if note_fields:
-        return dict(note_fields)
+    source = dict(note_fields) if note_fields else {}
+
+    def pick(*keys):
+        for key in keys:
+            if isinstance(key, (list, tuple)):
+                for sub_key in key:
+                    if source.get(sub_key):
+                        return source.get(sub_key)
+            elif source.get(key):
+                return source.get(key)
+        return None
+
+    front_fallback = pick("word", "front", "_front")
+    back_fallback = pick("translation", "back", "_back")
+    example_fallback = pick("example", "front", "_front")
 
     fields = {
-        "word": card_row.get("word") or card_row.get("target_word") or card_row.get("front") or "",
-        "translation": card_row.get("translation") or card_row.get("back") or "",
-        "example": card_row.get("example") or card_row.get("front") or "",
+        "word": front_fallback or card_row.get("word") or card_row.get("target_word") or card_row.get("front") or card_row.get("_front") or "",
+        "translation": back_fallback or card_row.get("translation") or card_row.get("back") or card_row.get("_back") or "",
+        "example": example_fallback or card_row.get("example") or card_row.get("front") or card_row.get("_front") or "",
         "level": card_row.get("leitner_level", 1),
-        "image": card_row.get("image_path")
+        "image": source.get("image")
+        or card_row.get("image_path")
         or card_row.get("front_image_path")
         or card_row.get("back_image_path")
         or "",

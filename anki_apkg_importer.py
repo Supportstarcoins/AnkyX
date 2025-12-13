@@ -7,6 +7,7 @@ import tempfile
 import time
 import zipfile
 import hashlib
+import html
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Any
@@ -16,6 +17,7 @@ from db_path import connect_to_db
 MEDIA_ROOT = "media"
 MEDIA_IMPORT_SUBDIR = "anki_import"
 FIELD_SEPARATOR = "\x1f"
+LOG_PATH = os.path.join("logs", "anki_import.log")
 
 
 def get_connection() -> sqlite3.Connection:
@@ -61,6 +63,53 @@ def _sanitize_name(name: str) -> str:
     return cleaned or "deck"
 
 
+def _strip_html(text: str) -> str:
+    if not text:
+        return ""
+    no_tags = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(no_tags)
+
+
+def _render_cloze_plain(text: str, reveal: bool) -> str:
+    def repl(match):
+        content = match.group(2)
+        return content if reveal else "____"
+
+    return re.sub(r"\{\{c(\d+)::(.*?)\}\}", repl, text)
+
+
+def normalize_fields_for_ui(fields_dict: dict, model_type: int = 0) -> dict:
+    front_raw = ""
+    back_raw = ""
+
+    if "Front" in fields_dict and "Back" in fields_dict:
+        front_raw = str(fields_dict.get("Front", ""))
+        back_raw = str(fields_dict.get("Back", ""))
+    elif "Text" in fields_dict and "Extra" in fields_dict:
+        front_raw = str(fields_dict.get("Text", ""))
+        back_raw = str(fields_dict.get("Extra", ""))
+    else:
+        non_empty = [str(v) for v in fields_dict.values() if str(v).strip()]
+        if non_empty:
+            front_raw = non_empty[0]
+            if len(non_empty) > 1:
+                back_raw = "\n\n".join(non_empty[1:])
+
+    is_cloze = model_type == 1 or "{{c" in front_raw
+
+    if is_cloze:
+        front_plain = _strip_html(_render_cloze_plain(front_raw, False))
+        back_plain = _strip_html(_render_cloze_plain(back_raw or front_raw, True))
+    else:
+        front_plain = _strip_html(front_raw)
+        back_plain = _strip_html(back_raw)
+
+    normalized = dict(fields_dict)
+    normalized["_front"] = front_plain
+    normalized["_back"] = back_plain
+    return normalized
+
+
 def rewrite_media_refs_in_fields(fields_dict: dict, filename_map: dict, new_name_map: dict) -> tuple[dict, list[tuple[str, str]]]:
     updated = {}
     media_entries: list[tuple[str, str]] = []
@@ -80,14 +129,14 @@ def rewrite_media_refs_in_fields(fields_dict: dict, filename_map: dict, new_name
                 return match.group(0).replace(orig, new_path)
             return match.group(0)
 
-    def replace_sound(match):
-        orig = match.group(1)
-        mapped = filename_map.get(orig, orig)
-        new_path = new_name_map.get(mapped)
-        if new_path:
-            media_entries.append((new_path, "audio"))
-            return f"[sound:{new_path}]"
-        return match.group(0)
+        def replace_sound(match):
+            orig = match.group(1)
+            mapped = filename_map.get(orig, orig)
+            new_path = new_name_map.get(mapped)
+            if new_path:
+                media_entries.append((new_path, "audio"))
+                return f"[sound:{new_path}]"
+            return match.group(0)
 
         text = img_pattern.sub(replace_img, text)
         text = sound_pattern.sub(replace_sound, text)
@@ -149,11 +198,11 @@ def _render_front_back(model: dict, fields: dict) -> tuple[str, str]:
     front_key = None
     back_key = None
 
-    for cand in ("front", "question", "word"):
+    for cand in ("front", "question", "word", "_front"):
         if cand in lower_keys:
             front_key = lower_keys[cand]
             break
-    for cand in ("back", "answer", "translation"):
+    for cand in ("back", "answer", "translation", "_back"):
         if cand in lower_keys:
             back_key = lower_keys[cand]
             break
@@ -254,10 +303,11 @@ def import_apkg(
     import_media = bool(opts.get("import_media", True))
 
     temp_dir = tempfile.mkdtemp(prefix="apkg_import_")
-    summary = {"notes": 0, "cards": 0, "media": 0, "errors": 0}
+    summary = {"notes": 0, "cards": 0, "media": 0, "errors": 0, "missing_note_refs": 0}
     done_cards = 0
     conn_target = get_connection()
     ensure_schema_for_import(conn_target)
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
     try:
         with zipfile.ZipFile(apkg_path, "r") as zf:
@@ -281,6 +331,8 @@ def import_apkg(
 
         notes_rows = ankiconn.execute("SELECT * FROM notes;").fetchall()
         total_cards = len(cards_rows) or 1
+        nid_map: dict[int, int] = {}
+        first_note_logged = False
 
         base_deck_name = "anki"
         if decks_map:
@@ -311,9 +363,13 @@ def import_apkg(
 
             note_type_id = _ensure_note_type(conn_target, model)
 
-            rewritten_fields, media_entries = rewrite_media_refs_in_fields(
-                fields, filename_map_global, new_name_map_global
-            ) if import_media else (fields, [])
+            rewritten_fields, media_entries = (
+                rewrite_media_refs_in_fields(fields, filename_map_global, new_name_map_global)
+                if import_media
+                else (fields, [])
+            )
+
+            normalized_fields = normalize_fields_for_ui(rewritten_fields, int(model.get("type", 0)))
 
             note_created_at = int(note_row["mod"] or time.time())
             cur = conn_target.cursor()
@@ -325,7 +381,7 @@ def import_apkg(
                 (
                     deck_id,
                     note_type_id,
-                    json.dumps(rewritten_fields, ensure_ascii=False),
+                    json.dumps(normalized_fields, ensure_ascii=False),
                     tags,
                     str(note_row["id"]),
                     "anki_import",
@@ -333,7 +389,20 @@ def import_apkg(
                 ),
             )
             note_id = cur.lastrowid
+            nid_map[int(note_row["id"])] = note_id
             summary["notes"] += 1
+
+            if not first_note_logged:
+                front_preview = normalized_fields.get("_front", "")[:60]
+                back_preview = normalized_fields.get("_back", "")[:60]
+                try:
+                    with open(LOG_PATH, "a", encoding="utf-8") as log_fh:
+                        log_fh.write(
+                            f"Imported note nid={note_row['id']} fields={field_names} front='{front_preview}' back='{back_preview}'\n"
+                        )
+                except Exception:
+                    pass
+                first_note_logged = True
 
             for card_row in cards_for_note:
                 if cancel_flag and cancel_flag():
@@ -341,7 +410,14 @@ def import_apkg(
                 card_deck = decks_map.get(str(card_row["did"])) or deck_info
                 card_deck_id = _ensure_deck(conn_target, card_deck.get("name") or deck_name)
 
-                front, back = _render_front_back(model, rewritten_fields)
+                note_id_for_card = nid_map.get(int(card_row["nid"]))
+                if not note_id_for_card:
+                    summary["missing_note_refs"] += 1
+                    if progress_cb:
+                        progress_cb("log", f"SKIP card {card_row['id']}: missing note nid={card_row['nid']}")
+                    continue
+
+                front, back = _render_front_back(model, normalized_fields)
 
                 if keep_schedule:
                     queue_val = int(card_row["queue"])
@@ -386,7 +462,7 @@ def import_apkg(
                         None,
                         None,
                         None,
-                        note_id,
+                        note_id_for_card,
                         int(card_row["ord"] or 0),
                         state,
                         int(due_ts),
@@ -421,6 +497,24 @@ def import_apkg(
 
             conn_target.commit()
 
+        for card_row in cards_rows:
+            if cancel_flag and cancel_flag():
+                break
+            anki_nid = int(card_row["nid"])
+            if anki_nid not in nid_map:
+                summary["missing_note_refs"] += 1
+                if progress_cb:
+                    progress_cb("log", f"SKIP card {card_row['id']}: missing note nid={anki_nid}")
+                continue
+        if progress_cb:
+            progress_cb(
+                "log",
+                f"Import finished. notes={summary['notes']} cards={summary['cards']} missing_note_refs={summary['missing_note_refs']} media={summary['media']} errors={summary['errors']}",
+            )
+        else:
+            print(
+                f"Import finished. notes={summary['notes']} cards={summary['cards']} missing_note_refs={summary['missing_note_refs']} media={summary['media']} errors={summary['errors']}"
+            )
         return summary
     finally:
         try:
