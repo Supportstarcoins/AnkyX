@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk
 
-from db_path import get_db_path
+from db_path import connect_to_db
 
 
 @dataclass
@@ -70,31 +70,12 @@ def get_descendant_deck_ids(conn: sqlite3.Connection, deck_id: int) -> List[int]
     return result
 
 
-def _resolve_db_path(db_path: str) -> str:
-    if not os.path.isabs(db_path):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        db_path = os.path.join(base_dir, db_path)
-    db_dir = os.path.dirname(db_path)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-    return db_path
-
-
 def _connect_with_logging(timeout: Optional[int] = 5) -> sqlite3.Connection:
-    db_path = get_db_path()
     print("[DB] CWD=", os.getcwd())
-    print("[DB] trying db_path=", repr(db_path))
-    resolved_path = _resolve_db_path(db_path)
-
     try:
-        conn = sqlite3.connect(resolved_path, timeout=timeout) if timeout is not None else sqlite3.connect(resolved_path)
-        conn.row_factory = sqlite3.Row
+        conn = connect_to_db(timeout=timeout)
         return conn
-    except Exception as exc:
-        try:
-            messagebox.showerror("Ошибка БД", f"Не удалось открыть БД:\n{resolved_path}\n{exc}")
-        except Exception:
-            print(f"[DB] Failed to open DB at {resolved_path}: {exc}")
+    except Exception:
         raise
 
 

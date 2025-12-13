@@ -1,37 +1,35 @@
 import os
+import shutil
 import sqlite3
 import tempfile
 from typing import Optional
 
 DB_FILENAME = "anki.db"
-YOUR_DB_FILENAME = "YOUR_DB.db"
 
-
-def _base_dir() -> str:
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def _candidate_paths(base_dir: str) -> list[str]:
-    return [
-        os.path.join(base_dir, DB_FILENAME),
-        os.path.join(base_dir, YOUR_DB_FILENAME),
-        os.path.join(base_dir, "data", DB_FILENAME),
-    ]
+_OLD_DB_PATHS = [
+    os.path.join("C:\\", "AnkyX-main", "data", DB_FILENAME),
+    os.path.join("C:\\", "AnkyX-main", DB_FILENAME),
+]
 
 
 def get_db_path() -> str:
-    """Возвращает абсолютный путь к SQLite БД, стараясь использовать уже существующую."""
+    base = os.getenv("APPDATA") or os.path.expanduser("~")
+    db_dir = os.path.join(base, "AnkyX", "data")
+    os.makedirs(db_dir, exist_ok=True)
 
-    base_dir = _base_dir()
-    candidates = _candidate_paths(base_dir)
+    target_path = os.path.join(db_dir, DB_FILENAME)
+    _migrate_legacy_db(target_path)
+    return target_path
 
-    for path in candidates:
-        if os.path.exists(path):
-            return os.path.abspath(path)
 
-    fallback = candidates[-1]
-    os.makedirs(os.path.dirname(fallback), exist_ok=True)
-    return os.path.abspath(fallback)
+def _migrate_legacy_db(target_path: str) -> None:
+    if os.path.exists(target_path):
+        return
+
+    for old_path in _OLD_DB_PATHS:
+        if os.path.exists(old_path):
+            shutil.copy2(old_path, target_path)
+            break
 
 
 def _ensure_writable_directory(db_dir: str) -> None:
@@ -47,8 +45,6 @@ def _ensure_writable_directory(db_dir: str) -> None:
 
 
 def connect_to_db(timeout: Optional[int] = 5) -> sqlite3.Connection:
-    """Открывает соединение с БД, проверяя доступность каталога и выдавая диагностику."""
-
     db_path = get_db_path()
     db_dir = os.path.dirname(db_path)
     try:
@@ -64,6 +60,5 @@ def connect_to_db(timeout: Optional[int] = 5) -> sqlite3.Connection:
 
             messagebox.showerror("Ошибка БД", message)
         except Exception:
-            # Если Tkinter не готов, просто печатаем сообщение.
             print(message)
         raise
