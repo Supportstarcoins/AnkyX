@@ -4,7 +4,7 @@ import csv
 import time
 import random
 from io import BytesIO
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from PIL import Image
@@ -15,6 +15,7 @@ MAX_RETRIES = 3
 RETRY_BACKOFF = [0.5, 1.0, 2.0]
 DELAY_RANGE = (0.15, 0.25)
 LOG_PATH = os.path.join("logs", "wiki_fetch.log")
+MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
@@ -85,29 +86,68 @@ def _perform_get(params: Dict[str, Any], stream: bool = False) -> requests.Respo
     raise Exception("Неизвестная ошибка запроса")
 
 
-def _perform_direct_get(url: str) -> requests.Response:
-    """Прямой запрос файла (не к API) с повторными попытками."""
+def _download_image_bytes(url: str, entry_id: Optional[int]) -> Optional[Tuple[bytes, str]]:
+    """Скачать картинку с проверкой Content-Type, размера и ретраями."""
 
     last_exc: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
         try:
-            resp = SESSION.get(url, timeout=20)
+            resp = SESSION.get(
+                url,
+                stream=True,
+                timeout=20,
+                allow_redirects=True,
+                headers={"User-Agent": USER_AGENT},
+            )
             _log_detail(f"GET {url} -> {resp.status_code}")
+
             if resp.status_code in {429, 503}:
                 raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
-            resp.raise_for_status()
-            return resp
+            if resp.status_code != 200:
+                _log_detail(f"HTTP {resp.status_code} for url={url}")
+                return None
+
+            ct = (resp.headers.get("Content-Type", "") or "").lower()
+            if not ct.startswith("image/"):
+                _log_detail(f"NOT_IMAGE Content-Type={ct} url={url}")
+                return None
+            if ct.startswith("image/svg"):
+                _log_detail(f"SKIP_SVG Content-Type={ct} url={url}")
+                return None
+
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                try:
+                    length_val = int(content_length)
+                    if length_val > MAX_DOWNLOAD_BYTES:
+                        _log_detail(f"SKIP_LARGE Content-Length={length_val} url={url}")
+                        return None
+                except ValueError:
+                    pass
+
+            collected = BytesIO()
+            total = 0
+            for chunk in resp.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    _log_detail(f"SKIP_LARGE_STREAM total={total} url={url}")
+                    return None
+                collected.write(chunk)
+            return collected.getvalue(), ct
         except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
             last_exc = exc
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_BACKOFF[attempt])
                 continue
-            raise
+            _log_detail(f"ID {entry_id}: ERROR DOWNLOAD {type(exc).__name__} url={url}")
+            return None
         finally:
             _sleep_between_requests()
     if last_exc:
-        raise last_exc
-    raise Exception("Неизвестная ошибка запроса")
+        _log_detail(f"ID {entry_id}: ERROR DOWNLOAD {type(last_exc).__name__} url={url}")
+    return None
 
 
 # ==========================
@@ -155,6 +195,7 @@ def file_imageinfo(file_title: str) -> Optional[Dict[str, Any]]:
         "titles": file_title,
         "prop": "imageinfo",
         "iiprop": "url|mime|size",
+        "iiurlwidth": 1024,
         "format": "json",
     }
     _log_detail(f"imageinfo title='{file_title}'")
@@ -165,13 +206,13 @@ def file_imageinfo(file_title: str) -> Optional[Dict[str, Any]]:
         if not info_list:
             continue
         info = info_list[0]
-        url = info.get("url")
+        url = info.get("thumburl") or info.get("url")
         mime = info.get("mime", "")
         width = info.get("width")
         height = info.get("height")
         if not url or not mime:
             continue
-        if mime not in {"image/png", "image/jpeg", "image/jpg"}:
+        if not mime.startswith("image/") or mime.startswith("image/svg"):
             continue
         if width is not None and height is not None and max(width, height) < 200:
             continue
@@ -203,10 +244,21 @@ def fetch_kind(word_clean: str, kind: str) -> Optional[str]:
 # Download helpers
 # ==========================
 
-def download_to_png(url: str, out_path: str) -> None:
-    resp = _perform_direct_get(url)
-    data = resp.content
-    image = Image.open(BytesIO(data))
+def download_to_png(url: str, out_path: str, entry_id: Optional[int]) -> bool:
+    result = _download_image_bytes(url, entry_id)
+    if not result:
+        return False
+
+    data, ct = result
+    try:
+        image = Image.open(BytesIO(data))
+    except Image.UnidentifiedImageError:
+        snippet = data[:200]
+        _log_detail(
+            f"ID {entry_id}: ERROR BAD_IMAGE (ct={ct}, url={url}, first_bytes={snippet!r})"
+        )
+        return False
+
     image = image.convert("RGBA")
     max_side = max(image.width, image.height)
     if max_side > 1024:
@@ -215,6 +267,7 @@ def download_to_png(url: str, out_path: str) -> None:
         image = image.resize(new_size, Image.LANCZOS)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     image.save(out_path, format="PNG")
+    return True
 
 
 # ==========================
@@ -268,9 +321,10 @@ def process_csv_file(
         else:
             try:
                 url = fetch_kind(word_clean, "PHOTO")
-                if url:
-                    download_to_png(url, path_photo)
+                if url and download_to_png(url, path_photo, entry_id):
                     statuses.append("OK (P)")
+                elif url:
+                    statuses.append("ERROR: BAD IMAGE (P)")
                 else:
                     statuses.append("NOT FOUND (P)")
             except requests.HTTPError as exc:
@@ -291,9 +345,10 @@ def process_csv_file(
         else:
             try:
                 url = fetch_kind(word_clean, "MEANING")
-                if url:
-                    download_to_png(url, path_meaning)
+                if url and download_to_png(url, path_meaning, entry_id):
                     statuses.append("OK (M)")
+                elif url:
+                    statuses.append("ERROR: BAD IMAGE (M)")
                 else:
                     statuses.append("NOT FOUND (M)")
             except requests.HTTPError as exc:
