@@ -187,9 +187,8 @@ def rewrite_media_refs_in_fields(fields_dict: dict, filename_map: dict, new_name
             mapped = filename_map.get(orig, orig)
             new_path = new_name_map.get(mapped)
             if new_path:
-                media_entries.append((new_path, "audio"))
-                return f"[sound:{new_path}]"
-            return match.group(0)
+                media_entries.append((new_path, "audio", "front", "anki_import"))
+            return ""
 
         text = img_pattern.sub(replace_img, text)
         text = sound_pattern.sub(replace_sound, text)
@@ -573,7 +572,7 @@ def import_apkg(
                     try:
                         from main import attach_media_to_note  # local import to avoid circular
 
-                        attach_media_to_note(note_id, [(path, mtype, "back", "anki_import")])
+                        attach_media_to_note(note_id, [(path, mtype, "front", "anki_import")])
                         summary["media"] += 1
                     except Exception:
                         summary["errors"] += 1
