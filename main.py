@@ -55,7 +55,7 @@ from stats_config import (
     save_stats_settings,
 )
 from db_migrations import ensure_schema_for_import, run_migrations
-from db_path import connect_to_db
+from db_connect import DB_WRITE_LOCK, commit_with_retry, open_db
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
 from overdue_badges import (
@@ -670,7 +670,7 @@ def get_next_review_for_level(level: int) -> datetime:
 # ==========================
 
 def get_connection():
-    return connect_to_db(timeout=5)
+    return open_db()
 
 
 def ensure_basic_note_type_id(conn: sqlite3.Connection | None = None) -> int:
@@ -1033,9 +1033,10 @@ def insert_media(
 
 
 def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str, str | None, str | None]]):
-    conn = get_connection()
     ts = int(time.time())
-    try:
+
+    def write():
+        ensure_media_table(conn)
         for entry in media_entries:
             if len(entry) == 2:
                 path, media_type = entry
@@ -1056,18 +1057,20 @@ def attach_media_to_note(note_id: int, media_entries: list[tuple[str | None, str
                 source=source,
                 created_at=ts,
             )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        messagebox.showerror("Ошибка сохранения медиа", f"{type(e).__name__}: {e}")
-    finally:
-        conn.close()
+
+    with open_db() as conn:
+        try:
+            commit_with_retry(conn, write)
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("Ошибка сохранения медиа", f"{type(e).__name__}: {e}")
 
 
 def attach_media_to_card(card_id: int, media_entries: list[tuple[str | None, str, str | None, str | None]]):
-    conn = get_connection()
     ts = int(time.time())
-    try:
+
+    def write():
+        ensure_media_table(conn)
         for entry in media_entries:
             if len(entry) == 2:
                 path, media_type = entry
@@ -1088,12 +1091,13 @@ def attach_media_to_card(card_id: int, media_entries: list[tuple[str | None, str
                 source=source,
                 created_at=ts,
             )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        messagebox.showerror("Ошибка сохранения медиа", f"{type(e).__name__}: {e}")
-    finally:
-        conn.close()
+
+    with open_db() as conn:
+        try:
+            commit_with_retry(conn, write)
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("Ошибка сохранения медиа", f"{type(e).__name__}: {e}")
 
 
 def get_media_for_card(card_id: int, note_id: int | None = None) -> list[dict]:
@@ -1150,18 +1154,18 @@ def get_card_audio_path(card: dict, prefer_side: str | None = "back") -> str | N
 
 
 def update_media_side(media_id: int, side: str):
-    conn = get_connection()
-    if not _table_exists(conn, "media"):
-        conn.close()
-        return
-    cur = conn.cursor()
-    columns = _get_media_columns(cur)
-    if "side" not in columns:
-        conn.close()
-        return
-    cur.execute("UPDATE media SET side = ? WHERE id = ?;", (side, media_id))
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        if not _table_exists(conn, "media"):
+            return
+        cur = conn.cursor()
+        columns = _get_media_columns(cur)
+        if "side" not in columns:
+            return
+
+        def write():
+            cur.execute("UPDATE media SET side = ? WHERE id = ?;", (side, media_id))
+
+        commit_with_retry(conn, write)
 
 
 def find_video_media_path(card: dict) -> str | None:

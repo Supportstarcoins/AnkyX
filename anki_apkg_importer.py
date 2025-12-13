@@ -16,8 +16,8 @@ from typing import Callable, Dict, Any
 class UnsupportedAnkiPackageError(Exception):
     """Raised when an Anki package cannot be parsed by the importer."""
 
+from db_connect import DB_WRITE_LOCK, commit_with_retry, open_db
 from db_migrations import ensure_schema_for_import
-from db_path import connect_to_db
 MEDIA_ROOT = "media"
 MEDIA_IMPORT_SUBDIR = "anki_import"
 FIELD_SEPARATOR = "\x1f"
@@ -25,7 +25,7 @@ LOG_PATH = os.path.join("logs", "anki_import.log")
 
 
 def get_connection() -> sqlite3.Connection:
-    return connect_to_db(timeout=5)
+    return open_db()
 
 
 def _select_collection_file(members: list[str]) -> str | None:
@@ -198,21 +198,27 @@ def rewrite_media_refs_in_fields(fields_dict: dict, filename_map: dict, new_name
     return updated, media_entries
 
 
-def _ensure_deck(conn: sqlite3.Connection, name: str) -> int:
+def _ensure_deck(conn: sqlite3.Connection, name: str, use_retry: bool = True) -> int:
     cur = conn.cursor()
     cur.execute("SELECT id FROM decks WHERE name = ? LIMIT 1;", (name,))
     row = cur.fetchone()
     if row:
         return row["id"]
-    cur.execute(
-        "INSERT INTO decks (name, description, front_template, back_template) VALUES (?, NULL, NULL, NULL);",
-        (name,),
-    )
-    conn.commit()
+
+    def write():
+        cur.execute(
+            "INSERT INTO decks (name, description, front_template, back_template) VALUES (?, NULL, NULL, NULL);",
+            (name,),
+        )
+
+    if use_retry:
+        commit_with_retry(conn, write)
+    else:
+        write()
     return cur.lastrowid
 
 
-def _ensure_note_type(conn: sqlite3.Connection, model: dict) -> int:
+def _ensure_note_type(conn: sqlite3.Connection, model: dict, use_retry: bool = True) -> int:
     name = model.get("name") or f"Model_{model.get('id', '')}" or "Anki"
     fields = [f.get("name", "Field") for f in model.get("flds", [])]
     templates = []
@@ -230,11 +236,17 @@ def _ensure_note_type(conn: sqlite3.Connection, model: dict) -> int:
     row = cur.fetchone()
     if row:
         return row["id"]
-    cur.execute(
-        "INSERT INTO note_types (name, fields_json, card_templates_json) VALUES (?, ?, ?);",
-        (name, json.dumps(fields, ensure_ascii=False), json.dumps(templates, ensure_ascii=False)),
-    )
-    conn.commit()
+
+    def write():
+        cur.execute(
+            "INSERT INTO note_types (name, fields_json, card_templates_json) VALUES (?, ?, ?);",
+            (name, json.dumps(fields, ensure_ascii=False), json.dumps(templates, ensure_ascii=False)),
+        )
+
+    if use_retry:
+        commit_with_retry(conn, write)
+    else:
+        write()
     return cur.lastrowid
 
 
@@ -434,25 +446,112 @@ def import_apkg(
             normalized_fields = normalize_fields_for_ui(rewritten_fields, int(model.get("type", 0)))
 
             note_created_at = int(note_row["mod"] or time.time())
-            cur = conn_target.cursor()
-            cur.execute(
-                """
-                INSERT INTO notes (deck_id, note_type_id, fields_json, tags, external_id, source, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?);
-                """,
-                (
-                    deck_id,
-                    note_type_id,
-                    json.dumps(normalized_fields, ensure_ascii=False),
-                    tags,
-                    str(note_row["id"]),
-                    "anki_import",
-                    note_created_at,
-                ),
-            )
-            note_id = cur.lastrowid
-            nid_map[int(note_row["id"])] = note_id
-            summary["notes"] += 1
+            created_note_id = None
+
+            def write_note_and_cards():
+                nonlocal done_cards, created_note_id
+
+                cur = conn_target.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO notes (deck_id, note_type_id, fields_json, tags, external_id, source, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        deck_id,
+                        note_type_id,
+                        json.dumps(normalized_fields, ensure_ascii=False),
+                        tags,
+                        str(note_row["id"]),
+                        "anki_import",
+                        note_created_at,
+                    ),
+                )
+                created_note_id = cur.lastrowid
+                nid_map[int(note_row["id"])] = created_note_id
+                summary["notes"] += 1
+
+                for card_row in cards_for_note:
+                    if cancel_flag and cancel_flag():
+                        break
+                    card_deck = decks_map.get(str(card_row["did"])) or deck_info
+                    card_deck_id = _ensure_deck(conn_target, card_deck.get("name") or deck_name, use_retry=False)
+
+                    note_id_for_card = nid_map.get(int(card_row["nid"]))
+                    if not note_id_for_card:
+                        summary["missing_note_refs"] += 1
+                        if progress_cb:
+                            progress_cb("log", f"SKIP card {card_row['id']}: missing note nid={card_row['nid']}")
+                        continue
+
+                    front, back = _render_front_back(model, normalized_fields)
+
+                    if keep_schedule:
+                        queue_val = int(card_row["queue"])
+                        if queue_val in (1, 3):
+                            due_ts = int(card_row["due"] or time.time())
+                        else:
+                            due_ts = normalize_due(card_row["due"], col_crt, "preserve")
+                        interval = int(card_row["ivl"] or 0)
+                        phase = _phase_from_interval(interval)
+                        state = _map_state(queue_val, int(card_row["type"]))
+                        reps_val = int(card_row["reps"] or 0)
+                        lapses_val = int(card_row["lapses"] or 0)
+                        step_val = int(card_row["left"] or 0)
+                        ease_val = convert_factor_to_ease(card_row["factor"])
+                    else:
+                        due_ts = int(time.time())
+                        interval = 0
+                        phase = 1
+                        state = "new"
+                        reps_val = 0
+                        lapses_val = 0
+                        step_val = 0
+                        ease_val = 250
+
+                    next_review_date = datetime.fromtimestamp(due_ts).isoformat()
+
+                    cur.execute(
+                        """
+                        INSERT INTO cards (
+                            deck_id, front, back, next_review, leitner_level, front_image_path,
+                            back_image_path, audio_path, note_id, template_ord, state, due, interval,
+                            ease, reps, lapses, step_index, last_review, phase, external_id, source
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            card_deck_id,
+                            front,
+                            back,
+                            next_review_date,
+                            max(1, phase),
+                            None,
+                            None,
+                            None,
+                            note_id_for_card,
+                            int(card_row["ord"] or 0),
+                            state,
+                            int(due_ts),
+                            interval,
+                            ease_val,
+                            reps_val,
+                            lapses_val,
+                            step_val,
+                            int(time.time()),
+                            phase,
+                            str(card_row["id"]),
+                            "anki_import",
+                        ),
+                    )
+                    summary["cards"] += 1
+                    done_cards += 1
+                    if progress_cb:
+                        progress_cb("progress", done_cards, total_cards, f"card {done_cards}/{total_cards}")
+
+                return created_note_id
+
+            note_id = commit_with_retry(conn_target, write_note_and_cards)
 
             if not first_note_logged:
                 front_preview = normalized_fields.get("_front", "")[:60]
@@ -466,84 +565,6 @@ def import_apkg(
                     pass
                 first_note_logged = True
 
-            for card_row in cards_for_note:
-                if cancel_flag and cancel_flag():
-                    break
-                card_deck = decks_map.get(str(card_row["did"])) or deck_info
-                card_deck_id = _ensure_deck(conn_target, card_deck.get("name") or deck_name)
-
-                note_id_for_card = nid_map.get(int(card_row["nid"]))
-                if not note_id_for_card:
-                    summary["missing_note_refs"] += 1
-                    if progress_cb:
-                        progress_cb("log", f"SKIP card {card_row['id']}: missing note nid={card_row['nid']}")
-                    continue
-
-                front, back = _render_front_back(model, normalized_fields)
-
-                if keep_schedule:
-                    queue_val = int(card_row["queue"])
-                    if queue_val in (1, 3):
-                        due_ts = int(card_row["due"] or time.time())
-                    else:
-                        due_ts = normalize_due(card_row["due"], col_crt, "preserve")
-                    interval = int(card_row["ivl"] or 0)
-                    phase = _phase_from_interval(interval)
-                    state = _map_state(queue_val, int(card_row["type"]))
-                    reps_val = int(card_row["reps"] or 0)
-                    lapses_val = int(card_row["lapses"] or 0)
-                    step_val = int(card_row["left"] or 0)
-                    ease_val = convert_factor_to_ease(card_row["factor"])
-                else:
-                    due_ts = int(time.time())
-                    interval = 0
-                    phase = 1
-                    state = "new"
-                    reps_val = 0
-                    lapses_val = 0
-                    step_val = 0
-                    ease_val = 250
-
-                next_review_date = datetime.fromtimestamp(due_ts).isoformat()
-
-                cur.execute(
-                    """
-                    INSERT INTO cards (
-                        deck_id, front, back, next_review, leitner_level, front_image_path,
-                        back_image_path, audio_path, note_id, template_ord, state, due, interval,
-                        ease, reps, lapses, step_index, last_review, phase, external_id, source
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        card_deck_id,
-                        front,
-                        back,
-                        next_review_date,
-                        max(1, phase),
-                        None,
-                        None,
-                        None,
-                        note_id_for_card,
-                        int(card_row["ord"] or 0),
-                        state,
-                        int(due_ts),
-                        interval,
-                        ease_val,
-                        reps_val,
-                        lapses_val,
-                        step_val,
-                        int(time.time()),
-                        phase,
-                        str(card_row["id"]),
-                        "anki_import",
-                    ),
-                )
-                summary["cards"] += 1
-                done_cards += 1
-                if progress_cb:
-                    progress_cb("progress", done_cards, total_cards, f"card {done_cards}/{total_cards}")
-
             if cancel_flag and cancel_flag():
                 break
 
@@ -556,8 +577,6 @@ def import_apkg(
                         summary["media"] += 1
                     except Exception:
                         summary["errors"] += 1
-
-            conn_target.commit()
 
         for card_row in cards_rows:
             if cancel_flag and cancel_flag():
