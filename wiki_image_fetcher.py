@@ -1,18 +1,28 @@
 import os
 import re
 import csv
+import time
+import random
 from io import BytesIO
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 from PIL import Image
 
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
-USER_AGENT = "AnkyX/1.0 (Wikimedia image fetcher)"
+USER_AGENT = "AnkyX/1.0 (commons api)"
+MAX_RETRIES = 3
+RETRY_BACKOFF = [0.5, 1.0, 2.0]
+DELAY_RANGE = (0.15, 0.25)
+LOG_PATH = os.path.join("logs", "wiki_fetch.log")
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
 
+
+# ==========================
+# CSV helpers
+# ==========================
 
 def _read_csv_rows(path: str) -> List[Dict[str, str]]:
     encodings = ["utf-8-sig", "cp1251", "cp1252"]
@@ -31,13 +41,95 @@ def _read_csv_rows(path: str) -> List[Dict[str, str]]:
     raise Exception(f"Не удалось прочитать CSV: {last_err}")
 
 
-def _request_json(params: Dict[str, Any]) -> Dict[str, Any]:
-    resp = SESSION.get(WIKIMEDIA_API, params=params, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
+# ==========================
+# Logging & network helpers
+# ==========================
+
+def _ensure_log_dir() -> None:
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
 
-def search_files(query: str) -> List[Dict[str, Any]]:
+def _log_detail(message: str) -> None:
+    _ensure_log_dir()
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_PATH, "a", encoding="utf-8") as log_f:
+        log_f.write(f"[{timestamp}] {message}\n")
+
+
+def _sleep_between_requests() -> None:
+    time.sleep(random.uniform(*DELAY_RANGE))
+
+
+def _perform_get(params: Dict[str, Any], stream: bool = False) -> requests.Response:
+    """GET запрос к Wikimedia API с повторными попытками."""
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = SESSION.get(WIKIMEDIA_API, params=params, timeout=20, stream=stream)
+            _log_detail(f"GET {resp.url} -> {resp.status_code}")
+            if resp.status_code in {429, 503}:
+                raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
+            resp.raise_for_status()
+            return resp
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BACKOFF[attempt])
+                continue
+            raise
+        finally:
+            _sleep_between_requests()
+    if last_exc:
+        raise last_exc
+    raise Exception("Неизвестная ошибка запроса")
+
+
+def _perform_direct_get(url: str) -> requests.Response:
+    """Прямой запрос файла (не к API) с повторными попытками."""
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = SESSION.get(url, timeout=20)
+            _log_detail(f"GET {url} -> {resp.status_code}")
+            if resp.status_code in {429, 503}:
+                raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
+            resp.raise_for_status()
+            return resp
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BACKOFF[attempt])
+                continue
+            raise
+        finally:
+            _sleep_between_requests()
+    if last_exc:
+        raise last_exc
+    raise Exception("Неизвестная ошибка запроса")
+
+
+# ==========================
+# Word cleaning
+# ==========================
+
+def clean_word(word: str) -> str:
+    cleaned = (word or "").strip()
+    cleaned = cleaned.replace("|", " ").replace("*", " ")
+    cleaned = re.sub(r"[\"']", "", cleaned)
+    cleaned = re.split(r"\s*\|\s*|;|,|\(", cleaned)[0].strip()
+    cleaned = re.sub(r"[\.,]+$", "", cleaned).strip()
+    cleaned = re.sub(r"^(der|die|das)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+# ==========================
+# Wikimedia API helpers
+# ==========================
+
+def search_file(query: str) -> List[str]:
     params = {
         "action": "query",
         "list": "search",
@@ -46,19 +138,27 @@ def search_files(query: str) -> List[Dict[str, Any]]:
         "srsearch": query,
         "format": "json",
     }
-    data = _request_json(params)
-    return data.get("query", {}).get("search", [])
+    _log_detail(f"search query='{query}'")
+    data = _perform_get(params).json()
+    results = data.get("query", {}).get("search", [])
+    titles: List[str] = []
+    for item in results:
+        title = item.get("title")
+        if title:
+            titles.append(title)
+    return titles
 
 
-def _get_imageinfo(title: str) -> Optional[Dict[str, Any]]:
+def file_imageinfo(file_title: str) -> Optional[Dict[str, Any]]:
     params = {
         "action": "query",
-        "titles": title,
+        "titles": file_title,
         "prop": "imageinfo",
         "iiprop": "url|mime|size",
         "format": "json",
     }
-    data = _request_json(params)
+    _log_detail(f"imageinfo title='{file_title}'")
+    data = _perform_get(params).json()
     pages = data.get("query", {}).get("pages", {})
     for page in pages.values():
         info_list = page.get("imageinfo", [])
@@ -71,9 +171,7 @@ def _get_imageinfo(title: str) -> Optional[Dict[str, Any]]:
         height = info.get("height")
         if not url or not mime:
             continue
-        if not mime.startswith("image/"):
-            continue
-        if mime == "image/svg+xml":
+        if mime not in {"image/png", "image/jpeg", "image/jpg"}:
             continue
         if width is not None and height is not None and max(width, height) < 200:
             continue
@@ -81,74 +179,33 @@ def _get_imageinfo(title: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _normalize_word(raw_word: str) -> str:
-    word = (raw_word or "").strip()
-    word = word.replace("|", " ").replace("*", " ")
-    word = re.sub(r"[\"']", "", word)
-    word = re.split(r"\s*\|\s*|;|,|\(", word)[0].strip()
-    word = re.sub(r"[\.,]+$", "", word).strip()
-    word = re.sub(r"^(der|die|das)\s+", "", word, flags=re.IGNORECASE)
-    word = re.sub(r"\s+", " ", word)
-    return word
-
-
-def _build_queries(word: str) -> Iterable[Tuple[str, str]]:
-    word_clean = _normalize_word(word)
-    if not word_clean:
-        return []
-    photo_query = f"{word_clean} photo"
-    meaning_query = f"{word_clean} icon illustration"
-    return [(photo_query, "PHOTO"), (meaning_query, "MEANING")]
-
-
-def _download_image(url: str) -> bytes:
-    resp = SESSION.get(url, timeout=20)
-    resp.raise_for_status()
-    return resp.content
-
-
-def fetch_best_image_for_row(row: Dict[str, str]) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-    word = (row.get("word") or "").strip()
-    last_error: Optional[str] = None
-
-    for query, kind in _build_queries(word):
-        try:
-            pages = search_files(query)
-        except requests.RequestException as exc:  # noqa: PERF203
-            return None, None, f"HTTP error {exc}"
-        except Exception as exc:  # noqa: BLE001
-            return None, None, f"error: {type(exc).__name__}: {exc}"
-
-        if not pages:
+def pick_best_image(titles: Iterable[str]) -> Optional[str]:
+    for title in titles:
+        info = file_imageinfo(title)
+        if not info:
             continue
-
-        for page in pages:
-            title = page.get("title")
-            if not title:
-                continue
-            try:
-                info = _get_imageinfo(title)
-            except requests.RequestException as exc:  # noqa: PERF203
-                last_error = f"HTTP error {exc}"
-                continue
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"error: {type(exc).__name__}: {exc}"
-                continue
-
-            if not info:
-                continue
-            try:
-                data = _download_image(info["url"])
-                return data, kind, None
-            except requests.RequestException as exc:  # noqa: PERF203
-                last_error = f"HTTP error {exc}"
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"error: {type(exc).__name__}: {exc}"
-
-    return None, None, last_error
+        return info["url"]
+    return None
 
 
-def save_png(data: bytes, out_path: str) -> None:
+def fetch_kind(word_clean: str, kind: str) -> Optional[str]:
+    if not word_clean:
+        return None
+    if kind == "PHOTO":
+        query = f"{word_clean} photo"
+    else:
+        query = f"{word_clean} icon OR illustration OR diagram"
+    titles = search_file(query)
+    return pick_best_image(titles)
+
+
+# ==========================
+# Download helpers
+# ==========================
+
+def download_to_png(url: str, out_path: str) -> None:
+    resp = _perform_direct_get(url)
+    data = resp.content
     image = Image.open(BytesIO(data))
     image = image.convert("RGBA")
     max_side = max(image.width, image.height)
@@ -156,17 +213,30 @@ def save_png(data: bytes, out_path: str) -> None:
         ratio = 1024 / float(max_side)
         new_size = (int(image.width * ratio), int(image.height * ratio))
         image = image.resize(new_size, Image.LANCZOS)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     image.save(out_path, format="PNG")
 
 
-def process_csv_file(csv_path: str, images_dir: str = "images", stop_checker=lambda: False, progress_callback=None, overwrite: bool = False):
+# ==========================
+# Main processing
+# ==========================
+
+def process_csv_file(
+    csv_path: str,
+    images_dir: str = "images",
+    stop_checker=lambda: False,
+    progress_callback=None,
+    overwrite: bool = False,
+):
     rows = _read_csv_rows(csv_path)
     os.makedirs(images_dir, exist_ok=True)
     total = len(rows)
     done = 0
+
     for row in rows:
         if stop_checker():
             break
+
         id_raw = row.get("id") or ""
         try:
             entry_id = int(re.search(r"\d+", id_raw).group(0))
@@ -175,25 +245,63 @@ def process_csv_file(csv_path: str, images_dir: str = "images", stop_checker=lam
             if progress_callback:
                 progress_callback(done, total, f"[пропуск] некорректный ID '{id_raw}'")
             continue
-        out_path = os.path.join(images_dir, f"{entry_id}.png")
-        if os.path.exists(out_path) and not overwrite:
-            status = f"ID {entry_id}: уже скачан"
+
+        path_photo = os.path.join(images_dir, f"{entry_id}_p.png")
+        path_meaning = os.path.join(images_dir, f"{entry_id}_m.png")
+
+        existing_photo = os.path.exists(path_photo)
+        existing_meaning = os.path.exists(path_meaning)
+
+        if existing_photo and existing_meaning and not overwrite:
+            status = f"ID {entry_id}: SKIP"
             done += 1
             if progress_callback:
                 progress_callback(done, total, status)
             continue
 
-        data, kind, err = fetch_best_image_for_row(row)
-        if data:
-            try:
-                save_png(data, out_path)
-                status = f"ID {entry_id}: OK ({kind})"
-            except Exception as exc:  # noqa: BLE001
-                status = f"ID {entry_id}: error: {type(exc).__name__}: {exc}"
-        elif err:
-            status = f"ID {entry_id}: {err}"
+        word_clean = clean_word(row.get("word", ""))
+        statuses: List[str] = []
+
+        # PHOTO
+        if existing_photo and not overwrite:
+            statuses.append("OK (P)")
         else:
-            status = f"ID {entry_id}: not found"
+            try:
+                url = fetch_kind(word_clean, "PHOTO")
+                if url:
+                    download_to_png(url, path_photo)
+                    statuses.append("OK (P)")
+                else:
+                    statuses.append("NOT FOUND (P)")
+            except requests.HTTPError as exc:
+                statuses.append(f"ERROR: HTTP {getattr(exc.response, 'status_code', '?')}")
+            except Exception as exc:  # noqa: BLE001
+                statuses.append(f"ERROR: {type(exc).__name__}")
+
+        if stop_checker():
+            status = f"ID {entry_id}: {', '.join(statuses)}"
+            done += 1
+            if progress_callback:
+                progress_callback(done, total, status)
+            break
+
+        # MEANING
+        if existing_meaning and not overwrite:
+            statuses.append("OK (M)")
+        else:
+            try:
+                url = fetch_kind(word_clean, "MEANING")
+                if url:
+                    download_to_png(url, path_meaning)
+                    statuses.append("OK (M)")
+                else:
+                    statuses.append("NOT FOUND (M)")
+            except requests.HTTPError as exc:
+                statuses.append(f"ERROR: HTTP {getattr(exc.response, 'status_code', '?')}")
+            except Exception as exc:  # noqa: BLE001
+                statuses.append(f"ERROR: {type(exc).__name__}")
+
+        status = f"ID {entry_id}: {', '.join(statuses)}"
         done += 1
         if progress_callback:
             progress_callback(done, total, status)
