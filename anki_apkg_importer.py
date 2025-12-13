@@ -12,17 +12,14 @@ from datetime import datetime, timedelta
 from typing import Callable, Dict, Any
 
 from db_migrations import ensure_schema_for_import
-
-DB_NAME = "anki.db"
+from db_path import connect_to_db
 MEDIA_ROOT = "media"
 MEDIA_IMPORT_SUBDIR = "anki_import"
 FIELD_SEPARATOR = "\x1f"
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_NAME, timeout=5)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_to_db(timeout=5)
 
 
 def parse_models(col_models_json: str) -> dict:

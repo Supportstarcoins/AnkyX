@@ -55,6 +55,7 @@ from stats_config import (
     save_stats_settings,
 )
 from db_migrations import ensure_schema_for_import, run_migrations
+from db_path import connect_to_db
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
 from overdue_badges import (
@@ -183,8 +184,6 @@ except ImportError:
     FigureCanvasTkAgg = None
     Figure = None
 
-
-DB_NAME = "anki.db"
 
 # OpenAI key только в памяти
 OPENAI_API_KEY = None
@@ -671,9 +670,7 @@ def get_next_review_for_level(level: int) -> datetime:
 # ==========================
 
 def get_connection():
-    conn = sqlite3.connect(DB_NAME, timeout=5)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_to_db(timeout=5)
 
 
 def ensure_basic_note_type_id(conn: sqlite3.Connection | None = None) -> int:
