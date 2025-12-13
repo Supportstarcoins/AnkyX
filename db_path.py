@@ -17,7 +17,7 @@ def get_db_path() -> str:
     db_dir = os.path.join(base, "AnkyX", "data")
     os.makedirs(db_dir, exist_ok=True)
 
-    target_path = os.path.join(db_dir, DB_FILENAME)
+    target_path = os.path.abspath(os.path.join(db_dir, DB_FILENAME))
     _migrate_legacy_db(target_path)
     return target_path
 
@@ -54,7 +54,7 @@ def connect_to_db(timeout: Optional[int] = 5) -> sqlite3.Connection:
         return conn
     except Exception as e:
         cwd = os.getcwd()
-        message = f"Не удалось открыть БД: {db_path}\nCWD: {cwd}\nОшибка: {e}"
+        message = f"Не удалось открыть БД: {db_path}\nCWD: {cwd}\nОшибка: {repr(e)}"
         try:
             from tkinter import messagebox
 
