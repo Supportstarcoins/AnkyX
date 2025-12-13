@@ -55,7 +55,7 @@ from stats_config import (
     save_stats_settings,
 )
 from db_migrations import ensure_schema_for_import, run_migrations
-from db_path import connect_to_db
+from db_path import get_db_path
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
 from overdue_badges import (
@@ -670,7 +670,17 @@ def get_next_review_for_level(level: int) -> datetime:
 # ==========================
 
 def get_connection():
-    return connect_to_db(timeout=5)
+    db_path = get_db_path()
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception as exc:
+        try:
+            messagebox.showerror("Ошибка БД", f"Не удалось открыть БД:\n{db_path}\n{exc}")
+        except Exception:
+            print(f"Не удалось открыть БД: {db_path}\n{exc}")
+        raise
 
 
 def ensure_basic_note_type_id(conn: sqlite3.Connection | None = None) -> int:
@@ -1658,12 +1668,8 @@ def delete_card(card_id: int):
 def count_overdue_for_deck(deck_id: int) -> int:
     """Кол-во просроченных карточек по колонке ``due`` (с учётом подколод)."""
 
-    conn = get_connection()
-    try:
-        counts = fetch_overdue_counts_by_phase(conn, deck_id)
-        return counts.total
-    finally:
-        conn.close()
+    counts = fetch_overdue_counts_by_phase(None, deck_id)
+    return counts.total
 
 
 def get_deck_stats(deck_id: int):
@@ -4990,13 +4996,9 @@ class AnkiApp(tk.Tk):
         counts_by_deck = {}
         timestamp = int(time.time())
         for deck_id in deck_ids:
-            conn = get_connection()
-            try:
-                counts_by_deck[deck_id] = fetch_overdue_counts_by_phase(
-                    conn, deck_id, now_ts=timestamp
-                )
-            finally:
-                conn.close()
+            counts_by_deck[deck_id] = fetch_overdue_counts_by_phase(
+                None, deck_id, now_ts=timestamp
+            )
 
         selected_counts = counts_by_deck.get(self.selected_deck_id)
         total_count = selected_counts.total if selected_counts else 0

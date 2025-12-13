@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
+
+from db_path import get_db_path
 
 
 @dataclass
@@ -67,26 +70,63 @@ def get_descendant_deck_ids(conn: sqlite3.Connection, deck_id: int) -> List[int]
     return result
 
 
+def _resolve_db_path(db_path: str) -> str:
+    if not os.path.isabs(db_path):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.join(base_dir, db_path)
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    return db_path
+
+
+def _connect_with_logging(timeout: Optional[int] = 5) -> sqlite3.Connection:
+    db_path = get_db_path()
+    print("[DB] CWD=", os.getcwd())
+    print("[DB] trying db_path=", repr(db_path))
+    resolved_path = _resolve_db_path(db_path)
+
+    try:
+        conn = sqlite3.connect(resolved_path, timeout=timeout) if timeout is not None else sqlite3.connect(resolved_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception as exc:
+        try:
+            messagebox.showerror("Ошибка БД", f"Не удалось открыть БД:\n{resolved_path}\n{exc}")
+        except Exception:
+            print(f"[DB] Failed to open DB at {resolved_path}: {exc}")
+        raise
+
+
 def fetch_overdue_counts_by_phase(
-    conn: sqlite3.Connection, deck_id: int, *, now_ts: Optional[int] = None
+    conn: Optional[sqlite3.Connection], deck_id: int, *, now_ts: Optional[int] = None
 ) -> OverdueCounts:
     """Возвращает количество просроченных карточек по фазам."""
 
-    ensure_due_column(conn)
-    timestamp = now_ts if now_ts is not None else int(time.time())
-    deck_ids = get_descendant_deck_ids(conn, deck_id)
+    close_conn = False
+    if conn is None:
+        conn = _connect_with_logging()
+        close_conn = True
 
-    placeholders = ",".join("?" for _ in deck_ids)
-    query = (
-        "SELECT phase, COUNT(*) FROM cards "
-        f"WHERE deck_id IN ({placeholders}) AND due IS NOT NULL AND due <= ? "
-        "GROUP BY phase;"
-    )
+    try:
+        ensure_due_column(conn)
+        timestamp = now_ts if now_ts is not None else int(time.time())
+        deck_ids = get_descendant_deck_ids(conn, deck_id)
 
-    cursor = conn.cursor()
-    cursor.execute(query, (*deck_ids, timestamp))
-    counts = {int(row[0]): int(row[1]) for row in cursor.fetchall() if row[0] is not None}
-    return OverdueCounts(by_phase=counts)
+        placeholders = ",".join("?" for _ in deck_ids)
+        query = (
+            "SELECT phase, COUNT(*) FROM cards "
+            f"WHERE deck_id IN ({placeholders}) AND due IS NOT NULL AND due <= ? "
+            "GROUP BY phase;"
+        )
+
+        cursor = conn.cursor()
+        cursor.execute(query, (*deck_ids, timestamp))
+        counts = {int(row[0]): int(row[1]) for row in cursor.fetchall() if row[0] is not None}
+        return OverdueCounts(by_phase=counts)
+    finally:
+        if close_conn:
+            conn.close()
 
 
 class PhaseOverdueBadges:
