@@ -1,46 +1,37 @@
 import os
-import shutil
 import sqlite3
 import tempfile
 from typing import Optional
 
 DB_FILENAME = "anki.db"
+YOUR_DB_FILENAME = "YOUR_DB.db"
 
 
-def _legacy_db_path(base_dir: str) -> str:
-    return os.path.join(base_dir, DB_FILENAME)
+def _base_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
 
 
-def _data_directory(base_dir: str) -> str:
-    return os.path.join(base_dir, "data")
-
-
-def _migrate_legacy_database(new_path: str, legacy_path: str) -> None:
-    if os.path.exists(new_path) or not os.path.exists(legacy_path):
-        return
-
-    try:
-        os.makedirs(os.path.dirname(new_path), exist_ok=True)
-        shutil.move(legacy_path, new_path)
-    except Exception:
-        try:
-            shutil.copy2(legacy_path, new_path)
-        finally:
-            # Если копирование удалось, оставляем исходный файл на месте для надёжности.
-            pass
+def _candidate_paths(base_dir: str) -> list[str]:
+    return [
+        os.path.join(base_dir, DB_FILENAME),
+        os.path.join(base_dir, YOUR_DB_FILENAME),
+        os.path.join(base_dir, "data", DB_FILENAME),
+    ]
 
 
 def get_db_path() -> str:
-    """Возвращает абсолютный путь к SQLite БД и гарантирует её каталог."""
+    """Возвращает абсолютный путь к SQLite БД, стараясь использовать уже существующую."""
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    db_dir = _data_directory(base_dir)
-    os.makedirs(db_dir, exist_ok=True)
+    base_dir = _base_dir()
+    candidates = _candidate_paths(base_dir)
 
-    db_path = os.path.join(db_dir, DB_FILENAME)
-    _migrate_legacy_database(db_path, _legacy_db_path(base_dir))
+    for path in candidates:
+        if os.path.exists(path):
+            return os.path.abspath(path)
 
-    return os.path.abspath(db_path)
+    fallback = candidates[-1]
+    os.makedirs(os.path.dirname(fallback), exist_ok=True)
+    return os.path.abspath(fallback)
 
 
 def _ensure_writable_directory(db_dir: str) -> None:
