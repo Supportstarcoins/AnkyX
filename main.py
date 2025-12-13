@@ -54,7 +54,7 @@ from stats_config import (
     load_stats_settings,
     save_stats_settings,
 )
-from db_migrations import run_migrations
+from db_migrations import ensure_schema_for_import, run_migrations
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
 from overdue_badges import (
@@ -1359,6 +1359,7 @@ def init_db():
     ensure_media_table(conn)
 
     run_migrations(conn)
+    ensure_schema_for_import(conn)
 
     conn.commit()
     conn.close()

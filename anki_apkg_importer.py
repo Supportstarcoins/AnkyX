@@ -11,6 +11,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Any
 
+from db_migrations import ensure_schema_for_import
+
 DB_NAME = "anki.db"
 MEDIA_ROOT = "media"
 MEDIA_IMPORT_SUBDIR = "anki_import"
@@ -258,6 +260,7 @@ def import_apkg(
     summary = {"notes": 0, "cards": 0, "media": 0, "errors": 0}
     done_cards = 0
     conn_target = get_connection()
+    ensure_schema_for_import(conn_target)
 
     try:
         with zipfile.ZipFile(apkg_path, "r") as zf:
