@@ -193,6 +193,7 @@ MIC_DEVICE_INDEX = None
 DEFAULT_FRONT_TEMPLATE = "{sentence_with_gap}"
 DEFAULT_BACK_TEMPLATE = "{word} [{ipa}] ({gender}; pl. {plural})\n\n{sentence}\n\n{translation}"
 MEDIA_FOLDER = "media"
+MEDIA_IMPORT_SUBDIR = "anki_import"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 
 CSV_COLUMN_ALIASES = {
@@ -1127,30 +1128,149 @@ def get_media_for_card(card_id: int, note_id: int | None = None) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def get_card_audio_path(card: dict, prefer_side: str | None = "back") -> str | None:
-    card_id = card.get("id")
-    note_id = card.get("note_id")
-    preferred = prefer_side.lower() if prefer_side else None
+SOUND_TAG_PATTERN = re.compile(r"\[sound:([^\]]+)\]")
 
-    audio_candidate = None
-    for item in get_media_for_card(card_id, note_id):
+
+def _normalize_sound_name(sound_name: str) -> str:
+    cleaned = sound_name.replace("\\", os.sep).replace("/", os.sep)
+    return os.path.normpath(cleaned)
+
+
+def resolve_sound_file(sound_name: str) -> str | None:
+    normalized = _normalize_sound_name(sound_name)
+    candidates = []
+    if os.path.isabs(normalized):
+        candidates.append(normalized)
+    else:
+        candidates.extend(
+            [
+                normalized,
+                os.path.join(MEDIA_FOLDER, normalized),
+                os.path.join(MEDIA_FOLDER, MEDIA_IMPORT_SUBDIR, normalized),
+                os.path.join(MEDIA_FOLDER, MEDIA_IMPORT_SUBDIR, os.path.basename(normalized)),
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def extract_audio_from_text(text: str, side: str) -> tuple[str, list[dict]]:
+    matches = SOUND_TAG_PATTERN.findall(text or "")
+    cleaned = SOUND_TAG_PATTERN.sub("", text or "")
+    entries: list[dict] = []
+    for sound_name in matches:
+        resolved = resolve_sound_file(sound_name)
+        entries.append(
+            {
+                "path": resolved,
+                "name": os.path.basename(sound_name) or sound_name,
+                "original": sound_name,
+                "side": side,
+                "missing": resolved is None,
+            }
+        )
+    return cleaned, entries
+
+
+def sanitize_card_sounds(card: dict) -> dict:
+    if card.get("_sound_sanitized"):
+        return card
+
+    inline_entries: list[dict] = []
+    for side_key in ("front", "back"):
+        cleaned, entries = extract_audio_from_text(card.get(side_key, ""), side_key)
+        card[side_key] = cleaned.strip()
+        inline_entries.extend(entries)
+
+    card["_inline_audio"] = inline_entries
+    card["_sound_sanitized"] = True
+
+    existing_entries = get_media_for_card(card.get("id"), card.get("note_id"))
+    existing_paths = {
+        entry.get("path")
+        for entry in existing_entries
+        if (entry.get("media_type") or entry.get("type") or "").lower() == "audio"
+    }
+
+    to_attach: list[tuple[str | None, str, str | None, str | None]] = []
+    for entry in inline_entries:
+        path = entry.get("path")
+        if path and path not in existing_paths:
+            to_attach.append((path, "audio", entry.get("side") or "front", "anki_inline"))
+            existing_paths.add(path)
+
+    if to_attach:
+        if card.get("id"):
+            attach_media_to_card(card.get("id"), to_attach)
+        elif card.get("note_id"):
+            attach_media_to_note(card.get("note_id"), to_attach)
+
+    return card
+
+
+def get_card_audio_entries(card: dict, prefer_side: str | None = None) -> list[dict]:
+    sanitize_card_sounds(card)
+    preferred = prefer_side.lower() if prefer_side else None
+    entries: list[dict] = []
+    seen: set[tuple] = set()
+
+    def add_entry(path: str | None, label: str, side: str | None, source: str | None, missing: bool, media_id=None):
+        key = (path or label, side or "back", missing)
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append(
+            {
+                "path": path,
+                "label": f"{label} ({(side or 'back')})" + (" [нет файла]" if missing else ""),
+                "side": side or "back",
+                "source": source,
+                "missing": missing,
+                "media_id": media_id,
+            }
+        )
+
+    for item in get_media_for_card(card.get("id"), card.get("note_id")):
         media_type = (item.get("media_type") or item.get("type") or "").lower()
         if media_type != "audio":
             continue
         path = item.get("path")
-        if not path or not os.path.exists(path):
-            continue
-        side = (item.get("side") or "back").lower()
-        if preferred and side == preferred:
-            return path
-        if audio_candidate is None:
-            audio_candidate = path
+        missing = not (path and os.path.exists(path))
+        label = os.path.basename(path) if path else "audio"
+        add_entry(path, label, item.get("side"), item.get("source"), missing, item.get("id"))
 
     fallback = card.get("audio_path")
-    if fallback and os.path.exists(fallback):
-        return fallback
+    if fallback:
+        add_entry(
+            fallback,
+            os.path.basename(fallback) or "audio",
+            card.get("audio_side", "back"),
+            card.get("audio_source"),
+            not os.path.exists(fallback),
+            None,
+        )
 
-    return audio_candidate
+    for entry in card.get("_inline_audio", []):
+        label = entry.get("name") or entry.get("original") or "audio"
+        add_entry(entry.get("path"), label, entry.get("side"), "inline_sound", entry.get("missing", False), None)
+
+    def sort_key(item: dict):
+        side = (item.get("side") or "").lower()
+        missing = bool(item.get("missing"))
+        return (0 if preferred and side == preferred else 1, 0 if not missing else 1)
+
+    entries.sort(key=sort_key)
+    return entries
+
+
+def get_card_audio_path(card: dict, prefer_side: str | None = "back") -> str | None:
+    for entry in get_card_audio_entries(card, prefer_side=prefer_side):
+        if entry.get("path") and not entry.get("missing"):
+            return entry.get("path")
+    return None
 
 
 def update_media_side(media_id: int, side: str):
@@ -1166,6 +1286,79 @@ def update_media_side(media_id: int, side: str):
             cur.execute("UPDATE media SET side = ? WHERE id = ?;", (side, media_id))
 
         commit_with_retry(conn, write)
+
+
+def remove_media_entry(media_id: int):
+    with open_db() as conn:
+        if not _table_exists(conn, "media"):
+            return
+        cur = conn.cursor()
+
+        def write():
+            cur.execute("DELETE FROM media WHERE id = ?;", (media_id,))
+
+        commit_with_retry(conn, write)
+
+
+def display_audio_entries_on_frame(audio_frame, entries: list[dict]):
+    audio_widget = getattr(audio_frame, "audio_widget", None)
+    if audio_widget is None:
+        audio_widget = AudioPlayerWidget(audio_frame)
+        audio_frame.audio_widget = audio_widget
+        audio_widget.pack(fill=tk.X)
+
+    selector_frame = getattr(audio_frame, "audio_selector_frame", None)
+    if selector_frame is None:
+        selector_frame = ttk.Frame(audio_frame)
+        selector_frame.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(selector_frame, text="Аудиофайлы:").pack(side=tk.LEFT, padx=(0, 5))
+        audio_frame.audio_selector_var = tk.StringVar()
+        combo = ttk.Combobox(
+            selector_frame,
+            textvariable=audio_frame.audio_selector_var,
+            state="readonly",
+        )
+        combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        audio_frame.audio_selector = combo
+        audio_frame.audio_selector_frame = selector_frame
+
+    combo: ttk.Combobox = getattr(audio_frame, "audio_selector", None)
+    if not entries:
+        audio_widget.load(None)
+        audio_widget.pack_forget()
+        if combo:
+            combo.set("")
+            selector_frame.pack_forget()
+        return
+
+    selector_frame.pack(fill=tk.X, pady=(0, 2))
+    audio_widget.pack(fill=tk.X)
+    entry_map = {entry.get("label"): entry for entry in entries}
+    audio_frame.audio_entry_map = entry_map
+    labels = list(entry_map.keys())
+    combo.config(values=labels)
+
+    def on_select(*_args):
+        selected = audio_frame.audio_selector_var.get()
+        entry = audio_frame.audio_entry_map.get(selected)
+        if not entry:
+            return
+        if entry.get("path") and not entry.get("missing"):
+            audio_widget.load(entry.get("path"))
+            audio_widget._set_status(entry.get("label"))
+        else:
+            audio_widget.load(None)
+            audio_widget._set_status(f"{entry.get('label')} - аудио не найдено")
+
+    combo.bind("<<ComboboxSelected>>", on_select)
+
+    first_label = labels[0]
+    audio_frame.audio_selector_var.set(first_label)
+    if len(labels) == 1:
+        combo.state(["disabled"])
+    else:
+        combo.state(["!disabled"])
+    on_select()
 
 
 def find_video_media_path(card: dict) -> str | None:
@@ -1237,7 +1430,11 @@ def create_note_with_cards(
 
 
 def ensure_notes_for_cards(cards: list[sqlite3.Row]) -> list[dict]:
-    return [ensure_note_for_card(card) for card in cards]
+    sanitized: list[dict] = []
+    for card in cards:
+        card_dict = ensure_note_for_card(card)
+        sanitized.append(sanitize_card_sounds(card_dict))
+    return sanitized
 
 
 def find_note_by_source_id(deck_id: int, source_id: int) -> sqlite3.Row | None:
@@ -5542,6 +5739,7 @@ class AnkiApp(tk.Tk):
         scrollbar.pack(side="right", fill="y")
 
         for c in cards:
+            c = sanitize_card_sounds(dict(c))
             card_frame = ttk.LabelFrame(
                 scroll_frame,
                 text=f"ID {c['id']} (уровень {c['leitner_level']}, next {c['next_review']}, prog {c['progress']})"
@@ -5614,20 +5812,10 @@ class AnkiApp(tk.Tk):
             ttk.Button(frame_img, text="Выбрать...",
                        command=select_back_img).grid(row=1, column=2, padx=5, pady=(3, 0))
 
-            audio_entries = [
-                m for m in get_media_for_card(c["id"], c.get("note_id"))
-                if (m.get("media_type") or m.get("type") or "").lower() == "audio"
-            ]
+            audio_entries = get_card_audio_entries(c)
 
             audio_frame = ttk.LabelFrame(card_frame, text="Аудио")
             audio_frame.pack(fill=tk.X, padx=5, pady=5)
-
-            if not audio_entries and c.get("audio_path"):
-                audio_entries.append({
-                    "id": None,
-                    "path": c.get("audio_path"),
-                    "side": "back",
-                })
 
             if audio_entries:
                 for idx, entry in enumerate(audio_entries):
@@ -5635,12 +5823,20 @@ class AnkiApp(tk.Tk):
                     row_frame = ttk.Frame(audio_frame)
                     row_frame.pack(fill=tk.X, pady=2)
 
-                    ttk.Label(row_frame, text=os.path.basename(entry.get("path") or ""))\
+                    ttk.Label(row_frame, text=entry.get("label") or os.path.basename(entry.get("path") or ""))\
                         .pack(side=tk.LEFT, padx=5)
+
+                    def play_selected(path=entry.get("path"), missing=entry.get("missing")):
+                        if path and os.path.exists(path) and not missing:
+                            play_audio_file(path)
+                        else:
+                            messagebox.showwarning("Аудио", "Аудио не найдено")
+
                     ttk.Button(
                         row_frame,
-                        text="▶", 
-                        command=lambda p=entry.get("path"): play_audio_file(p) if p else None,
+                        text="▶",
+                        command=play_selected,
+                        state=tk.NORMAL if entry.get("path") and not entry.get("missing") else tk.DISABLED,
                     ).pack(side=tk.LEFT, padx=5)
 
                     def make_side_updater(media_id, var):
@@ -5649,20 +5845,29 @@ class AnkiApp(tk.Tk):
                                 update_media_side(media_id, var.get())
                         return updater
 
-                    ttk.Radiobutton(
+                    for side_label, side_value in (("Front", "front"), ("Back", "back")):
+                        ttk.Radiobutton(
+                            row_frame,
+                            text=side_label,
+                            variable=side_var,
+                            value=side_value,
+                            command=make_side_updater(entry.get("media_id"), side_var),
+                            state=tk.NORMAL if entry.get("media_id") else tk.DISABLED,
+                        ).pack(side=tk.LEFT, padx=2)
+
+                    def make_delete_handler(media_id, frame=row_frame):
+                        def handler():
+                            if media_id:
+                                remove_media_entry(media_id)
+                            frame.destroy()
+                        return handler
+
+                    ttk.Button(
                         row_frame,
-                        text="Front",
-                        variable=side_var,
-                        value="front",
-                        command=make_side_updater(entry.get("id"), side_var),
-                    ).pack(side=tk.LEFT, padx=2)
-                    ttk.Radiobutton(
-                        row_frame,
-                        text="Back",
-                        variable=side_var,
-                        value="back",
-                        command=make_side_updater(entry.get("id"), side_var),
-                    ).pack(side=tk.LEFT, padx=2)
+                        text="Удалить привязку",
+                        command=make_delete_handler(entry.get("media_id")),
+                        state=tk.NORMAL if entry.get("media_id") else tk.DISABLED,
+                    ).pack(side=tk.LEFT, padx=5)
             else:
                 ttk.Label(audio_frame, text="(Нет аудио)").pack(anchor="w", padx=5, pady=3)
 
@@ -6544,19 +6749,11 @@ class OverviewWindow(tk.Toplevel):
     
     def update_audio_player(self, audio_frame, card, prefer_side: str = "back"):
         """Обновить аудио плеер"""
-        audio_widget = getattr(audio_frame, "audio_widget", None)
-        if audio_widget is None:
-            audio_widget = AudioPlayerWidget(audio_frame, on_error_callback=self._show_audio_error)
-            audio_frame.audio_widget = audio_widget
-            audio_widget.pack(fill=tk.X)
-
-        audio_path = get_card_audio_path(card, prefer_side=prefer_side)
-        if audio_path:
-            audio_widget.load(audio_path)
-            audio_widget.pack(fill=tk.X)
-        else:
-            audio_widget.load(None)
-            audio_widget.pack_forget()
+        entries = get_card_audio_entries(card, prefer_side=prefer_side)
+        if not hasattr(audio_frame, "audio_widget"):
+            audio_frame.audio_widget = AudioPlayerWidget(audio_frame, on_error_callback=self._show_audio_error)
+            audio_frame.audio_widget.pack(fill=tk.X)
+        display_audio_entries_on_frame(audio_frame, entries)
 
     def _show_audio_error(self, title: str, message: str):
         try:
@@ -6824,17 +7021,13 @@ class RepeatWindow(tk.Toplevel):
 
         # Добавить аудио-плеер
         self.audio_widget = AudioPlayerWidget(self.card_frame, on_error_callback=self._show_audio_error)
+        self.card_frame.audio_widget = self.audio_widget
         self.update_audio_player()
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
-        audio_path = get_card_audio_path(self.current_card, prefer_side="back" if self.show_back else "front")
-        if audio_path:
-            self.audio_widget.load(audio_path)
-            self.audio_widget.place(x=10, y=350, width=780, height=110)
-        else:
-            self.audio_widget.load(None)
-            self.audio_widget.place_forget()
+        entries = get_card_audio_entries(self.current_card, prefer_side="back" if self.show_back else "front")
+        display_audio_entries_on_frame(self.card_frame, entries)
 
     def _show_audio_error(self, title: str, message: str):
         try:
@@ -7299,20 +7492,15 @@ class ReviewWindow(tk.Toplevel):
 
         self.btn_sound = ttk.Button(btn_frame, text="🔊 Слово", command=self.play_word)
         self.btn_sound.grid(row=0, column=3, padx=5)
-        
+
         # Добавить аудио-плеер
+        self.card_frame.audio_widget = self.audio_widget
         self.update_audio_player()
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
-        audio_path = get_card_audio_path(self.current_card, prefer_side="back" if self.show_back else "front")
-        if audio_path:
-            self.audio_widget.load(audio_path)
-            if not self.audio_widget.winfo_ismapped():
-                self.audio_widget.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
-        else:
-            self.audio_widget.load(None)
-            self.audio_widget.pack_forget()
+        entries = get_card_audio_entries(self.current_card, prefer_side="back" if self.show_back else "front")
+        display_audio_entries_on_frame(self.card_frame, entries)
 
     def _show_audio_error(self, title: str, message: str):
         try:
