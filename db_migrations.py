@@ -139,6 +139,9 @@ def run_migrations(conn: sqlite3.Connection):
 
     for column, definition in srs_columns.items():
         _add_column_if_missing(cur, "cards", column, definition)
+    _add_column_if_missing(cur, "cards", "phase", "INTEGER")
+    _add_column_if_missing(cur, "cards", "external_id", "TEXT")
+    _add_column_if_missing(cur, "cards", "source", "TEXT")
 
     # Новые таблицы для note types/notes
     cur.execute(
@@ -160,12 +163,17 @@ def run_migrations(conn: sqlite3.Connection):
             note_type_id INTEGER NOT NULL,
             fields_json TEXT NOT NULL,
             tags TEXT,
+            external_id TEXT,
+            source TEXT,
             created_at INTEGER NOT NULL,
             FOREIGN KEY(deck_id) REFERENCES decks(id),
             FOREIGN KEY(note_type_id) REFERENCES note_types(id)
         );
         """
     )
+
+    _add_column_if_missing(cur, "notes", "external_id", "TEXT")
+    _add_column_if_missing(cur, "notes", "source", "TEXT")
 
     _add_column_if_missing(cur, "cards", "note_id", "INTEGER")
     _add_column_if_missing(cur, "cards", "template_ord", "INTEGER")
