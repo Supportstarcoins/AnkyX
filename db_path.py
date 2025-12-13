@@ -49,9 +49,15 @@ def connect_to_db(timeout: Optional[int] = 5) -> sqlite3.Connection:
     db_dir = os.path.dirname(db_path)
     try:
         _ensure_writable_directory(db_dir)
-        conn = sqlite3.connect(db_path, timeout=timeout) if timeout is not None else sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        db_timeout = 30 if timeout is None else timeout
+        con = sqlite3.connect(db_path, timeout=db_timeout, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA temp_store=MEMORY")
+        con.execute("PRAGMA foreign_keys=ON")
+        return con
     except Exception as e:
         cwd = os.getcwd()
         message = f"Не удалось открыть БД: {db_path}\nCWD: {cwd}\nОшибка: {repr(e)}"

@@ -1,4 +1,7 @@
-import os
+import os, tempfile
+safe = tempfile.gettempdir()
+os.environ["TEMP"] = safe
+os.environ["TMP"] = safe
 import time
 import base64
 import sqlite3
@@ -5257,28 +5260,42 @@ class AnkiApp(tk.Tk):
 
     def update_overdue_badge(self):
         """Обновить бейджи просрочек для выбранной колоды и фаз."""
-
         deck_ids = {deck_id for deck_id, _ in self.deck_items.values() if deck_id is not None}
-        counts_by_deck = {}
-        timestamp = int(time.time())
-        for deck_id in deck_ids:
-            counts_by_deck[deck_id] = fetch_overdue_counts_by_phase(
-                None, deck_id, now_ts=timestamp
-            )
-
-        selected_counts = counts_by_deck.get(self.selected_deck_id)
-        total_count = selected_counts.total if selected_counts else 0
-
-        if self.overdue_canvas is not None:
-            self.overdue_canvas.delete("all")
-            if total_count > 0:
-                self.overdue_canvas.create_oval(2, 2, 22, 22, fill="red", outline="red")
-                self.overdue_badge_text_id = self.overdue_canvas.create_text(
-                    12, 12, text=str(total_count), fill="white", font=("Arial", 9, "bold")
+        counts_by_deck: dict[int | None, PhaseOverdueBadges] = {}
+        try:
+            timestamp = int(time.time())
+            for deck_id in deck_ids:
+                counts_by_deck[deck_id] = fetch_overdue_counts_by_phase(
+                    None, deck_id, now_ts=timestamp
                 )
 
-        if self.phase_badge_manager:
-            self.phase_badge_manager.update(self.deck_items, counts_by_deck)
+            selected_counts = counts_by_deck.get(self.selected_deck_id)
+            total_count = selected_counts.total if selected_counts else 0
+
+            if self.overdue_canvas is not None:
+                self.overdue_canvas.delete("all")
+                if total_count > 0:
+                    self.overdue_canvas.create_oval(2, 2, 22, 22, fill="red", outline="red")
+                    self.overdue_badge_text_id = self.overdue_canvas.create_text(
+                        12, 12, text=str(total_count), fill="white", font=("Arial", 9, "bold")
+                    )
+
+            if self.phase_badge_manager:
+                self.phase_badge_manager.update(self.deck_items, counts_by_deck)
+        except sqlite3.OperationalError as e:
+            error_message = str(e)
+            os.makedirs("logs", exist_ok=True)
+            with open(os.path.join("logs", "db.log"), "a", encoding="utf-8") as log_file:
+                log_file.write(f"[{datetime.now().isoformat()}] update_overdue_badge: {error_message}\n")
+
+            if "unable to open database file" in error_message.lower():
+                counts_by_deck = {}
+                if self.overdue_canvas is not None:
+                    self.overdue_canvas.delete("all")
+                if self.phase_badge_manager:
+                    self.phase_badge_manager.update(self.deck_items, counts_by_deck)
+            else:
+                raise
 
         self.schedule_overdue_badges_refresh()
 
