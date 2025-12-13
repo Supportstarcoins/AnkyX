@@ -3118,6 +3118,9 @@ class AnkiApp(tk.Tk):
         self.overdue_badge_text_id = None
         self.phase_badge_manager: PhaseOverdueBadges | None = None
         self.overdue_update_job = None
+        self._deck_select_job: str | None = None
+
+        self._refresh_in_progress = False
 
         self.image_import_watch_job = None
 
@@ -5118,55 +5121,62 @@ class AnkiApp(tk.Tk):
                   command=self.start_overview_mode).pack(side=tk.RIGHT, padx=5)
 
     def refresh_decks(self):
-        self.decks = list_decks()
-        self.deck_items = {}
-        self.deck_icons = {}
-        self.deck_preview_images = {}
+        if self._refresh_in_progress:
+            return
+
+        self._refresh_in_progress = True
+        try:
+            self.decks = list_decks()
+            self.deck_items = {}
+            self.deck_icons = {}
+            self.deck_preview_images = {}
         
-        # очистить дерево
-        for item in self.decks_tree.get_children():
-            self.decks_tree.delete(item)
+            # очистить дерево
+            for item in self.decks_tree.get_children():
+                self.decks_tree.delete(item)
 
-        # заполнить колоды и подколоды-фазы
-        for d in self.decks:
-            # Загружаем иконку
-            icon = None
-            if d["icon_path"] and os.path.exists(d["icon_path"]) and PIL_AVAILABLE:
-                try:
-                    img = Image.open(d["icon_path"])
-                    img = img.resize((16, 16), Image.Resampling.LANCZOS)
-                    icon = ImageTk.PhotoImage(img)
-                    self.deck_icons[d["id"]] = icon
-                except Exception:
-                    pass
-            
-            desc = d["description"] or "без описания"
-            deck_text = f"{d['name']} ({desc})"
-            
-            # Вставляем колоду с иконкой
-            if icon:
-                root_id = self.decks_tree.insert("", "end", text=deck_text, image=icon, open=False)
-            else:
-                root_id = self.decks_tree.insert("", "end", text=deck_text, open=False)
-                
-            self.deck_items[root_id] = (d["id"], None)
-            
-            # Получаем статистику для этой колоды
-            stats = get_deck_stats(d["id"])
-            
-            for phase in range(1, 11):
-                phase_count = stats["phase_stats"].get(phase, 0)
-                total_cards = stats["total"]
-                percentage = (phase_count / total_cards * 100) if total_cards > 0 else 0
-                
-                child_text = f"Фаза {phase}: {phase_count} карт. ({percentage:.1f}%)"
-                child_id = self.decks_tree.insert(root_id, "end", text=child_text)
-                self.deck_items[child_id] = (d["id"], phase)
+            # заполнить колоды и подколоды-фазы
+            for d in self.decks:
+                # Загружаем иконку
+                icon = None
+                if d["icon_path"] and os.path.exists(d["icon_path"]) and PIL_AVAILABLE:
+                    try:
+                        img = Image.open(d["icon_path"])
+                        img = img.resize((16, 16), Image.Resampling.LANCZOS)
+                        icon = ImageTk.PhotoImage(img)
+                        self.deck_icons[d["id"]] = icon
+                    except Exception:
+                        pass
 
-        self.selected_deck_id = None
-        self.selected_phase = None
-        self.update_overdue_badge()
-        self.update_deck_preview()
+                desc = d["description"] or "без описания"
+                deck_text = f"{d['name']} ({desc})"
+
+                # Вставляем колоду с иконкой
+                if icon:
+                    root_id = self.decks_tree.insert("", "end", text=deck_text, image=icon, open=False)
+                else:
+                    root_id = self.decks_tree.insert("", "end", text=deck_text, open=False)
+
+                self.deck_items[root_id] = (d["id"], None)
+
+                # Получаем статистику для этой колоды
+                stats = get_deck_stats(d["id"])
+
+                for phase in range(1, 11):
+                    phase_count = stats["phase_stats"].get(phase, 0)
+                    total_cards = stats["total"]
+                    percentage = (phase_count / total_cards * 100) if total_cards > 0 else 0
+
+                    child_text = f"Фаза {phase}: {phase_count} карт. ({percentage:.1f}%)"
+                    child_id = self.decks_tree.insert(root_id, "end", text=child_text)
+                    self.deck_items[child_id] = (d["id"], phase)
+
+            self.selected_deck_id = None
+            self.selected_phase = None
+            self.after(50, self.update_overdue_badge)
+            self.update_deck_preview()
+        finally:
+            self._refresh_in_progress = False
 
     def update_deck_preview(self):
         """Обновить превью выбранной колоды."""
@@ -5272,6 +5282,12 @@ class AnkiApp(tk.Tk):
         self.overdue_update_job = self.after(60_000, self.update_overdue_badge)
 
     def on_deck_select(self, event):
+        if self._deck_select_job:
+            self.after_cancel(self._deck_select_job)
+        self._deck_select_job = self.after(150, self._apply_selected_deck)
+
+    def _apply_selected_deck(self):
+        self._deck_select_job = None
         sel = self.decks_tree.selection()
         if not sel:
             self.selected_deck_id = None
