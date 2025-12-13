@@ -6,6 +6,8 @@ import sqlite3
 import time
 from typing import Any, Iterable
 
+from db_connect import DB_WRITE_LOCK, commit_with_retry
+
 from db_migrations import ensure_schema_for_import
 
 
@@ -295,12 +297,15 @@ def attach_image_if_exists(
             continue
 
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO media (note_id, card_id, type, path, side, source, created_at)
-            VALUES (?, ?, 'image', ?, 'front', 'csv_import', ?);
-            """,
-            (note_id, card_id, candidate, int(time.time())),
-        )
-        conn.commit()
+
+        def write():
+            cur.execute(
+                """
+                INSERT INTO media (note_id, card_id, type, path, side, source, created_at)
+                VALUES (?, ?, 'image', ?, 'front', 'csv_import', ?);
+                """,
+                (note_id, card_id, candidate, int(time.time())),
+            )
+
+        commit_with_retry(conn, write)
         return
