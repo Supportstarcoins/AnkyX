@@ -95,6 +95,81 @@ def migrate_media_note_nullable(conn: sqlite3.Connection):
     conn.commit()
 
 
+def ensure_schema_for_import(conn: sqlite3.Connection):
+    """Ensure columns used by importers exist before writing data."""
+
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = 'notes' LIMIT 1;"
+        )
+    except sqlite3.Error as exc:  # noqa: BLE001
+        raise RuntimeError(f"failed to inspect schema: {exc}") from exc
+
+    if cur.fetchone() is None:
+        raise RuntimeError("notes table not found")
+
+    cur.execute("PRAGMA table_info(notes);")
+    note_columns = {row[1] for row in cur.fetchall()}
+
+    def _add_note_column(name: str, definition: str):
+        if name in note_columns:
+            return
+        try:
+            cur.execute(f"ALTER TABLE notes ADD COLUMN {name} {definition};")
+            note_columns.add(name)
+        except sqlite3.Error as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"failed to add column '{name}' to notes: {exc}"
+            ) from exc
+
+    _add_note_column("external_id", "TEXT")
+    _add_note_column("source", "TEXT")
+    _add_note_column("created_at", "INTEGER")
+
+    try:
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = 'cards' LIMIT 1;"
+        )
+    except sqlite3.Error as exc:  # noqa: BLE001
+        raise RuntimeError(f"failed to inspect cards table: {exc}") from exc
+
+    if cur.fetchone() is None:
+        raise RuntimeError("cards table not found")
+
+    cur.execute("PRAGMA table_info(cards);")
+    card_columns = {row[1] for row in cur.fetchall()}
+
+    def _add_card_column(name: str, definition: str):
+        if name in card_columns:
+            return
+        try:
+            cur.execute(f"ALTER TABLE cards ADD COLUMN {name} {definition};")
+            card_columns.add(name)
+        except sqlite3.Error as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"failed to add column '{name}' to cards: {exc}"
+            ) from exc
+
+    _add_card_column("note_id", "INTEGER")
+    _add_card_column("template_ord", "INTEGER")
+    _add_card_column("state", "TEXT")
+    _add_card_column("due", "INTEGER")
+    _add_card_column("interval", "INTEGER")
+    _add_card_column("ease", "INTEGER")
+    _add_card_column("reps", "INTEGER")
+    _add_card_column("lapses", "INTEGER")
+    _add_card_column("step_index", "INTEGER")
+    _add_card_column("phase", "INTEGER")
+    _add_card_column("external_id", "TEXT")
+    _add_card_column("source", "TEXT")
+    _add_card_column("translation_shown", "BOOLEAN DEFAULT 1")
+    _add_card_column("overview_added", "BOOLEAN DEFAULT 0")
+
+    conn.commit()
+
+
 def run_migrations(conn: sqlite3.Connection):
     cur = conn.cursor()
 

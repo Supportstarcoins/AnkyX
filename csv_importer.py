@@ -6,6 +6,8 @@ import sqlite3
 import time
 from typing import Any, Iterable
 
+from db_migrations import ensure_schema_for_import
+
 
 MEDIA_EXTENSIONS = [".png", ".jpg", ".jpeg"]
 
@@ -32,6 +34,9 @@ def normalize_tags(raw: str | None) -> str:
     cleaned = raw.replace(",", " ")
     parts = [part.strip() for part in cleaned.split() if part.strip()]
     return " ".join(parts)
+
+
+_SCHEMA_CHECKED: set[int] = set()
 
 
 def _safe_get(row: Any, key: Any) -> str:
@@ -129,6 +134,14 @@ def _compute_row_hash(fields: dict[str, Any], tags: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _ensure_import_schema(conn: sqlite3.Connection):
+    conn_id = id(conn)
+    if conn_id in _SCHEMA_CHECKED:
+        return
+    ensure_schema_for_import(conn)
+    _SCHEMA_CHECKED.add(conn_id)
+
+
 def upsert_note_and_cards(
     conn: sqlite3.Connection,
     deck_id: int,
@@ -138,6 +151,7 @@ def upsert_note_and_cards(
     srs_defaults: dict[str, Any],
     mode: dict[str, Any],
 ) -> dict[str, Any]:
+    _ensure_import_schema(conn)
     cur = conn.cursor()
     note_type_id = _ensure_basic_note_type(cur)
 
@@ -146,11 +160,21 @@ def upsert_note_and_cards(
     source = mode.get("source", "csv_import")
     row_hash = _compute_row_hash(fields, normalized_tags)
 
-    cur.execute(
-        "SELECT * FROM notes WHERE deck_id = ? AND external_id = ? LIMIT 1;",
-        (deck_id, str(external_id) if external_id is not None else ""),
-    )
-    existing_note = cur.fetchone()
+    existing_note = None
+    if external_id is not None:
+        cur.execute(
+            "SELECT id FROM notes WHERE external_id = ? AND deck_id = ? LIMIT 1;",
+            (str(external_id), deck_id),
+        )
+        existing_id_row = cur.fetchone()
+        if existing_id_row:
+            existing_id = (
+                existing_id_row["id"]
+                if hasattr(existing_id_row, "keys")
+                else existing_id_row[0]
+            )
+            cur.execute("SELECT * FROM notes WHERE id = ?;", (existing_id,))
+            existing_note = cur.fetchone()
 
     faces = render_card_faces(fields)
     srs_state = {
