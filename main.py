@@ -14,6 +14,14 @@ import gzip
 import pickle
 from datetime import date, datetime, timedelta
 import collections
+from csv_importer import (
+    attach_image_if_exists,
+    detect_encoding,
+    map_row_to_fields,
+    normalize_tags,
+    render_card_faces,
+    upsert_note_and_cards,
+)
 
 # В начале main() или init_db()
 os.makedirs("sentence_audio", exist_ok=True)
@@ -2933,6 +2941,7 @@ class AnkiApp(tk.Tk):
                              command=self.open_video_clip_window)
         gen_menu.add_command(label="Импорт картинок по ID (CSV)…",
                              command=self.open_image_id_import_window)
+        gen_menu.add_command(label="Импорт CSV колоды", command=self.open_csv_import_window)
         gen_menu.add_command(label="Картинки по CSV (Wikimedia)",
                              command=self.open_wikimedia_csv_window)
         menubar.add_cascade(label="Режим генерации", menu=gen_menu)
@@ -3598,6 +3607,315 @@ class AnkiApp(tk.Tk):
 
         log_box = tk.Text(win, height=15, state="disabled")
         log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    def open_csv_import_window(self):
+        win = tk.Toplevel(self)
+        win.title("Импорт CSV колоды")
+        win.geometry("880x740")
+        win.grab_set()
+
+        file_var = tk.StringVar()
+        deck_var = tk.StringVar()
+        has_headers_var = tk.BooleanVar(value=True)
+        upsert_var = tk.BooleanVar(value=True)
+        skip_existing_var = tk.BooleanVar(value=False)
+        generate_id_var = tk.BooleanVar(value=True)
+        attach_images_var = tk.BooleanVar(value=True)
+        preserve_srs_var = tk.BooleanVar(value=False)
+        reset_srs_var = tk.BooleanVar(value=False)
+        start_state_var = tk.StringVar(value="new")
+        start_phase_var = tk.IntVar(value=1)
+        images_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "images"))
+
+        id_col_var = tk.IntVar(value=1)
+        word_col_var = tk.IntVar(value=2)
+        translation_col_var = tk.IntVar(value=3)
+        example_col_var = tk.IntVar(value=4)
+        notes_col_var = tk.IntVar(value=5)
+        tags_col_var = tk.IntVar(value=6)
+        front_col_var = tk.IntVar(value=1)
+        back_col_var = tk.IntVar(value=2)
+
+        decks = list_decks()
+        if decks:
+            deck_var.set(str(decks[0]["id"]))
+
+        progress_var = tk.DoubleVar(value=0)
+        progress_label_var = tk.StringVar(value="0/0")
+        processing_task: dict[str, BackgroundTask | None] = {"task": None}
+
+        def refresh_decks_list():
+            self.refresh_decks()
+            decks_local = list_decks()
+            deck_box["values"] = [f"{d['id']}: {d['name']}" for d in decks_local]
+            if self.selected_deck_id:
+                deck_var.set(str(self.selected_deck_id))
+            elif decks_local:
+                deck_var.set(str(decks_local[0]["id"]))
+
+        def log_msg(msg: str):
+            log_box.configure(state="normal")
+            log_box.insert(tk.END, msg + "\n")
+            log_box.see(tk.END)
+            log_box.configure(state="disabled")
+
+        def handle_event(event):
+            kind = event[0]
+            if kind == "progress":
+                done, total, label = event[1:]
+                progress_bar.configure(maximum=max(total, 1))
+                progress_var.set(done)
+                progress_label_var.set(f"{done}/{total} {label}")
+            elif kind == "log":
+                log_msg(event[1])
+            elif kind == "done":
+                summary = event[1] or {"total": 0, "created": 0, "updated": 0, "skipped": 0, "errors": 0}
+                messagebox.showinfo(
+                    "Готово",
+                    (
+                        f"Всего строк: {summary['total']}\n"
+                        f"Создано: {summary['created']}\n"
+                        f"Обновлено: {summary['updated']}\n"
+                        f"Пропущено: {summary['skipped']}\n"
+                        f"Ошибки: {summary['errors']}"
+                    ),
+                )
+                self.unregister_bg_handler(processing_task["task"].queue)
+                processing_task["task"] = None
+            elif kind == "error":
+                messagebox.showerror("Ошибка", event[1])
+                self.unregister_bg_handler(processing_task["task"].queue)
+                processing_task["task"] = None
+
+        def browse_file():
+            path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")])
+            if path:
+                file_var.set(path)
+
+        def browse_images_dir():
+            path = filedialog.askdirectory(initialdir=images_dir_var.get() or os.getcwd())
+            if path:
+                images_dir_var.set(path)
+
+        def on_toggle_headers():
+            manual_frame.grid_remove() if has_headers_var.get() else manual_frame.grid()
+
+        def build_manual_map():
+            manual_map: dict[str, int] = {}
+            for target, var in (
+                ("id", id_col_var),
+                ("word", word_col_var),
+                ("translation", translation_col_var),
+                ("example", example_col_var),
+                ("notes", notes_col_var),
+                ("tags", tags_col_var),
+                ("front", front_col_var),
+                ("back", back_col_var),
+            ):
+                if var.get() > 0:
+                    manual_map[target] = var.get() - 1
+            return manual_map
+
+        def start_import():
+            if processing_task["task"]:
+                messagebox.showinfo("Занято", "Импорт уже выполняется")
+                return
+
+            csv_path = file_var.get().strip()
+            if not csv_path or not os.path.exists(csv_path):
+                messagebox.showerror("Ошибка", "Укажите существующий CSV файл")
+                return
+
+            deck_id_raw = deck_var.get()
+            if not deck_id_raw:
+                messagebox.showerror("Ошибка", "Выберите колоду")
+                return
+            deck_id = int(deck_id_raw.split(":", 1)[0]) if ":" in deck_id_raw else int(deck_id_raw)
+
+            mapping_mode = {"variant": "auto"}
+            manual_tags_idx: int | None = None
+            manual_id_idx: int | None = None
+            if not has_headers_var.get():
+                manual_map = build_manual_map()
+                manual_tags_idx = manual_map.pop("tags", None)
+                manual_id_idx = manual_map.pop("id", None)
+                mapping_mode = {"variant": "manual", "manual_map": manual_map}
+
+            attach_images = attach_images_var.get()
+            images_dir = images_dir_var.get().strip() or os.path.join(os.getcwd(), "images")
+
+            def worker(task_obj: BackgroundTask):
+                summary = {"total": 0, "created": 0, "updated": 0, "skipped": 0, "errors": 0}
+                conn = get_connection()
+                try:
+                    encoding = detect_encoding(csv_path)
+                    with open(csv_path, "r", encoding=encoding, newline="") as fh:
+                        reader = csv.DictReader(fh) if has_headers_var.get() else csv.reader(fh)
+                        rows = list(reader)
+
+                    total_rows = len(rows)
+                    for idx, row in enumerate(rows, start=1):
+                        if task_obj.cancelled():
+                            break
+                        summary["total"] += 1
+                        try:
+                            row_data = row
+                            tags_value = ""
+                            external_id = None
+
+                            if has_headers_var.get() and isinstance(row, dict):
+                                lowered = {k.lower(): v for k, v in row.items()}
+                                for candidate in ("id", "external_id", "word_id", "uid"):
+                                    if candidate in lowered:
+                                        external_id = lowered.get(candidate)
+                                        break
+                                tags_value = lowered.get("tags", "")
+                                fields = map_row_to_fields(lowered, mapping_mode)
+                            else:
+                                tags_value = normalize_tags(row[manual_tags_idx]) if manual_tags_idx is not None and len(row) > manual_tags_idx else ""
+                                fields = map_row_to_fields(row, mapping_mode)
+                                if manual_id_idx is not None and len(row) > manual_id_idx:
+                                    external_id = row[manual_id_idx]
+                                elif generate_id_var.get() and row:
+                                    external_id = row[0]
+
+                            if not fields:
+                                raise ValueError("Пустая строка")
+
+                            srs_defaults = {
+                                "state": start_state_var.get(),
+                                "due": int(time.time()),
+                                "interval": 0,
+                                "ease": 250,
+                                "reps": 0,
+                                "lapses": 0,
+                                "step_index": 0,
+                                "phase": start_phase_var.get(),
+                            }
+
+                            if preserve_srs_var.get() and isinstance(row_data, dict):
+                                for key in ("due", "interval", "ease", "reps", "lapses", "step_index", "phase"):
+                                    if key in row_data and str(row_data.get(key)).strip():
+                                        try:
+                                            srs_defaults[key] = int(float(row_data.get(key)))
+                                        except Exception:
+                                            pass
+                                if row_data.get("state"):
+                                    srs_defaults["state"] = str(row_data.get("state")).strip()
+
+                            mode = {
+                                "skip_existing": skip_existing_var.get() or not upsert_var.get(),
+                                "reset_srs": reset_srs_var.get(),
+                                "state": srs_defaults["state"],
+                            }
+
+                            result = upsert_note_and_cards(
+                                conn,
+                                deck_id,
+                                str(external_id) if external_id is not None else None,
+                                fields,
+                                tags_value,
+                                srs_defaults,
+                                mode,
+                            )
+                            conn.commit()
+
+                            note_id = result.get("note_id")
+                            card_ids = result.get("card_ids") or []
+                            if attach_images and external_id and card_ids:
+                                attach_image_if_exists(conn, note_id, card_ids[0], external_id, images_dir)
+                                conn.commit()
+
+                            status = result.get("status", "created")
+                            summary[status] = summary.get(status, 0) + 1
+                            log_msg(f"[{status}] строка {idx}: {render_card_faces(fields)[0]}")
+                        except Exception as exc:  # noqa: BLE001
+                            summary["errors"] += 1
+                            log_msg(f"[ошибка] строка {idx}: {exc}")
+                        task_obj.queue.put(("progress", idx, max(total_rows, 1), "импорт"))
+
+                    task_obj.queue.put(("done", summary))
+                except Exception as exc:  # noqa: BLE001
+                    task_obj.queue.put(("error", str(exc)))
+                finally:
+                    conn.close()
+
+            task = start_background_task(worker)
+            processing_task["task"] = task
+            self.register_bg_handler(task.queue, handle_event)
+
+        def cancel_import():
+            if processing_task["task"]:
+                processing_task["task"].cancel()
+                processing_task["task"] = None
+                log_msg("[остановлено] Импорт прерван")
+
+        top_frame = ttk.Frame(win)
+        top_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(top_frame, text="CSV файл:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(top_frame, textvariable=file_var).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(top_frame, text="Выбрать", command=browse_file).grid(row=0, column=2, padx=5)
+        top_frame.columnconfigure(1, weight=1)
+
+        deck_frame = ttk.Frame(win)
+        deck_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(deck_frame, text="Целевая колода:").grid(row=0, column=0, sticky="w")
+        deck_box = ttk.Combobox(deck_frame, textvariable=deck_var, values=[f"{d['id']}: {d['name']}" for d in decks])
+        deck_box.grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(deck_frame, text="Создать новую", command=lambda: (self.add_deck_window(), refresh_decks_list())).grid(row=0, column=2, padx=5)
+        deck_frame.columnconfigure(1, weight=1)
+
+        options = ttk.LabelFrame(win, text="Настройки импорта")
+        options.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Checkbutton(options, text="CSV имеет заголовки", variable=has_headers_var, command=on_toggle_headers).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(options, text="Обновлять существующие по ID (upsert)", variable=upsert_var).grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(options, text="Пропускать существующие по ID", variable=skip_existing_var).grid(row=2, column=0, sticky="w")
+        ttk.Checkbutton(options, text="Если нет ID — генерировать", variable=generate_id_var).grid(row=3, column=0, sticky="w")
+        ttk.Checkbutton(options, text="Прикреплять картинки из папки images/<id>.png", variable=attach_images_var).grid(row=4, column=0, sticky="w")
+        ttk.Checkbutton(options, text="Сохранить интервалы из CSV (due/interval/ease)", variable=preserve_srs_var).grid(row=5, column=0, sticky="w")
+        ttk.Checkbutton(options, text="Сбросить расписание при обновлении", variable=reset_srs_var).grid(row=6, column=0, sticky="w")
+
+        ttk.Label(options, text="Стартовая фаза:").grid(row=0, column=1, sticky="w", padx=5)
+        ttk.Spinbox(options, from_=1, to=10, textvariable=start_phase_var, width=5).grid(row=0, column=2, sticky="w")
+        ttk.Label(options, text="Стартовое состояние SRS:").grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Combobox(options, values=["new", "learning", "review"], textvariable=start_state_var, width=10).grid(row=1, column=2, sticky="w")
+        ttk.Label(options, text="Папка с картинками:").grid(row=2, column=1, sticky="w", padx=5)
+        ttk.Entry(options, textvariable=images_dir_var, width=28).grid(row=2, column=2, sticky="we", padx=5)
+        ttk.Button(options, text="...", command=browse_images_dir, width=4).grid(row=2, column=3, padx=5)
+
+        manual_frame = ttk.LabelFrame(win, text="Сопоставление колонок (если нет заголовков)")
+        manual_frame.pack(fill=tk.X, padx=10, pady=5)
+        for i, (label, var) in enumerate(
+            [
+                ("ID", id_col_var),
+                ("Word", word_col_var),
+                ("Translation", translation_col_var),
+                ("Example", example_col_var),
+                ("Notes", notes_col_var),
+                ("Tags", tags_col_var),
+                ("Front", front_col_var),
+                ("Back", back_col_var),
+            ]
+        ):
+            ttk.Label(manual_frame, text=label + ":").grid(row=i // 2, column=(i % 2) * 2, sticky="e", padx=5, pady=2)
+            ttk.Spinbox(manual_frame, from_=0, to=20, textvariable=var, width=5).grid(row=i // 2, column=(i % 2) * 2 + 1, sticky="w", padx=5, pady=2)
+        if has_headers_var.get():
+            manual_frame.grid_remove()
+
+        progress_frame = ttk.Frame(win)
+        progress_frame.pack(fill=tk.X, padx=10, pady=5)
+        progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=1)
+        progress_bar.pack(fill=tk.X, expand=True)
+        ttk.Label(progress_frame, textvariable=progress_label_var).pack(anchor="w")
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(btn_frame, text="Импортировать", command=start_import).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Отмена", command=cancel_import).pack(side=tk.LEFT, padx=5)
+
+        log_box = tk.Text(win, height=14, state="disabled")
+        log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
     # --------- режим ознакомления ---------
 
