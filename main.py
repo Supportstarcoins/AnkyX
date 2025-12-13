@@ -61,6 +61,7 @@ from db_migrations import ensure_schema_for_import, run_migrations
 from db_connect import DB_WRITE_LOCK, commit_with_retry, open_db
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
+from ui_progress import BusyDialog, TaskRunner
 from overdue_badges import (
     PhaseOverdueBadges,
     ensure_due_column,
@@ -3121,9 +3122,13 @@ class AnkiApp(tk.Tk):
         self.overdue_badge_text_id = None
         self.phase_badge_manager: PhaseOverdueBadges | None = None
         self.overdue_update_job = None
+        self._overdue_task_running = False
         self._deck_select_job: str | None = None
 
         self._refresh_in_progress = False
+
+        self.busy_dialog = BusyDialog(self)
+        self.task_runner = TaskRunner(self, self.busy_dialog)
 
         self.image_import_watch_job = None
 
@@ -3170,6 +3175,9 @@ class AnkiApp(tk.Tk):
                 except Exception:
                     pass
         self.after(50, self.poll_bg_queues)
+
+    def run_task(self, title: str, mode: str, task_fn, on_success, on_error, total=None):
+        self.task_runner.run_task(title, mode, task_fn, on_success, on_error, total)
 
     # --------- меню ---------
 
@@ -4316,18 +4324,29 @@ class AnkiApp(tk.Tk):
         if self.selected_deck_id is None:
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
             return
-        
-        # Используем get_overview_cards вместо get_cards_in_deck
-        cards = get_overview_cards(self.selected_deck_id)
-        if self.selected_phase is not None:
-            cards = [c for c in cards if c["leitner_level"] == self.selected_phase]
-        
-        if not cards:
-            phase_text = f" (фаза {self.selected_phase})" if self.selected_phase is not None else ""
-            messagebox.showinfo("Ознакомление", f"В этой колоде{phase_text} пока нет карточек.")
-            return
-        
-        OverviewWindow(self, cards)
+        deck_id = self.selected_deck_id
+        phase_filter = self.selected_phase
+
+        def task(progress_cb):
+            cards = get_overview_cards(deck_id)
+            if phase_filter is not None:
+                cards = [c for c in cards if c["leitner_level"] == phase_filter]
+            total = len(cards)
+            for idx in range(0, total, max(1, max(1, total // 20))):
+                progress_cb(min(idx + 1, total), total, f"Подготовка {min(idx + 1, total)}/{total}")
+            return cards
+
+        def on_success(cards):
+            if not cards:
+                phase_text = f" (фаза {phase_filter})" if phase_filter is not None else ""
+                messagebox.showinfo("Ознакомление", f"В этой колоде{phase_text} пока нет карточек.")
+                return
+            OverviewWindow(self, cards)
+
+        def on_error(exc: Exception):
+            messagebox.showerror("Ошибка", str(exc))
+
+        self.run_task("Режим ознакомления", "determinate", task, on_success, on_error)
 
     def add_cards_to_overview_from_repeat(self):
         """Добавить карточки из режима повторения в режим ознакомления"""
@@ -5134,58 +5153,68 @@ class AnkiApp(tk.Tk):
             return
 
         self._refresh_in_progress = True
-        try:
-            self.decks = list_decks()
+
+        def task(progress_cb):
+            decks_data = list_decks()
+            stats_by_deck: dict[int, dict] = {}
+            total = len(decks_data)
+            for idx, deck in enumerate(decks_data, start=1):
+                stats_by_deck[deck["id"]] = get_deck_stats(deck["id"])
+                if total and (idx % max(1, total // 10 or 1) == 0 or idx == total):
+                    progress_cb(idx, total, f"Загрузка колод {idx}/{total}")
+            return {"decks": decks_data, "stats": stats_by_deck}
+
+        def on_success(result):
+            self.decks = result["decks"]
             self.deck_items = {}
             self.deck_icons = {}
             self.deck_preview_images = {}
-        
-            # очистить дерево
+
             for item in self.decks_tree.get_children():
                 self.decks_tree.delete(item)
 
-            # заполнить колоды и подколоды-фазы
-            for d in self.decks:
-                # Загружаем иконку
+            for deck in self.decks:
                 icon = None
-                if d["icon_path"] and os.path.exists(d["icon_path"]) and PIL_AVAILABLE:
+                if deck["icon_path"] and os.path.exists(deck["icon_path"]) and PIL_AVAILABLE:
                     try:
-                        img = Image.open(d["icon_path"])
+                        img = Image.open(deck["icon_path"])
                         img = img.resize((16, 16), Image.Resampling.LANCZOS)
                         icon = ImageTk.PhotoImage(img)
-                        self.deck_icons[d["id"]] = icon
+                        self.deck_icons[deck["id"]] = icon
                     except Exception:
                         pass
 
-                desc = d["description"] or "без описания"
-                deck_text = f"{d['name']} ({desc})"
+                desc = deck["description"] or "без описания"
+                deck_text = f"{deck['name']} ({desc})"
 
-                # Вставляем колоду с иконкой
                 if icon:
                     root_id = self.decks_tree.insert("", "end", text=deck_text, image=icon, open=False)
                 else:
                     root_id = self.decks_tree.insert("", "end", text=deck_text, open=False)
 
-                self.deck_items[root_id] = (d["id"], None)
+                self.deck_items[root_id] = (deck["id"], None)
 
-                # Получаем статистику для этой колоды
-                stats = get_deck_stats(d["id"])
-
+                stats = result["stats"].get(deck["id"], {"phase_stats": {}, "total": 0})
                 for phase in range(1, 11):
-                    phase_count = stats["phase_stats"].get(phase, 0)
-                    total_cards = stats["total"]
+                    phase_count = stats.get("phase_stats", {}).get(phase, 0)
+                    total_cards = stats.get("total", 0)
                     percentage = (phase_count / total_cards * 100) if total_cards > 0 else 0
 
                     child_text = f"Фаза {phase}: {phase_count} карт. ({percentage:.1f}%)"
                     child_id = self.decks_tree.insert(root_id, "end", text=child_text)
-                    self.deck_items[child_id] = (d["id"], phase)
+                    self.deck_items[child_id] = (deck["id"], phase)
 
             self.selected_deck_id = None
             self.selected_phase = None
             self.after(50, self.update_overdue_badge)
             self.update_deck_preview()
-        finally:
             self._refresh_in_progress = False
+
+        def on_error(exc):
+            messagebox.showerror("Ошибка", str(exc))
+            self._refresh_in_progress = False
+
+        self.run_task("Загрузка колод", "determinate", task, on_success, on_error)
 
     def update_deck_preview(self):
         """Обновить превью выбранной колоды."""
@@ -5260,15 +5289,25 @@ class AnkiApp(tk.Tk):
 
     def update_overdue_badge(self):
         """Обновить бейджи просрочек для выбранной колоды и фаз."""
+        if self._overdue_task_running:
+            return
+
         deck_ids = {deck_id for deck_id, _ in self.deck_items.values() if deck_id is not None}
-        counts_by_deck: dict[int | None, PhaseOverdueBadges] = {}
-        try:
+        total = len(deck_ids)
+        self._overdue_task_running = True
+
+        def task(progress_cb):
+            counts_by_deck: dict[int | None, PhaseOverdueBadges] = {}
             timestamp = int(time.time())
-            for deck_id in deck_ids:
+            for idx, deck_id in enumerate(deck_ids, start=1):
                 counts_by_deck[deck_id] = fetch_overdue_counts_by_phase(
                     None, deck_id, now_ts=timestamp
                 )
+                if total and (idx % max(1, total // 10 or 1) == 0 or idx == total):
+                    progress_cb(idx, total, f"Просрочки {idx}/{total}")
+            return counts_by_deck
 
+        def on_success(counts_by_deck: dict[int | None, PhaseOverdueBadges]):
             selected_counts = counts_by_deck.get(self.selected_deck_id)
             total_count = selected_counts.total if selected_counts else 0
 
@@ -5282,22 +5321,27 @@ class AnkiApp(tk.Tk):
 
             if self.phase_badge_manager:
                 self.phase_badge_manager.update(self.deck_items, counts_by_deck)
-        except sqlite3.OperationalError as e:
-            error_message = str(e)
+            self._overdue_task_running = False
+            self.schedule_overdue_badges_refresh()
+
+        def on_error(exc: Exception):
+            error_message = str(exc)
             os.makedirs("logs", exist_ok=True)
             with open(os.path.join("logs", "db.log"), "a", encoding="utf-8") as log_file:
                 log_file.write(f"[{datetime.now().isoformat()}] update_overdue_badge: {error_message}\n")
 
             if "unable to open database file" in error_message.lower():
-                counts_by_deck = {}
+                counts_by_deck: dict[int | None, PhaseOverdueBadges] = {}
                 if self.overdue_canvas is not None:
                     self.overdue_canvas.delete("all")
                 if self.phase_badge_manager:
                     self.phase_badge_manager.update(self.deck_items, counts_by_deck)
             else:
-                raise
+                messagebox.showerror("БД", error_message)
+            self._overdue_task_running = False
+            self.schedule_overdue_badges_refresh()
 
-        self.schedule_overdue_badges_refresh()
+        self.run_task("Просроченные карточки", "determinate", task, on_success, on_error, total=total or None)
 
     def schedule_overdue_badges_refresh(self):
         if self.overdue_update_job is not None:
@@ -6671,32 +6715,61 @@ class AnkiApp(tk.Tk):
         if self.selected_deck_id is None:
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
             return
-        cards = get_cards_for_repeat(self.selected_deck_id)
-        if self.selected_phase is not None:
-            cards = [c for c in cards if c["leitner_level"] == self.selected_phase]
-        if not cards:
-            phase_text = f" (фаза {self.selected_phase})" if self.selected_phase is not None else ""
-            messagebox.showinfo("Повторение", f"В этой колоде{phase_text} пока нет карточек.")
-            return
-        repeat_window = RepeatWindow(self, cards)
-        
-        # Добавляем кнопку в режим ознакомления
-        if hasattr(repeat_window, 'btn_frame'):
-            ttk.Button(repeat_window.btn_frame, text="Добавить в ознакомление", 
-                      command=self.add_cards_to_overview_from_repeat).grid(row=0, column=7, padx=5)
+        deck_id = self.selected_deck_id
+        phase_filter = self.selected_phase
+
+        def task(progress_cb):
+            cards = get_cards_for_repeat(deck_id)
+            if phase_filter is not None:
+                cards = [c for c in cards if c["leitner_level"] == phase_filter]
+            total = len(cards)
+            for idx in range(0, total, max(1, max(1, total // 20))):
+                progress_cb(min(idx + 1, total), total, f"Подготовка {min(idx + 1, total)}/{total}")
+            return cards
+
+        def on_success(cards):
+            if not cards:
+                phase_text = f" (фаза {phase_filter})" if phase_filter is not None else ""
+                messagebox.showinfo("Повторение", f"В этой колоде{phase_text} пока нет карточек.")
+                return
+            repeat_window = RepeatWindow(self, cards)
+
+            if hasattr(repeat_window, 'btn_frame'):
+                ttk.Button(repeat_window.btn_frame, text="Добавить в ознакомление",
+                          command=self.add_cards_to_overview_from_repeat).grid(row=0, column=7, padx=5)
+
+        def on_error(exc: Exception):
+            messagebox.showerror("Ошибка", str(exc))
+
+        self.run_task("Режим повторения", "determinate", task, on_success, on_error)
 
     def start_playback_mode(self):
         if self.selected_deck_id is None:
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
             return
-        cards = get_cards_for_playback(self.selected_deck_id)
-        if self.selected_phase is not None:
-            cards = [c for c in cards if c["leitner_level"] == self.selected_phase]
-        if not cards:
-            phase_text = f" (фаза {self.selected_phase})" if self.selected_phase is not None else ""
-            messagebox.showinfo("Воспроизведение", f"В этой колоде{phase_text} пока нет карточек.")
-            return
-        ReviewWindow(self, cards)
+        deck_id = self.selected_deck_id
+        phase_filter = self.selected_phase
+
+        def task(progress_cb):
+            cards = get_cards_for_playback(deck_id)
+            if phase_filter is not None:
+                cards = [c for c in cards if c["leitner_level"] == phase_filter]
+            total = len(cards)
+            for idx in range(0, total, max(1, max(1, total // 20))):
+                progress_cb(min(idx + 1, total), total, f"Подготовка {min(idx + 1, total)}/{total}")
+            return cards
+
+        def on_success(cards):
+            if not cards:
+                phase_text = f" (фаза {phase_filter})" if phase_filter is not None else ""
+                messagebox.showinfo("Воспроизведение", f"В этой колоде{phase_text} пока нет карточек.")
+                return
+            ReviewWindow(self, cards)
+
+        def on_error(exc: Exception):
+            messagebox.showerror("Ошибка", str(exc))
+
+        self.run_task("Режим воспроизведения", "determinate", task, on_success, on_error)
 
 
 class OverviewWindow(tk.Toplevel):
