@@ -16,6 +16,8 @@ import numpy as np
 from PIL import Image
 import pytesseract
 
+from tesseract_setup import build_tessdata_config, ensure_languages
+
 ProgressCallback = Callable[[int, int, str], None]
 
 
@@ -146,8 +148,17 @@ def ocr_photo_document(image_path: str, lang: str, progress_cb: ProgressCallback
     pil_img = Image.fromarray(binary)
 
     # Шаг 4: OCR
-    config_primary = "--oem 1 --psm 6"
-    config_secondary = "--oem 1 --psm 4"
+    config_primary = build_tessdata_config("--oem 1 --psm 6")
+    config_secondary = build_tessdata_config("--oem 1 --psm 4")
+
+    if "deu" in lang and "rus" in lang:
+        ok, missing = ensure_languages(["deu", "rus"])
+        if not ok:
+            missing_files = ", ".join(f"{code}.traineddata" for code in missing)
+            raise RuntimeError(
+                "Не найдены файлы языков для OCR. "
+                f"Ожидаются: {missing_files}."
+            )
     text = pytesseract.image_to_string(pil_img, lang=lang, config=config_primary)
     _report(progress_cb, 4, total_steps, "OCR (основной проход)")
 
