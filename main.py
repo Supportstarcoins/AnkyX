@@ -94,32 +94,44 @@ except ImportError:
     pytesseract = None
     OCR_AVAILABLE = False
 
-from shutil import which
+from tesseract_setup import (
+    build_tessdata_config,
+    configure_pytesseract,
+    ensure_languages,
+    get_tesseract_diag,
+    get_tessdata_dir,
+    get_tesseract_cmd,
+    is_tesseract_available as setup_is_tesseract_available,
+)
 
 
 def auto_configure_tesseract():
     if not OCR_AVAILABLE:
         return
-    cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", None)
-    if cmd and os.path.isabs(cmd) and os.path.exists(cmd):
-        return
-    common_paths = [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    ]
-    for path in common_paths:
-        if os.path.exists(path):
-            pytesseract.pytesseract.tesseract_cmd = path
-            return
+    configure_pytesseract()
 
 
 def is_tesseract_available() -> bool:
     if not OCR_AVAILABLE:
         return False
-    cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")
-    if os.path.isabs(cmd):
-        return os.path.exists(cmd)
-    return which(cmd) is not None
+    return setup_is_tesseract_available()
+
+
+def _ensure_deu_rus_present(selected_lang: str) -> bool:
+    if "deu" in selected_lang and "rus" in selected_lang:
+        ok, missing = ensure_languages(["deu", "rus"])
+        if not ok:
+            tessdata_dir = get_tessdata_dir() or r"C:\\Program Files\\Tesseract-OCR\\tessdata"
+            missing_files = ", ".join(f"{code}.traineddata" for code in missing)
+            messagebox.showerror(
+                "Не хватает языков Tesseract",
+                "Не найдены файлы языков для OCR.\n"
+                f"Ожидается папка tessdata: {tessdata_dir}\n"
+                f"Отсутствуют: {missing_files}\n\n"
+                "Скачайте deu.traineddata и rus.traineddata и поместите их в указанную папку.",
+            )
+            return False
+    return True
 
 
 auto_configure_tesseract()
@@ -297,7 +309,8 @@ def extract_id_with_ocr(image_path: str) -> int | None:
         img = Image.open(image_path)
         gray = ImageOps.grayscale(img)
         enhanced = ImageOps.autocontrast(gray)
-        text = pytesseract.image_to_string(enhanced)
+        config = build_tessdata_config("")
+        text = pytesseract.image_to_string(enhanced, config=config)
         match = re.search(r"(\d+)", text)
         if match:
             return int(match.group(1))
@@ -2718,7 +2731,8 @@ def auto_generate_cards_from_image(deck_id: int,
         raise FileNotFoundError(image_path)
 
     img = Image.open(image_path)
-    text = pytesseract.image_to_string(img)
+    config = build_tessdata_config("")
+    text = pytesseract.image_to_string(img, config=config)
     if not text.strip():
         return 0
 
@@ -6417,6 +6431,8 @@ class AnkiApp(tk.Tk):
                 return
             if ocr_task_holder["task"] is not None:
                 return
+            if not _ensure_deu_rus_present(ocr_lang_var.get()):
+                return
 
             ocr_progress_var.set(0)
             ocr_progress_label.set("Запуск…")
@@ -6426,12 +6442,18 @@ class AnkiApp(tk.Tk):
                 def progress_cb(step, total, label):
                     task_obj.queue.put(("ocr_progress", step, total, label))
 
-                if photo_mode_var.get() and ocr_photo_document:
-                    return ocr_photo_document(img_path, ocr_lang_var.get(), progress_cb)
-                task_obj.queue.put(("ocr_progress", 0, 1, "Загрузка изображения"))
-                with Image.open(img_path) as img:
-                    task_obj.queue.put(("ocr_progress", 1, 1, "OCR стандартный режим"))
-                    return pytesseract.image_to_string(img, lang=ocr_lang_var.get())
+                try:
+                    lang = ocr_lang_var.get()
+                    if photo_mode_var.get() and ocr_photo_document:
+                        return ocr_photo_document(img_path, lang, progress_cb)
+                    task_obj.queue.put(("ocr_progress", 0, 1, "Загрузка изображения"))
+                    with Image.open(img_path) as img:
+                        task_obj.queue.put(("ocr_progress", 1, 1, "OCR стандартный режим"))
+                        config = build_tessdata_config("")
+                        return pytesseract.image_to_string(img, lang=lang, config=config)
+                except Exception as e:
+                    diag = get_tesseract_diag()
+                    raise RuntimeError(f"{e}\n\nДиагностика Tesseract:\n{diag}") from e
 
             ocr_task_holder["task"] = start_background_task(worker)
             self.register_bg_handler(ocr_task_holder["task"].queue, handle_ocr_event)
