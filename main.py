@@ -145,16 +145,18 @@ def _ensure_deu_rus_present(selected_lang: str) -> bool:
 
 
 def _build_required_ocr_config(base_config: str = "--oem 1 --psm 6") -> tuple[str, str, str]:
-    tessdata_dir = get_tessdata_dir() or DEFAULT_TESSDATA_DIR
-    config = f'{base_config} --tessdata-dir "{tessdata_dir}"'.strip()
-    tesseract_cmd = get_tesseract_cmd() or DEFAULT_TESSERACT_CMD
+    tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
+    tessdata_dir_arg = tessdata_dir.replace("\\", "/")
+    config_base = (base_config or "--oem 1 --psm 6").strip()
+    config = f'{config_base} --tessdata-dir "{tessdata_dir_arg}"'
+    tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
     if pytesseract:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
     return config, tessdata_dir, tesseract_cmd
 
 
 def _ensure_required_lang_files() -> bool:
-    tessdata_dir = get_tessdata_dir() or DEFAULT_TESSDATA_DIR
+    tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
     missing_codes = [code for code in ("deu", "rus") if not os.path.isfile(os.path.join(tessdata_dir, f"{code}.traineddata"))]
     if missing_codes:
         missing_display = ", ".join(f"{code}.traineddata" for code in missing_codes)
@@ -170,13 +172,13 @@ def _ensure_required_lang_files() -> bool:
 
 
 def _format_ocr_diag(config: str, lang: str) -> str:
-    tessdata_dir = get_tessdata_dir() or DEFAULT_TESSDATA_DIR
-    tesseract_cmd = get_tesseract_cmd() or DEFAULT_TESSERACT_CMD
+    tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
+    tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
     diag = get_tesseract_diag()
     extra = [
         f"tesseract_cmd: {tesseract_cmd}",
-        f"tessdata_dir: {tessdata_dir}",
-        f"config: {config}",
+        f"tessdata_dir: {repr(tessdata_dir)}",
+        f"config: {repr(config)}",
         f"lang: {lang}",
     ]
     return "\n".join(extra + ["", "Диагностика Tesseract:", diag])
