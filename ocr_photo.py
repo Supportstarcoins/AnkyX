@@ -10,13 +10,17 @@ from __future__ import annotations
 import os
 import re
 from typing import Callable
+from pathlib import Path
+from uuid import uuid4
+import tempfile
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import pytesseract
 
 from tesseract_setup import ensure_languages, to_short_path
+from main import load_image_for_ocr, _format_image_diag
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -106,9 +110,8 @@ def ocr_photo_document(image_path: str, lang: str, progress_cb: ProgressCallback
     if not os.path.exists(image_path):
         raise FileNotFoundError(image_path)
 
-    img = cv2.imread(image_path)
-    if img is None:
-        raise RuntimeError("Не удалось прочитать изображение.")
+    pil_source_img = load_image_for_ocr(image_path)
+    img = cv2.cvtColor(np.array(pil_source_img), cv2.COLOR_RGB2BGR)
 
     img = _resize_to_limit(img)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -146,6 +149,8 @@ def ocr_photo_document(image_path: str, lang: str, progress_cb: ProgressCallback
     _report(progress_cb, 3, total_steps, "Нормализация освещения")
 
     pil_img = Image.fromarray(binary)
+    pil_img = ImageOps.exif_transpose(pil_img)
+    tmp_png = Path(tempfile.gettempdir()) / f"anky_ocr_{uuid4().hex}.png"
 
     # Шаг 4: OCR
     tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
@@ -166,14 +171,22 @@ def ocr_photo_document(image_path: str, lang: str, progress_cb: ProgressCallback
                 "Не найдены файлы языков для OCR. "
                 f"Ожидаются: {missing_files}."
             )
-    text = pytesseract.image_to_string(pil_img, lang=lang, config=config_primary)
-    _report(progress_cb, 4, total_steps, "OCR (основной проход)")
+    try:
+        pil_img.save(tmp_png, format="PNG")
+        text = pytesseract.image_to_string(str(tmp_png), lang=lang, config=config_primary)
+        _report(progress_cb, 4, total_steps, "OCR (основной проход)")
 
-    if _is_noisy(text):
-        text = pytesseract.image_to_string(pil_img, lang=lang, config=config_secondary)
+        if _is_noisy(text):
+            text = pytesseract.image_to_string(str(tmp_png), lang=lang, config=config_secondary)
 
-    # Шаг 5: постобработка
-    cleaned = _clean_text(text)
-    _report(progress_cb, 5, total_steps, "Очистка результата")
-    return cleaned
+        # Шаг 5: постобработка
+        cleaned = _clean_text(text)
+        _report(progress_cb, 5, total_steps, "Очистка результата")
+        return cleaned
+    except Exception as e:
+        diag = _format_image_diag(image_path, pil_source_img)
+        raise RuntimeError(f"{e}\n\n{diag}") from e
+    finally:
+        if tmp_png.exists():
+            tmp_png.unlink()
 

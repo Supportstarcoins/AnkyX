@@ -1,4 +1,5 @@
 import os, tempfile
+import io
 safe = tempfile.gettempdir()
 os.environ["TEMP"] = safe
 os.environ["TMP"] = safe
@@ -12,6 +13,8 @@ import json
 import csv
 import calendar
 import shutil
+from pathlib import Path
+from uuid import uuid4
 csv.field_size_limit(10 * 1024 * 1024)
 import gzip
 import pickle
@@ -171,7 +174,7 @@ def _ensure_required_lang_files() -> bool:
     return True
 
 
-def _format_ocr_diag(config: str, lang: str) -> str:
+def _format_ocr_diag(config: str, lang: str, image_diag: str | None = None) -> str:
     tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
     tessdata_dir_short = to_short_path(tessdata_dir)
     tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
@@ -183,7 +186,54 @@ def _format_ocr_diag(config: str, lang: str) -> str:
         f"config: {repr(config)}",
         f"lang: {lang}",
     ]
-    return "\n".join(extra + ["", "Диагностика Tesseract:", diag])
+    blocks = ["\n".join(extra), "Диагностика Tesseract:", diag]
+    if image_diag:
+        blocks.insert(1, image_diag)
+    return "\n\n".join(blocks)
+
+
+def _format_image_diag(image_path: str, img: Image.Image) -> str:
+    exists = os.path.exists(image_path)
+    size = os.path.getsize(image_path) if exists else 0
+    if PIL_AVAILABLE:
+        try:
+            import PIL
+
+            pil_version = getattr(PIL, "__version__", "unknown")
+        except Exception:
+            pil_version = "unknown"
+    else:
+        pil_version = "unavailable"
+    image_format = getattr(img, "_anky_original_format", None) or getattr(img, "format", None) or "unknown"
+    return "\n".join(
+        [
+            f"image_path: {image_path}",
+            f"exists/size bytes: {exists}/{size}",
+            f"PIL version: {pil_version}",
+            f"image format: {image_format}",
+            f"image mode: {getattr(img, 'mode', 'unknown')}",
+        ]
+    )
+
+
+def load_image_for_ocr(path: str) -> Image.Image:
+    if not PIL_AVAILABLE:
+        messagebox.showerror(
+            "Pillow не установлен",
+            "Установите Pillow:\nC:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow",
+        )
+        raise RuntimeError("Pillow недоступен")
+
+    with open(path, "rb") as f:
+        data = f.read()
+
+    img = Image.open(io.BytesIO(data))
+    img._anky_original_format = getattr(img, "format", None) or "unknown"
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    img.load()
+    return img
 
 
 auto_configure_tesseract()
@@ -6483,6 +6533,12 @@ class AnkiApp(tk.Tk):
                 messagebox.showerror("OCR (фото)", "Нужно: pip install opencv-python")
                 photo_mode_var.set(False)
                 return
+            if not PIL_AVAILABLE:
+                messagebox.showerror(
+                    "Pillow не установлен",
+                    "Установите Pillow:\nC:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow",
+                )
+                return
             if ocr_task_holder["task"] is not None:
                 return
             if not _ensure_deu_rus_present(ocr_lang_var.get()):
@@ -6504,11 +6560,23 @@ class AnkiApp(tk.Tk):
                     if photo_mode_var.get() and ocr_photo_document:
                         return ocr_photo_document(img_path, lang, progress_cb)
                     task_obj.queue.put(("ocr_progress", 0, 1, "Загрузка изображения"))
-                    with Image.open(img_path) as img:
+                    tmp_png = None
+                    try:
+                        img = load_image_for_ocr(img_path)
+                        image_diag = _format_image_diag(img_path, img)
+                        tmp_png = Path(tempfile.gettempdir()) / f"anky_ocr_{uuid4().hex}.png"
+                        img.save(tmp_png, format="PNG")
                         task_obj.queue.put(("ocr_progress", 1, 1, "OCR стандартный режим"))
-                        return pytesseract.image_to_string(img, lang=lang, config=config)
+                        return pytesseract.image_to_string(str(tmp_png), lang=lang, config=config)
+                    finally:
+                        if tmp_png and tmp_png.exists():
+                            tmp_png.unlink()
                 except Exception as e:
-                    diag = _format_ocr_diag(config if 'config' in locals() else "", lang if 'lang' in locals() else DEFAULT_OCR_LANG)
+                    diag = _format_ocr_diag(
+                        config if 'config' in locals() else "",
+                        lang if 'lang' in locals() else DEFAULT_OCR_LANG,
+                        image_diag if 'image_diag' in locals() else None,
+                    )
                     raise RuntimeError(f"{e}\n\n{diag}\n\nПроверьте путь к tessdata и tesseract.exe.") from e
 
             ocr_task_holder["task"] = start_background_task(worker)
