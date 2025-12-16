@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from shutil import which
 from typing import List, Optional, Tuple
@@ -18,6 +19,28 @@ DEFAULT_TESSDATA_DIR = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
 _TESSERACT_EXE: Optional[str] = None
 _TESSDATA_DIR: Optional[str] = None
 _TESSDATA_PREFIX: Optional[str] = None
+
+
+def _strip_quotes(path: str | None) -> str | None:
+    if path is None:
+        return None
+    return path.strip("\"'")
+
+
+def _quote_for_cli(path: str) -> str:
+    """Quote a path for CLI usage without introducing mismatched quotes.
+
+    The resulting string is safe to concatenate into a config option that will
+    later be tokenized by :func:`shlex.split` (used internally by pytesseract).
+    """
+
+    normalized = os.path.normpath(path)
+    normalized = _strip_quotes(normalized) or ""
+    if os.name == "nt":
+        # list2cmdline adds surrounding quotes only when needed and escapes
+        # internal quotes correctly for Windows.
+        return subprocess.list2cmdline([normalized])
+    return shlex.quote(normalized)
 
 
 def _candidate_tesseract_paths() -> List[str]:
@@ -55,7 +78,8 @@ def configure_pytesseract() -> Tuple[Optional[str], Optional[str], Optional[str]
     _TESSERACT_EXE, _TESSDATA_DIR, _TESSDATA_PREFIX = find_tesseract_install()
 
     if pytesseract:
-        pytesseract.pytesseract.tesseract_cmd = _TESSERACT_EXE or DEFAULT_TESSERACT_EXE
+        clean_cmd = _strip_quotes(_TESSERACT_EXE) or DEFAULT_TESSERACT_EXE
+        pytesseract.pytesseract.tesseract_cmd = os.path.normpath(clean_cmd)
 
     if _TESSDATA_PREFIX:
         os.environ["TESSDATA_PREFIX"] = _TESSDATA_PREFIX
@@ -75,7 +99,7 @@ def build_tessdata_config(base_config: str | None = "") -> str:
     config = (base_config or "").strip()
     tessdata_dir = get_tessdata_dir()
     if tessdata_dir:
-        extra = f'--tessdata-dir "{tessdata_dir}"'
+        extra = f"--tessdata-dir {_quote_for_cli(tessdata_dir)}"
         config = f"{config} {extra}".strip()
     return config
 

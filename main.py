@@ -145,11 +145,10 @@ def _ensure_deu_rus_present(selected_lang: str) -> bool:
 
 
 def _build_required_ocr_config(base_config: str = "--oem 1 --psm 6") -> tuple[str, str, str]:
-    tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
-    tessdata_dir_arg = tessdata_dir.replace("\\", "/")
+    tessdata_dir = get_tessdata_dir() or DEFAULT_TESSDATA_DIR
     config_base = (base_config or "--oem 1 --psm 6").strip()
-    config = f'{config_base} --tessdata-dir "{tessdata_dir_arg}"'
-    tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+    config = build_tessdata_config(config_base)
+    tesseract_cmd = get_tesseract_cmd() or DEFAULT_TESSERACT_CMD
     if pytesseract:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
     return config, tessdata_dir, tesseract_cmd
