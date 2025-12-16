@@ -1,6 +1,7 @@
 """Helpers for configuring Tesseract/pytesseract without system env vars."""
 from __future__ import annotations
 
+import ctypes
 import os
 import shlex
 import subprocess
@@ -25,6 +26,24 @@ def _strip_quotes(path: str | None) -> str | None:
     if path is None:
         return None
     return path.strip("\"'")
+
+
+def to_short_path(path: str) -> str:
+    """Return Windows 8.3 short path if available, otherwise the original path."""
+
+    if not path or os.name != "nt":
+        return path
+    try:
+        required = ctypes.windll.kernel32.GetShortPathNameW(path, None, 0)
+        if not required:
+            return path
+        buffer = ctypes.create_unicode_buffer(required)
+        result = ctypes.windll.kernel32.GetShortPathNameW(path, buffer, required)
+        if result == 0:
+            return path
+        return buffer.value or path
+    except Exception:
+        return path
 
 
 def _quote_for_cli(path: str) -> str:
@@ -77,12 +96,17 @@ def configure_pytesseract() -> Tuple[Optional[str], Optional[str], Optional[str]
 
     _TESSERACT_EXE, _TESSDATA_DIR, _TESSDATA_PREFIX = find_tesseract_install()
 
+    _TESSERACT_EXE = _TESSERACT_EXE or DEFAULT_TESSERACT_EXE
+    _TESSDATA_DIR = _TESSDATA_DIR or DEFAULT_TESSDATA_DIR
+    _TESSDATA_PREFIX = _TESSDATA_PREFIX or os.path.dirname(_TESSDATA_DIR)
+
     if pytesseract:
         clean_cmd = _strip_quotes(_TESSERACT_EXE) or DEFAULT_TESSERACT_EXE
-        pytesseract.pytesseract.tesseract_cmd = os.path.normpath(clean_cmd)
+        clean_cmd = os.path.normpath(clean_cmd)
+        pytesseract.pytesseract.tesseract_cmd = to_short_path(clean_cmd)
 
     if _TESSDATA_PREFIX:
-        os.environ["TESSDATA_PREFIX"] = _TESSDATA_PREFIX
+        os.environ["TESSDATA_PREFIX"] = to_short_path(_TESSDATA_PREFIX)
 
     return _TESSERACT_EXE, _TESSDATA_DIR, _TESSDATA_PREFIX
 
@@ -99,7 +123,8 @@ def build_tessdata_config(base_config: str | None = "") -> str:
     config = (base_config or "").strip()
     tessdata_dir = get_tessdata_dir()
     if tessdata_dir:
-        extra = f"--tessdata-dir {_quote_for_cli(tessdata_dir)}"
+        tessdata_dir_short = to_short_path(os.path.normpath(tessdata_dir))
+        extra = f"--tessdata-dir {tessdata_dir_short}"
         config = f"{config} {extra}".strip()
     return config
 
