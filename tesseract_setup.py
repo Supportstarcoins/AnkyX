@@ -12,16 +12,16 @@ except ImportError:  # pragma: no cover - optional dependency
     pytesseract = None
 
 
+DEFAULT_TESSERACT_EXE = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+DEFAULT_TESSDATA_DIR = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
+
 _TESSERACT_EXE: Optional[str] = None
 _TESSDATA_DIR: Optional[str] = None
 _TESSDATA_PREFIX: Optional[str] = None
 
 
 def _candidate_tesseract_paths() -> List[str]:
-    candidates = [
-        r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
-        r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe",
-    ]
+    candidates = [DEFAULT_TESSERACT_EXE, r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe"]
     if pytesseract:
         cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", None)
         if cmd and os.path.isabs(cmd):
@@ -33,10 +33,7 @@ def _candidate_tesseract_paths() -> List[str]:
 
 
 def _candidate_tessdata_dirs() -> List[str]:
-    return [
-        r"C:\\Program Files\\Tesseract-OCR\\tessdata",
-        r"C:\\Program Files (x86)\\Tesseract-OCR\\tessdata",
-    ]
+    return [DEFAULT_TESSDATA_DIR, r"C:\\Program Files (x86)\\Tesseract-OCR\\tessdata"]
 
 
 def find_tesseract_install() -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -57,8 +54,8 @@ def configure_pytesseract() -> Tuple[Optional[str], Optional[str], Optional[str]
 
     _TESSERACT_EXE, _TESSDATA_DIR, _TESSDATA_PREFIX = find_tesseract_install()
 
-    if pytesseract and _TESSERACT_EXE:
-        pytesseract.pytesseract.tesseract_cmd = _TESSERACT_EXE
+    if pytesseract:
+        pytesseract.pytesseract.tesseract_cmd = _TESSERACT_EXE or DEFAULT_TESSERACT_EXE
 
     if _TESSDATA_PREFIX:
         os.environ["TESSDATA_PREFIX"] = _TESSDATA_PREFIX
@@ -67,17 +64,18 @@ def configure_pytesseract() -> Tuple[Optional[str], Optional[str], Optional[str]
 
 
 def get_tesseract_cmd() -> Optional[str]:
-    return _TESSERACT_EXE
+    return _TESSERACT_EXE or DEFAULT_TESSERACT_EXE
 
 
 def get_tessdata_dir() -> Optional[str]:
-    return _TESSDATA_DIR
+    return _TESSDATA_DIR or DEFAULT_TESSDATA_DIR
 
 
 def build_tessdata_config(base_config: str | None = "") -> str:
     config = (base_config or "").strip()
-    if _TESSDATA_DIR:
-        extra = f'--tessdata-dir "{_TESSDATA_DIR}"'
+    tessdata_dir = get_tessdata_dir()
+    if tessdata_dir:
+        extra = f'--tessdata-dir "{tessdata_dir}"'
         config = f"{config} {extra}".strip()
     return config
 
@@ -85,11 +83,12 @@ def build_tessdata_config(base_config: str | None = "") -> str:
 def ensure_languages(lang_codes: List[str]) -> Tuple[bool, List[str]]:
     if not lang_codes:
         return True, []
-    if not _TESSDATA_DIR:
+    tessdata_dir = get_tessdata_dir()
+    if not tessdata_dir:
         return False, lang_codes
     missing = []
     for code in lang_codes:
-        expected_file = os.path.join(_TESSDATA_DIR, f"{code}.traineddata")
+        expected_file = os.path.join(tessdata_dir, f"{code}.traineddata")
         if not os.path.isfile(expected_file):
             missing.append(code)
     return len(missing) == 0, missing
