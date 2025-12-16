@@ -95,13 +95,13 @@ except ImportError:
     OCR_AVAILABLE = False
 
 from tesseract_setup import (
-    build_tessdata_config,
     configure_pytesseract,
     ensure_languages,
     get_tesseract_diag,
     get_tessdata_dir,
     get_tesseract_cmd,
     is_tesseract_available as setup_is_tesseract_available,
+    to_short_path,
 )
 
 DEFAULT_TESSDATA_DIR = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
@@ -145,13 +145,14 @@ def _ensure_deu_rus_present(selected_lang: str) -> bool:
 
 
 def _build_required_ocr_config(base_config: str = "--oem 1 --psm 6") -> tuple[str, str, str]:
-    tessdata_dir = get_tessdata_dir() or DEFAULT_TESSDATA_DIR
+    tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
+    tessdata_dir_short = to_short_path(tessdata_dir)
     config_base = (base_config or "--oem 1 --psm 6").strip()
-    config = build_tessdata_config(config_base)
-    tesseract_cmd = get_tesseract_cmd() or DEFAULT_TESSERACT_CMD
+    config = f"{config_base} --tessdata-dir {tessdata_dir_short}".strip()
+    tesseract_cmd = to_short_path(get_tesseract_cmd() or DEFAULT_TESSERACT_CMD)
     if pytesseract:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-    return config, tessdata_dir, tesseract_cmd
+    return config, tessdata_dir_short, tesseract_cmd
 
 
 def _ensure_required_lang_files() -> bool:
@@ -172,11 +173,13 @@ def _ensure_required_lang_files() -> bool:
 
 def _format_ocr_diag(config: str, lang: str) -> str:
     tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
+    tessdata_dir_short = to_short_path(tessdata_dir)
     tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
     diag = get_tesseract_diag()
     extra = [
         f"tesseract_cmd: {tesseract_cmd}",
         f"tessdata_dir: {repr(tessdata_dir)}",
+        f"tessdata_dir_short: {tessdata_dir_short}",
         f"config: {repr(config)}",
         f"lang: {lang}",
     ]
