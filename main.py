@@ -104,6 +104,10 @@ from tesseract_setup import (
     is_tesseract_available as setup_is_tesseract_available,
 )
 
+DEFAULT_TESSDATA_DIR = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
+DEFAULT_TESSERACT_CMD = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+DEFAULT_OCR_LANG = "deu+rus"
+
 
 def auto_configure_tesseract():
     if not OCR_AVAILABLE:
@@ -119,19 +123,63 @@ def is_tesseract_available() -> bool:
 
 def _ensure_deu_rus_present(selected_lang: str) -> bool:
     if "deu" in selected_lang and "rus" in selected_lang:
+        tessdata_dir = get_tessdata_dir() or DEFAULT_TESSDATA_DIR
         ok, missing = ensure_languages(["deu", "rus"])
-        if not ok:
-            tessdata_dir = get_tessdata_dir() or r"C:\\Program Files\\Tesseract-OCR\\tessdata"
-            missing_files = ", ".join(f"{code}.traineddata" for code in missing)
+        missing_files = [code for code in missing]
+        for code in ["deu", "rus"]:
+            expected_file = os.path.join(tessdata_dir, f"{code}.traineddata")
+            if not os.path.isfile(expected_file) and code not in missing_files:
+                missing_files.append(code)
+
+        if missing_files:
+            missing_display = ", ".join(f"{code}.traineddata" for code in missing_files)
             messagebox.showerror(
                 "Не хватает языков Tesseract",
                 "Не найдены файлы языков для OCR.\n"
                 f"Ожидается папка tessdata: {tessdata_dir}\n"
-                f"Отсутствуют: {missing_files}\n\n"
+                f"Отсутствуют: {missing_display}\n\n"
                 "Скачайте deu.traineddata и rus.traineddata и поместите их в указанную папку.",
             )
             return False
     return True
+
+
+def _build_required_ocr_config(base_config: str = "--oem 1 --psm 6") -> tuple[str, str, str]:
+    tessdata_dir = get_tessdata_dir() or DEFAULT_TESSDATA_DIR
+    config = f'{base_config} --tessdata-dir "{tessdata_dir}"'.strip()
+    tesseract_cmd = get_tesseract_cmd() or DEFAULT_TESSERACT_CMD
+    if pytesseract:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    return config, tessdata_dir, tesseract_cmd
+
+
+def _ensure_required_lang_files() -> bool:
+    tessdata_dir = get_tessdata_dir() or DEFAULT_TESSDATA_DIR
+    missing_codes = [code for code in ("deu", "rus") if not os.path.isfile(os.path.join(tessdata_dir, f"{code}.traineddata"))]
+    if missing_codes:
+        missing_display = ", ".join(f"{code}.traineddata" for code in missing_codes)
+        messagebox.showerror(
+            "Не хватает языков Tesseract",
+            "Не найдены файлы языков для OCR.\n"
+            f"Ожидается папка tessdata: {tessdata_dir}\n"
+            f"Отсутствуют: {missing_display}\n\n"
+            "Скачайте deu.traineddata и rus.traineddata и поместите их в указанную папку.",
+        )
+        return False
+    return True
+
+
+def _format_ocr_diag(config: str, lang: str) -> str:
+    tessdata_dir = get_tessdata_dir() or DEFAULT_TESSDATA_DIR
+    tesseract_cmd = get_tesseract_cmd() or DEFAULT_TESSERACT_CMD
+    diag = get_tesseract_diag()
+    extra = [
+        f"tesseract_cmd: {tesseract_cmd}",
+        f"tessdata_dir: {tessdata_dir}",
+        f"config: {config}",
+        f"lang: {lang}",
+    ]
+    return "\n".join(extra + ["", "Диагностика Tesseract:", diag])
 
 
 auto_configure_tesseract()
@@ -309,8 +357,8 @@ def extract_id_with_ocr(image_path: str) -> int | None:
         img = Image.open(image_path)
         gray = ImageOps.grayscale(img)
         enhanced = ImageOps.autocontrast(gray)
-        config = build_tessdata_config("")
-        text = pytesseract.image_to_string(enhanced, config=config)
+        config, _, _ = _build_required_ocr_config("--oem 1 --psm 6")
+        text = pytesseract.image_to_string(enhanced, lang=DEFAULT_OCR_LANG, config=config)
         match = re.search(r"(\d+)", text)
         if match:
             return int(match.group(1))
@@ -2729,10 +2777,12 @@ def auto_generate_cards_from_image(deck_id: int,
         raise RuntimeError("Tesseract OCR не настроен.")
     if not os.path.exists(image_path):
         raise FileNotFoundError(image_path)
+    if not _ensure_required_lang_files():
+        raise RuntimeError("Не найдены файлы deu.traineddata / rus.traineddata в tessdata.")
 
     img = Image.open(image_path)
-    config = build_tessdata_config("")
-    text = pytesseract.image_to_string(img, config=config)
+    config, _, _ = _build_required_ocr_config("--oem 1 --psm 6")
+    text = pytesseract.image_to_string(img, lang=DEFAULT_OCR_LANG, config=config)
     if not text.strip():
         return 0
 
@@ -6433,6 +6483,8 @@ class AnkiApp(tk.Tk):
                 return
             if not _ensure_deu_rus_present(ocr_lang_var.get()):
                 return
+            if not _ensure_required_lang_files():
+                return
 
             ocr_progress_var.set(0)
             ocr_progress_label.set("Запуск…")
@@ -6443,17 +6495,17 @@ class AnkiApp(tk.Tk):
                     task_obj.queue.put(("ocr_progress", step, total, label))
 
                 try:
-                    lang = ocr_lang_var.get()
+                    lang = ocr_lang_var.get() or DEFAULT_OCR_LANG
+                    config, tessdata_dir, tesseract_cmd = _build_required_ocr_config("--oem 1 --psm 6")
                     if photo_mode_var.get() and ocr_photo_document:
                         return ocr_photo_document(img_path, lang, progress_cb)
                     task_obj.queue.put(("ocr_progress", 0, 1, "Загрузка изображения"))
                     with Image.open(img_path) as img:
                         task_obj.queue.put(("ocr_progress", 1, 1, "OCR стандартный режим"))
-                        config = build_tessdata_config("")
                         return pytesseract.image_to_string(img, lang=lang, config=config)
                 except Exception as e:
-                    diag = get_tesseract_diag()
-                    raise RuntimeError(f"{e}\n\nДиагностика Tesseract:\n{diag}") from e
+                    diag = _format_ocr_diag(config if 'config' in locals() else "", lang if 'lang' in locals() else DEFAULT_OCR_LANG)
+                    raise RuntimeError(f"{e}\n\n{diag}\n\nПроверьте путь к tessdata и tesseract.exe.") from e
 
             ocr_task_holder["task"] = start_background_task(worker)
             self.register_bg_handler(ocr_task_holder["task"].queue, handle_ocr_event)
