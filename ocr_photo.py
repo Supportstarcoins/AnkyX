@@ -707,6 +707,14 @@ def _run_variant_ocr(
     return text, avg_conf, words_count, score
 
 
+def _prepare_column_image(column_img: np.ndarray) -> np.ndarray:
+    pad = 40
+    col = cv2.copyMakeBorder(column_img, pad, pad, pad, pad, borderType=cv2.BORDER_CONSTANT, value=255)
+    if col.shape[1] < 1400:
+        col = cv2.resize(col, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    return col
+
+
 def _run_best_column_ocr(
     column_img: np.ndarray,
     lang: str,
@@ -714,43 +722,45 @@ def _run_best_column_ocr(
     dpi: int | None,
     debug_dir: Path | None,
     prefix: str,
-) -> str:
-    pad = 40
-    padded = cv2.copyMakeBorder(column_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
-    variants = preprocess_variants(padded)
-
-    if debug_dir:
-        for name, img in variants:
-            _save_debug_image(debug_dir, f"{prefix}{name}", img)
-
+) -> tuple[str, int]:
     best_text = ""
     best_score = -1e9
     best_avg_conf = 0.0
     best_words = 0
-    best_variant = ""
+    best_psm = 4
 
-    def evaluate(psm: int):
-        nonlocal best_text, best_score, best_avg_conf, best_variant, best_words
-        for name, img in variants:
-            text, avg_conf, words_count, score = _run_variant_ocr(img, lang=lang, psm=psm, preserve_spaces=preserve_spaces, dpi=dpi)
-            print(
-                f"[OCR][{prefix}{name}] psm={psm} words={words_count} avg_conf={avg_conf:.1f} score={score:.2f}"
-            )
-            if score > best_score or (abs(score - best_score) < 1e-6 and len(text) > len(best_text)):
-                best_score = score
-                best_text = text
-                best_avg_conf = avg_conf
-                best_variant = name
-                best_words = words_count
+    for psm in (4, 6):
+        config = _build_tesseract_config(psm, preserve_spaces=preserve_spaces, dpi=dpi)
+        pil_img = Image.fromarray(column_img)
+        data = _tesseract_image_to_data(pil_img, lang=lang, config=config)
+        words_conf: list[float] = []
+        for raw_conf in data.get("conf", []) or []:
+            try:
+                conf_value = float(raw_conf)
+            except Exception:  # noqa: BLE001
+                continue
+            if conf_value == -1:
+                continue
+            words_conf.append(conf_value)
+        words_count = len(words_conf)
+        avg_conf = float(np.mean(words_conf)) if words_conf else 0.0
+        score = avg_conf + min(words_count, 200) / 10
+        text_candidate = _reconstruct_text_from_data(data, preserve_spaces=preserve_spaces)
+        print(f"[OCR][{prefix.upper()}] psm={psm} avg_conf={avg_conf:.1f} words={words_count} score={score:.2f}")
 
-    evaluate(4)
-    if len(best_text.strip()) < 30:
-        evaluate(6)
+        if score > best_score or (abs(score - best_score) < 1e-6 and len(best_text) < len(text_candidate)):
+            best_score = score
+            best_avg_conf = avg_conf
+            best_words = words_count
+            best_psm = psm
+            best_text = text_candidate
 
     print(
-        f"[OCR][{prefix}] selected variant={best_variant} words={best_words} avg_conf={best_avg_conf:.1f} score={best_score:.2f}"
+        f"[OCR][{prefix.upper()}] selected psm={best_psm} words={best_words} avg_conf={best_avg_conf:.1f} score={best_score:.2f}"
     )
-    return best_text
+    if debug_dir:
+        _save_debug_image(debug_dir, f"debug_{prefix}_best", column_img)
+    return best_text, best_psm
 
 
 def ocr_with_tesseract(image: np.ndarray, lang: str, psm: int = 4, preserve_spaces: bool = True, dpi: int | None = 300) -> str:
@@ -948,28 +958,27 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
             x_split, left_img, right_img = split_columns_auto(split_source, options.split_offset_percent)
             _save_debug_image(debug_dir, "04_split_left", left_img)
             _save_debug_image(debug_dir, "05_split_right", right_img)
-            pad = 40
-            left_img = cv2.copyMakeBorder(left_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
-            right_img = cv2.copyMakeBorder(right_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+            left_img = _prepare_column_image(left_img)
+            right_img = _prepare_column_image(right_img)
             if options.debug_images:
-                _save_debug_image(debug_dir, "06_left_padded", left_img)
-                _save_debug_image(debug_dir, "07_right_padded", right_img)
+                _save_debug_image(debug_dir, "debug_left_input", left_img)
+                _save_debug_image(debug_dir, "debug_right_input", right_img)
 
-            left_engine_text = _run_best_column_ocr(
+            left_engine_text, _ = _run_best_column_ocr(
                 left_img,
                 lang="deu",
                 preserve_spaces=options.preserve_spaces,
                 dpi=options.dpi,
                 debug_dir=debug_dir if options.debug_images else None,
-                prefix="left_",
+                prefix="left",
             )
-            right_engine_text = _run_best_column_ocr(
+            right_engine_text, _ = _run_best_column_ocr(
                 right_img,
                 lang="rus",
                 preserve_spaces=options.preserve_spaces,
                 dpi=options.dpi,
                 debug_dir=debug_dir if options.debug_images else None,
-                prefix="right_",
+                prefix="right",
             )
             left_engine_text = _postprocess_column_text(left_engine_text, "deu")
             right_engine_text = _postprocess_column_text(right_engine_text, "rus")
