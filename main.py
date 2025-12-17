@@ -110,6 +110,7 @@ from tesseract_setup import (
 DEFAULT_TESSDATA_DIR = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
 DEFAULT_TESSERACT_CMD = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
 DEFAULT_OCR_LANG = "deu+rus"
+DEFAULT_OCR_CONFIG_BASE = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
 
 
 def auto_configure_tesseract():
@@ -147,7 +148,7 @@ def _ensure_deu_rus_present(selected_lang: str) -> bool:
     return True
 
 
-def _build_required_ocr_config(base_config: str = "--oem 1 --psm 6") -> tuple[str, str, str]:
+def _build_required_ocr_config(base_config: str = DEFAULT_OCR_CONFIG_BASE) -> tuple[str, str, str]:
     tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
     tessdata_dir_short = to_short_path(tessdata_dir)
     config_base = (base_config or "--oem 1 --psm 6").strip()
@@ -174,7 +175,13 @@ def _ensure_required_lang_files() -> bool:
     return True
 
 
-def _format_ocr_diag(config: str, lang: str, image_diag: str | None = None) -> str:
+def _format_ocr_diag(
+    config: str,
+    lang: str,
+    image_diag: str | None = None,
+    ocr_mode: str | None = None,
+    preprocess_enabled: bool | None = None,
+) -> str:
     tessdata_dir = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
     tessdata_dir_short = to_short_path(tessdata_dir)
     tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
@@ -185,6 +192,10 @@ def _format_ocr_diag(config: str, lang: str, image_diag: str | None = None) -> s
         f"tessdata_dir_short: {tessdata_dir_short}",
         f"config: {repr(config)}",
         f"lang: {lang}",
+        f"ocr_mode: {ocr_mode or 'standard'}",
+        f"preprocess_enabled: {preprocess_enabled}",
+        f"PIL version: {_get_pil_version()}",
+        f"OpenCV version: {_get_cv2_version()}",
     ]
     blocks = ["\n".join(extra), "Диагностика Tesseract:", diag]
     if image_diag:
@@ -195,20 +206,15 @@ def _format_ocr_diag(config: str, lang: str, image_diag: str | None = None) -> s
 def _format_image_diag(image_path: str, img: Image.Image) -> str:
     exists = os.path.exists(image_path)
     size = os.path.getsize(image_path) if exists else 0
-    if PIL_AVAILABLE:
-        try:
-            import PIL
-
-            pil_version = getattr(PIL, "__version__", "unknown")
-        except Exception:
-            pil_version = "unknown"
-    else:
-        pil_version = "unavailable"
+    pil_version = _get_pil_version()
+    dimensions = getattr(img, "size", None)
+    width, height = dimensions if dimensions else ("unknown", "unknown")
     image_format = getattr(img, "_anky_original_format", None) or getattr(img, "format", None) or "unknown"
     return "\n".join(
         [
             f"image_path: {image_path}",
             f"exists/size bytes: {exists}/{size}",
+            f"dimensions: {width}x{height}",
             f"PIL version: {pil_version}",
             f"image format: {image_format}",
             f"image mode: {getattr(img, 'mode', 'unknown')}",
@@ -234,6 +240,78 @@ def load_image_for_ocr(path: str) -> Image.Image:
         img = img.convert("RGB")
     img.load()
     return img
+
+
+def _get_pil_version() -> str:
+    if PIL_AVAILABLE:
+        try:
+            import PIL
+
+            return getattr(PIL, "__version__", "unknown")
+        except Exception:
+            return "unknown"
+    return "unavailable"
+
+
+def _get_cv2_version() -> str:
+    if CV2_AVAILABLE:
+        try:
+            import cv2 as _cv2
+
+            return getattr(_cv2, "__version__", "unknown")
+        except Exception:
+            return "unknown"
+    return "unavailable"
+
+
+def preprocess_for_ocr(image_path: str) -> Image.Image:
+    if not CV2_AVAILABLE or not NUMPY_AVAILABLE:
+        messagebox.showerror(
+            "OpenCV не установлен",
+            "Установите OpenCV и NumPy:\nC:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
+        )
+        raise RuntimeError("OpenCV/NumPy недоступны для предобработки")
+
+    pil_img = load_image_for_ocr(image_path)
+    np_img = np.array(pil_img)
+    img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+
+    h, w = img.shape[:2]
+    img = cv2.resize(img, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe_img = clahe.apply(gray)
+
+    denoised = cv2.bilateralFilter(clahe_img, d=7, sigmaColor=50, sigmaSpace=50)
+    binary = cv2.adaptiveThreshold(
+        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 11
+    )
+
+    return Image.fromarray(binary)
+
+
+def split_two_columns(pil_img: Image.Image) -> tuple[Image.Image, Image.Image]:
+    if pil_img.mode not in ("RGB", "L"):
+        pil_img = pil_img.convert("RGB")
+    w, h = pil_img.size
+    padding = max(1, int(w * 0.03))
+    mid = w // 2
+    left_box = (max(0, 0), 0, max(padding, mid - padding), h)
+    right_box = (min(w, mid + padding), 0, w, h)
+    left_img = pil_img.crop(left_box)
+    right_img = pil_img.crop(right_box)
+    return left_img, right_img
+
+
+def ocr_image(pil_img: Image.Image, lang: str, config: str) -> str:
+    tmp_png = Path(tempfile.gettempdir()) / f"anky_ocr_{uuid4().hex}.png"
+    try:
+        pil_img.save(tmp_png, format="PNG")
+        return pytesseract.image_to_string(str(tmp_png), lang=lang, config=config)
+    finally:
+        if tmp_png.exists():
+            tmp_png.unlink()
 
 
 auto_configure_tesseract()
@@ -411,7 +489,7 @@ def extract_id_with_ocr(image_path: str) -> int | None:
         img = Image.open(image_path)
         gray = ImageOps.grayscale(img)
         enhanced = ImageOps.autocontrast(gray)
-        config, _, _ = _build_required_ocr_config("--oem 1 --psm 6")
+        config, _, _ = _build_required_ocr_config(DEFAULT_OCR_CONFIG_BASE)
         text = pytesseract.image_to_string(enhanced, lang=DEFAULT_OCR_LANG, config=config)
         match = re.search(r"(\d+)", text)
         if match:
@@ -2835,7 +2913,7 @@ def auto_generate_cards_from_image(deck_id: int,
         raise RuntimeError("Не найдены файлы deu.traineddata / rus.traineddata в tessdata.")
 
     img = Image.open(image_path)
-    config, _, _ = _build_required_ocr_config("--oem 1 --psm 6")
+    config, _, _ = _build_required_ocr_config(DEFAULT_OCR_CONFIG_BASE)
     text = pytesseract.image_to_string(img, lang=DEFAULT_OCR_LANG, config=config)
     if not text.strip():
         return 0
@@ -6465,18 +6543,30 @@ class AnkiApp(tk.Tk):
         ocr_opts = ttk.LabelFrame(main_frame, text="OCR настройки")
         ocr_opts.pack(fill=tk.X, pady=(0, 10))
 
+        ocr_mode_var = tk.StringVar(value="single")
+        ttk.Label(ocr_opts, text="Режим:").grid(row=0, column=0, sticky="w", padx=(10, 5), pady=5)
+        ttk.Radiobutton(ocr_opts, text="Обычный OCR", variable=ocr_mode_var, value="single").grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        ttk.Radiobutton(ocr_opts, text="2 колонки (DE|RU)", variable=ocr_mode_var, value="two_columns").grid(row=0, column=2, sticky="w", padx=5, pady=5)
+
+        preprocess_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ocr_opts,
+            text="Улучшить фото (OpenCV)",
+            variable=preprocess_var,
+        ).grid(row=1, column=0, sticky="w", padx=10, pady=5)
+
         photo_mode_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             ocr_opts,
             text="Фото (тени/перспектива)",
             variable=photo_mode_var,
-        ).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        ).grid(row=1, column=1, sticky="w", padx=5, pady=5)
 
-        ttk.Label(ocr_opts, text="Языки OCR:").grid(row=0, column=1, sticky="e")
+        ttk.Label(ocr_opts, text="Языки OCR:").grid(row=1, column=2, sticky="e")
         ocr_lang_var = tk.StringVar(value="deu+rus")
         lang_choices = ("deu+rus", "deu+rus+eng")
         ocr_lang_combo = ttk.Combobox(ocr_opts, textvariable=ocr_lang_var, values=lang_choices, state="readonly", width=15)
-        ocr_lang_combo.grid(row=0, column=2, sticky="w", padx=5)
+        ocr_lang_combo.grid(row=1, column=3, sticky="w", padx=5)
 
         ocr_progress_var = tk.DoubleVar(value=0)
         ocr_progress_label = tk.StringVar(value="Ожидание запуска…")
@@ -6529,6 +6619,13 @@ class AnkiApp(tk.Tk):
                 messagebox.showerror("Ошибка OCR", event[1])
 
         def run_ocr():
+            if preprocess_var.get() and not CV2_AVAILABLE:
+                messagebox.showerror(
+                    "OpenCV не установлен",
+                    "Установите OpenCV и NumPy:\nC:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
+                )
+                preprocess_var.set(False)
+                return
             if photo_mode_var.get() and not CV2_AVAILABLE:
                 messagebox.showerror("OCR (фото)", "Нужно: pip install opencv-python")
                 photo_mode_var.set(False)
@@ -6541,7 +6638,8 @@ class AnkiApp(tk.Tk):
                 return
             if ocr_task_holder["task"] is not None:
                 return
-            if not _ensure_deu_rus_present(ocr_lang_var.get()):
+            selected_lang = ocr_lang_var.get() if ocr_mode_var.get() == "single" else "deu+rus"
+            if not _ensure_deu_rus_present(selected_lang):
                 return
             if not _ensure_required_lang_files():
                 return
@@ -6555,27 +6653,51 @@ class AnkiApp(tk.Tk):
                     task_obj.queue.put(("ocr_progress", step, total, label))
 
                 try:
-                    lang = ocr_lang_var.get() or DEFAULT_OCR_LANG
-                    config, tessdata_dir, tesseract_cmd = _build_required_ocr_config("--oem 1 --psm 6")
+                    lang = selected_lang or DEFAULT_OCR_LANG
+                    ocr_mode = ocr_mode_var.get()
+                    preprocess_enabled = preprocess_var.get()
+                    config, tessdata_dir, tesseract_cmd = _build_required_ocr_config(DEFAULT_OCR_CONFIG_BASE)
                     if photo_mode_var.get() and ocr_photo_document:
                         return ocr_photo_document(img_path, lang, progress_cb)
-                    task_obj.queue.put(("ocr_progress", 0, 1, "Загрузка изображения"))
-                    tmp_png = None
-                    try:
-                        img = load_image_for_ocr(img_path)
-                        image_diag = _format_image_diag(img_path, img)
-                        tmp_png = Path(tempfile.gettempdir()) / f"anky_ocr_{uuid4().hex}.png"
-                        img.save(tmp_png, format="PNG")
-                        task_obj.queue.put(("ocr_progress", 1, 1, "OCR стандартный режим"))
-                        return pytesseract.image_to_string(str(tmp_png), lang=lang, config=config)
-                    finally:
-                        if tmp_png and tmp_png.exists():
-                            tmp_png.unlink()
+                    task_obj.queue.put(("ocr_progress", 0, 4, "Загрузка изображения"))
+                    img = load_image_for_ocr(img_path)
+                    image_diag = _format_image_diag(img_path, img)
+                    working_img = img
+
+                    if preprocess_enabled:
+                        task_obj.queue.put(("ocr_progress", 1, 4, "Предобработка (OpenCV)"))
+                        working_img = preprocess_for_ocr(img_path)
+                    else:
+                        task_obj.queue.put(("ocr_progress", 1, 4, "Предобработка отключена"))
+
+                    if ocr_mode == "two_columns":
+                        task_obj.queue.put(("ocr_progress", 2, 4, "Деление на 2 колонки"))
+                        left_img, right_img = split_two_columns(working_img)
+                        left_text = ocr_image(left_img, "deu", config).strip()
+                        task_obj.queue.put(("ocr_progress", 3, 4, "OCR левая колонка (DE)"))
+                        right_text = ocr_image(right_img, "rus", config).strip()
+                        combined = "\n\n".join(
+                            [
+                                "--- DE ---",
+                                left_text,
+                                "--- RU ---",
+                                right_text,
+                            ]
+                        )
+                        task_obj.queue.put(("ocr_progress", 4, 4, "OCR завершен"))
+                        return combined
+
+                    task_obj.queue.put(("ocr_progress", 2, 4, "OCR стандартный режим"))
+                    text = ocr_image(working_img, lang, config)
+                    task_obj.queue.put(("ocr_progress", 4, 4, "OCR завершен"))
+                    return text
                 except Exception as e:
                     diag = _format_ocr_diag(
                         config if 'config' in locals() else "",
                         lang if 'lang' in locals() else DEFAULT_OCR_LANG,
                         image_diag if 'image_diag' in locals() else None,
+                        ocr_mode if 'ocr_mode' in locals() else None,
+                        preprocess_enabled if 'preprocess_enabled' in locals() else None,
                     )
                     raise RuntimeError(f"{e}\n\n{diag}\n\nПроверьте путь к tessdata и tesseract.exe.") from e
 
@@ -6583,7 +6705,7 @@ class AnkiApp(tk.Tk):
             self.register_bg_handler(ocr_task_holder["task"].queue, handle_ocr_event)
 
         ocr_button = ttk.Button(ocr_opts, text="Запустить OCR", command=run_ocr)
-        ocr_button.grid(row=0, column=3, padx=10)
+        ocr_button.grid(row=0, column=4, padx=10, rowspan=2)
 
         # Фрейм с настройками генерации
         settings_frame = ttk.LabelFrame(main_frame, text="Настройки генерации карточек")
