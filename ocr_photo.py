@@ -157,8 +157,8 @@ def ocr_photo_document(image_path: str, lang: str, progress_cb: ProgressCallback
     tessdata_dir_short = to_short_path(tessdata_dir)
     pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
 
-    config_primary = f"--oem 1 --psm 6 --tessdata-dir {tessdata_dir_short}"
-    config_secondary = f"--oem 1 --psm 4 --tessdata-dir {tessdata_dir_short}"
+    config_primary = f"--oem 1 --psm 6 -c preserve_interword_spaces=1 --tessdata-dir {tessdata_dir_short}"
+    config_secondary = f"--oem 1 --psm 4 -c preserve_interword_spaces=1 --tessdata-dir {tessdata_dir_short}"
     print(f"[OCR] tessdata_dir_short={tessdata_dir_short}")
     print(f"[OCR] config_primary={repr(config_primary)}")
     print(f"[OCR] config_secondary={repr(config_secondary)}")
