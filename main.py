@@ -6656,37 +6656,37 @@ class AnkiApp(tk.Tk):
             log_text.configure(state=tk.DISABLED)
 
         def handle_ocr_event(event):
-            kind = event[0]
-            if kind == "ocr_progress":
-                step, total, label = event[1:]
-                ocr_bar.config(maximum=max(total, 1))
-                ocr_progress_var.set(step)
-                ocr_progress_label.set(label)
-                append_ocr_log(label)
-            elif kind == "log":
-                append_ocr_log(str(event[1]))
-            elif kind == "done":
-                ocr_text = (event[1] or "")
-                if ocr_task_holder["task"]:
-                    self.unregister_bg_handler(ocr_task_holder["task"].queue)
-                ocr_task_holder["task"] = None
-                ocr_progress_label.set("Готово")
-                ocr_button.config(state=tk.NORMAL)
-                def _update_text():
+            def _process():
+                kind = event[0]
+                if kind == "ocr_progress":
+                    step, total, label = event[1:]
+                    ocr_bar.config(maximum=max(total, 1))
+                    ocr_progress_var.set(step)
+                    ocr_progress_label.set(label)
+                    append_ocr_log(label)
+                elif kind == "log":
+                    append_ocr_log(str(event[1]))
+                elif kind == "done":
+                    ocr_text = (event[1] or "")
+                    if ocr_task_holder["task"]:
+                        self.unregister_bg_handler(ocr_task_holder["task"].queue)
+                    ocr_task_holder["task"] = None
+                    ocr_progress_label.set("Готово")
+                    ocr_button.config(state=tk.NORMAL)
                     prev_state = txt_ocr.cget("state")
                     txt_ocr.configure(state=tk.NORMAL)
                     txt_ocr.delete("1.0", tk.END)
                     txt_ocr.insert("1.0", str(ocr_text))
                     txt_ocr.configure(state=prev_state)
+                elif kind == "error":
+                    if ocr_task_holder["task"]:
+                        self.unregister_bg_handler(ocr_task_holder["task"].queue)
+                    ocr_task_holder["task"] = None
+                    ocr_progress_label.set("Ошибка")
+                    ocr_button.config(state=tk.NORMAL)
+                    messagebox.showerror("Ошибка OCR", event[1])
 
-                self.after(0, _update_text)
-            elif kind == "error":
-                if ocr_task_holder["task"]:
-                    self.unregister_bg_handler(ocr_task_holder["task"].queue)
-                ocr_task_holder["task"] = None
-                ocr_progress_label.set("Ошибка")
-                ocr_button.config(state=tk.NORMAL)
-                messagebox.showerror("Ошибка OCR", event[1])
+            self.after(0, _process)
 
         def run_ocr():
             if not CV2_AVAILABLE:
@@ -6729,13 +6729,17 @@ class AnkiApp(tk.Tk):
                 def progress_cb(step, total, label):
                     task_obj.queue.put(("ocr_progress", step, total, label))
 
+                def log_cb(message: str):
+                    task_obj.queue.put(("log", message))
+
                 try:
+                    binarize_mode = (binarize_mode_var.get() or "none").strip().lower()
                     options = OcrRunOptions(
                         ocr_mode=selected_mode,
                         lang_mode=selected_lang,
                         perspective_correction=perspective_var.get(),
                         flatten_background=flatten_var.get(),
-                        binarize_mode=binarize_mode_var.get(),
+                        binarize_mode=binarize_mode,
                         deskew=deskew_var.get(),
                         debug_images=debug_images_var.get(),
                         psm=int(psm_var.get()),
@@ -6749,7 +6753,7 @@ class AnkiApp(tk.Tk):
                         options.deskew = False
                         options.perspective_correction = False
                     task_obj.queue.put(("log", f"OCR режим: {options.ocr_mode}, lang={options.lang_mode}"))
-                    text = perform_page_ocr(img_path, options, progress_cb)
+                    text = perform_page_ocr(img_path, options, progress_cb, log_cb)
                     return text
                 except Exception as e:
                     task_obj.queue.put(("log", str(e)))

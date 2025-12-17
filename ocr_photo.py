@@ -224,6 +224,43 @@ def upscale_and_binarize(gray: np.ndarray, mode: str = "adaptive") -> np.ndarray
     return binary
 
 
+def apply_binarize(pil_img: Image.Image, mode: str, log_cb: Callable[[str], None] | None = None, debug_dir: Path | None = None) -> Image.Image:
+    mode_normalized = (mode or "none").strip().lower()
+    arr = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    if debug_dir is not None:
+        _save_debug_pil(debug_dir, "debug_gray", Image.fromarray(gray))
+
+    if mode_normalized == "adaptive":
+        gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        blockSize = 31
+        C = 10
+        th = cv2.adaptiveThreshold(
+            gray_blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize,
+            C,
+        )
+        if th.mean() < 127:
+            th = 255 - th
+        out = Image.fromarray(th)
+        if debug_dir is not None:
+            _save_debug_pil(debug_dir, "debug_adaptive", out)
+    elif mode_normalized == "otsu":
+        th = upscale_and_binarize(gray, mode="otsu")
+        out = Image.fromarray(th)
+    else:
+        out = Image.fromarray(gray)
+
+    if log_cb is not None:
+        log_cb(f"apply_binarize mode={mode_normalized} gray_mean={gray.mean():.2f}")
+
+    return out
+
+
 def deskew(binary_or_gray: np.ndarray) -> np.ndarray:
     img = binary_or_gray
     if len(img.shape) == 3:
@@ -282,6 +319,12 @@ def _save_debug_image(base_dir: Path, prefix: str, image: np.ndarray):
         cv2.imwrite(str(target), image)
     else:
         cv2.imwrite(str(target), cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+
+def _save_debug_pil(base_dir: Path, prefix: str, image: Image.Image):
+    base_dir.mkdir(parents=True, exist_ok=True)
+    target = base_dir / f"{prefix}.png"
+    image.save(target, format="PNG")
 
 
 def _clean_text_basic(text: str) -> str:
@@ -445,7 +488,12 @@ def _compose_diag(image_path: str, pil_img: Image.Image | None, config: str | No
     return "\n".join(diag_parts)
 
 
-def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: ProgressCallback | None = None) -> str:
+def perform_page_ocr(
+    image_path: str,
+    options: OcrRunOptions,
+    progress_cb: ProgressCallback | None = None,
+    log_cb: Callable[[str], None] | None = None,
+) -> str:
     total_steps = 6
     _report(progress_cb, 1, total_steps, "Шаг 1/6: загрузка")
 
@@ -453,13 +501,17 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
     bgr: np.ndarray | None = None
     gray: np.ndarray | None = None
     binary: np.ndarray | None = None
+    flat_for_debug: np.ndarray | None = None
+    target_for_ocr: np.ndarray | None = None
     result_text = ""
     config = _build_tesseract_config(psm=options.psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
+    mode_normalized = (options.binarize_mode or "none").strip().lower()
+    save_debug = options.debug_images
+    debug_dir = Path("logs") / "ocr_debug" / datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     try:
         original_pil = load_image_for_ocr(image_path)
         bgr = load_image_any(image_path)
-        debug_dir = Path("logs") / "ocr_debug" / datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         if options.debug_images and bgr is not None:
             _save_debug_image(debug_dir, "01_original", bgr)
 
@@ -481,15 +533,30 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
         else:
             flat = gray
             _report(progress_cb, 3, total_steps, "Шаг 3/6: фон без изменений")
+        flat_for_debug = flat
         if options.debug_images:
             _save_debug_image(debug_dir, "03_flatten", flat)
 
-        binary = upscale_and_binarize(flat, mode=options.binarize_mode)
+        flat_pil = Image.fromarray(flat)
+        binary_pil = apply_binarize(
+            flat_pil,
+            mode_normalized,
+            log_cb=log_cb,
+            debug_dir=debug_dir if options.debug_images else None,
+        )
+        binary = np.array(binary_pil)
         _report(progress_cb, 4, total_steps, "Шаг 4/6: бинаризация")
         if options.deskew:
             binary = deskew(binary)
         if options.debug_images:
             _save_debug_image(debug_dir, "04_binary", binary)
+
+        target_for_ocr = binary if binary is not None else gray if gray is not None else working
+        if target_for_ocr is not None:
+            h, w = target_for_ocr.shape[:2]
+            mean_val = float(np.mean(target_for_ocr)) if target_for_ocr.size else 0.0
+            if log_cb:
+                log_cb(f"binarize={mode_normalized}, img={w}x{h}, mean={mean_val:.2f}")
 
         if options.ocr_mode == "two_columns" and binary is not None:
             x_split, left_img, right_img = split_columns_auto(binary, options.split_offset_percent)
@@ -512,11 +579,14 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
             result_text = ocr_with_paddle(binary, options.lang_mode)
             _report(progress_cb, 6, total_steps, "Шаг 6/6: постобработка")
         else:
-            target_img = binary if binary is not None else gray if gray is not None else working
+            target_img = target_for_ocr
             _report(progress_cb, 5, total_steps, "Шаг 5/6: Tesseract")
             result_text = ocr_with_tesseract(target_img, options.lang_mode, psm=options.psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
             _report(progress_cb, 6, total_steps, "Шаг 6/6: постобработка")
     except Exception as e:  # noqa: BLE001
+        save_debug = True
+        if log_cb:
+            log_cb(f"Ошибка OCR: {e}")
         diag = _compose_diag(image_path, original_pil, config=config, lang=options.lang_mode, ocr_mode=options.ocr_mode)
         _show_message_async("Ошибка OCR", f"{e}\n\nПереключаюсь на Tesseract OCR.\n\n{diag}")
         fallback_source = binary if binary is not None else gray if gray is not None else bgr
@@ -535,9 +605,40 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
                 preserve_spaces=options.preserve_spaces,
                 dpi=options.dpi,
             )
+            target_for_ocr = fallback_source
         except Exception as inner:  # noqa: BLE001
             _show_message_async("Ошибка Tesseract", f"{inner}\n\n{diag}")
             result_text = f"{e}\n\n{diag}\n\nTesseract fallback error: {inner}"
+
+    if log_cb:
+        log_cb(f"ocr_len={len(result_text or '')}")
+    if not (result_text or "").strip():
+        save_debug = True
+        hint = "Результат пуст. Попробуйте сменить PSM на 3/4 и отключить коррекцию перспективы."
+        if log_cb:
+            log_cb(hint)
+        try:
+            root = tk._default_root  # type: ignore[attr-defined]
+            if root is not None:
+                root.after(0, lambda: messagebox.showinfo("OCR пуст", hint))
+            else:
+                messagebox.showinfo("OCR пуст", hint)
+        except Exception:
+            pass
+
+    if save_debug:
+        if flat_for_debug is not None:
+            _save_debug_pil(debug_dir, "debug_gray", Image.fromarray(flat_for_debug))
+        elif gray is not None:
+            _save_debug_pil(debug_dir, "debug_gray", Image.fromarray(gray))
+        if mode_normalized == "adaptive" and binary is not None:
+            _save_debug_pil(debug_dir, "debug_adaptive", Image.fromarray(binary))
+        if target_for_ocr is not None:
+            if len(target_for_ocr.shape) == 3:
+                final_img = Image.fromarray(cv2.cvtColor(target_for_ocr, cv2.COLOR_BGR2RGB))
+            else:
+                final_img = Image.fromarray(target_for_ocr)
+            _save_debug_pil(debug_dir, "final_for_tesseract", final_img)
 
     return postprocess_text(result_text, options.lang_mode, is_dictionary_page=options.dictionary_mode, preserve_spaces=options.preserve_spaces)
 
