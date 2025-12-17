@@ -392,6 +392,7 @@ if CV2_AVAILABLE:
         from ocr_photo import (
             OcrRunOptions,
             PADDLE_AVAILABLE,
+            PADDLEOCR_AVAILABLE,
             load_image_any,
             ocr_photo_document,
             perform_page_ocr,
@@ -400,12 +401,14 @@ if CV2_AVAILABLE:
         ocr_photo_document = None
         CV2_AVAILABLE = False
         PADDLE_AVAILABLE = False
+        PADDLEOCR_AVAILABLE = False
         OcrRunOptions = None  # type: ignore
         load_image_any = None  # type: ignore
         perform_page_ocr = None  # type: ignore
 else:
     ocr_photo_document = None
     PADDLE_AVAILABLE = False
+    PADDLEOCR_AVAILABLE = False
 
 
 # OpenAI key только в памяти
@@ -6702,11 +6705,11 @@ class AnkiApp(tk.Tk):
                 return
             selected_mode = ocr_mode_var.get()
             selected_lang = lang_mode_var.get()
-            if selected_mode == "pro" and not PADDLE_AVAILABLE:
+            if selected_mode == "pro" and not (PADDLE_AVAILABLE and PADDLEOCR_AVAILABLE):
                 messagebox.showinfo(
                     "PaddleOCR недоступен",
                     "Установите зависимости внутри venv:\n"
-                    "python -m pip install paddlepaddle paddleocr",
+                    "C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install paddleocr paddlepaddle",
                 )
                 return
             if selected_mode != "pro":

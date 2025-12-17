@@ -39,14 +39,29 @@ from main import load_image_for_ocr, _format_image_diag
 
 ProgressCallback = Callable[[int, int, str], None]
 
+PADDLE_AVAILABLE = False
+PADDLE_VERSION: str | None = None
+PADDLEOCR_AVAILABLE = False
+PADDLEOCR_VERSION: str | None = None
 
-try:  # PaddleOCR (optional)
-    from paddleocr import PaddleOCR
+try:
+    import paddle
 
     PADDLE_AVAILABLE = True
+    PADDLE_VERSION = getattr(paddle, "__version__", None)
+except Exception:
+    PADDLE_AVAILABLE = False
+
+try:
+    import paddleocr
+    from paddleocr import PaddleOCR
+
+    PADDLEOCR_AVAILABLE = True
+    PADDLEOCR_VERSION = getattr(paddleocr, "__version__", None)
 except Exception:
     PaddleOCR = None  # type: ignore
-    PADDLE_AVAILABLE = False
+    PADDLEOCR_AVAILABLE = False
+    PADDLEOCR_VERSION = None
 
 
 _PADDLE_OCR_CACHE: dict[str, PaddleOCR] = {}
@@ -74,6 +89,9 @@ def _report(cb: ProgressCallback | None, step: int, total: int, label: str):
         cb(step, total, label)
 
 
+INSTALL_PADDLE_CMD = r"C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install paddleocr paddlepaddle"
+
+
 def _show_message_async(title: str, message: str):
     try:
         root = tk._default_root  # type: ignore[attr-defined]
@@ -84,6 +102,17 @@ def _show_message_async(title: str, message: str):
     except Exception:
         # GUI errors should never crash OCR flow
         pass
+
+
+def _is_paddle_ready() -> bool:
+    return bool(PADDLE_AVAILABLE and PADDLEOCR_AVAILABLE and PaddleOCR is not None)
+
+
+def _notify_paddle_missing():
+    _show_message_async(
+        "PaddleOCR недоступен",
+        "Установите зависимости внутри venv:\n" f"{INSTALL_PADDLE_CMD}",
+    )
 
 
 def _order_points(pts: np.ndarray) -> np.ndarray:
@@ -365,10 +394,10 @@ def _run_paddle_single_pass(image: np.ndarray, lang: str, fallback_lang: str | N
 
 
 def ocr_with_paddle(image: np.ndarray, lang_mode: str) -> str:
-    if not PADDLE_AVAILABLE:
+    if not _is_paddle_ready():
+        _notify_paddle_missing()
         raise RuntimeError(
-            "PaddleOCR не установлен. Установите зависимости внутри venv:\n"
-            "python -m pip install paddlepaddle paddleocr"
+            "PaddleOCR недоступен. Проверьте установку paddlepaddle и paddleocr."
         )
 
     lang_mode_clean = lang_mode.strip().lower()
@@ -376,15 +405,18 @@ def ocr_with_paddle(image: np.ndarray, lang_mode: str) -> str:
     has_deu = "deu" in langs
     has_rus = "rus" in langs
 
-    if has_deu and has_rus:
-        german_lang, german_fallback = _normalize_paddle_lang("deu")
-        ru_lang, ru_fallback = _normalize_paddle_lang("rus")
-        ru_text = _run_paddle_single_pass(image, ru_lang, ru_fallback)
-        de_text = _run_paddle_single_pass(image, german_lang, german_fallback)
-        return "\n\n".join(["--- RU ---", ru_text.strip(), "--- DE ---", de_text.strip()])
+    try:
+        if has_deu and has_rus:
+            german_lang, german_fallback = _normalize_paddle_lang("deu")
+            ru_lang, ru_fallback = _normalize_paddle_lang("rus")
+            ru_text = _run_paddle_single_pass(image, ru_lang, ru_fallback)
+            de_text = _run_paddle_single_pass(image, german_lang, german_fallback)
+            return "\n\n".join(["--- RU ---", ru_text.strip(), "--- DE ---", de_text.strip()])
 
-    target_lang, fallback_lang = _normalize_paddle_lang(lang_mode_clean or "en")
-    return _run_paddle_single_pass(image, target_lang, fallback_lang)
+        target_lang, fallback_lang = _normalize_paddle_lang(lang_mode_clean or "en")
+        return _run_paddle_single_pass(image, target_lang, fallback_lang)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"PaddleOCR ошибка: {e}") from e
 
 
 def _compose_diag(image_path: str, pil_img: Image.Image | None, config: str | None = None, lang: str | None = None, ocr_mode: str | None = None) -> str:
@@ -397,6 +429,12 @@ def _compose_diag(image_path: str, pil_img: Image.Image | None, config: str | No
     diag_parts.append(f"python: {platform.python_version()}")
     diag_parts.append(f"opencv: {cv2.__version__}")
     diag_parts.append(f"pillow: {Image.__version__}")
+    diag_parts.append(
+        f"paddle_available: {PADDLE_AVAILABLE}, paddle_version: {PADDLE_VERSION}"
+    )
+    diag_parts.append(
+        f"paddleocr_available: {PADDLEOCR_AVAILABLE}, paddleocr_version: {PADDLEOCR_VERSION}"
+    )
     diag_parts.append(f"pytesseract: {getattr(pytesseract, '__version__', 'unknown')}")
     diag_parts.append(f"tesseract config: {config}")
     diag_parts.append(f"lang: {lang}")
@@ -459,7 +497,7 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
                 _save_debug_image(debug_dir, "05_left", left_img)
                 _save_debug_image(debug_dir, "06_right", right_img)
             _report(progress_cb, 5, total_steps, "Шаг 5/6: OCR левая колонка")
-            if options.prefer_paddle_for_columns and PADDLE_AVAILABLE:
+            if options.prefer_paddle_for_columns and _is_paddle_ready():
                 left_engine_text = ocr_with_paddle(left_img, "deu")
                 _report(progress_cb, 6, total_steps, "Шаг 6/6: OCR правая колонка")
                 right_engine_text = ocr_with_paddle(right_img, "rus")
@@ -480,7 +518,7 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
             _report(progress_cb, 6, total_steps, "Шаг 6/6: постобработка")
     except Exception as e:  # noqa: BLE001
         diag = _compose_diag(image_path, original_pil, config=config, lang=options.lang_mode, ocr_mode=options.ocr_mode)
-        _show_message_async("Ошибка OCR", f"{e}\n\n{diag}")
+        _show_message_async("Ошибка OCR", f"{e}\n\nПереключаюсь на Tesseract OCR.\n\n{diag}")
         fallback_source = binary if binary is not None else gray if gray is not None else bgr
         if fallback_source is None and original_pil is not None:
             try:
