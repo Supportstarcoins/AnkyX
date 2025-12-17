@@ -6669,8 +6669,14 @@ class AnkiApp(tk.Tk):
                 ocr_task_holder["task"] = None
                 ocr_progress_label.set("Готово")
                 ocr_button.config(state=tk.NORMAL)
-                txt_ocr.delete("1.0", tk.END)
-                txt_ocr.insert("1.0", str(ocr_text))
+                def _update_text():
+                    prev_state = txt_ocr.cget("state")
+                    txt_ocr.configure(state=tk.NORMAL)
+                    txt_ocr.delete("1.0", tk.END)
+                    txt_ocr.insert("1.0", str(ocr_text))
+                    txt_ocr.configure(state=prev_state)
+
+                self.after(0, _update_text)
             elif kind == "error":
                 if ocr_task_holder["task"]:
                     self.unregister_bg_handler(ocr_task_holder["task"].queue)

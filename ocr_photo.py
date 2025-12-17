@@ -31,6 +31,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 import pytesseract
+import tkinter as tk
+from tkinter import messagebox
 
 from tesseract_setup import get_tesseract_diag, to_short_path
 from main import load_image_for_ocr, _format_image_diag
@@ -45,6 +47,9 @@ try:  # PaddleOCR (optional)
 except Exception:
     PaddleOCR = None  # type: ignore
     PADDLE_AVAILABLE = False
+
+
+_PADDLE_OCR_CACHE: dict[str, PaddleOCR] = {}
 
 
 @dataclass
@@ -67,6 +72,18 @@ class OcrRunOptions:
 def _report(cb: ProgressCallback | None, step: int, total: int, label: str):
     if cb:
         cb(step, total, label)
+
+
+def _show_message_async(title: str, message: str):
+    try:
+        root = tk._default_root  # type: ignore[attr-defined]
+        if root is not None:
+            root.after(0, lambda: messagebox.showerror(title, message))
+        else:
+            messagebox.showerror(title, message)
+    except Exception:
+        # GUI errors should never crash OCR flow
+        pass
 
 
 def _order_points(pts: np.ndarray) -> np.ndarray:
@@ -289,12 +306,62 @@ def ocr_with_tesseract(image: np.ndarray, lang: str, psm: int = 4, preserve_spac
     return _tesseract_image_to_string(pil_img, lang=lang, config=config)
 
 
-def _normalize_paddle_lang(lang_mode: str) -> str:
+def _normalize_paddle_lang(lang_mode: str) -> tuple[str, str]:
     if "rus" in lang_mode:
-        return "ru"
+        return "ru", "en"
     if "deu" in lang_mode:
-        return "german"
-    return "en"
+        return "german", "en"
+    return "en", "en"
+
+
+def get_paddle_ocr(lang: str) -> PaddleOCR:
+    if lang in _PADDLE_OCR_CACHE:
+        return _PADDLE_OCR_CACHE[lang]
+
+    def _create(with_show_log: bool):
+        kwargs = {"lang": lang, "use_angle_cls": True}
+        if with_show_log:
+            kwargs["show_log"] = False
+        return PaddleOCR(**kwargs)
+
+    try:
+        ocr = _create(with_show_log=True)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if "Unknown argument: show_log" in msg or (
+            isinstance(e, TypeError) and "show_log" in msg
+        ):
+            ocr = _create(with_show_log=False)
+        else:
+            raise
+
+    _PADDLE_OCR_CACHE[lang] = ocr
+    return ocr
+
+
+def _extract_sorted_text(result) -> str:
+    lines: list[tuple[tuple[float, float], str]] = []
+    for page in result:
+        for line in page:
+            box, (text, _score) = line
+            xs = [float(pt[0]) for pt in box]
+            ys = [float(pt[1]) for pt in box]
+            lines.append(((min(ys), min(xs)), text))
+    lines.sort(key=lambda item: (item[0][0], item[0][1]))
+    return "\n".join(text for _pos, text in lines)
+
+
+def _run_paddle_single_pass(image: np.ndarray, lang: str, fallback_lang: str | None = None) -> str:
+    try:
+        ocr = get_paddle_ocr(lang)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e).lower()
+        if fallback_lang and ("lang" in msg or "language" in msg or "support" in msg):
+            ocr = get_paddle_ocr(fallback_lang)
+        else:
+            raise
+    result = ocr.ocr(image, cls=True)
+    return _extract_sorted_text(result)
 
 
 def ocr_with_paddle(image: np.ndarray, lang_mode: str) -> str:
@@ -303,18 +370,21 @@ def ocr_with_paddle(image: np.ndarray, lang_mode: str) -> str:
             "PaddleOCR не установлен. Установите зависимости внутри venv:\n"
             "python -m pip install paddlepaddle paddleocr"
         )
-    lang = _normalize_paddle_lang(lang_mode)
-    ocr = PaddleOCR(lang=lang, use_angle_cls=True, show_log=False)
-    result = ocr.ocr(image, cls=True)
-    lines: list[tuple[tuple[int, int], str]] = []
-    for page in result:
-        for line in page:
-            box, (text, _score) = line
-            xs = [pt[0] for pt in box]
-            ys = [pt[1] for pt in box]
-            lines.append(((min(xs), min(ys)), text))
-    lines.sort(key=lambda item: (item[0][1], item[0][0]))
-    return "\n".join(text for _pos, text in lines)
+
+    lang_mode_clean = lang_mode.strip().lower()
+    langs = [lang.strip().lower() for lang in lang_mode_clean.split("+") if lang.strip()]
+    has_deu = "deu" in langs
+    has_rus = "rus" in langs
+
+    if has_deu and has_rus:
+        german_lang, german_fallback = _normalize_paddle_lang("deu")
+        ru_lang, ru_fallback = _normalize_paddle_lang("rus")
+        ru_text = _run_paddle_single_pass(image, ru_lang, ru_fallback)
+        de_text = _run_paddle_single_pass(image, german_lang, german_fallback)
+        return "\n\n".join(["--- RU ---", ru_text.strip(), "--- DE ---", de_text.strip()])
+
+    target_lang, fallback_lang = _normalize_paddle_lang(lang_mode_clean or "en")
+    return _run_paddle_single_pass(image, target_lang, fallback_lang)
 
 
 def _compose_diag(image_path: str, pil_img: Image.Image | None, config: str | None = None, lang: str | None = None, ocr_mode: str | None = None) -> str:
@@ -341,52 +411,54 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
     total_steps = 6
     _report(progress_cb, 1, total_steps, "Шаг 1/6: загрузка")
 
-    original_pil = load_image_for_ocr(image_path)
-    bgr = load_image_any(image_path)
-    debug_dir = Path("logs") / "ocr_debug" / datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    if options.debug_images:
-        _save_debug_image(debug_dir, "01_original", bgr)
-
-    working = bgr
-    warp_info = {"found_quad": False}
-    if options.perspective_correction:
-        working, warp_info = detect_and_warp_page(bgr)
-        _report(progress_cb, 2, total_steps, "Шаг 2/6: перспектива" if warp_info.get("found_quad") else "Шаг 2/6: перспектива пропущена")
-        if options.debug_images:
-            _save_debug_image(debug_dir, "02_warped", working)
-    else:
-        _report(progress_cb, 2, total_steps, "Шаг 2/6: перспектива выключена")
-
-    gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
-
-    if options.flatten_background:
-        flat = flatten_background(gray)
-        _report(progress_cb, 3, total_steps, "Шаг 3/6: фон выровнен")
-    else:
-        flat = gray
-        _report(progress_cb, 3, total_steps, "Шаг 3/6: фон без изменений")
-    if options.debug_images:
-        _save_debug_image(debug_dir, "03_flatten", flat)
-
-    binary = upscale_and_binarize(flat, mode=options.binarize_mode)
-    _report(progress_cb, 4, total_steps, "Шаг 4/6: бинаризация")
-    if options.deskew:
-        binary = deskew(binary)
-    if options.debug_images:
-        _save_debug_image(debug_dir, "04_binary", binary)
-
+    original_pil: Image.Image | None = None
+    bgr: np.ndarray | None = None
+    gray: np.ndarray | None = None
+    binary: np.ndarray | None = None
     result_text = ""
     config = _build_tesseract_config(psm=options.psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
 
     try:
-        if options.ocr_mode == "two_columns":
+        original_pil = load_image_for_ocr(image_path)
+        bgr = load_image_any(image_path)
+        debug_dir = Path("logs") / "ocr_debug" / datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        if options.debug_images and bgr is not None:
+            _save_debug_image(debug_dir, "01_original", bgr)
+
+        working = bgr if bgr is not None else np.array(original_pil)
+        warp_info = {"found_quad": False}
+        if options.perspective_correction and bgr is not None:
+            working, warp_info = detect_and_warp_page(bgr)
+            _report(progress_cb, 2, total_steps, "Шаг 2/6: перспектива" if warp_info.get("found_quad") else "Шаг 2/6: перспектива пропущена")
+            if options.debug_images:
+                _save_debug_image(debug_dir, "02_warped", working)
+        else:
+            _report(progress_cb, 2, total_steps, "Шаг 2/6: перспектива выключена")
+
+        gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+
+        if options.flatten_background:
+            flat = flatten_background(gray)
+            _report(progress_cb, 3, total_steps, "Шаг 3/6: фон выровнен")
+        else:
+            flat = gray
+            _report(progress_cb, 3, total_steps, "Шаг 3/6: фон без изменений")
+        if options.debug_images:
+            _save_debug_image(debug_dir, "03_flatten", flat)
+
+        binary = upscale_and_binarize(flat, mode=options.binarize_mode)
+        _report(progress_cb, 4, total_steps, "Шаг 4/6: бинаризация")
+        if options.deskew:
+            binary = deskew(binary)
+        if options.debug_images:
+            _save_debug_image(debug_dir, "04_binary", binary)
+
+        if options.ocr_mode == "two_columns" and binary is not None:
             x_split, left_img, right_img = split_columns_auto(binary, options.split_offset_percent)
             if options.debug_images:
                 _save_debug_image(debug_dir, "05_left", left_img)
                 _save_debug_image(debug_dir, "06_right", right_img)
             _report(progress_cb, 5, total_steps, "Шаг 5/6: OCR левая колонка")
-            left_engine_text: str
-            right_engine_text: str
             if options.prefer_paddle_for_columns and PADDLE_AVAILABLE:
                 left_engine_text = ocr_with_paddle(left_img, "deu")
                 _report(progress_cb, 6, total_steps, "Шаг 6/6: OCR правая колонка")
@@ -397,17 +469,37 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
                 right_engine_text = ocr_with_tesseract(right_img, "rus", psm=options.psm)
             combined = "\n\n".join(["--- DE ---", left_engine_text.strip(), "--- RU ---", right_engine_text.strip()])
             result_text = combined
-        elif options.ocr_mode == "pro":
+        elif options.ocr_mode == "pro" and binary is not None:
             _report(progress_cb, 5, total_steps, "Шаг 5/6: PaddleOCR")
             result_text = ocr_with_paddle(binary, options.lang_mode)
             _report(progress_cb, 6, total_steps, "Шаг 6/6: постобработка")
         else:
+            target_img = binary if binary is not None else gray if gray is not None else working
             _report(progress_cb, 5, total_steps, "Шаг 5/6: Tesseract")
-            result_text = ocr_with_tesseract(binary, options.lang_mode, psm=options.psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
+            result_text = ocr_with_tesseract(target_img, options.lang_mode, psm=options.psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
             _report(progress_cb, 6, total_steps, "Шаг 6/6: постобработка")
     except Exception as e:  # noqa: BLE001
         diag = _compose_diag(image_path, original_pil, config=config, lang=options.lang_mode, ocr_mode=options.ocr_mode)
-        raise RuntimeError(f"{e}\n\n{diag}\n\n{traceback.format_exc()}") from e
+        _show_message_async("Ошибка OCR", f"{e}\n\n{diag}")
+        fallback_source = binary if binary is not None else gray if gray is not None else bgr
+        if fallback_source is None and original_pil is not None:
+            try:
+                fallback_source = cv2.cvtColor(np.array(original_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+            except Exception:
+                fallback_source = np.array(original_pil)
+        try:
+            if fallback_source is None:
+                raise RuntimeError("Нет изображения для резервного OCR")
+            result_text = ocr_with_tesseract(
+                fallback_source,
+                options.lang_mode,
+                psm=options.psm,
+                preserve_spaces=options.preserve_spaces,
+                dpi=options.dpi,
+            )
+        except Exception as inner:  # noqa: BLE001
+            _show_message_async("Ошибка Tesseract", f"{inner}\n\n{diag}")
+            result_text = f"{e}\n\n{diag}\n\nTesseract fallback error: {inner}"
 
     return postprocess_text(result_text, options.lang_mode, is_dictionary_page=options.dictionary_mode, preserve_spaces=options.preserve_spaces)
 
