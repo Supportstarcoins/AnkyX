@@ -6585,7 +6585,17 @@ class AnkiApp(tk.Tk):
         deskew_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ocr_opts, text="Выравнивать наклон (deskew)", variable=deskew_var).grid(row=2, column=3, sticky="w", padx=5, pady=5)
 
-        ttk.Label(ocr_opts, text="Binarize:").grid(row=3, column=0, sticky="e", padx=(10, 5), pady=5)
+        ttk.Label(ocr_opts, text="Пресет предобработки:").grid(row=3, column=0, sticky="e", padx=(10, 5), pady=5)
+        preprocess_preset_var = tk.StringVar(value="auto_pro")
+        ttk.Combobox(
+            ocr_opts,
+            textvariable=preprocess_preset_var,
+            values=("auto_pro", "basic"),
+            state="readonly",
+            width=12,
+        ).grid(row=3, column=1, sticky="w", padx=5)
+
+        ttk.Label(ocr_opts, text="Binarize:").grid(row=4, column=0, sticky="e", padx=(10, 5), pady=5)
         binarize_mode_var = tk.StringVar(value="adaptive")
         ttk.Combobox(
             ocr_opts,
@@ -6593,25 +6603,25 @@ class AnkiApp(tk.Tk):
             values=("adaptive", "otsu", "none"),
             state="readonly",
             width=10,
-        ).grid(row=3, column=1, sticky="w", padx=5)
+        ).grid(row=4, column=1, sticky="w", padx=5)
 
-        ttk.Label(ocr_opts, text="PSM:").grid(row=3, column=2, sticky="e")
+        ttk.Label(ocr_opts, text="PSM:").grid(row=4, column=2, sticky="e")
         psm_var = tk.StringVar(value="4")
-        ttk.Combobox(ocr_opts, textvariable=psm_var, values=("3", "4", "6", "11"), state="readonly", width=5).grid(row=3, column=3, sticky="w", padx=5)
+        ttk.Combobox(ocr_opts, textvariable=psm_var, values=("3", "4", "6", "11"), state="readonly", width=5).grid(row=4, column=3, sticky="w", padx=5)
 
         dictionary_mode_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ocr_opts, text="Словарь/учебник", variable=dictionary_mode_var).grid(row=4, column=0, sticky="w", padx=10, pady=5)
+        ttk.Checkbutton(ocr_opts, text="Словарь/учебник", variable=dictionary_mode_var).grid(row=5, column=0, sticky="w", padx=10, pady=5)
 
         debug_images_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ocr_opts, text="Сохранять debug картинки", variable=debug_images_var).grid(row=4, column=1, sticky="w", padx=5, pady=5)
+        ttk.Checkbutton(ocr_opts, text="Сохранять debug картинки", variable=debug_images_var).grid(row=5, column=1, sticky="w", padx=5, pady=5)
 
         split_offset_var = tk.DoubleVar(value=0.0)
-        ttk.Label(ocr_opts, text="2 колонки: Авто-разделение").grid(row=5, column=0, sticky="w", padx=10)
-        ttk.Label(ocr_opts, text="Сдвиг разделителя (%):").grid(row=5, column=1, sticky="e")
+        ttk.Label(ocr_opts, text="2 колонки: Авто-разделение").grid(row=6, column=0, sticky="w", padx=10)
+        ttk.Label(ocr_opts, text="Сдвиг разделителя (%):").grid(row=6, column=1, sticky="e")
         split_slider = ttk.Scale(ocr_opts, from_=-20, to=20, orient=tk.HORIZONTAL, variable=split_offset_var)
-        split_slider.grid(row=5, column=2, sticky="we", padx=5)
+        split_slider.grid(row=6, column=2, sticky="we", padx=5)
         split_val_label = ttk.Label(ocr_opts, textvariable=tk.StringVar(value="0"))
-        split_val_label.grid(row=5, column=3, sticky="w")
+        split_val_label.grid(row=6, column=3, sticky="w")
 
         def _update_split_label(*_args):
             split_val_label.config(text=f"{split_offset_var.get():.1f}")
@@ -6743,11 +6753,13 @@ class AnkiApp(tk.Tk):
                         split_offset_percent=float(split_offset_var.get()),
                         preserve_spaces=True,
                         prefer_paddle_for_columns=True,
+                        preprocess_preset=preprocess_preset_var.get(),
                     )
                     if not preprocess_var.get():
                         options.flatten_background = False
                         options.deskew = False
                         options.perspective_correction = False
+                        options.preprocess_preset = "none"
                     task_obj.queue.put(("log", f"OCR режим: {options.ocr_mode}, lang={options.lang_mode}"))
                     text = perform_page_ocr(img_path, options, progress_cb)
                     return text
