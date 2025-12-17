@@ -393,6 +393,33 @@ def _compute_text_stats(text: str) -> tuple[float, float]:
     return alpha_ratio, bad_ratio
 
 
+def _score_ocr_data(data: dict) -> tuple[float, int, float]:
+    texts = data.get("text", []) or []
+    confs = data.get("conf", []) or []
+    total_conf = 0.0
+    total_words = 0
+    normal_words = 0
+    for text, conf in zip(texts, confs):
+        if not isinstance(text, str):
+            continue
+        word = text.strip()
+        if not word:
+            continue
+        try:
+            conf_value = float(conf)
+        except Exception:
+            conf_value = -1.0
+        total_words += 1
+        if conf_value > 0:
+            total_conf += conf_value
+        if re.search(r"[A-Za-z\u00C0-\u024f\u0400-\u04FF]", word) and len(word) >= 2:
+            normal_words += 1
+
+    avg_conf = total_conf / max(total_words, 1)
+    score = avg_conf + normal_words * 0.5
+    return avg_conf, total_words, score
+
+
 def _evaluate_variant(
     image: np.ndarray,
     lang: str,
@@ -438,6 +465,33 @@ def _build_auto_variants(
     return variants
 
 
+def preprocess_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    flattened = _flatten_background_pro(gray)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe_img = clahe.apply(flattened)
+    base = _unsharp_mask(clahe_img, strength=1.3, blur_size=3)
+
+    variants: list[tuple[str, np.ndarray]] = [("A", base)]
+
+    adaptive = cv2.adaptiveThreshold(
+        base,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        10,
+    )
+    if float(np.mean(adaptive)) < 128:
+        adaptive = 255 - adaptive
+    variants.append(("B", adaptive))
+
+    _, otsu = cv2.threshold(base, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(("C", otsu))
+
+    return variants
+
+
 def _select_best_variant(
     bgr: np.ndarray,
     lang: str,
@@ -471,6 +525,44 @@ def _clean_text_basic(text: str) -> str:
     cleaned = cleaned.replace("\r", "\n")
     cleaned = re.sub(r"[\u200b\u00ad]", "", cleaned)
     return cleaned
+
+
+def _merge_hyphenated_lines(lines: list[str]) -> list[str]:
+    merged: list[str] = []
+    skip_next = False
+    for idx, line in enumerate(lines):
+        if skip_next:
+            skip_next = False
+            continue
+        line_clean = line.rstrip()
+        if line_clean.endswith("-") and idx + 1 < len(lines):
+            next_line = lines[idx + 1].lstrip()
+            if next_line and re.match(r"[A-Za-z\u00C0-\u024f\u0400-\u04FF]", next_line[0]):
+                merged.append(line_clean[:-1] + next_line)
+                skip_next = True
+                continue
+        merged.append(line_clean)
+    return merged
+
+
+def _apply_language_specific_fixes(text: str, lang: str) -> str:
+    lang_low = (lang or "").lower()
+    if lang_low.startswith("deu"):
+        text = re.sub(r"(?<=[A-Za-zÄÖÜäöüß])1(?=[A-Za-zÄÖÜäöüß])", "l", text)
+        text = re.sub(r"(?<=[A-Za-zÄÖÜäöüß])0(?=[A-Za-zÄÖÜäöüß])", "O", text)
+    if lang_low.startswith("rus"):
+        text = re.sub(r"(?<=[А-Яа-яЁё])1(?=[А-Яа-яЁё])", "л", text)
+        text = re.sub(r"(?<=[А-Яа-яЁё])0(?=[А-Яа-яЁё])", "О", text)
+    return text
+
+
+def _postprocess_column_text(text: str, lang: str) -> str:
+    text = _clean_text_basic(text)
+    lines = [line.rstrip() for line in text.splitlines()]
+    lines = _merge_hyphenated_lines(lines)
+    joined = "\n".join(lines)
+    joined = _apply_language_specific_fixes(joined, lang)
+    return joined.strip()
 
 
 def _reconstruct_text_from_data(data: dict, preserve_spaces: bool = True) -> str:
@@ -518,7 +610,7 @@ def _reconstruct_text_from_data(data: dict, preserve_spaces: bool = True) -> str
         words = sorted(lines[key], key=lambda e: (e["left"], e["word"]))
         widths = [max(1, w["width"]) / max(1, len(w["text"])) for w in words]
         avg_char_width = float(np.median(widths)) if widths else 1.0
-        gap_threshold = avg_char_width * 0.6
+        gap_threshold = avg_char_width * 1.2
 
         line_parts: list[str] = []
         prev_right = None
@@ -543,8 +635,7 @@ def _reconstruct_text_from_data(data: dict, preserve_spaces: bool = True) -> str
 
 def postprocess_text(text: str, lang_mode: str, is_dictionary_page: bool = True, preserve_spaces: bool = True) -> str:
     text = _clean_text_basic(text)
-    text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)
-    lines = [line.rstrip() for line in text.splitlines()]
+    lines = _merge_hyphenated_lines([line.rstrip() for line in text.splitlines()])
     if not is_dictionary_page:
         joined = " ".join(line.strip() for line in lines)
     else:
@@ -554,6 +645,8 @@ def postprocess_text(text: str, lang_mode: str, is_dictionary_page: bool = True,
     else:
         joined = re.sub(r"[ ]{2,}", " ", joined)
         joined = re.sub(r"\s{3,}", "\n\n", joined)
+    primary_lang = (lang_mode.split("+")[0]).strip() if lang_mode else ""
+    joined = _apply_language_specific_fixes(joined, primary_lang)
     return joined.strip()
 
 
@@ -587,6 +680,77 @@ def _tesseract_image_to_data(pil_img: Image.Image, lang: str, config: str) -> di
     finally:
         if tmp_png.exists():
             tmp_png.unlink()
+
+
+def _tesseract_data_from_array(
+    image: np.ndarray,
+    lang: str,
+    psm: int,
+    preserve_spaces: bool,
+    dpi: int | None = 300,
+) -> dict:
+    config = _build_tesseract_config(psm, preserve_spaces=preserve_spaces, dpi=dpi)
+    pil_img = Image.fromarray(image)
+    return _tesseract_image_to_data(pil_img, lang=lang, config=config)
+
+
+def _run_variant_ocr(
+    image: np.ndarray,
+    lang: str,
+    psm: int,
+    preserve_spaces: bool,
+    dpi: int | None = 300,
+) -> tuple[str, float, int, float]:
+    data = _tesseract_data_from_array(image, lang=lang, psm=psm, preserve_spaces=preserve_spaces, dpi=dpi)
+    text = _reconstruct_text_from_data(data, preserve_spaces=preserve_spaces)
+    avg_conf, words_count, score = _score_ocr_data(data)
+    return text, avg_conf, words_count, score
+
+
+def _run_best_column_ocr(
+    column_img: np.ndarray,
+    lang: str,
+    preserve_spaces: bool,
+    dpi: int | None,
+    debug_dir: Path | None,
+    prefix: str,
+) -> str:
+    pad = 40
+    padded = cv2.copyMakeBorder(column_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+    variants = preprocess_variants(padded)
+
+    if debug_dir:
+        for name, img in variants:
+            _save_debug_image(debug_dir, f"{prefix}{name}", img)
+
+    best_text = ""
+    best_score = -1e9
+    best_avg_conf = 0.0
+    best_words = 0
+    best_variant = ""
+
+    def evaluate(psm: int):
+        nonlocal best_text, best_score, best_avg_conf, best_variant, best_words
+        for name, img in variants:
+            text, avg_conf, words_count, score = _run_variant_ocr(img, lang=lang, psm=psm, preserve_spaces=preserve_spaces, dpi=dpi)
+            print(
+                f"[OCR][{prefix}{name}] psm={psm} words={words_count} avg_conf={avg_conf:.1f} score={score:.2f}"
+            )
+            if score > best_score or (abs(score - best_score) < 1e-6 and len(text) > len(best_text)):
+                best_score = score
+                best_text = text
+                best_avg_conf = avg_conf
+                best_variant = name
+                best_words = words_count
+
+    evaluate(4)
+    if len(best_text.strip()) < 30:
+        evaluate(6)
+
+    print(
+        f"[OCR][{prefix}] selected variant={best_variant} words={best_words} avg_conf={best_avg_conf:.1f} score={best_score:.2f}"
+    )
+    return best_text
 
 
 def ocr_with_tesseract(image: np.ndarray, lang: str, psm: int = 4, preserve_spaces: bool = True, dpi: int | None = 300) -> str:
@@ -784,51 +948,31 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
             x_split, left_img, right_img = split_columns_auto(split_source, options.split_offset_percent)
             _save_debug_image(debug_dir, "04_split_left", left_img)
             _save_debug_image(debug_dir, "05_split_right", right_img)
-            column_psms: tuple[int, ...] = (6, 4)
-            column_psm = column_psms[0]
+            pad = 40
+            left_img = cv2.copyMakeBorder(left_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+            right_img = cv2.copyMakeBorder(right_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+            if options.debug_images:
+                _save_debug_image(debug_dir, "06_left_padded", left_img)
+                _save_debug_image(debug_dir, "07_right_padded", right_img)
 
-            if options.preprocess_preset == "auto_pro":
-                left_processed, left_key, left_score, left_conf, left_psm = _select_best_variant(
-                    left_img,
-                    lang="deu",
-                    debug_dir=debug_dir,
-                    prefix="left_",
-                    allowed_psms=column_psms,
-                    preserve_spaces=options.preserve_spaces,
-                )
-                left_processed = _ensure_black_text_on_white(left_processed)
-                if options.deskew:
-                    left_processed = deskew(left_processed)
-                _step(
-                    "Column L: selected preset "
-                    f"{left_key}, selected psm {left_psm}, score={left_score:.2f}, conf={left_conf:.1f}"
-                )
-                _save_debug_image(debug_dir, "06_left_best", left_processed)
-
-                right_processed, right_key, right_score, right_conf, right_psm = _select_best_variant(
-                    right_img,
-                    lang="rus",
-                    debug_dir=debug_dir,
-                    prefix="right_",
-                    allowed_psms=column_psms,
-                    preserve_spaces=options.preserve_spaces,
-                )
-                right_processed = _ensure_black_text_on_white(right_processed)
-                if options.deskew:
-                    right_processed = deskew(right_processed)
-                _step(
-                    "Column R: selected preset "
-                    f"{right_key}, selected psm {right_psm}, score={right_score:.2f}, conf={right_conf:.1f}"
-                )
-                _save_debug_image(debug_dir, "07_right_best", right_processed)
-            else:
-                left_processed = left_img
-                right_processed = right_img
-                left_psm = column_psm
-                right_psm = column_psm
-
-            left_engine_text = ocr_with_tesseract(left_processed, "deu", psm=left_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
-            right_engine_text = ocr_with_tesseract(right_processed, "rus", psm=right_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
+            left_engine_text = _run_best_column_ocr(
+                left_img,
+                lang="deu",
+                preserve_spaces=options.preserve_spaces,
+                dpi=options.dpi,
+                debug_dir=debug_dir if options.debug_images else None,
+                prefix="left_",
+            )
+            right_engine_text = _run_best_column_ocr(
+                right_img,
+                lang="rus",
+                preserve_spaces=options.preserve_spaces,
+                dpi=options.dpi,
+                debug_dir=debug_dir if options.debug_images else None,
+                prefix="right_",
+            )
+            left_engine_text = _postprocess_column_text(left_engine_text, "deu")
+            right_engine_text = _postprocess_column_text(right_engine_text, "rus")
             combined = "\n\n".join(["--- DE ---", left_engine_text.strip(), "--- RU ---", right_engine_text.strip()])
             result_text = combined
             _step("постобработка")
