@@ -389,12 +389,23 @@ except ImportError:
 
 if CV2_AVAILABLE:
     try:
-        from ocr_photo import ocr_photo_document
+        from ocr_photo import (
+            OcrRunOptions,
+            PADDLE_AVAILABLE,
+            load_image_any,
+            ocr_photo_document,
+            perform_page_ocr,
+        )
     except Exception:
         ocr_photo_document = None
         CV2_AVAILABLE = False
+        PADDLE_AVAILABLE = False
+        OcrRunOptions = None  # type: ignore
+        load_image_any = None  # type: ignore
+        perform_page_ocr = None  # type: ignore
 else:
     ocr_photo_document = None
+    PADDLE_AVAILABLE = False
 
 
 # OpenAI key только в памяти
@@ -6543,38 +6554,79 @@ class AnkiApp(tk.Tk):
         ocr_opts = ttk.LabelFrame(main_frame, text="OCR настройки")
         ocr_opts.pack(fill=tk.X, pady=(0, 10))
 
-        ocr_mode_var = tk.StringVar(value="single")
-        ttk.Label(ocr_opts, text="Режим:").grid(row=0, column=0, sticky="w", padx=(10, 5), pady=5)
-        ttk.Radiobutton(ocr_opts, text="Обычный OCR", variable=ocr_mode_var, value="single").grid(row=0, column=1, sticky="w", padx=5, pady=5)
-        ttk.Radiobutton(ocr_opts, text="2 колонки (DE|RU)", variable=ocr_mode_var, value="two_columns").grid(row=0, column=2, sticky="w", padx=5, pady=5)
+        ocr_mode_var = tk.StringVar(value="fast")
+        ttk.Label(ocr_opts, text="OCR MODE:").grid(row=0, column=0, sticky="w", padx=(10, 5), pady=5)
+        ttk.Radiobutton(ocr_opts, text="Быстрый (Tesseract)", variable=ocr_mode_var, value="fast").grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        ttk.Radiobutton(ocr_opts, text="PRO (PaddleOCR)", variable=ocr_mode_var, value="pro").grid(row=0, column=2, sticky="w", padx=5, pady=5)
+        ttk.Radiobutton(ocr_opts, text="Авто 2 колонки (DE|RU)", variable=ocr_mode_var, value="two_columns").grid(row=0, column=3, sticky="w", padx=5, pady=5)
+
+        ttk.Label(ocr_opts, text="LANG MODE:").grid(row=1, column=0, sticky="e", padx=(10, 5), pady=5)
+        lang_mode_var = tk.StringVar(value="deu+rus")
+        ttk.Combobox(
+            ocr_opts,
+            textvariable=lang_mode_var,
+            values=("deu+rus", "deu", "rus"),
+            state="readonly",
+            width=12,
+        ).grid(row=1, column=1, sticky="w", padx=5)
 
         preprocess_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            ocr_opts,
-            text="Улучшить фото (OpenCV)",
-            variable=preprocess_var,
-        ).grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        ttk.Checkbutton(ocr_opts, text="Улучшить фото (OpenCV)", variable=preprocess_var).grid(row=2, column=0, sticky="w", padx=10, pady=5)
 
-        photo_mode_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            ocr_opts,
-            text="Фото (тени/перспектива)",
-            variable=photo_mode_var,
-        ).grid(row=1, column=1, sticky="w", padx=5, pady=5)
+        perspective_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ocr_opts, text="Выравнивать перспективу (лист)", variable=perspective_var).grid(row=2, column=1, sticky="w", padx=5, pady=5)
 
-        ttk.Label(ocr_opts, text="Языки OCR:").grid(row=1, column=2, sticky="e")
-        ocr_lang_var = tk.StringVar(value="deu+rus")
-        lang_choices = ("deu+rus", "deu+rus+eng")
-        ocr_lang_combo = ttk.Combobox(ocr_opts, textvariable=ocr_lang_var, values=lang_choices, state="readonly", width=15)
-        ocr_lang_combo.grid(row=1, column=3, sticky="w", padx=5)
+        flatten_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ocr_opts, text="Убрать тени / выровнять фон", variable=flatten_var).grid(row=2, column=2, sticky="w", padx=5, pady=5)
+
+        deskew_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ocr_opts, text="Выравнивать наклон (deskew)", variable=deskew_var).grid(row=2, column=3, sticky="w", padx=5, pady=5)
+
+        ttk.Label(ocr_opts, text="Binarize:").grid(row=3, column=0, sticky="e", padx=(10, 5), pady=5)
+        binarize_mode_var = tk.StringVar(value="adaptive")
+        ttk.Combobox(
+            ocr_opts,
+            textvariable=binarize_mode_var,
+            values=("adaptive", "otsu", "none"),
+            state="readonly",
+            width=10,
+        ).grid(row=3, column=1, sticky="w", padx=5)
+
+        ttk.Label(ocr_opts, text="PSM:").grid(row=3, column=2, sticky="e")
+        psm_var = tk.StringVar(value="4")
+        ttk.Combobox(ocr_opts, textvariable=psm_var, values=("3", "4", "6", "11"), state="readonly", width=5).grid(row=3, column=3, sticky="w", padx=5)
+
+        dictionary_mode_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ocr_opts, text="Словарь/учебник", variable=dictionary_mode_var).grid(row=4, column=0, sticky="w", padx=10, pady=5)
+
+        debug_images_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ocr_opts, text="Сохранять debug картинки", variable=debug_images_var).grid(row=4, column=1, sticky="w", padx=5, pady=5)
+
+        split_offset_var = tk.DoubleVar(value=0.0)
+        ttk.Label(ocr_opts, text="2 колонки: Авто-разделение").grid(row=5, column=0, sticky="w", padx=10)
+        ttk.Label(ocr_opts, text="Сдвиг разделителя (%):").grid(row=5, column=1, sticky="e")
+        split_slider = ttk.Scale(ocr_opts, from_=-20, to=20, orient=tk.HORIZONTAL, variable=split_offset_var)
+        split_slider.grid(row=5, column=2, sticky="we", padx=5)
+        split_val_label = ttk.Label(ocr_opts, textvariable=tk.StringVar(value="0"))
+        split_val_label.grid(row=5, column=3, sticky="w")
+
+        def _update_split_label(*_args):
+            split_val_label.config(text=f"{split_offset_var.get():.1f}")
+
+        split_offset_var.trace_add("write", _update_split_label)
 
         ocr_progress_var = tk.DoubleVar(value=0)
         ocr_progress_label = tk.StringVar(value="Ожидание запуска…")
         ocr_status_frame = ttk.LabelFrame(main_frame, text="OCR прогресс")
         ocr_status_frame.pack(fill=tk.X, pady=(0, 10))
-        ocr_bar = ttk.Progressbar(ocr_status_frame, variable=ocr_progress_var, maximum=5)
+        ocr_bar = ttk.Progressbar(ocr_status_frame, variable=ocr_progress_var, maximum=6)
         ocr_bar.pack(fill=tk.X, padx=10, pady=5)
         ttk.Label(ocr_status_frame, textvariable=ocr_progress_label).pack(anchor="w", padx=10)
+
+        log_frame = ttk.Frame(ocr_status_frame)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 5))
+        log_text = tk.Text(log_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
+        log_text.pack(fill=tk.BOTH, expand=True)
 
         ocr_task_holder = {"task": None}
 
@@ -6594,6 +6646,12 @@ class AnkiApp(tk.Tk):
 
         attach_simple_toolbar(ocr_frame, txt_ocr)
 
+        def append_ocr_log(message: str):
+            log_text.configure(state=tk.NORMAL)
+            log_text.insert(tk.END, message + "\n")
+            log_text.see(tk.END)
+            log_text.configure(state=tk.DISABLED)
+
         def handle_ocr_event(event):
             kind = event[0]
             if kind == "ocr_progress":
@@ -6601,6 +6659,9 @@ class AnkiApp(tk.Tk):
                 ocr_bar.config(maximum=max(total, 1))
                 ocr_progress_var.set(step)
                 ocr_progress_label.set(label)
+                append_ocr_log(label)
+            elif kind == "log":
+                append_ocr_log(str(event[1]))
             elif kind == "done":
                 ocr_text = (event[1] or "")
                 if ocr_task_holder["task"]:
@@ -6619,16 +6680,11 @@ class AnkiApp(tk.Tk):
                 messagebox.showerror("Ошибка OCR", event[1])
 
         def run_ocr():
-            if preprocess_var.get() and not CV2_AVAILABLE:
+            if not CV2_AVAILABLE:
                 messagebox.showerror(
                     "OpenCV не установлен",
                     "Установите OpenCV и NumPy:\nC:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
                 )
-                preprocess_var.set(False)
-                return
-            if photo_mode_var.get() and not CV2_AVAILABLE:
-                messagebox.showerror("OCR (фото)", "Нужно: pip install opencv-python")
-                photo_mode_var.set(False)
                 return
             if not PIL_AVAILABLE:
                 messagebox.showerror(
@@ -6638,14 +6694,26 @@ class AnkiApp(tk.Tk):
                 return
             if ocr_task_holder["task"] is not None:
                 return
-            selected_lang = ocr_lang_var.get() if ocr_mode_var.get() == "single" else "deu+rus"
-            if not _ensure_deu_rus_present(selected_lang):
+            selected_mode = ocr_mode_var.get()
+            selected_lang = lang_mode_var.get()
+            if selected_mode == "pro" and not PADDLE_AVAILABLE:
+                messagebox.showinfo(
+                    "PaddleOCR недоступен",
+                    "Установите зависимости внутри venv:\n"
+                    "python -m pip install paddlepaddle paddleocr",
+                )
                 return
-            if not _ensure_required_lang_files():
-                return
+            if selected_mode != "pro":
+                if not _ensure_deu_rus_present(selected_lang):
+                    return
+                if not _ensure_required_lang_files():
+                    return
 
             ocr_progress_var.set(0)
             ocr_progress_label.set("Запуск…")
+            log_text.configure(state=tk.NORMAL)
+            log_text.delete("1.0", tk.END)
+            log_text.configure(state=tk.DISABLED)
             ocr_button.config(state=tk.DISABLED)
 
             def worker(task_obj):
@@ -6653,53 +6721,30 @@ class AnkiApp(tk.Tk):
                     task_obj.queue.put(("ocr_progress", step, total, label))
 
                 try:
-                    lang = selected_lang or DEFAULT_OCR_LANG
-                    ocr_mode = ocr_mode_var.get()
-                    preprocess_enabled = preprocess_var.get()
-                    config, tessdata_dir, tesseract_cmd = _build_required_ocr_config(DEFAULT_OCR_CONFIG_BASE)
-                    if photo_mode_var.get() and ocr_photo_document:
-                        return ocr_photo_document(img_path, lang, progress_cb)
-                    task_obj.queue.put(("ocr_progress", 0, 4, "Загрузка изображения"))
-                    img = load_image_for_ocr(img_path)
-                    image_diag = _format_image_diag(img_path, img)
-                    working_img = img
-
-                    if preprocess_enabled:
-                        task_obj.queue.put(("ocr_progress", 1, 4, "Предобработка (OpenCV)"))
-                        working_img = preprocess_for_ocr(img_path)
-                    else:
-                        task_obj.queue.put(("ocr_progress", 1, 4, "Предобработка отключена"))
-
-                    if ocr_mode == "two_columns":
-                        task_obj.queue.put(("ocr_progress", 2, 4, "Деление на 2 колонки"))
-                        left_img, right_img = split_two_columns(working_img)
-                        left_text = ocr_image(left_img, "deu", config).strip()
-                        task_obj.queue.put(("ocr_progress", 3, 4, "OCR левая колонка (DE)"))
-                        right_text = ocr_image(right_img, "rus", config).strip()
-                        combined = "\n\n".join(
-                            [
-                                "--- DE ---",
-                                left_text,
-                                "--- RU ---",
-                                right_text,
-                            ]
-                        )
-                        task_obj.queue.put(("ocr_progress", 4, 4, "OCR завершен"))
-                        return combined
-
-                    task_obj.queue.put(("ocr_progress", 2, 4, "OCR стандартный режим"))
-                    text = ocr_image(working_img, lang, config)
-                    task_obj.queue.put(("ocr_progress", 4, 4, "OCR завершен"))
+                    options = OcrRunOptions(
+                        ocr_mode=selected_mode,
+                        lang_mode=selected_lang,
+                        perspective_correction=perspective_var.get(),
+                        flatten_background=flatten_var.get(),
+                        binarize_mode=binarize_mode_var.get(),
+                        deskew=deskew_var.get(),
+                        debug_images=debug_images_var.get(),
+                        psm=int(psm_var.get()),
+                        dictionary_mode=dictionary_mode_var.get(),
+                        split_offset_percent=float(split_offset_var.get()),
+                        preserve_spaces=True,
+                        prefer_paddle_for_columns=True,
+                    )
+                    if not preprocess_var.get():
+                        options.flatten_background = False
+                        options.deskew = False
+                        options.perspective_correction = False
+                    task_obj.queue.put(("log", f"OCR режим: {options.ocr_mode}, lang={options.lang_mode}"))
+                    text = perform_page_ocr(img_path, options, progress_cb)
                     return text
                 except Exception as e:
-                    diag = _format_ocr_diag(
-                        config if 'config' in locals() else "",
-                        lang if 'lang' in locals() else DEFAULT_OCR_LANG,
-                        image_diag if 'image_diag' in locals() else None,
-                        ocr_mode if 'ocr_mode' in locals() else None,
-                        preprocess_enabled if 'preprocess_enabled' in locals() else None,
-                    )
-                    raise RuntimeError(f"{e}\n\n{diag}\n\nПроверьте путь к tessdata и tesseract.exe.") from e
+                    task_obj.queue.put(("log", str(e)))
+                    raise
 
             ocr_task_holder["task"] = start_background_task(worker)
             self.register_bg_handler(ocr_task_holder["task"].queue, handle_ocr_event)
