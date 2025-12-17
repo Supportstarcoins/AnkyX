@@ -365,11 +365,9 @@ def _ensure_black_text_on_white(image: np.ndarray) -> np.ndarray:
         img_uint8 = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     else:
         img_uint8 = image
-    unique_values = np.unique(img_uint8)
-    if unique_values.size <= 4:
-        mean_val = float(np.mean(img_uint8))
-        if mean_val < 127:
-            return 255 - img_uint8
+    mean_val = float(np.mean(img_uint8))
+    if mean_val < 127:
+        return 255 - img_uint8
     return img_uint8
 
 
@@ -403,11 +401,10 @@ def _evaluate_variant(
 ) -> tuple[float, float, float]:
     config = _build_tesseract_config(psm, preserve_spaces=preserve_spaces, dpi=300)
     data = pytesseract.image_to_data(image, lang=lang, config=config, output_type=pytesseract.Output.DICT)
+    reconstructed = _reconstruct_text_from_data(data, preserve_spaces=preserve_spaces)
     confs = [float(c) for c in data.get("conf", []) if isinstance(c, (int, float, str)) and float(c) > 0]
     avg_conf = float(np.mean(confs)) if confs else 0.0
-    words = [t for t in data.get("text", []) if isinstance(t, str) and t.strip()]
-    joined = " ".join(words)
-    alpha_ratio, bad_ratio = _compute_text_stats(joined)
+    alpha_ratio, bad_ratio = _compute_text_stats(reconstructed)
     score = avg_conf + 30 * alpha_ratio - 30 * bad_ratio
     return avg_conf, alpha_ratio, score
 
@@ -446,24 +443,27 @@ def _select_best_variant(
     lang: str,
     debug_dir: Path,
     prefix: str,
-    psm: int,
+    allowed_psms: tuple[int, ...],
     preserve_spaces: bool,
-) -> tuple[np.ndarray, str, float, float]:
+) -> tuple[np.ndarray, str, float, float, int]:
     variants = _build_auto_variants(bgr, debug_dir, prefix)
     best_key = "A"
     best_score = -1e9
     best_img = variants["A"]
     best_avg_conf = 0.0
+    best_psm = allowed_psms[0]
 
     for key, img in variants.items():
-        avg_conf, alpha_ratio, score = _evaluate_variant(img, lang=lang, psm=psm, preserve_spaces=preserve_spaces)
-        if score > best_score:
-            best_score = score
-            best_key = key
-            best_img = img
-            best_avg_conf = avg_conf
+        for psm in allowed_psms:
+            avg_conf, alpha_ratio, score = _evaluate_variant(img, lang=lang, psm=psm, preserve_spaces=preserve_spaces)
+            if score > best_score:
+                best_score = score
+                best_key = key
+                best_img = img
+                best_avg_conf = avg_conf
+                best_psm = psm
 
-    return best_img, best_key, best_score, best_avg_conf
+    return best_img, best_key, best_score, best_avg_conf, best_psm
 
 
 def _clean_text_basic(text: str) -> str:
@@ -471,6 +471,74 @@ def _clean_text_basic(text: str) -> str:
     cleaned = cleaned.replace("\r", "\n")
     cleaned = re.sub(r"[\u200b\u00ad]", "", cleaned)
     return cleaned
+
+
+def _reconstruct_text_from_data(data: dict, preserve_spaces: bool = True) -> str:
+    required_fields = ["block_num", "par_num", "line_num", "word_num", "left", "width", "text"]
+    if not all(field in data for field in required_fields):
+        return ""
+
+    entries = []
+    count = len(data.get("text", []))
+    for idx in range(count):
+        raw_text = data.get("text", [""])[idx]
+        if not isinstance(raw_text, str):
+            continue
+        text = raw_text.strip()
+        if not text:
+            continue
+        try:
+            entries.append(
+                {
+                    "block": int(data.get("block_num", [0])[idx]),
+                    "par": int(data.get("par_num", [0])[idx]),
+                    "line": int(data.get("line_num", [0])[idx]),
+                    "word": int(data.get("word_num", [0])[idx]),
+                    "left": int(data.get("left", [0])[idx]),
+                    "width": int(data.get("width", [0])[idx]),
+                    "text": text,
+                }
+            )
+        except Exception:
+            continue
+
+    lines: dict[tuple[int, int, int], list[dict]] = {}
+    for entry in entries:
+        key = (entry["block"], entry["par"], entry["line"])
+        lines.setdefault(key, []).append(entry)
+
+    reconstructed_lines: list[str] = []
+    last_paragraph: tuple[int, int] | None = None
+    for key in sorted(lines.keys()):
+        block_par = (key[0], key[1])
+        if last_paragraph is not None and block_par != last_paragraph:
+            reconstructed_lines.append("")
+        last_paragraph = block_par
+
+        words = sorted(lines[key], key=lambda e: (e["left"], e["word"]))
+        widths = [max(1, w["width"]) / max(1, len(w["text"])) for w in words]
+        avg_char_width = float(np.median(widths)) if widths else 1.0
+        gap_threshold = avg_char_width * 0.6
+
+        line_parts: list[str] = []
+        prev_right = None
+        for word in words:
+            if prev_right is not None:
+                gap = word["left"] - prev_right
+                spaces = 0
+                if gap > gap_threshold:
+                    spaces = max(1, int(round(gap / max(avg_char_width, 1.0))))
+                elif preserve_spaces:
+                    spaces = 1
+                if spaces:
+                    line_parts.append(" " * min(spaces, 10))
+            line_parts.append(word["text"])
+            prev_right = word["left"] + word["width"]
+
+        reconstructed_line = "".join(line_parts).rstrip()
+        reconstructed_lines.append(reconstructed_line)
+
+    return "\n".join(line for line in reconstructed_lines if preserve_spaces or line.strip())
 
 
 def postprocess_text(text: str, lang_mode: str, is_dictionary_page: bool = True, preserve_spaces: bool = True) -> str:
@@ -511,10 +579,36 @@ def _tesseract_image_to_string(pil_img: Image.Image, lang: str, config: str) -> 
             tmp_png.unlink()
 
 
+def _tesseract_image_to_data(pil_img: Image.Image, lang: str, config: str) -> dict:
+    tmp_png = Path(tempfile.gettempdir()) / f"anky_ocr_{uuid4().hex}.png"
+    try:
+        pil_img.save(tmp_png, format="PNG")
+        return pytesseract.image_to_data(str(tmp_png), lang=lang, config=config, output_type=pytesseract.Output.DICT)
+    finally:
+        if tmp_png.exists():
+            tmp_png.unlink()
+
+
 def ocr_with_tesseract(image: np.ndarray, lang: str, psm: int = 4, preserve_spaces: bool = True, dpi: int | None = 300) -> str:
-    config = _build_tesseract_config(psm, preserve_spaces=preserve_spaces, dpi=dpi)
-    pil_img = Image.fromarray(image)
-    return _tesseract_image_to_string(pil_img, lang=lang, config=config)
+    def _run_single(psm_value: int) -> tuple[str, float, float]:
+        config = _build_tesseract_config(psm_value, preserve_spaces=preserve_spaces, dpi=dpi)
+        pil_img = Image.fromarray(image)
+        data = _tesseract_image_to_data(pil_img, lang=lang, config=config)
+        text = _reconstruct_text_from_data(data, preserve_spaces=preserve_spaces)
+        confs = [float(c) for c in data.get("conf", []) if isinstance(c, (int, float, str)) and float(c) > 0]
+        avg_conf = float(np.mean(confs)) if confs else 0.0
+        alpha_ratio, bad_ratio = _compute_text_stats(text)
+        score = avg_conf + 30 * alpha_ratio - 30 * bad_ratio
+        return text, score, avg_conf
+
+    primary_text, primary_score, primary_conf = _run_single(psm)
+    if len(primary_text.strip()) < 30 and psm in (4, 6):
+        alt_psm = 6 if psm == 4 else 4
+        alt_text, alt_score, alt_conf = _run_single(alt_psm)
+        if alt_score > primary_score or len(alt_text.strip()) > len(primary_text.strip()):
+            primary_text, primary_score, primary_conf = alt_text, alt_score, alt_conf
+
+    return primary_text
 
 
 def _normalize_paddle_lang(lang_mode: str) -> tuple[str, str]:
@@ -690,61 +784,73 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
             x_split, left_img, right_img = split_columns_auto(split_source, options.split_offset_percent)
             _save_debug_image(debug_dir, "04_split_left", left_img)
             _save_debug_image(debug_dir, "05_split_right", right_img)
-            column_psm = 6
+            column_psms: tuple[int, ...] = (6, 4)
+            column_psm = column_psms[0]
 
             if options.preprocess_preset == "auto_pro":
-                left_processed, left_key, left_score, left_conf = _select_best_variant(
+                left_processed, left_key, left_score, left_conf, left_psm = _select_best_variant(
                     left_img,
                     lang="deu",
                     debug_dir=debug_dir,
                     prefix="left_",
-                    psm=column_psm,
+                    allowed_psms=column_psms,
                     preserve_spaces=options.preserve_spaces,
                 )
                 left_processed = _ensure_black_text_on_white(left_processed)
                 if options.deskew:
                     left_processed = deskew(left_processed)
-                _step(f"Левая колонка: пресет {left_key}, score={left_score:.2f}, avg_conf={left_conf:.1f}")
+                _step(
+                    "Column L: selected preset "
+                    f"{left_key}, selected psm {left_psm}, score={left_score:.2f}, conf={left_conf:.1f}"
+                )
                 _save_debug_image(debug_dir, "06_left_best", left_processed)
 
-                right_processed, right_key, right_score, right_conf = _select_best_variant(
+                right_processed, right_key, right_score, right_conf, right_psm = _select_best_variant(
                     right_img,
                     lang="rus",
                     debug_dir=debug_dir,
                     prefix="right_",
-                    psm=column_psm,
+                    allowed_psms=column_psms,
                     preserve_spaces=options.preserve_spaces,
                 )
                 right_processed = _ensure_black_text_on_white(right_processed)
                 if options.deskew:
                     right_processed = deskew(right_processed)
-                _step(f"Правая колонка: пресет {right_key}, score={right_score:.2f}, avg_conf={right_conf:.1f}")
+                _step(
+                    "Column R: selected preset "
+                    f"{right_key}, selected psm {right_psm}, score={right_score:.2f}, conf={right_conf:.1f}"
+                )
                 _save_debug_image(debug_dir, "07_right_best", right_processed)
             else:
                 left_processed = left_img
                 right_processed = right_img
+                left_psm = column_psm
+                right_psm = column_psm
 
-            left_engine_text = ocr_with_tesseract(left_processed, "deu", psm=column_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
-            right_engine_text = ocr_with_tesseract(right_processed, "rus", psm=column_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
+            left_engine_text = ocr_with_tesseract(left_processed, "deu", psm=left_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
+            right_engine_text = ocr_with_tesseract(right_processed, "rus", psm=right_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
             combined = "\n\n".join(["--- DE ---", left_engine_text.strip(), "--- RU ---", right_engine_text.strip()])
             result_text = combined
             _step("постобработка")
         elif options.preprocess_preset == "auto_pro":
             _step("авто-подготовка")
-            page_psm = options.psm if options.psm in (3, 4) else 4
-            best_img, best_key, best_score, best_avg_conf = _select_best_variant(
+            page_psms: tuple[int, ...] = (6, 4)
+            best_img, best_key, best_score, best_avg_conf, best_psm = _select_best_variant(
                 working,
                 lang=options.lang_mode,
                 debug_dir=debug_dir,
                 prefix="page_",
-                psm=page_psm,
+                allowed_psms=page_psms,
                 preserve_spaces=options.preserve_spaces,
             )
             best_img = _ensure_black_text_on_white(best_img)
             if options.deskew:
                 best_img = deskew(best_img)
             _save_debug_image(debug_dir, "03_best", best_img)
-            _step(f"Выбранный пресет: {best_key}, score={best_score:.2f}, avg_conf={best_avg_conf:.1f}")
+            _step(
+                f"Выбранный пресет: {best_key}, выбранный psm: {best_psm}, "
+                f"score={best_score:.2f}, avg_conf={best_avg_conf:.1f}"
+            )
             selected_page = best_img
 
             if options.ocr_mode == "pro":
@@ -753,7 +859,7 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
                 _step("постобработка")
             else:
                 _step("Tesseract")
-                result_text = ocr_with_tesseract(selected_page, options.lang_mode, psm=page_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
+                result_text = ocr_with_tesseract(selected_page, options.lang_mode, psm=best_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
                 _step("постобработка")
             _step("завершено")
         elif options.ocr_mode == "pro" and selected_page is not None:
@@ -762,7 +868,7 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
             _step("постобработка")
             _step("завершено")
         else:
-            page_psm = options.psm if options.psm in (3, 4, 6, 11) else 4
+            page_psm = options.psm if options.psm in (3, 4, 6) else 4
             target_img = selected_page
             _step("Tesseract")
             result_text = ocr_with_tesseract(target_img, options.lang_mode, psm=page_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
