@@ -82,6 +82,7 @@ class OcrRunOptions:
     dpi: int | None = 300
     split_offset_percent: float = 0.0
     prefer_paddle_for_columns: bool = True
+    preprocess_preset: Literal["basic", "auto_pro", "none"] = "basic"
 
 
 def _report(cb: ProgressCallback | None, step: int, total: int, label: str):
@@ -247,10 +248,11 @@ def deskew(binary_or_gray: np.ndarray) -> np.ndarray:
 def split_columns_auto(binary_or_gray: np.ndarray, offset_percent: float = 0.0):
     """Split page into two columns using whitespace valley detection."""
 
-    if len(binary_or_gray.shape) == 3:
-        gray = cv2.cvtColor(binary_or_gray, cv2.COLOR_BGR2GRAY)
+    src = binary_or_gray
+    if len(src.shape) == 3:
+        gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
     else:
-        gray = binary_or_gray
+        gray = src
 
     h, w = gray.shape[:2]
     top = int(h * 0.2)
@@ -270,8 +272,8 @@ def split_columns_auto(binary_or_gray: np.ndarray, offset_percent: float = 0.0):
     x_split = int(x_split + (offset_percent / 100.0) * w)
     x_split = max(int(w * 0.1), min(int(w * 0.9), x_split))
     padding = int(w * 0.03)
-    left = gray[:, : max(1, x_split - padding)]
-    right = gray[:, min(w, x_split + padding) :]
+    left = src[:, : max(1, x_split - padding)]
+    right = src[:, min(w, x_split + padding) :]
     return x_split, left, right
 
 
@@ -282,6 +284,186 @@ def _save_debug_image(base_dir: Path, prefix: str, image: np.ndarray):
         cv2.imwrite(str(target), image)
     else:
         cv2.imwrite(str(target), cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+
+def _ensure_min_width(image: np.ndarray, min_width: int = 1600) -> np.ndarray:
+    h, w = image.shape[:2]
+    if w >= min_width:
+        return image
+    scale = 2.0
+    new_size = (int(w * scale), int(h * scale))
+    return cv2.resize(image, new_size, interpolation=cv2.INTER_CUBIC)
+
+
+def _unsharp_mask(gray: np.ndarray, strength: float = 1.2, blur_size: int = 3) -> np.ndarray:
+    blurred = cv2.GaussianBlur(gray, (0, 0), blur_size)
+    return cv2.addWeighted(gray, strength, blurred, -0.2, 0)
+
+
+def _apply_clahe_to_l(image: np.ndarray) -> np.ndarray:
+    if len(image.shape) == 3:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        merged = cv2.merge((l, a, b))
+        return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(image)
+
+
+def _flatten_background_pro(gray: np.ndarray) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+    blurred = cv2.GaussianBlur(opened, (0, 0), sigmaX=15, sigmaY=15)
+    normalized = cv2.divide(gray, blurred, scale=255)
+    normalized = cv2.normalize(normalized, None, 0, 255, cv2.NORM_MINMAX)
+    return normalized.astype(np.uint8)
+
+
+def _adaptive_threshold(gray: np.ndarray) -> np.ndarray:
+    return cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        35,
+        10,
+    )
+
+
+def _sauvola_threshold(gray: np.ndarray, window: int = 25, k: float = 0.2, r: float = 128.0) -> np.ndarray:
+    gray_f = gray.astype(np.float64)
+    padded = cv2.copyMakeBorder(gray_f, window // 2, window // 2, window // 2, window // 2, cv2.BORDER_REFLECT)
+    integral = cv2.integral(padded)
+    integral_sq = cv2.integral(padded * padded)
+
+    h, w = gray.shape
+    mean = np.zeros_like(gray_f)
+    std = np.zeros_like(gray_f)
+
+    for y in range(h):
+        y1 = y
+        y2 = y + window
+        for x in range(w):
+            x1 = x
+            x2 = x + window
+            area = window * window
+            s = integral[y2, x2] - integral[y1, x2] - integral[y2, x1] + integral[y1, x1]
+            sq = integral_sq[y2, x2] - integral_sq[y1, x2] - integral_sq[y2, x1] + integral_sq[y1, x1]
+            m = s / area
+            mean[y, x] = m
+            std[y, x] = max(0.0, np.sqrt(max(sq / area - m * m, 0.0)))
+
+    threshold = mean * (1 + k * ((std / r) - 1))
+    binary = (gray_f > threshold).astype(np.uint8) * 255
+    return binary.astype(np.uint8)
+
+
+def _ensure_black_text_on_white(image: np.ndarray) -> np.ndarray:
+    if image.dtype != np.uint8:
+        img_uint8 = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    else:
+        img_uint8 = image
+    unique_values = np.unique(img_uint8)
+    if unique_values.size <= 4:
+        mean_val = float(np.mean(img_uint8))
+        if mean_val < 127:
+            return 255 - img_uint8
+    return img_uint8
+
+
+def _compute_text_stats(text: str) -> tuple[float, float]:
+    total_chars = len([ch for ch in text if not ch.isspace()])
+    if total_chars == 0:
+        return 0.0, 0.0
+    alpha_chars = len(re.findall(r"[A-Za-z\u00C0-\u024f\u0400-\u04FF]", text))
+    allowed_punct = set(",.;:!?()[]{}\"'`´-–—/_\\|")
+    bad_chars = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        if ch.isdigit():
+            continue
+        if re.match(r"[A-Za-z\u00C0-\u024f\u0400-\u04FF]", ch):
+            continue
+        if ch in allowed_punct:
+            continue
+        bad_chars += 1
+    alpha_ratio = alpha_chars / total_chars
+    bad_ratio = bad_chars / total_chars
+    return alpha_ratio, bad_ratio
+
+
+def _evaluate_variant(
+    image: np.ndarray,
+    lang: str,
+    psm: int,
+    preserve_spaces: bool,
+) -> tuple[float, float, float]:
+    config = _build_tesseract_config(psm, preserve_spaces=preserve_spaces, dpi=300)
+    data = pytesseract.image_to_data(image, lang=lang, config=config, output_type=pytesseract.Output.DICT)
+    confs = [float(c) for c in data.get("conf", []) if isinstance(c, (int, float, str)) and float(c) > 0]
+    avg_conf = float(np.mean(confs)) if confs else 0.0
+    words = [t for t in data.get("text", []) if isinstance(t, str) and t.strip()]
+    joined = " ".join(words)
+    alpha_ratio, bad_ratio = _compute_text_stats(joined)
+    score = avg_conf + 30 * alpha_ratio - 30 * bad_ratio
+    return avg_conf, alpha_ratio, score
+
+
+def _build_auto_variants(
+    bgr: np.ndarray,
+    debug_dir: Path,
+    prefix: str,
+) -> dict[str, np.ndarray]:
+    variants: dict[str, np.ndarray] = {}
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    variants["A"] = _unsharp_mask(gray)
+
+    clahe_img = _apply_clahe_to_l(bgr)
+    clahe_gray = cv2.cvtColor(clahe_img, cv2.COLOR_BGR2GRAY) if len(clahe_img.shape) == 3 else clahe_img
+    variants["B"] = clahe_gray
+
+    flattened = _flatten_background_pro(gray)
+    variants["C"] = flattened
+
+    adaptive_base = flattened if flattened is not None else clahe_gray
+    variants["D"] = _ensure_black_text_on_white(_adaptive_threshold(adaptive_base))
+
+    sauvola_base = flattened if flattened is not None else gray
+    variants["E"] = _ensure_black_text_on_white(_sauvola_threshold(sauvola_base))
+
+    for key, img in variants.items():
+        _save_debug_image(debug_dir, f"{prefix}{key}_", img)
+
+    return variants
+
+
+def _select_best_variant(
+    bgr: np.ndarray,
+    lang: str,
+    debug_dir: Path,
+    prefix: str,
+    psm: int,
+    preserve_spaces: bool,
+) -> tuple[np.ndarray, str, float, float]:
+    variants = _build_auto_variants(bgr, debug_dir, prefix)
+    best_key = "A"
+    best_score = -1e9
+    best_img = variants["A"]
+    best_avg_conf = 0.0
+
+    for key, img in variants.items():
+        avg_conf, alpha_ratio, score = _evaluate_variant(img, lang=lang, psm=psm, preserve_spaces=preserve_spaces)
+        if score > best_score:
+            best_score = score
+            best_key = key
+            best_img = img
+            best_avg_conf = avg_conf
+
+    return best_img, best_key, best_score, best_avg_conf
 
 
 def _clean_text_basic(text: str) -> str:
@@ -446,8 +628,15 @@ def _compose_diag(image_path: str, pil_img: Image.Image | None, config: str | No
 
 
 def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: ProgressCallback | None = None) -> str:
-    total_steps = 6
-    _report(progress_cb, 1, total_steps, "Шаг 1/6: загрузка")
+    total_steps = 9 if options.ocr_mode == "two_columns" else 8
+    current_step = 1
+
+    def _step(label: str):
+        nonlocal current_step
+        _report(progress_cb, current_step, total_steps, f"Шаг {current_step}/{total_steps}: {label}")
+        current_step += 1
+
+    _step("загрузка")
 
     original_pil: Image.Image | None = None
     bgr: np.ndarray | None = None
@@ -460,62 +649,125 @@ def perform_page_ocr(image_path: str, options: OcrRunOptions, progress_cb: Progr
         original_pil = load_image_for_ocr(image_path)
         bgr = load_image_any(image_path)
         debug_dir = Path("logs") / "ocr_debug" / datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        if options.debug_images and bgr is not None:
+        if bgr is not None:
             _save_debug_image(debug_dir, "01_original", bgr)
 
         working = bgr if bgr is not None else np.array(original_pil)
         warp_info = {"found_quad": False}
         if options.perspective_correction and bgr is not None:
             working, warp_info = detect_and_warp_page(bgr)
-            _report(progress_cb, 2, total_steps, "Шаг 2/6: перспектива" if warp_info.get("found_quad") else "Шаг 2/6: перспектива пропущена")
-            if options.debug_images:
-                _save_debug_image(debug_dir, "02_warped", working)
+            _step("перспектива" if warp_info.get("found_quad") else "перспектива пропущена")
+            _save_debug_image(debug_dir, "02_warped", working)
         else:
-            _report(progress_cb, 2, total_steps, "Шаг 2/6: перспектива выключена")
+            _step("перспектива выключена")
 
-        gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+        working = _ensure_min_width(working)
+        selected_page = working
 
-        if options.flatten_background:
-            flat = flatten_background(gray)
-            _report(progress_cb, 3, total_steps, "Шаг 3/6: фон выровнен")
-        else:
-            flat = gray
-            _report(progress_cb, 3, total_steps, "Шаг 3/6: фон без изменений")
-        if options.debug_images:
+        if options.preprocess_preset != "auto_pro":
+            _step("базовая подготовка")
+            gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+
+            if options.flatten_background:
+                flat = flatten_background(gray)
+                _step("фон выровнен")
+            else:
+                flat = gray
+                _step("фон без изменений")
             _save_debug_image(debug_dir, "03_flatten", flat)
 
-        binary = upscale_and_binarize(flat, mode=options.binarize_mode)
-        _report(progress_cb, 4, total_steps, "Шаг 4/6: бинаризация")
-        if options.deskew:
-            binary = deskew(binary)
-        if options.debug_images:
+            binary = upscale_and_binarize(flat, mode=options.binarize_mode)
+            binary = _ensure_black_text_on_white(binary)
+            _step("бинаризация")
+            if options.deskew:
+                binary = deskew(binary)
             _save_debug_image(debug_dir, "04_binary", binary)
+            selected_page = binary if binary is not None else gray if gray is not None else working
 
-        if options.ocr_mode == "two_columns" and binary is not None:
-            x_split, left_img, right_img = split_columns_auto(binary, options.split_offset_percent)
-            if options.debug_images:
-                _save_debug_image(debug_dir, "05_left", left_img)
-                _save_debug_image(debug_dir, "06_right", right_img)
-            _report(progress_cb, 5, total_steps, "Шаг 5/6: OCR левая колонка")
-            if options.prefer_paddle_for_columns and _is_paddle_ready():
-                left_engine_text = ocr_with_paddle(left_img, "deu")
-                _report(progress_cb, 6, total_steps, "Шаг 6/6: OCR правая колонка")
-                right_engine_text = ocr_with_paddle(right_img, "rus")
+        if options.ocr_mode == "two_columns":
+            _step("разделение колонки")
+            split_source = selected_page if options.preprocess_preset != "auto_pro" else working
+            x_split, left_img, right_img = split_columns_auto(split_source, options.split_offset_percent)
+            _save_debug_image(debug_dir, "04_split_left", left_img)
+            _save_debug_image(debug_dir, "05_split_right", right_img)
+            column_psm = 6
+
+            if options.preprocess_preset == "auto_pro":
+                left_processed, left_key, left_score, left_conf = _select_best_variant(
+                    left_img,
+                    lang="deu",
+                    debug_dir=debug_dir,
+                    prefix="left_",
+                    psm=column_psm,
+                    preserve_spaces=options.preserve_spaces,
+                )
+                left_processed = _ensure_black_text_on_white(left_processed)
+                if options.deskew:
+                    left_processed = deskew(left_processed)
+                _step(f"Левая колонка: пресет {left_key}, score={left_score:.2f}, avg_conf={left_conf:.1f}")
+                _save_debug_image(debug_dir, "06_left_best", left_processed)
+
+                right_processed, right_key, right_score, right_conf = _select_best_variant(
+                    right_img,
+                    lang="rus",
+                    debug_dir=debug_dir,
+                    prefix="right_",
+                    psm=column_psm,
+                    preserve_spaces=options.preserve_spaces,
+                )
+                right_processed = _ensure_black_text_on_white(right_processed)
+                if options.deskew:
+                    right_processed = deskew(right_processed)
+                _step(f"Правая колонка: пресет {right_key}, score={right_score:.2f}, avg_conf={right_conf:.1f}")
+                _save_debug_image(debug_dir, "07_right_best", right_processed)
             else:
-                left_engine_text = ocr_with_tesseract(left_img, "deu", psm=options.psm)
-                _report(progress_cb, 6, total_steps, "Шаг 6/6: OCR правая колонка")
-                right_engine_text = ocr_with_tesseract(right_img, "rus", psm=options.psm)
+                left_processed = left_img
+                right_processed = right_img
+
+            left_engine_text = ocr_with_tesseract(left_processed, "deu", psm=column_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
+            right_engine_text = ocr_with_tesseract(right_processed, "rus", psm=column_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
             combined = "\n\n".join(["--- DE ---", left_engine_text.strip(), "--- RU ---", right_engine_text.strip()])
             result_text = combined
-        elif options.ocr_mode == "pro" and binary is not None:
-            _report(progress_cb, 5, total_steps, "Шаг 5/6: PaddleOCR")
-            result_text = ocr_with_paddle(binary, options.lang_mode)
-            _report(progress_cb, 6, total_steps, "Шаг 6/6: постобработка")
+            _step("постобработка")
+        elif options.preprocess_preset == "auto_pro":
+            _step("авто-подготовка")
+            page_psm = options.psm if options.psm in (3, 4) else 4
+            best_img, best_key, best_score, best_avg_conf = _select_best_variant(
+                working,
+                lang=options.lang_mode,
+                debug_dir=debug_dir,
+                prefix="page_",
+                psm=page_psm,
+                preserve_spaces=options.preserve_spaces,
+            )
+            best_img = _ensure_black_text_on_white(best_img)
+            if options.deskew:
+                best_img = deskew(best_img)
+            _save_debug_image(debug_dir, "03_best", best_img)
+            _step(f"Выбранный пресет: {best_key}, score={best_score:.2f}, avg_conf={best_avg_conf:.1f}")
+            selected_page = best_img
+
+            if options.ocr_mode == "pro":
+                _step("PaddleOCR")
+                result_text = ocr_with_paddle(selected_page, options.lang_mode)
+                _step("постобработка")
+            else:
+                _step("Tesseract")
+                result_text = ocr_with_tesseract(selected_page, options.lang_mode, psm=page_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
+                _step("постобработка")
+            _step("завершено")
+        elif options.ocr_mode == "pro" and selected_page is not None:
+            _step("PaddleOCR")
+            result_text = ocr_with_paddle(selected_page, options.lang_mode)
+            _step("постобработка")
+            _step("завершено")
         else:
-            target_img = binary if binary is not None else gray if gray is not None else working
-            _report(progress_cb, 5, total_steps, "Шаг 5/6: Tesseract")
-            result_text = ocr_with_tesseract(target_img, options.lang_mode, psm=options.psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
-            _report(progress_cb, 6, total_steps, "Шаг 6/6: постобработка")
+            page_psm = options.psm if options.psm in (3, 4, 6, 11) else 4
+            target_img = selected_page
+            _step("Tesseract")
+            result_text = ocr_with_tesseract(target_img, options.lang_mode, psm=page_psm, preserve_spaces=options.preserve_spaces, dpi=options.dpi)
+            _step("постобработка")
+            _step("завершено")
     except Exception as e:  # noqa: BLE001
         diag = _compose_diag(image_path, original_pil, config=config, lang=options.lang_mode, ocr_mode=options.ocr_mode)
         _show_message_async("Ошибка OCR", f"{e}\n\nПереключаюсь на Tesseract OCR.\n\n{diag}")
