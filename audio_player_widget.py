@@ -79,6 +79,12 @@ class AudioPlayerWidget(ttk.Frame):
         self._vlc_ready = False
         self._vlc_instance = None
         self._player = None
+        self.palette = getattr(master, "palette", None)
+        if self.palette:
+            try:
+                self.configure(style="CardInner.TFrame")
+            except Exception:
+                pass
         if VLC_AVAILABLE and VLC_LOAD_ERROR is None:
             try:
                 self._vlc_instance = vlc.Instance()
@@ -101,7 +107,7 @@ class AudioPlayerWidget(ttk.Frame):
                 self._set_status("Установите VLC x64")
 
     def _build_ui(self):
-        control_frame = ttk.Frame(self)
+        control_frame = ttk.Frame(self, style="CardInner.TFrame")
         control_frame.pack(fill=tk.X, pady=2)
 
         self.play_btn = ttk.Button(control_frame, text="▶ Play", command=self.play)
@@ -113,7 +119,7 @@ class AudioPlayerWidget(ttk.Frame):
         self.stop_btn = ttk.Button(control_frame, text="⏹ Stop", command=self.stop)
         self.stop_btn.pack(side=tk.LEFT, padx=2)
 
-        vol_frame = ttk.Frame(self)
+        vol_frame = ttk.Frame(self, style="CardInner.TFrame")
         vol_frame.pack(fill=tk.X, pady=2)
         ttk.Label(vol_frame, text="Громкость").pack(side=tk.LEFT, padx=(0, 5))
         self.volume_var = tk.DoubleVar(value=70)
@@ -123,7 +129,7 @@ class AudioPlayerWidget(ttk.Frame):
         )
         self.volume_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        rate_frame = ttk.Frame(self)
+        rate_frame = ttk.Frame(self, style="CardInner.TFrame")
         rate_frame.pack(fill=tk.X, pady=2)
         ttk.Label(rate_frame, text="Скорость").pack(side=tk.LEFT, padx=(0, 5))
         self.rate_var = tk.DoubleVar(value=1.0)
@@ -133,7 +139,7 @@ class AudioPlayerWidget(ttk.Frame):
         )
         self.rate_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        seek_frame = ttk.Frame(self)
+        seek_frame = ttk.Frame(self, style="CardInner.TFrame")
         seek_frame.pack(fill=tk.X, pady=2)
         self.time_label = ttk.Label(seek_frame, text="00:00 / 00:00")
         self.time_label.pack(side=tk.LEFT, padx=(0, 5))
@@ -149,6 +155,11 @@ class AudioPlayerWidget(ttk.Frame):
 
         self.status_label = ttk.Label(self, text="")
         self.status_label.pack(fill=tk.X, pady=(2, 0))
+        if self.palette:
+            try:
+                self.status_label.configure(foreground=self.palette.get("muted"), background=self.palette.get("panel"))
+            except Exception:
+                pass
 
     def _handle_error(self, msg: str, exc: Exception | None = None):
         if self.on_error_callback:

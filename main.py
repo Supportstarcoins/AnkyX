@@ -85,6 +85,7 @@ from video_tools import (
     open_in_external_player,
 )
 from audio_player_widget import AudioPlayerWidget
+from ui_theme import apply_premium_dark_theme, style_card, style_text_widget
 
 # ==========================
 # OCR: pytesseract + автопоиск tesseract.exe
@@ -225,8 +226,9 @@ def _format_image_diag(image_path: str, img: Image.Image) -> str:
 def load_image_for_ocr(path: str) -> Image.Image:
     if not PIL_AVAILABLE:
         messagebox.showerror(
-            "Pillow не установлен",
-            "Установите Pillow:\nC:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow",
+            "Не удалось открыть изображение",
+            "Для загрузки изображений нужен модуль Pillow.\n"
+            "Установите его и повторите попытку: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow",
         )
         raise RuntimeError("Pillow недоступен")
 
@@ -267,8 +269,9 @@ def _get_cv2_version() -> str:
 def preprocess_for_ocr(image_path: str) -> Image.Image:
     if not CV2_AVAILABLE or not NUMPY_AVAILABLE:
         messagebox.showerror(
-            "OpenCV не установлен",
-            "Установите OpenCV и NumPy:\nC:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
+            "Недоступна обработка изображения",
+            "Для улучшения OCR необходимы OpenCV и NumPy.\n"
+            "Установите пакеты: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
         )
         raise RuntimeError("OpenCV/NumPy недоступны для предобработки")
 
@@ -3328,6 +3331,8 @@ class AnkiApp(tk.Tk):
 
         self.root = self
 
+        self.style, self.palette = apply_premium_dark_theme(self)
+
         self.decks = []
         self.selected_deck_id = None
         self.selected_phase = None
@@ -3699,7 +3704,7 @@ class AnkiApp(tk.Tk):
 
     def open_image_id_import_window(self):
         if not PIL_AVAILABLE:
-            messagebox.showerror("Pillow не установлен", "Для режима импорта картинок нужен пакет Pillow")
+            messagebox.showerror("Импорт изображений недоступен", "Чтобы прикреплять картинки, установите пакет Pillow и попробуйте снова.")
             return
 
         win = tk.Toplevel(self)
@@ -4101,7 +4106,7 @@ class AnkiApp(tk.Tk):
 
     def open_wikimedia_csv_window(self):
         if not PIL_AVAILABLE:
-            messagebox.showerror("Pillow не установлен", "Для режима нужен пакет Pillow")
+            messagebox.showerror("Изображения недоступны", "Для загрузки картинок установите пакет Pillow и повторите попытку.")
             return
 
         win = tk.Toplevel(self)
@@ -4883,8 +4888,8 @@ class AnkiApp(tk.Tk):
         if not SR_AVAILABLE:
             messagebox.showerror(
                 "Речь недоступна",
-                "SpeechRecognition не установлен.\n"
-                "Установи: pip install SpeechRecognition pyaudio"
+                "Чтобы выбрать микрофон, установите SpeechRecognition и PyAudio:\n"
+                "pip install SpeechRecognition pyaudio"
             )
             return
 
@@ -5113,7 +5118,7 @@ class AnkiApp(tk.Tk):
                 for widget in charts_frame.winfo_children():
                     widget.destroy()
                 ttk.Label(charts_frame,
-                         text="Matplotlib не установлен. Установите: pip install matplotlib",
+                         text="Графики недоступны: установите Matplotlib (pip install matplotlib) и перезапустите приложение.",
                          foreground="red").pack(pady=20)
                 return
 
@@ -5262,117 +5267,127 @@ class AnkiApp(tk.Tk):
     # --------- главное окно ---------
 
     def create_widgets(self):
-        # Основной контейнер с двумя фреймами
-        main_container = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        main_container.pack(fill=tk.BOTH, expand=True)
+        header = ttk.Frame(self, style="Header.TFrame")
+        header.pack(fill=tk.X, padx=14, pady=(10, 6))
+        ttk.Label(header, text="Leitner Anki", style="HeaderTitle.TLabel").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(header, text="Цифровой слух · OCR · Wiktionary · AI", style="HeaderSub.TLabel").pack(side=tk.LEFT)
 
-        # Левый фрейм для списка колод
-        left_frame = ttk.Frame(main_container)
+        quick_actions = ttk.Frame(header, style="Header.TFrame")
+        quick_actions.pack(side=tk.RIGHT)
+        ttk.Button(quick_actions, text="Импорт .apkg", style="Ghost.TButton", command=self.open_apkg_import_window).pack(side=tk.LEFT, padx=4)
+        ttk.Button(quick_actions, text="Импорт CSV", style="Ghost.TButton", command=self.open_csv_import_window).pack(side=tk.LEFT, padx=4)
+        ttk.Button(quick_actions, text="Новая колода", style="Primary.TButton", command=self.add_deck_window).pack(side=tk.LEFT, padx=(8, 0))
+
+        shell = ttk.Frame(self, style="Surface.TFrame")
+        shell.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        main_container = ttk.PanedWindow(shell, orient=tk.HORIZONTAL)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        left_frame = ttk.Frame(main_container, style="Surface.TFrame")
         main_container.add(left_frame, weight=1)
 
-        # Правый фрейм для превью колоды
-        right_frame = ttk.Frame(main_container)
+        right_frame = ttk.Frame(main_container, style="Surface.TFrame")
         main_container.add(right_frame, weight=1)
 
-        # Левый фрейм: список колод
-        frame_top = ttk.Frame(left_frame)
-        frame_top.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        frame_top = ttk.Frame(left_frame, style="Card.TFrame", padding=12)
+        frame_top.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        title_frame = ttk.Frame(frame_top)
-        title_frame.pack(fill=tk.X)
+        title_frame = ttk.Frame(frame_top, style="CardInner.TFrame")
+        title_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(title_frame, text="Колоды:").pack(side=tk.LEFT, anchor="w")
+        ttk.Label(title_frame, text="Колоды", style="Heading.TLabel").pack(side=tk.LEFT, anchor="w")
 
-        # Красный кружок с числом просроченных карточек
         self.overdue_canvas = tk.Canvas(
             title_frame, width=24, height=24,
-            highlightthickness=0, bg=self.cget("bg")
+            highlightthickness=0, bg=self.palette["panel"]
         )
-        self.overdue_canvas.pack(side=tk.LEFT, padx=6)
+        self.overdue_canvas.pack(side=tk.LEFT, padx=8)
         self.overdue_badge_text_id = None
 
-        # Treeview вместо Listbox: колода -> фазы 1..10
         self.decks_tree = ttk.Treeview(frame_top, show="tree", selectmode="browse")
-        self.decks_tree.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        self.decks_tree.pack(fill=tk.BOTH, expand=True)
         self.decks_tree.bind("<<TreeviewSelect>>", self.on_deck_select)
         self.phase_badge_manager = PhaseOverdueBadges(self.decks_tree)
 
-        frame_buttons = ttk.Frame(left_frame)
-        frame_buttons.pack(fill=tk.X, padx=10, pady=10)
+        frame_buttons = ttk.Frame(left_frame, style="Card.TFrame", padding=10)
+        frame_buttons.pack(fill=tk.X, padx=8, pady=(0, 10))
 
-        ttk.Button(frame_buttons, text="Новая колода", command=self.add_deck_window)\
+        ttk.Button(frame_buttons, text="Новая колода", command=self.add_deck_window, style="Primary.TButton")\
             .pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame_buttons, text="Редактировать колоду", command=self.edit_deck_window)\
+        ttk.Button(frame_buttons, text="Редактировать", command=self.edit_deck_window)\
             .pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame_buttons, text="Удалить колоду", command=self.delete_selected_deck)\
+        ttk.Button(frame_buttons, text="Удалить", command=self.delete_selected_deck)\
             .pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame_buttons, text="Добавить карточку вручную", command=self.add_card_window)\
+        ttk.Button(frame_buttons, text="Добавить карточку", command=self.add_card_window)\
             .pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame_buttons, text="Режим повторения", command=self.start_repeat_mode)\
+        ttk.Button(frame_buttons, text="Режим повторения", command=self.start_repeat_mode, style="Ghost.TButton")\
             .pack(side=tk.RIGHT, padx=5)
 
-        # Правый фрейм: превью колоды
-        self.preview_frame = ttk.LabelFrame(right_frame, text="Превью колоды")
-        self.preview_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.preview_frame = ttk.LabelFrame(right_frame, text="Превью колоды", style="Card.TLabelframe")
+        self.preview_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        style_card(self.preview_frame, self.palette, padded=True)
 
-        # Контейнер для изображения и текста
-        preview_container = ttk.Frame(self.preview_frame)
-        preview_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        preview_container = ttk.Frame(self.preview_frame, style="CardInner.TFrame")
+        preview_container.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        # Фрейм для изображения (левая часть)
-        self.image_frame = ttk.Frame(preview_container)
-        self.image_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        self.image_frame = ttk.Frame(preview_container, style="CardInner.TFrame")
+        self.image_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
 
         self.deck_preview_label = tk.Label(
-            self.image_frame, 
+            self.image_frame,
             text="Выберите колоду для просмотра",
-            bg="white",
-            relief="solid",
-            bd=1
+            bg=self.palette["panel"],
+            fg=self.palette["muted"],
+            relief="flat",
+            bd=0,
+            wraplength=240,
+            justify=tk.CENTER,
+            font=("Segoe UI", 12, "bold"),
         )
         self.deck_preview_label.pack(fill=tk.BOTH, expand=True)
 
-        # Фрейм для текста (правая часть)
-        text_frame = ttk.Frame(preview_container)
+        text_frame = ttk.Frame(preview_container, style="CardInner.TFrame")
         text_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self.deck_name_label = ttk.Label(
             text_frame,
             text="Название колоды",
-            font=("Arial", 14, "bold"),
-            wraplength=200
+            style="Heading.TLabel",
+            wraplength=220
         )
         self.deck_name_label.pack(anchor=tk.W, pady=(0, 10))
 
         self.deck_desc_label = ttk.Label(
             text_frame,
             text="Описание колоды",
-            wraplength=200,
+            style="Body.TLabel",
+            wraplength=220,
             justify=tk.LEFT
         )
-        self.deck_desc_label.pack(anchor=tk.W, pady=(0, 10))
+        self.deck_desc_label.pack(anchor=tk.W, pady=(0, 8))
 
-        # Статистика колоды в превью
-        stats_frame = ttk.LabelFrame(text_frame, text="Статистика")
+        stats_frame = ttk.LabelFrame(text_frame, text="Статистика", style="Card.TLabelframe")
         stats_frame.pack(fill=tk.X, pady=10)
+        style_card(stats_frame, self.palette, padded=True)
 
         self.deck_stats_label = ttk.Label(
             stats_frame,
             text="Карточек: 0\nФаз: 0/10\nОзнакомлено: 0",
+            style="Body.TLabel",
             justify=tk.LEFT
         )
-        self.deck_stats_label.pack(padx=10, pady=10)
+        self.deck_stats_label.pack(anchor=tk.W)
 
-        # Кнопки действий для выбранной колоды
-        action_frame = ttk.Frame(self.preview_frame)
+        action_frame = ttk.Frame(self.preview_frame, style="CardInner.TFrame")
         action_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-        ttk.Button(action_frame, text="Просмотреть карточки", 
-                  command=self.show_cards_window).pack(side=tk.LEFT, padx=5)
-        ttk.Button(action_frame, text="Режим воспроизведения", 
-                  command=self.start_playback_mode).pack(side=tk.LEFT, padx=5)
-        ttk.Button(action_frame, text="Режим ознакомления", 
-                  command=self.start_overview_mode).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(action_frame, text="Просмотреть карточки",
+                  command=self.show_cards_window, style="Primary.TButton").pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Режим воспроизведения",
+                  command=self.start_playback_mode, style="Ghost.TButton").pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Режим ознакомления",
+                  command=self.start_overview_mode, style="Ghost.TButton").pack(side=tk.RIGHT, padx=5)
 
     def refresh_decks(self):
         if self._refresh_in_progress:
@@ -5500,7 +5515,7 @@ class AnkiApp(tk.Tk):
         else:
             self.deck_preview_label.config(
                 image="", 
-                text="Изображение не загружено\nили Pillow не установлен"
+                text="Изображение не загружено.\nУстановите Pillow, чтобы добавить превью."
             )
         
         # Обновляем статистику
@@ -6701,14 +6716,14 @@ class AnkiApp(tk.Tk):
         def run_ocr():
             if not CV2_AVAILABLE:
                 messagebox.showerror(
-                    "OpenCV не установлен",
-                    "Установите OpenCV и NumPy:\nC:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
+                    "Недоступна обработка изображения",
+                    "Для OCR нужен OpenCV и NumPy.\nУстановите пакеты: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
                 )
                 return
             if not PIL_AVAILABLE:
                 messagebox.showerror(
-                    "Pillow не установлен",
-                    "Установите Pillow:\nC:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow",
+                    "Не удалось открыть изображение",
+                    "Для OCR нужен модуль Pillow.\nУстановите его: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow",
                 )
                 return
             if ocr_task_holder["task"] is not None:
@@ -6937,8 +6952,8 @@ class AnkiApp(tk.Tk):
         if not SR_AVAILABLE:
             messagebox.showerror(
                 "Речь недоступна",
-                "SpeechRecognition не установлен.\n"
-                "Установи: pip install SpeechRecognition pyaudio"
+                "Чтобы записывать речь, установите SpeechRecognition и PyAudio:\n"
+                "pip install SpeechRecognition pyaudio"
             )
             return
 
@@ -7268,47 +7283,50 @@ class OverviewWindow(tk.Toplevel):
         # Очищаем фрейм
         for widget in parent_frame.winfo_children():
             widget.destroy()
-        
-        # Настройка карточки
-        content = ttk.Frame(parent_frame)
+
+        colors = getattr(self.master, "palette", None)
+
+        content = ttk.Frame(parent_frame, style="CardInner.TFrame")
         content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
+
         # Текст с прокруткой
-        text_frame = ttk.Frame(content)
+        text_frame = ttk.Frame(content, style="CardInner.TFrame")
         text_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         text_widget = tk.Text(
             text_frame,
             wrap=tk.WORD,
             font=("Arial", 12),
-            bg="white",
-            fg="black",
+            bg=colors["panel"] if colors else "white",
+            fg=colors["text"] if colors else "black",
             height=10
         )
+        style_text_widget(text_widget, colors)
         text_widget.config(state='normal')
-        scrollbar = ttk.Scrollbar(text_frame, command=text_widget.yview)
+        scrollbar = ttk.Scrollbar(text_frame, command=text_widget.yview, style="Vertical.TScrollbar")
         text_widget.configure(yscrollcommand=scrollbar.set)
-        
+
         text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
         # Изображение
         image_label = ResizableImageLabel(
             content,
-            bg="white",
-            relief="solid",
-            bd=1
+            bg=colors["panel"] if colors else "white",
+            relief="flat",
+            bd=0
         )
+        style_card(image_label, colors)
         image_label.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
         # Аудио кнопка
-        audio_frame = ttk.Frame(content)
+        audio_frame = ttk.Frame(content, style="CardInner.TFrame")
         audio_frame.pack(fill=tk.X, pady=(10, 0))
         audio_frame.audio_widget = AudioPlayerWidget(audio_frame, on_error_callback=self._show_audio_error)
         audio_frame.audio_widget.pack(fill=tk.X)
         audio_frame.audio_widget.pack_forget()
 
-        video_frame = ttk.Frame(content)
+        video_frame = ttk.Frame(content, style="CardInner.TFrame")
         video_frame.pack(fill=tk.X, pady=(5, 0))
 
         return text_widget, image_label, audio_frame, video_frame
@@ -7558,8 +7576,10 @@ class RepeatWindow(tk.Toplevel):
         self.load_checkpoint_state()
 
     def create_widgets(self):
-        frame_main = ttk.Frame(self)
+        frame_main = ttk.Frame(self, style="Surface.TFrame")
         frame_main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        colors = getattr(self.master, "palette", None)
 
         # Статус
         self.lbl_status = ttk.Label(frame_main, text="")
@@ -7568,9 +7588,9 @@ class RepeatWindow(tk.Toplevel):
         # Основной фрейм карточки
         self.card_frame = tk.Frame(
             frame_main,
-            bg="white",
-            bd=2,
-            relief="solid",
+            bg=colors["panel"] if colors else "white",
+            bd=0,
+            relief="flat",
             width=800,
             height=520
         )
@@ -7578,17 +7598,21 @@ class RepeatWindow(tk.Toplevel):
         self.card_frame.pack_propagate(False)
 
         # Уровень карточки
-        self.lbl_level = tk.Label(self.card_frame, text="", bg="white",
-                                  fg="black", font=("Arial", 10, "bold"))
+        self.lbl_level = tk.Label(
+            self.card_frame,
+            text="",
+            bg=colors["panel"] if colors else "white",
+            fg=colors["text"] if colors else "black",
+            font=("Segoe UI", 10, "bold"))
         self.lbl_level.place(x=5, y=5)
 
         # Контейнер для контента с прокруткой
-        content_container = tk.Frame(self.card_frame, bg="white")
+        content_container = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
         content_container.place(x=10, y=40, width=780, height=300)
 
-        canvas = tk.Canvas(content_container, bg="white", highlightthickness=0)
+        canvas = tk.Canvas(content_container, bg=colors["panel"] if colors else "white", highlightthickness=0, borderwidth=0)
         scrollbar = ttk.Scrollbar(content_container, orient="vertical", command=canvas.yview)
-        self.scrollable_frame = tk.Frame(canvas, bg="white")
+        self.scrollable_frame = tk.Frame(canvas, bg=colors["panel"] if colors else "white")
 
         self.scrollable_frame.bind(
             "<Configure>",
@@ -7602,37 +7626,37 @@ class RepeatWindow(tk.Toplevel):
         scrollbar.pack(side="right", fill="y")
 
         # Фреймы для контента
-        self.content_frame = tk.Frame(self.scrollable_frame, bg="white")
+        self.content_frame = tk.Frame(self.scrollable_frame, bg=colors["panel"] if colors else "white")
         self.content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # Текст
-        self.text_frame = tk.Frame(self.content_frame, bg="white")
+        self.text_frame = tk.Frame(self.content_frame, bg=colors["panel"] if colors else "white")
         self.text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
         self.lbl_text = tk.Label(
             self.text_frame,
             text="",
-            bg="white",
-            fg="black",
+            bg=colors["panel"] if colors else "white",
+            fg=colors["text"] if colors else "black",
             wraplength=400,
             justify="left",
-            font=("Arial", 12)
+            font=("Segoe UI", 12)
         )
         self.lbl_text.pack(anchor="w")
 
         # Изображение с возможностью масштабирования
-        self.image_frame = tk.Frame(self.content_frame, bg="white")
+        self.image_frame = tk.Frame(self.content_frame, bg=colors["panel"] if colors else "white")
         self.image_frame.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.image_label = ResizableImageLabel(
             self.image_frame,
-            bg="white",
+            bg=colors["panel"] if colors else "white",
             text=""
         )
         self.image_label.pack()
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
-        self.checkpoint_frame = tk.Frame(self.card_frame, bg="white")
+        self.checkpoint_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
         self.checkpoint_frame.place(x=250, y=470, width=300, height=40)
         
         # Создаем 6 чекбоксов в ряд
@@ -7644,13 +7668,14 @@ class RepeatWindow(tk.Toplevel):
                 self.checkpoint_frame,
                 text=f"✓{i+1}",
                 variable=var,
-                bg="white",
+                bg=colors["panel"] if colors else "white",
+                fg=colors["text"] if colors else "black",
                 command=lambda idx=i: self.update_checkpoint_state(idx)
             )
             cb.pack(side=tk.LEFT, padx=5)
 
         # Панель кнопок
-        self.btn_frame = ttk.Frame(frame_main)
+        self.btn_frame = ttk.Frame(frame_main, style="Surface.TFrame")
         self.btn_frame.pack(pady=10)
 
         # Кнопка перевода (для лицевой стороны)
@@ -7763,37 +7788,39 @@ class RepeatWindow(tk.Toplevel):
         
         words = re.findall(r'\b\w+\b', text, re.UNICODE)
         result = []
-        
+
         for word in words:
             if len(word) < 2:  # Пропускаем очень короткие слова
                 result.append(word)
                 continue
-                
+
             translation = get_translation(word, use_openai=False) if self.show_translations else ""
             if translation:
                 # Создаем фрейм для слова и перевода
-                word_frame = tk.Frame(self.text_frame, bg="white")
-                
+                colors = getattr(self.master, "palette", None)
+                word_frame = tk.Frame(self.text_frame, bg=colors["panel"] if colors else "white")
+
                 # Слово
                 word_label = tk.Label(
                     word_frame,
                     text=word,
-                    bg="white",
-                    font=("Arial", 12)
+                    bg=colors["panel"] if colors else "white",
+                    fg=colors["text"] if colors else "black",
+                    font=("Segoe UI", 12)
                 )
                 word_label.pack(side=tk.LEFT, padx=(0, 5))
-                
+
                 # Перевод
                 if self.show_translations:
                     trans_label = tk.Label(
                         word_frame,
                         text=f"({translation})",
-                        bg="white",
-                        fg="blue",
-                        font=("Arial", 10, "italic")
+                        bg=colors["panel"] if colors else "white",
+                        fg=colors["accent"] if colors else "blue",
+                        font=("Segoe UI", 10, "italic")
                     )
                     trans_label.pack(side=tk.LEFT)
-                
+
                 result.append(word_frame)
             else:
                 result.append(word)
@@ -7804,6 +7831,8 @@ class RepeatWindow(tk.Toplevel):
         total = len(self.cards)
         idx = self.current_index + 1
         c = self.current_card
+        colors = getattr(self.master, "palette", None)
+        colors = getattr(self.master, "palette", None)
 
         self.lbl_status.config(
             text=f"Карточка {idx}/{total} | ID {c['id']}"
@@ -7828,15 +7857,15 @@ class RepeatWindow(tk.Toplevel):
             # Очищаем текстовый фрейм и показываем текст в label
             for widget in self.text_frame.winfo_children():
                 widget.destroy()
-            
+
             self.lbl_text = tk.Label(
                 self.text_frame,
                 text=text,
-                bg="white",
-                fg="black",
+                bg=colors["panel"] if colors else "white",
+                fg=colors["text"] if colors else "black",
                 wraplength=400,
                 justify="left",
-                font=("Arial", 12)
+                font=("Segoe UI", 12)
             )
             self.lbl_text.pack(anchor="w")
             
@@ -7875,8 +7904,9 @@ class RepeatWindow(tk.Toplevel):
                         label = tk.Label(
                             self.text_frame,
                             text=item,
-                            bg="white",
-                            font=("Arial", 12)
+                            bg=colors["panel"] if colors else "white",
+                            fg=colors["text"] if colors else "black",
+                            font=("Segoe UI", 12)
                         )
                         label.grid(row=row, column=col, sticky="w", padx=5, pady=2)
                         col += 1
@@ -7888,11 +7918,11 @@ class RepeatWindow(tk.Toplevel):
                 self.lbl_text = tk.Label(
                     self.text_frame,
                     text=text,
-                    bg="white",
-                    fg="black",
+                    bg=colors["panel"] if colors else "white",
+                    fg=colors["text"] if colors else "black",
                     wraplength=400,
                     justify="left",
-                    font=("Arial", 12)
+                    font=("Segoe UI", 12)
                 )
                 self.lbl_text.pack(anchor="w")
             
@@ -8022,8 +8052,10 @@ class ReviewWindow(tk.Toplevel):
         self.load_checkpoint_state()
 
     def create_widgets(self):
-        frame_main = ttk.Frame(self)
+        frame_main = ttk.Frame(self, style="Surface.TFrame")
         frame_main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        colors = getattr(self.master, "palette", None)
 
         self.lbl_status = ttk.Label(frame_main, text="")
         self.lbl_status.pack(anchor="w")
@@ -8032,18 +8064,18 @@ class ReviewWindow(tk.Toplevel):
         self.timer_label = tk.Label(
             frame_main,
             text="⏰ 00:00",
-            bg=self.cget("bg"),
-            fg="red",
-            font=("Arial", 11, "bold")
+            bg=colors["background"] if colors else self.cget("bg"),
+            fg=colors["error"] if colors else "red",
+            font=("Segoe UI", 11, "bold")
         )
         self.timer_label.pack(anchor="center", pady=(3, 5))
 
         # Фрейм карточки
         self.card_frame = tk.Frame(
             frame_main,
-            bg="white",
-            bd=2,
-            relief="solid",
+            bg=colors["panel"] if colors else "white",
+            bd=0,
+            relief="flat",
             width=700,
             height=420
         )
@@ -8052,19 +8084,19 @@ class ReviewWindow(tk.Toplevel):
 
         # Индикатор загрузки
         self.dot_canvas = tk.Canvas(self.card_frame, width=20, height=20,
-                                    bg="white", highlightthickness=0)
+                                    bg=colors["panel"] if colors else "white", highlightthickness=0, borderwidth=0)
         self.dot_canvas.place(relx=0.5, rely=0.5, anchor="center")
         self.dot_canvas.create_oval(7, 7, 13, 13, fill="red", outline="red")
 
         # Уровень
-        self.lbl_level = tk.Label(self.card_frame, text="", bg="white",
-                                  fg="black", font=("Arial", 10, "bold"))
+        self.lbl_level = tk.Label(self.card_frame, text="", bg=colors["panel"] if colors else "white",
+                                  fg=colors["text"] if colors else "black", font=("Segoe UI", 10, "bold"))
         self.lbl_level.place(x=5, y=5)
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
-        self.checkpoint_frame = tk.Frame(self.card_frame, bg="white")
+        self.checkpoint_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
         self.checkpoint_frame.place(x=200, y=280, width=300, height=30)
-        
+
         # Создаем 6 чекбоксов в ряд
         self.checkpoint_vars = []
         for i in range(6):
@@ -8074,47 +8106,48 @@ class ReviewWindow(tk.Toplevel):
                 self.checkpoint_frame,
                 text=f"✓{i+1}",
                 variable=var,
-                bg="white",
+                bg=colors["panel"] if colors else "white",
+                fg=colors["text"] if colors else "black",
                 command=lambda idx=i: self.update_checkpoint_state(idx)
             )
             cb.pack(side=tk.LEFT, padx=5)
 
         # Контент
-        content_frame = tk.Frame(self.card_frame, bg="white")
+        content_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
         content_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=(25, 10))
 
         self.lbl_text = tk.Label(
             content_frame,
             text="",
-            bg="white",
-            fg="black",
+            bg=colors["panel"] if colors else "white",
+            fg=colors["text"] if colors else "black",
             wraplength=420,
             justify="left",
-            font=("Arial", 12)
+            font=("Segoe UI", 12)
         )
         self.lbl_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
         # Изображение с возможностью масштабирования
         self.image_label = ResizableImageLabel(
             content_frame,
-            bg="white",
+            bg=colors["panel"] if colors else "white",
             text=""
         )
         self.image_label.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Прогресс-бар
-        progress_frame = tk.Frame(self.card_frame, bg="white")
+        progress_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
         progress_frame.pack(side=tk.BOTTOM, pady=(0, 4))
 
         self.progress_canvas = tk.Canvas(
             progress_frame, width=260, height=14,
-            bg="white", highlightthickness=1, highlightbackground="#cccccc"
+            bg=colors["panel"] if colors else "white", highlightthickness=1, highlightbackground=colors["border"] if colors else "#cccccc"
         )
         self.progress_canvas.pack(side=tk.LEFT, padx=(10, 4))
 
         self.progress_label = tk.Label(
             progress_frame, text="0 / 100",
-            bg="white", fg="black", font=("Arial", 9)
+            bg=colors["panel"] if colors else "white", fg=colors["text"] if colors else "black", font=("Segoe UI", 9)
         )
         self.progress_label.pack(side=tk.LEFT, padx=4)
 
@@ -8128,7 +8161,7 @@ class ReviewWindow(tk.Toplevel):
         self.audio_widget.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
 
         # Панель кнопок
-        bottom_frame = tk.Frame(self.card_frame, bg="white")
+        bottom_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
         bottom_frame.pack(side=tk.BOTTOM, pady=8)
 
         self.btn_audio_icon = ttk.Button(bottom_frame, text="🔊", width=3, command=self.play_word)
@@ -8639,7 +8672,7 @@ class AudioEditorWindow:
     def transcribe_all(self):
         """Распознать текст для всех сегментов"""
         if not SR_AVAILABLE:
-            messagebox.showerror("Ошибка", "SpeechRecognition не установлен")
+            messagebox.showerror("Распознавание недоступно", "Чтобы распознать речь, установите SpeechRecognition и попробуйте снова.")
             return
             
         r = sr.Recognizer()
