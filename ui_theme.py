@@ -70,9 +70,9 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     )
 
     for label_style, font, color in [
-        ("HeaderTitle.TLabel", ("Segoe UI", 18, "bold"), PALETTE["text"]),
+        ("HeaderTitle.TLabel", ("Segoe UI", 15, "bold"), PALETTE["text"]),
         ("HeaderSub.TLabel", ("Segoe UI", 11), PALETTE["muted"]),
-        ("Heading.TLabel", ("Segoe UI", 16, "bold"), PALETTE["text"]),
+        ("Heading.TLabel", ("Segoe UI", 14, "bold"), PALETTE["text"]),
         ("Body.TLabel", ("Segoe UI", 12), PALETTE["text"]),
         ("Muted.TLabel", ("Segoe UI", 11), PALETTE["muted"]),
         ("Badge.TLabel", ("Segoe UI", 10, "bold"), PALETTE["accent"]),
@@ -90,7 +90,7 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     )
     style.map(
         "TButton",
-        background=[("active", "#162132"), ("pressed", "#0f172a")],
+        background=[("active", "#162132"), ("pressed", "#0f172a"), ("focus", "#162132")],
         foreground=[("disabled", PALETTE["muted"])],
     )
     style.configure(
@@ -103,7 +103,7 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     )
     style.map(
         "Primary.TButton",
-        background=[("active", "#1d4ed8"), ("pressed", "#1e3a8a")],
+        background=[("active", "#1d4ed8"), ("pressed", "#1e3a8a"), ("focus", "#1d4ed8")],
         foreground=[("disabled", PALETTE["muted"])],
     )
     style.configure(
@@ -116,7 +116,8 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     )
     style.map(
         "Ghost.TButton",
-        background=[("active", "#162132"), ("pressed", "#0f172a")],
+        background=[("active", "#162132"), ("pressed", "#0f172a"), ("focus", "#162132")],
+        bordercolor=[("focus", PALETTE["accent"])],
     )
 
     style.configure(
@@ -142,6 +143,9 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
         fieldbackground=PALETTE["panel"],
         foreground=PALETTE["text"],
         bordercolor=PALETTE["border"],
+        lightcolor=PALETTE["border"],
+        darkcolor=PALETTE["border"],
+        borderwidth=1,
         rowheight=26,
     )
     style.map(
