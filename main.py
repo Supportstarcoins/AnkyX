@@ -1,4 +1,5 @@
 import os, tempfile
+os.environ.setdefault("DISABLE_MODEL_SOURCE_CHECK", "True")
 import io
 safe = tempfile.gettempdir()
 os.environ["TEMP"] = safe
@@ -422,29 +423,134 @@ except ImportError:
     FigureCanvasTkAgg = None
     Figure = None
 
-if CV2_AVAILABLE:
+# --------------------------
+# OCR Photo (OpenCV/PaddleOCR) — optional. Load lazily to avoid startup crashes/spam.
+# --------------------------
+
+# Fallback options container (used even when PaddleOCR is not available)
+class OcrRunOptions:  # noqa: N801
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+# Lazily populated when/if ocr_photo is successfully imported
+PADDLE_AVAILABLE = False
+PADDLEOCR_AVAILABLE = False
+load_image_any = None  # type: ignore
+ocr_photo_document = None  # type: ignore
+_perform_page_ocr_impl = None  # type: ignore
+
+def _ensure_ocr_photo_loaded() -> bool:
+    """Try to import ocr_photo (and PaddleOCR) only when needed.
+
+    Returns True if import succeeded and PaddleOCR pipeline is available.
+    """
+    global PADDLE_AVAILABLE, PADDLEOCR_AVAILABLE, load_image_any, ocr_photo_document, _perform_page_ocr_impl, OcrRunOptions
+    if _perform_page_ocr_impl is not None:
+        return True
+    if not CV2_AVAILABLE:
+        return False
     try:
         from ocr_photo import (
-            OcrRunOptions,
-            PADDLE_AVAILABLE,
-            PADDLEOCR_AVAILABLE,
-            load_image_any,
-            ocr_photo_document,
-            perform_page_ocr,
+            OcrRunOptions as _OcrRunOptions,
+            PADDLE_AVAILABLE as _PADDLE_AVAILABLE,
+            PADDLEOCR_AVAILABLE as _PADDLEOCR_AVAILABLE,
+            load_image_any as _load_image_any,
+            ocr_photo_document as _ocr_photo_document,
+            perform_page_ocr as _perform_page_ocr,
         )
+        OcrRunOptions = _OcrRunOptions  # type: ignore
+        PADDLE_AVAILABLE = bool(_PADDLE_AVAILABLE)
+        PADDLEOCR_AVAILABLE = bool(_PADDLEOCR_AVAILABLE)
+        load_image_any = _load_image_any  # type: ignore
+        ocr_photo_document = _ocr_photo_document  # type: ignore
+        _perform_page_ocr_impl = _perform_page_ocr  # type: ignore
+        return True
     except Exception:
-        ocr_photo_document = None
-        CV2_AVAILABLE = False
         PADDLE_AVAILABLE = False
         PADDLEOCR_AVAILABLE = False
-        OcrRunOptions = None  # type: ignore
         load_image_any = None  # type: ignore
-        perform_page_ocr = None  # type: ignore
-else:
-    ocr_photo_document = None
-    PADDLE_AVAILABLE = False
-    PADDLEOCR_AVAILABLE = False
+        ocr_photo_document = None  # type: ignore
+        _perform_page_ocr_impl = None  # type: ignore
+        return False
 
+def _perform_page_ocr_tesseract(img_path: str, options, progress_cb=None) -> str:
+    """Fallback OCR using pytesseract (no PaddleOCR).
+
+    Supports basic modes used in UI:
+    - options.ocr_mode: 'pro' | 'two_columns' | other
+    - options.lang_mode: like 'deu+rus'
+    - options.psm: int
+    - options.preprocess_preset: 'none' or any -> try OpenCV preprocess if available
+    """
+    if progress_cb:
+        try:
+            progress_cb(0, 3, "Загрузка изображения")
+        except Exception:
+            pass
+
+    lang = getattr(options, "lang_mode", DEFAULT_OCR_LANG) or DEFAULT_OCR_LANG
+    psm = int(getattr(options, "psm", 6) or 6)
+    preserve_spaces = bool(getattr(options, "preserve_spaces", True))
+    base_cfg = f"--oem 1 --psm {psm}"
+    if preserve_spaces:
+        base_cfg += " -c preserve_interword_spaces=1"
+
+    config, _, _ = _build_required_ocr_config(base_cfg)
+
+    preprocess_preset = str(getattr(options, "preprocess_preset", "none") or "none")
+    use_preprocess = preprocess_preset != "none"
+
+    # Load/preprocess
+    try:
+        if use_preprocess and CV2_AVAILABLE and NUMPY_AVAILABLE:
+            pil_img = preprocess_for_ocr(img_path)
+        else:
+            pil_img = load_image_for_ocr(img_path)
+    except Exception:
+        # As a last resort, try plain PIL open
+        pil_img = load_image_for_ocr(img_path)
+
+    mode = str(getattr(options, "ocr_mode", "standard") or "standard")
+    if mode == "two_columns":
+        left_img, right_img = split_two_columns(pil_img)
+        if progress_cb:
+            try:
+                progress_cb(1, 3, "OCR левая колонка")
+            except Exception:
+                pass
+        left_text = ocr_image(left_img, lang=lang, config=config)
+        if progress_cb:
+            try:
+                progress_cb(2, 3, "OCR правая колонка")
+            except Exception:
+                pass
+        right_text = ocr_image(right_img, lang=lang, config=config)
+        result = (left_text or "").strip() + "\n\n" + (right_text or "").strip()
+    else:
+        if progress_cb:
+            try:
+                progress_cb(1, 3, "OCR")
+            except Exception:
+                pass
+        result = ocr_image(pil_img, lang=lang, config=config)
+
+    if progress_cb:
+        try:
+            progress_cb(3, 3, "Готово")
+        except Exception:
+            pass
+    return (result or "").strip()
+
+def perform_page_ocr(img_path: str, options, progress_cb=None) -> str:
+    """Unified entrypoint used by UI: tries PaddleOCR pipeline if available, else falls back to Tesseract."""
+    if getattr(options, "ocr_mode", "") == "pro":
+        if _ensure_ocr_photo_loaded() and _perform_page_ocr_impl is not None and PADDLE_AVAILABLE and PADDLEOCR_AVAILABLE:
+            return _perform_page_ocr_impl(img_path, options, progress_cb)
+        # If 'pro' selected but PaddleOCR isn't available, fall back gracefully:
+        return _perform_page_ocr_tesseract(img_path, options, progress_cb)
+    # Non-pro modes: always use Tesseract fallback (stable, no paddle deps)
+    return _perform_page_ocr_tesseract(img_path, options, progress_cb)
 
 # OpenAI key только в памяти
 OPENAI_API_KEY = None
@@ -5304,6 +5410,64 @@ class AnkiApp(tk.Tk):
 
     # --------- главное окно ---------
 
+    def _mk_wrapped_tk_button(self, parent, text: str, command, style_name: str, wraplength: int = 180):
+        """Create a dark-themed tk.Button that supports wraplength (ttk.Button does not)."""
+        p = getattr(self, "palette", None) or {}
+        bg_main = p.get("bg", "#0B0F14")
+        panel = p.get("panel", "#111823")
+        border = p.get("border", "#1F2A37")
+        text_color = p.get("text", "#E5E7EB")
+        accent = p.get("accent", "#3B82F6")
+
+        # Map ttk styles to tk colors
+        if style_name == "Primary.TButton":
+            bg = accent
+            fg = "#FFFFFF"
+            bg_hover = p.get("accent_hover", accent)
+            bg_active = p.get("accent_active", bg_hover)
+        elif style_name == "Ghost.TButton":
+            bg = bg_main
+            fg = text_color
+            bg_hover = panel
+            bg_active = panel
+        else:
+            # Secondary/normal
+            bg = panel
+            fg = text_color
+            bg_hover = p.get("panel_hover", panel)
+            bg_active = p.get("panel_active", bg_hover)
+
+        btn = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground=bg_active,
+            activeforeground=fg,
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=border,
+            highlightcolor=border,
+            padx=14,
+            pady=10,
+            wraplength=wraplength,
+            justify=tk.CENTER,
+            font=("Segoe UI", 11),
+            cursor="hand2",
+        )
+
+        def _enter(_e):
+            btn.configure(bg=bg_hover)
+
+        def _leave(_e):
+            btn.configure(bg=bg)
+
+        btn.bind("<Enter>", _enter)
+        btn.bind("<Leave>", _leave)
+        return btn
+
     def create_widgets(self):
         header = ttk.Frame(self, style="Header.TFrame")
         header.pack(fill=tk.X, padx=14, pady=(10, 6))
@@ -5349,7 +5513,11 @@ class AnkiApp(tk.Tk):
 
         self.decks_tree = ttk.Treeview(frame_top, show="tree", selectmode="browse")
         self.decks_tree.pack(fill=tk.BOTH, expand=True)
-        self.decks_tree.configure(borderwidth=0, highlightthickness=0)
+        # ttk.Treeview doesn't support classic Tk options like borderwidth/highlightthickness.
+        try:
+            self.decks_tree.configure(borderwidth=0, highlightthickness=0)
+        except tk.TclError:
+            pass
         self.decks_tree.bind("<<TreeviewSelect>>", self.on_deck_select)
         self.phase_badge_manager = PhaseOverdueBadges(self.decks_tree)
 
@@ -5369,13 +5537,7 @@ class AnkiApp(tk.Tk):
         for idx, (text, command, style_name) in enumerate(buttons_config):
             row = idx // 3
             col = idx % 3
-            btn = ttk.Button(
-                frame_buttons,
-                text=text,
-                command=command,
-                style=style_name,
-                wraplength=150,
-            )
+            btn = self._mk_wrapped_tk_button(frame_buttons, text, command, style_name, wraplength=150)
             btn.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
 
         self.preview_frame = ttk.LabelFrame(right_frame, text="Превью колоды", style="Card.TLabelframe")
@@ -5449,13 +5611,7 @@ class AnkiApp(tk.Tk):
             row = idx // 2
             col = idx % 2
             span = 2 if idx == 2 else 1
-            btn = ttk.Button(
-                action_frame,
-                text=text,
-                command=command,
-                style=style_name,
-                wraplength=180,
-            )
+            btn = self._mk_wrapped_tk_button(action_frame, text, command, style_name, wraplength=180)
             btn.grid(row=row, column=col, columnspan=span, padx=6, pady=6, sticky="nsew")
 
     def refresh_decks(self):
@@ -6799,6 +6955,8 @@ class AnkiApp(tk.Tk):
                 return
             selected_mode = ocr_mode_var.get()
             selected_lang = lang_mode_var.get()
+            if selected_mode == "pro":
+                _ensure_ocr_photo_loaded()
             if selected_mode == "pro" and not (PADDLE_AVAILABLE and PADDLEOCR_AVAILABLE):
                 messagebox.showinfo(
                     "PaddleOCR недоступен",
