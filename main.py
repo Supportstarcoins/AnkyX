@@ -3359,7 +3359,8 @@ class AnkiApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Leitner Anki (цифровой слух + Wiktionary + AI + русско-немецкий словарь)")
-        self.geometry("1000x700")
+        self.geometry("1366x768")
+        self.minsize(1100, 700)
 
         self.root = self
 
@@ -5322,13 +5323,17 @@ class AnkiApp(tk.Tk):
         main_container.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         left_frame = ttk.Frame(main_container, style="Surface.TFrame")
+        left_frame.grid_columnconfigure(0, weight=1)
+        left_frame.grid_rowconfigure(0, weight=1)
         main_container.add(left_frame, weight=1)
 
         right_frame = ttk.Frame(main_container, style="Surface.TFrame")
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(0, weight=1)
         main_container.add(right_frame, weight=1)
 
         frame_top = ttk.Frame(left_frame, style="Card.TFrame", padding=12)
-        frame_top.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        frame_top.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
         title_frame = ttk.Frame(frame_top, style="CardInner.TFrame")
         title_frame.pack(fill=tk.X, pady=(0, 8))
@@ -5344,29 +5349,43 @@ class AnkiApp(tk.Tk):
 
         self.decks_tree = ttk.Treeview(frame_top, show="tree", selectmode="browse")
         self.decks_tree.pack(fill=tk.BOTH, expand=True)
+        self.decks_tree.configure(borderwidth=0, highlightthickness=0)
         self.decks_tree.bind("<<TreeviewSelect>>", self.on_deck_select)
         self.phase_badge_manager = PhaseOverdueBadges(self.decks_tree)
 
         frame_buttons = ttk.Frame(left_frame, style="Card.TFrame", padding=10)
-        frame_buttons.pack(fill=tk.X, padx=8, pady=(0, 10))
+        frame_buttons.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 10))
+        frame_buttons.grid_columnconfigure((0, 1, 2), weight=1, uniform="buttons")
+        frame_buttons.grid_rowconfigure((0, 1), weight=1)
 
-        ttk.Button(frame_buttons, text="Новая колода", command=self.add_deck_window, style="Primary.TButton")\
-            .pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame_buttons, text="Редактировать", command=self.edit_deck_window)\
-            .pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame_buttons, text="Удалить", command=self.delete_selected_deck)\
-            .pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame_buttons, text="Добавить карточку", command=self.add_card_window)\
-            .pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame_buttons, text="Режим повторения", command=self.start_repeat_mode, style="Ghost.TButton")\
-            .pack(side=tk.RIGHT, padx=5)
+        buttons_config = [
+            ("Новая колода", self.add_deck_window, "Primary.TButton"),
+            ("Редактировать", self.edit_deck_window, "TButton"),
+            ("Удалить", self.delete_selected_deck, "TButton"),
+            ("Добавить карточку", self.add_card_window, "TButton"),
+            ("Режим повторения", self.start_repeat_mode, "Ghost.TButton"),
+        ]
+
+        for idx, (text, command, style_name) in enumerate(buttons_config):
+            row = idx // 3
+            col = idx % 3
+            btn = ttk.Button(
+                frame_buttons,
+                text=text,
+                command=command,
+                style=style_name,
+                wraplength=150,
+            )
+            btn.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
 
         self.preview_frame = ttk.LabelFrame(right_frame, text="Превью колоды", style="Card.TLabelframe")
-        self.preview_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.preview_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.preview_frame.grid_columnconfigure(0, weight=1)
+        self.preview_frame.grid_rowconfigure(0, weight=1)
         style_card(self.preview_frame, self.palette, padded=True)
 
         preview_container = ttk.Frame(self.preview_frame, style="CardInner.TFrame")
-        preview_container.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        preview_container.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
         self.image_frame = ttk.Frame(preview_container, style="CardInner.TFrame")
         self.image_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
@@ -5391,7 +5410,7 @@ class AnkiApp(tk.Tk):
             text_frame,
             text="Название колоды",
             style="Heading.TLabel",
-            wraplength=220
+            wraplength=240
         )
         self.deck_name_label.pack(anchor=tk.W, pady=(0, 10))
 
@@ -5399,7 +5418,7 @@ class AnkiApp(tk.Tk):
             text_frame,
             text="Описание колоды",
             style="Body.TLabel",
-            wraplength=220,
+            wraplength=240,
             justify=tk.LEFT
         )
         self.deck_desc_label.pack(anchor=tk.W, pady=(0, 8))
@@ -5417,14 +5436,27 @@ class AnkiApp(tk.Tk):
         self.deck_stats_label.pack(anchor=tk.W)
 
         action_frame = ttk.Frame(self.preview_frame, style="CardInner.TFrame")
-        action_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        action_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        action_frame.grid_columnconfigure((0, 1), weight=1, uniform="actions")
 
-        ttk.Button(action_frame, text="Просмотреть карточки",
-                  command=self.show_cards_window, style="Primary.TButton").pack(side=tk.LEFT, padx=5)
-        ttk.Button(action_frame, text="Режим воспроизведения",
-                  command=self.start_playback_mode, style="Ghost.TButton").pack(side=tk.LEFT, padx=5)
-        ttk.Button(action_frame, text="Режим ознакомления",
-                  command=self.start_overview_mode, style="Ghost.TButton").pack(side=tk.RIGHT, padx=5)
+        action_buttons = [
+            ("Просмотреть карточки", self.show_cards_window, "Primary.TButton"),
+            ("Режим воспроизведения", self.start_playback_mode, "Ghost.TButton"),
+            ("Режим ознакомления", self.start_overview_mode, "Ghost.TButton"),
+        ]
+
+        for idx, (text, command, style_name) in enumerate(action_buttons):
+            row = idx // 2
+            col = idx % 2
+            span = 2 if idx == 2 else 1
+            btn = ttk.Button(
+                action_frame,
+                text=text,
+                command=command,
+                style=style_name,
+                wraplength=180,
+            )
+            btn.grid(row=row, column=col, columnspan=span, padx=6, pady=6, sticky="nsew")
 
     def refresh_decks(self):
         if self._refresh_in_progress:
