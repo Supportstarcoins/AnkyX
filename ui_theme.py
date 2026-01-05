@@ -5,7 +5,7 @@ from tkinter import ttk
 PALETTE = {
     "background": "#0B0F14",
     "panel": "#111823",
-    "border": "#1F2A37",
+    "border": "#1B2430",
     "text": "#E5E7EB",
     "muted": "#9CA3AF",
     "accent": "#3B82F6",
@@ -31,7 +31,7 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
 
     root.configure(bg=PALETTE["background"])
 
-    root.option_add("*Font", "Segoe UI 12")
+    root.option_add("*Font", "Segoe UI 11")
     root.option_add("*background", PALETTE["background"])
     root.option_add("*foreground", PALETTE["text"])
     root.option_add("*Entry*foreground", PALETTE["text"])
@@ -73,8 +73,8 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
         ("HeaderTitle.TLabel", ("Segoe UI", 15, "bold"), PALETTE["text"]),
         ("HeaderSub.TLabel", ("Segoe UI", 11), PALETTE["muted"]),
         ("Heading.TLabel", ("Segoe UI", 14, "bold"), PALETTE["text"]),
-        ("Body.TLabel", ("Segoe UI", 12), PALETTE["text"]),
-        ("Muted.TLabel", ("Segoe UI", 11), PALETTE["muted"]),
+        ("Body.TLabel", ("Segoe UI", 11), PALETTE["text"]),
+        ("Muted.TLabel", ("Segoe UI", 10), PALETTE["muted"]),
         ("Badge.TLabel", ("Segoe UI", 10, "bold"), PALETTE["accent"]),
     ]:
         style.configure(label_style, font=font, background=PALETTE["panel"], foreground=color)
@@ -82,9 +82,10 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     style.configure("TLabel", background=PALETTE["background"], foreground=PALETTE["text"])
     style.configure(
         "TButton",
-        padding=10,
-        borderwidth=0,
+        padding=(12, 8),
+        borderwidth=1,
         relief="flat",
+        bordercolor=PALETTE["border"],
         background=PALETTE["panel"],
         foreground=PALETTE["text"],
     )
@@ -92,19 +93,21 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
         "TButton",
         background=[("active", "#162132"), ("pressed", "#0f172a"), ("focus", "#162132")],
         foreground=[("disabled", PALETTE["muted"])],
+        bordercolor=[("focus", PALETTE["accent"]), ("active", PALETTE["accent"])],
     )
     style.configure(
         "Primary.TButton",
         background=PALETTE["accent"],
         foreground=PALETTE["text"],
         bordercolor=PALETTE["accent"],
-        borderwidth=0,
+        borderwidth=1,
         padding=(14, 10),
     )
     style.map(
         "Primary.TButton",
         background=[("active", "#1d4ed8"), ("pressed", "#1e3a8a"), ("focus", "#1d4ed8")],
         foreground=[("disabled", PALETTE["muted"])],
+        bordercolor=[("focus", "#2563eb"), ("active", "#2563eb")],
     )
     style.configure(
         "Ghost.TButton",
@@ -117,7 +120,7 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     style.map(
         "Ghost.TButton",
         background=[("active", "#162132"), ("pressed", "#0f172a"), ("focus", "#162132")],
-        bordercolor=[("focus", PALETTE["accent"])],
+        bordercolor=[("focus", PALETTE["accent"]), ("active", PALETTE["accent"])],
     )
 
     style.configure(
@@ -162,7 +165,7 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     )
     style.configure(
         "TNotebook.Tab",
-        padding=10,
+        padding=9,
         background=PALETTE["panel"],
         foreground=PALETTE["text"],
     )
@@ -179,7 +182,7 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
         "TLabelframe",
         background=PALETTE["panel"],
         bordercolor=PALETTE["border"],
-        relief="flat",
+        relief="solid",
         labeloutside=False,
         padding=12,
     )
