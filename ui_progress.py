@@ -12,6 +12,7 @@ class BusyDialog:
         self.label_var = tk.StringVar(value="")
         self.progressbar: ttk.Progressbar | None = None
         self.mode = "indeterminate"
+        self.palette = getattr(root, "palette", None)
 
     def show(self, title: str, mode: str, total: Optional[int] = None):
         if self.window is None or not tk.Toplevel.winfo_exists(self.window):
@@ -20,6 +21,8 @@ class BusyDialog:
             self.window.grab_set()
             self.window.title(title)
             self.window.resizable(False, False)
+            if self.palette:
+                self.window.configure(bg=self.palette.get("panel", self.root.cget("bg")))
             ttk.Label(self.window, textvariable=self.label_var).pack(padx=15, pady=(15, 5))
             self.progressbar = ttk.Progressbar(self.window)
             self.progressbar.pack(fill=tk.X, padx=15, pady=(0, 15))
