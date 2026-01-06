@@ -3464,7 +3464,7 @@ class ResizableImageLabel(tk.Label):
 class AnkiApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Leitner Anki (цифровой слух + Wiktionary + AI + русско-немецкий словарь)")
+        self.title("X-FLASH")
         self.geometry("1366x768")
         self.minsize(1100, 700)
 
@@ -5413,29 +5413,38 @@ class AnkiApp(tk.Tk):
     def _mk_wrapped_tk_button(self, parent, text: str, command, style_name: str, wraplength: int = 180):
         """Create a dark-themed tk.Button that supports wraplength (ttk.Button does not)."""
         p = getattr(self, "palette", None) or {}
-        bg_main = p.get("bg", "#0B0F14")
-        panel = p.get("panel", "#111823")
-        border = p.get("border", "#1F2A37")
-        text_color = p.get("text", "#E5E7EB")
+        bg_main = p.get("bg", "#0B0D12")
+        panel = p.get("panel", "#111522")
+        panel2 = p.get("panel2", panel)
+        border = p.get("border", "#242A3A")
+        text_color = p.get("text", "#E8ECF4")
+        muted = p.get("muted", "#A7B0C0")
         accent = p.get("accent", "#3B82F6")
+        accent_hover = p.get("accent_hover", accent)
+        accent_active = p.get("accent_active", accent_hover)
 
         # Map ttk styles to tk colors
         if style_name == "Primary.TButton":
             bg = accent
             fg = "#FFFFFF"
-            bg_hover = p.get("accent_hover", accent)
-            bg_active = p.get("accent_active", bg_hover)
+            bg_hover = accent_hover
+            bg_active = accent_active
         elif style_name == "Ghost.TButton":
             bg = bg_main
             fg = text_color
-            bg_hover = panel
-            bg_active = panel
+            bg_hover = panel2
+            bg_active = panel2
+        elif style_name == "Secondary.TButton":
+            bg = panel
+            fg = text_color
+            bg_hover = panel2
+            bg_active = panel2
         else:
             # Secondary/normal
             bg = panel
             fg = text_color
-            bg_hover = p.get("panel_hover", panel)
-            bg_active = p.get("panel_active", bg_hover)
+            bg_hover = panel2
+            bg_active = panel2
 
         btn = tk.Button(
             parent,
@@ -5454,7 +5463,7 @@ class AnkiApp(tk.Tk):
             pady=10,
             wraplength=wraplength,
             justify=tk.CENTER,
-            font=("Segoe UI", 11),
+            font=("Segoe UI", 12),
             cursor="hand2",
         )
 
@@ -5470,18 +5479,18 @@ class AnkiApp(tk.Tk):
 
     def create_widgets(self):
         header = ttk.Frame(self, style="Header.TFrame")
-        header.pack(fill=tk.X, padx=14, pady=(10, 6))
-        ttk.Label(header, text="Leitner Anki", style="HeaderTitle.TLabel").pack(side=tk.LEFT, padx=(0, 10))
+        header.pack(fill=tk.X, padx=16, pady=(12, 8))
+        ttk.Label(header, text="X-FLASH", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(header, text="Цифровой слух · OCR · Wiktionary · AI", style="HeaderSub.TLabel").pack(side=tk.LEFT)
 
         quick_actions = ttk.Frame(header, style="Header.TFrame")
         quick_actions.pack(side=tk.RIGHT)
-        ttk.Button(quick_actions, text="Импорт .apkg", style="Ghost.TButton", command=self.open_apkg_import_window).pack(side=tk.LEFT, padx=4)
-        ttk.Button(quick_actions, text="Импорт CSV", style="Ghost.TButton", command=self.open_csv_import_window).pack(side=tk.LEFT, padx=4)
-        ttk.Button(quick_actions, text="Новая колода", style="Primary.TButton", command=self.add_deck_window).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(quick_actions, text="Импорт .apkg", style="Secondary.TButton", command=self.open_apkg_import_window).pack(side=tk.LEFT, padx=6)
+        ttk.Button(quick_actions, text="Импорт CSV", style="Secondary.TButton", command=self.open_csv_import_window).pack(side=tk.LEFT, padx=6)
+        ttk.Button(quick_actions, text="Новая колода", style="Primary.TButton", command=self.add_deck_window).pack(side=tk.LEFT, padx=(10, 0))
 
         shell = ttk.Frame(self, style="Surface.TFrame")
-        shell.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        shell.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
         main_container = ttk.PanedWindow(shell, orient=tk.HORIZONTAL)
         main_container.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -5496,13 +5505,13 @@ class AnkiApp(tk.Tk):
         right_frame.grid_rowconfigure(0, weight=1)
         main_container.add(right_frame, weight=1)
 
-        frame_top = ttk.Frame(left_frame, style="Card.TFrame", padding=12)
-        frame_top.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        frame_top = ttk.Frame(left_frame, style="Card.TFrame", padding=14)
+        frame_top.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
 
         title_frame = ttk.Frame(frame_top, style="CardInner.TFrame")
-        title_frame.pack(fill=tk.X, pady=(0, 8))
+        title_frame.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(title_frame, text="Колоды", style="Heading.TLabel").pack(side=tk.LEFT, anchor="w")
+        ttk.Label(title_frame, text="Колоды", style="Section.TLabel").pack(side=tk.LEFT, anchor="w")
 
         self.overdue_canvas = tk.Canvas(
             title_frame, width=24, height=24,
@@ -5521,16 +5530,16 @@ class AnkiApp(tk.Tk):
         self.decks_tree.bind("<<TreeviewSelect>>", self.on_deck_select)
         self.phase_badge_manager = PhaseOverdueBadges(self.decks_tree)
 
-        frame_buttons = ttk.Frame(left_frame, style="Card.TFrame", padding=10)
-        frame_buttons.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 10))
+        frame_buttons = ttk.Frame(left_frame, style="Card.TFrame", padding=12)
+        frame_buttons.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 12))
         frame_buttons.grid_columnconfigure((0, 1, 2), weight=1, uniform="buttons")
         frame_buttons.grid_rowconfigure((0, 1), weight=1)
 
         buttons_config = [
             ("Новая колода", self.add_deck_window, "Primary.TButton"),
-            ("Редактировать", self.edit_deck_window, "TButton"),
-            ("Удалить", self.delete_selected_deck, "TButton"),
-            ("Добавить карточку", self.add_card_window, "TButton"),
+            ("Редактировать", self.edit_deck_window, "Secondary.TButton"),
+            ("Удалить", self.delete_selected_deck, "Secondary.TButton"),
+            ("Добавить карточку", self.add_card_window, "Secondary.TButton"),
             ("Режим повторения", self.start_repeat_mode, "Ghost.TButton"),
         ]
 
@@ -5541,13 +5550,13 @@ class AnkiApp(tk.Tk):
             btn.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
 
         self.preview_frame = ttk.LabelFrame(right_frame, text="Превью колоды", style="Card.TLabelframe")
-        self.preview_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.preview_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
         self.preview_frame.grid_columnconfigure(0, weight=1)
         self.preview_frame.grid_rowconfigure(0, weight=1)
         style_card(self.preview_frame, self.palette, padded=True)
 
         preview_container = ttk.Frame(self.preview_frame, style="CardInner.TFrame")
-        preview_container.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        preview_container.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
         self.image_frame = ttk.Frame(preview_container, style="CardInner.TFrame")
         self.image_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
@@ -5571,7 +5580,7 @@ class AnkiApp(tk.Tk):
         self.deck_name_label = ttk.Label(
             text_frame,
             text="Название колоды",
-            style="Heading.TLabel",
+            style="Section.TLabel",
             wraplength=240
         )
         self.deck_name_label.pack(anchor=tk.W, pady=(0, 10))
@@ -5579,7 +5588,7 @@ class AnkiApp(tk.Tk):
         self.deck_desc_label = ttk.Label(
             text_frame,
             text="Описание колоды",
-            style="Body.TLabel",
+            style="Muted.TLabel",
             wraplength=240,
             justify=tk.LEFT
         )
@@ -5592,13 +5601,13 @@ class AnkiApp(tk.Tk):
         self.deck_stats_label = ttk.Label(
             stats_frame,
             text="Карточек: 0\nФаз: 0/10\nОзнакомлено: 0",
-            style="Body.TLabel",
+            style="Muted.TLabel",
             justify=tk.LEFT
         )
         self.deck_stats_label.pack(anchor=tk.W)
 
         action_frame = ttk.Frame(self.preview_frame, style="CardInner.TFrame")
-        action_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        action_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 12))
         action_frame.grid_columnconfigure((0, 1), weight=1, uniform="actions")
 
         action_buttons = [
@@ -5780,9 +5789,9 @@ class AnkiApp(tk.Tk):
             if self.overdue_canvas is not None:
                 self.overdue_canvas.delete("all")
                 if total_count > 0:
-                    self.overdue_canvas.create_oval(2, 2, 22, 22, fill="red", outline="red")
+                    self.overdue_canvas.create_oval(2, 2, 22, 22, fill=self.palette.get("accent", "#3B82F6"), outline=self.palette.get("accent", "#3B82F6"))
                     self.overdue_badge_text_id = self.overdue_canvas.create_text(
-                        12, 12, text=str(total_count), fill="white", font=("Arial", 9, "bold")
+                        12, 12, text=str(total_count), fill=self.palette.get("text", "white"), font=("Segoe UI", 10, "bold")
                     )
 
             if self.phase_badge_manager:

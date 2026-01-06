@@ -3,15 +3,20 @@ from tkinter import ttk
 
 
 PALETTE = {
-    "background": "#0B0F14",
-    "panel": "#111823",
-    "border": "#1B2430",
-    "text": "#E5E7EB",
-    "muted": "#9CA3AF",
+    "background": "#0B0D12",
+    "bg": "#0B0D12",
+    "panel": "#111522",
+    "panel2": "#0F1320",
+    "border": "#242A3A",
+    "text": "#E8ECF4",
+    "muted": "#A7B0C0",
     "accent": "#3B82F6",
-    "success": "#22C55E",
+    "accent_hover": "#2F65DB",
+    "accent_active": "#234DAF",
+    "accent_soft": "#1D2D4A",
+    "success": "#2EE59D",
     "warning": "#F59E0B",
-    "error": "#EF4444",
+    "error": "#FF4D4D",
 }
 
 
@@ -31,7 +36,7 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
 
     root.configure(bg=PALETTE["background"])
 
-    root.option_add("*Font", "Segoe UI 11")
+    root.option_add("*Font", "Segoe UI 12")
     root.option_add("*background", PALETTE["background"])
     root.option_add("*foreground", PALETTE["text"])
     root.option_add("*Entry*foreground", PALETTE["text"])
@@ -69,29 +74,45 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
         background=PALETTE["background"],
     )
 
-    for label_style, font, color in [
-        ("HeaderTitle.TLabel", ("Segoe UI", 15, "bold"), PALETTE["text"]),
-        ("HeaderSub.TLabel", ("Segoe UI", 11), PALETTE["muted"]),
-        ("Heading.TLabel", ("Segoe UI", 14, "bold"), PALETTE["text"]),
-        ("Body.TLabel", ("Segoe UI", 11), PALETTE["text"]),
-        ("Muted.TLabel", ("Segoe UI", 10), PALETTE["muted"]),
-        ("Badge.TLabel", ("Segoe UI", 10, "bold"), PALETTE["accent"]),
+    for label_style, font, color, bg_key in [
+        ("Title.TLabel", ("Segoe UI", 16, "semibold"), PALETTE["text"], "background"),
+        ("HeaderTitle.TLabel", ("Segoe UI", 16, "semibold"), PALETTE["text"], "background"),
+        ("HeaderSub.TLabel", ("Segoe UI", 12), PALETTE["muted"], "background"),
+        ("Section.TLabel", ("Segoe UI", 14, "semibold"), PALETTE["text"], "panel"),
+        ("Heading.TLabel", ("Segoe UI", 14, "semibold"), PALETTE["text"], "panel"),
+        ("Body.TLabel", ("Segoe UI", 12), PALETTE["text"], "panel"),
+        ("Muted.TLabel", ("Segoe UI", 12), PALETTE["muted"], "panel"),
+        ("Badge.TLabel", ("Segoe UI", 11, "semibold"), PALETTE["accent"], "panel"),
     ]:
-        style.configure(label_style, font=font, background=PALETTE["panel"], foreground=color)
+        style.configure(label_style, font=font, background=PALETTE.get(bg_key, PALETTE["panel"]), foreground=color)
 
     style.configure("TLabel", background=PALETTE["background"], foreground=PALETTE["text"])
     style.configure(
         "TButton",
-        padding=(12, 8),
+        padding=(14, 10),
         borderwidth=1,
         relief="flat",
         bordercolor=PALETTE["border"],
-        background=PALETTE["panel"],
+        background=PALETTE["panel2"],
         foreground=PALETTE["text"],
     )
     style.map(
         "TButton",
-        background=[("active", "#162132"), ("pressed", "#0f172a"), ("focus", "#162132")],
+        background=[("active", PALETTE["panel"]), ("pressed", PALETTE["accent_soft"]), ("focus", PALETTE["panel"])],
+        foreground=[("disabled", PALETTE["muted"])],
+        bordercolor=[("focus", PALETTE["accent"]), ("active", PALETTE["accent"])],
+    )
+    style.configure(
+        "Secondary.TButton",
+        background=PALETTE["panel"],
+        foreground=PALETTE["text"],
+        bordercolor=PALETTE["border"],
+        borderwidth=1,
+        padding=(14, 10),
+    )
+    style.map(
+        "Secondary.TButton",
+        background=[("active", PALETTE["panel2"]), ("pressed", PALETTE["accent_soft"]), ("focus", PALETTE["panel2"])],
         foreground=[("disabled", PALETTE["muted"])],
         bordercolor=[("focus", PALETTE["accent"]), ("active", PALETTE["accent"])],
     )
@@ -105,13 +126,13 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     )
     style.map(
         "Primary.TButton",
-        background=[("active", "#1d4ed8"), ("pressed", "#1e3a8a"), ("focus", "#1d4ed8")],
+        background=[("active", PALETTE["accent_hover"]), ("pressed", PALETTE["accent_active"]), ("focus", PALETTE["accent_hover"])],
         foreground=[("disabled", PALETTE["muted"])],
-        bordercolor=[("focus", "#2563eb"), ("active", "#2563eb")],
+        bordercolor=[("focus", PALETTE["accent_hover"]), ("active", PALETTE["accent_hover"])],
     )
     style.configure(
         "Ghost.TButton",
-        background=PALETTE["panel"],
+        background=PALETTE["background"],
         foreground=PALETTE["text"],
         borderwidth=1,
         bordercolor=PALETTE["border"],
@@ -119,7 +140,7 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     )
     style.map(
         "Ghost.TButton",
-        background=[("active", "#162132"), ("pressed", "#0f172a"), ("focus", "#162132")],
+        background=[("active", PALETTE["panel2"]), ("pressed", PALETTE["accent_soft"]), ("focus", PALETTE["panel2"])],
         bordercolor=[("focus", PALETTE["accent"]), ("active", PALETTE["accent"])],
     )
 
@@ -142,19 +163,34 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     )
     style.configure(
         "Treeview",
-        background=PALETTE["panel"],
-        fieldbackground=PALETTE["panel"],
+        background=PALETTE["panel2"],
+        fieldbackground=PALETTE["panel2"],
         foreground=PALETTE["text"],
         bordercolor=PALETTE["border"],
         lightcolor=PALETTE["border"],
         darkcolor=PALETTE["border"],
         borderwidth=1,
-        rowheight=26,
+        rowheight=28,
+        font=("Segoe UI", 12),
     )
     style.map(
         "Treeview",
-        background=[("selected", "#1f2a44")],
+        background=[("selected", PALETTE["accent_soft"])],
         foreground=[("selected", PALETTE["text"])],
+    )
+    style.configure(
+        "Treeview.Heading",
+        background=PALETTE["panel"],
+        foreground=PALETTE["text"],
+        bordercolor=PALETTE["border"],
+        font=("Segoe UI", 12, "semibold"),
+        relief="flat",
+        padding=(8, 6),
+    )
+    style.map(
+        "Treeview.Heading",
+        background=[("active", PALETTE["panel2"]), ("pressed", PALETTE["accent_soft"])],
+        foreground=[("active", PALETTE["text"]), ("pressed", PALETTE["text"])],
     )
 
     style.configure(
@@ -184,14 +220,14 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
         bordercolor=PALETTE["border"],
         relief="solid",
         labeloutside=False,
-        padding=12,
+        padding=14,
     )
     style.configure(
         "Card.TLabelframe",
         background=PALETTE["panel"],
         bordercolor=PALETTE["border"],
         relief="flat",
-        padding=12,
+        padding=14,
         labeloutside=False,
     )
     style.configure(
@@ -225,11 +261,11 @@ def style_text_widget(widget: tk.Text, palette: dict | None = None) -> None:
 def style_card(widget: tk.Widget, palette: dict | None = None, padded: bool = False) -> None:
     colors = palette or PALETTE
     try:
-        widget.configure(bg=colors["panel"], highlightthickness=1, highlightbackground=colors["border"])
+        widget.configure(bg=colors["panel"], highlightthickness=1, highlightbackground=colors["border"], relief="flat")
     except tk.TclError:
         try:
             widget.configure(style="Card.TFrame")
         except tk.TclError:
             pass
     if padded and isinstance(widget, (ttk.Frame, ttk.LabelFrame)):
-        widget.configure(padding=12)
+        widget.configure(padding=14)
