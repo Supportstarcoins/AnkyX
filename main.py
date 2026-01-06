@@ -1035,7 +1035,14 @@ LEITNER_SCHEDULE = {
 
 DEFAULT_USER_ID_FILE = Path(get_db_path()).with_name("user_id.txt")
 TEXT_GEN_CREDIT_COST = 50
-OCR_CREDIT_COST = 30
+OCR_CREDIT_COST = 1
+IMAGE_ID_IMPORT_COST = 5
+WIKIMEDIA_IMPORT_COST = 5
+WIKIMEDIA_TICKET_SIZE = 10
+CARD_IMAGE_CREDIT_COST = 1
+ACTIVATION_MIN_HOURS = 24
+ACTIVATION_MIN_CARDS = 10
+ACTIVATION_MIN_REVIEWS = 20
 
 
 def get_local_user_id() -> str:
@@ -1049,6 +1056,39 @@ def get_local_user_id() -> str:
     user_id = f"user-{uuid4().hex}"
     DEFAULT_USER_ID_FILE.write_text(user_id, encoding="utf-8")
     return user_id
+
+
+def ensure_user_profile_row(user_id: str) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO user_profile (
+            user_id, created_at, is_premium, premium_until,
+            starter_50_claimed, activation_200_claimed, wikimedia_tickets, first_import_ts
+        )
+        VALUES (?, ?, 0, 0, 0, 0, 0, 0);
+        """,
+        (user_id, int(time.time())),
+    )
+    conn.commit()
+    cur.execute("SELECT * FROM user_profile WHERE user_id = ? LIMIT 1;", (user_id,))
+    row = cur.fetchone() or {}
+    conn.close()
+    return dict(row)
+
+
+def update_user_profile(user_id: str, **fields) -> dict:
+    if not fields:
+        return ensure_user_profile_row(user_id)
+    conn = get_connection()
+    cur = conn.cursor()
+    columns = ", ".join(f"{k} = ?" for k in fields.keys())
+    values = list(fields.values()) + [user_id]
+    cur.execute(f"UPDATE user_profile SET {columns} WHERE user_id = ?;", values)
+    conn.commit()
+    conn.close()
+    return ensure_user_profile_row(user_id)
 
 
 def get_next_review_for_level(level: int) -> datetime:
@@ -2856,7 +2896,8 @@ def auto_generate_cards_from_text(deck_id: int,
                                   audio_source: str | None = None,
                                   audio_side: str = "back",
                                   progress_queue: queue.Queue | None = None,
-                                  cancel_check=None) -> int:
+                                  cancel_check=None,
+                                  image_spend_cb=None) -> int:
     """
     Если one_sentence_one_card = True:
         1 предложение = 1 карточка (длинный текст -> много карточек).
@@ -2935,7 +2976,11 @@ def auto_generate_cards_from_text(deck_id: int,
         if use_ai_images and api_key:
             try:
                 img_prompt = f"Illustration for German sentence '{sentence}' with key word '{target_word}'"
-                img_path_front = generate_image_with_openai(img_prompt, api_key)
+                allow_image = True
+                if callable(image_spend_cb):
+                    allow_image = image_spend_cb("card_image_generation", {"prompt": img_prompt})
+                if allow_image:
+                    img_path_front = generate_image_with_openai(img_prompt, api_key)
             except Exception:
                 img_path_front = None
 
@@ -3081,7 +3126,8 @@ def auto_generate_cards_from_image(deck_id: int,
                                    api_key: str | None,
                                    front_template: str,
                                    back_template: str,
-                                   one_sentence_one_card: bool = False) -> int:
+                                   one_sentence_one_card: bool = False,
+                                   image_spend_cb=None) -> int:
     if not OCR_AVAILABLE or not is_tesseract_available():
         raise RuntimeError("Tesseract OCR не настроен.")
     if not os.path.exists(image_path):
@@ -3099,7 +3145,8 @@ def auto_generate_cards_from_image(deck_id: int,
         deck_id, text, use_ai_images, api_key,
         front_template, back_template,
         one_sentence_one_card=one_sentence_one_card,
-        audio_path=None
+        audio_path=None,
+        image_spend_cb=image_spend_cb,
     )
 
 
@@ -3112,7 +3159,8 @@ def auto_generate_cards_from_speech(deck_id: int,
                                     mic_index: int | None,
                                     one_sentence_one_card: bool = False,
                                     progress_queue: queue.Queue | None = None,
-                                    cancel_check=None) -> int:
+                                    cancel_check=None,
+                                    image_spend_cb=None) -> int:
     if not SR_AVAILABLE:
         raise RuntimeError("SpeechRecognition не установлен.")
     r = sr.Recognizer()
@@ -3158,6 +3206,7 @@ def auto_generate_cards_from_speech(deck_id: int,
         audio_side="back",
         progress_queue=progress_queue,
         cancel_check=cancel_check,
+        image_spend_cb=image_spend_cb,
     )
 
 
@@ -3166,7 +3215,8 @@ def auto_generate_cards_from_video(deck_id: int,
                                    use_ai_images: bool,
                                    api_key: str | None,
                                    front_template: str,
-                                   back_template: str) -> int:
+                                   back_template: str,
+                                   image_spend_cb=None) -> int:
     """
     Генерация карточек из видео: извлечение аудио, нарезка на предложения,
     распознавание речи, создание карточки с аудио.
@@ -3217,6 +3267,7 @@ def auto_generate_cards_from_video(deck_id: int,
             audio_path=audio_filename,
             audio_source="digital_hearing",
             audio_side="back",
+            image_spend_cb=image_spend_cb,
         )
         
     except Exception as e:
@@ -3535,19 +3586,29 @@ class AnkiApp(tk.Tk):
         self.deck_items = {}
 
         self.user_id = get_local_user_id()
+        self.user_profile = ensure_user_profile_row(self.user_id)
         self.credits_service = CreditsService()
         self.referral_service = ReferralService(credits_service=self.credits_service)
         self.balance_var = tk.StringVar(value="—")
+        self.premium_var = tk.BooleanVar(value=False)
         self.main_notebook: ttk.Notebook | None = None
         self.personal_tab = None
         self.ledger_tree: ttk.Treeview | None = None
         self.ref_summary_vars: dict[str, tk.StringVar] = {}
+        self.activation_progress_vars: dict[str, tk.DoubleVar] = {}
+        self.activation_status_var = tk.StringVar(value="")
         self.payment_status_var = tk.StringVar(value="")
         self.payment_code_var = tk.StringVar(value="")
         self.package_choice_var = tk.StringVar(value="pack_500")
         self.balance_labels: list[tk.Variable] = []
+        self.balance_widgets: list[tk.Label] = []
         self.credit_icon_image = None
+        self.credit_icon_small = None
+        self.credit_icon_large = None
+        self.generation_menu = None
+        self.generation_menu_indexes: dict[str, int] = {}
         self._ensure_initial_credits()
+        self.premium_var.set(self.is_premium_active())
 
         # Инициализируем словарь
         init_dictionary()
@@ -3616,21 +3677,33 @@ class AnkiApp(tk.Tk):
         menubar.add_cascade(label="Настройки", menu=settings_menu)
 
         gen_menu = tk.Menu(menubar, tearoff=0)
+        self.generation_menu = gen_menu
         gen_menu.add_command(label="Генерация из текста…", command=self.open_generate_from_text_window)
-        gen_menu.add_command(label="Генерация из изображения (OCR)…",
-                             command=self.open_generate_from_image_window)
+        self.generation_menu_indexes["text"] = gen_menu.index("end")
+        gen_menu.add_command(
+            label="Генерация из изображения (OCR) 👑 (1⚡/стр)",
+            command=self.open_generate_from_image_window,
+        )
+        self.generation_menu_indexes["ocr"] = gen_menu.index("end")
         gen_menu.add_command(label="Генерация через цифровой слух…",
                              command=self.open_generate_from_speech_window)
         gen_menu.add_command(label="Генерация из видео (цифровой слух)…",
                              command=self.open_generate_from_video_window)
         gen_menu.add_command(label="Видео → клипы → карточки",
                              command=self.open_video_clip_window)
-        gen_menu.add_command(label="Импорт картинок по ID (CSV)…",
-                             command=self.open_image_id_import_window)
+        gen_menu.add_command(
+            label="Импорт картинок по ID (CSV) 👑 (5⚡/операция)",
+            command=self.open_image_id_import_window,
+        )
+        self.generation_menu_indexes["image_id_import"] = gen_menu.index("end")
         gen_menu.add_command(label="Импорт CSV колоды", command=self.open_csv_import_window)
-        gen_menu.add_command(label="Картинки по CSV (Wikimedia)",
-                             command=self.open_wikimedia_csv_window)
+        gen_menu.add_command(
+            label="Картинки по CSV (Wikimedia) 👑 (5⚡ за 10 импортов)",
+            command=self.open_wikimedia_csv_window,
+        )
+        self.generation_menu_indexes["wikimedia"] = gen_menu.index("end")
         menubar.add_cascade(label="Режим генерации", menu=gen_menu)
+        self.refresh_generation_menu_state()
 
         modes_menu = tk.Menu(menubar, tearoff=0)
         modes_menu.add_command(label="Режим повторения (по дате)",
@@ -3889,6 +3962,13 @@ class AnkiApp(tk.Tk):
             messagebox.showerror("Импорт изображений недоступен", "Чтобы прикреплять картинки, установите пакет Pillow и попробуйте снова.")
             return
 
+        if not self.is_premium_active():
+            messagebox.showinfo(
+                "Нужна подписка",
+                "Импорт картинок по ID доступен в Pro. Откройте личный кабинет для активации.",
+            )
+            return
+
         win = tk.Toplevel(self)
         win.title("Импорт картинок по ID (CSV)")
         win.geometry("820x680")
@@ -3954,6 +4034,8 @@ class AnkiApp(tk.Tk):
                     f"Ошибки: {summary['errors']}"
                 )
                 messagebox.showinfo("Импорт завершен", msg)
+                if summary.get("imported") or summary.get("updated"):
+                    self.mark_first_import()
                 if running_watch_mode["value"] and watch_var.get() and not stop_flag.get("stop"):
                     self.image_import_watch_job = win.after(interval_var.get() * 1000, lambda: process_files(False, True))
             elif kind == "error":
@@ -4108,6 +4190,14 @@ class AnkiApp(tk.Tk):
                 if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
             ]
             files.sort()
+            if not dry_run:
+                if not self.guard_premium_and_spend(
+                    "image_id_import",
+                    IMAGE_ID_IMPORT_COST,
+                    require_premium=True,
+                    meta={"files": len(files), "csv": os.path.basename(csv_path)},
+                ):
+                    return
 
             def worker(task_obj):
                 summary = {"total": 0, "imported": 0, "updated": 0, "skipped": 0, "errors": 0}
@@ -4291,6 +4381,13 @@ class AnkiApp(tk.Tk):
             messagebox.showerror("Изображения недоступны", "Для загрузки картинок установите пакет Pillow и повторите попытку.")
             return
 
+        if not self.is_premium_active():
+            messagebox.showinfo(
+                "Нужна подписка",
+                "Загрузка с Wikimedia доступна в Pro. Откройте личный кабинет для активации.",
+            )
+            return
+
         win = tk.Toplevel(self)
         win.title("Картинки по CSV (Wikimedia)")
         win.geometry("720x520")
@@ -4323,6 +4420,8 @@ class AnkiApp(tk.Tk):
                 status_var.set("Готово")
                 progress_label_var.set(f"{summary.get('done', 0)}/{summary.get('total', 0)}")
                 log_msg("Завершено")
+                if summary.get("done"):
+                    self.mark_first_import()
                 _finish_task()
             elif kind == "cancelled":
                 status_var.set("Отменено пользователем")
@@ -4351,6 +4450,8 @@ class AnkiApp(tk.Tk):
             csv_path = csv_path_var.get().strip()
             if not csv_path:
                 messagebox.showerror("Ошибка", "Укажите CSV-файл")
+                return
+            if not self.consume_wikimedia_ticket():
                 return
             status_var.set("Начинаю загрузку…")
             progress_var.set(0)
@@ -5532,15 +5633,22 @@ class AnkiApp(tk.Tk):
 
         balance_frame = ttk.Frame(account_bar, style="Header.TFrame")
         balance_frame.pack(side=tk.RIGHT, padx=(0, 8))
-        balance_icon = self._load_credit_icon()
+        balance_icon = self._load_credit_icon(size=32)
         if balance_icon:
+            self.credit_icon_small = balance_icon
             self.credit_icon_image = balance_icon
-            ttk.Label(balance_frame, image=balance_icon, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+            ttk.Label(balance_frame, image=balance_icon, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         else:
             ttk.Label(balance_frame, text="ⓘ", style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 4))
-        lbl_balance = ttk.Label(balance_frame, textvariable=self.balance_var, style="HeaderSub.TLabel")
+        lbl_balance = ttk.Label(
+            balance_frame,
+            textvariable=self.balance_var,
+            style="HeaderSub.TLabel",
+            font=("Segoe UI", 16, "bold"),
+        )
         lbl_balance.pack(side=tk.LEFT)
         self.balance_labels.append(self.balance_var)
+        self.balance_widgets.append(lbl_balance)
 
         ttk.Button(
             account_bar,
@@ -5694,7 +5802,7 @@ class AnkiApp(tk.Tk):
             btn = self._mk_wrapped_tk_button(action_frame, text, command, style_name, wraplength=180)
             btn.grid(row=row, column=col, columnspan=span, padx=6, pady=6, sticky="nsew")
 
-    def _load_credit_icon(self):
+    def _load_credit_icon(self, size: int = 18):
         search_paths = [Path("iconcoin1.png"), Path("icon credits.jpeg")]
         for path in search_paths:
             if not path.exists():
@@ -5702,7 +5810,7 @@ class AnkiApp(tk.Tk):
             try:
                 if PIL_AVAILABLE:
                     img = Image.open(path)
-                    img = img.resize((18, 18), Image.Resampling.LANCZOS)
+                    img = img.resize((size, size), Image.Resampling.LANCZOS)
                     return ImageTk.PhotoImage(img)
                 if path.suffix.lower() in (".png", ".gif"):
                     return tk.PhotoImage(file=str(path))
@@ -5716,6 +5824,7 @@ class AnkiApp(tk.Tk):
             self.refresh_balance_display()
             self.refresh_ledger_table()
             self.refresh_referral_info()
+            self.refresh_activation_progress_ui()
 
     def refresh_balance_display(self):
         balance = self.credits_service.get_balance(self.user_id)
@@ -5723,6 +5832,25 @@ class AnkiApp(tk.Tk):
         self.balance_var.set(formatted)
         for var in self.balance_labels:
             var.set(formatted)
+        for lbl in self.balance_widgets:
+            try:
+                lbl.configure(text=formatted)
+            except Exception:
+                continue
+        self.refresh_generation_menu_state()
+
+    def refresh_generation_menu_state(self):
+        if not self.generation_menu:
+            return
+        state = tk.NORMAL if self.is_premium_active() else tk.DISABLED
+        for key in ("ocr", "image_id_import", "wikimedia"):
+            idx = self.generation_menu_indexes.get(key)
+            if idx is None:
+                continue
+            try:
+                self.generation_menu.entryconfig(idx, state=state)
+            except Exception:
+                pass
 
     def _record_payment(
         self,
@@ -5754,29 +5882,229 @@ class AnkiApp(tk.Tk):
         self.refresh_balance_display()
         self.refresh_ledger_table()
         self.refresh_referral_info()
+        self.refresh_activation_progress_ui()
 
     def _ensure_initial_credits(self):
-        balance = self.credits_service.get_balance(self.user_id)
-        existing_ledger = self.credits_service.get_ledger(self.user_id, limit=1)
-        if existing_ledger or balance > 0:
-            return
-        self.credits_service.add_credits(
+        self.user_profile = ensure_user_profile_row(self.user_id)
+        created_at = self.user_profile.get("created_at") or int(time.time())
+        if not self.user_profile.get("created_at"):
+            self.user_profile = update_user_profile(self.user_id, created_at=created_at)
+
+        if not self.user_profile.get("starter_50_claimed"):
+            self.credits_service.add(
+                self.user_id,
+                50,
+                reason="Стартовый бонус",
+                meta={"source": "starter_bonus"},
+            )
+            self.user_profile = update_user_profile(self.user_id, starter_50_claimed=1)
+        self.premium_var.set(self.is_premium_active())
+
+    def is_premium_active(self) -> bool:
+        now_ts = int(time.time())
+        premium_until = int(self.user_profile.get("premium_until") or 0)
+        is_flag = bool(self.user_profile.get("is_premium"))
+        return bool(is_flag or premium_until > now_ts)
+
+    def set_premium_until(self, timestamp: int | None):
+        ts_val = int(timestamp or 0)
+        self.user_profile = update_user_profile(
             self.user_id,
-            2000,
-            reason="Стартовый пакет Pro",
-            meta={"source": "bootstrap"},
+            premium_until=ts_val,
+            is_premium=1 if ts_val > int(time.time()) else self.user_profile.get("is_premium", 0),
         )
+        self.premium_var.set(self.is_premium_active())
+        self.refresh_generation_menu_state()
+
+    def grant_premium_trial(self, days: int = 30):
+        until = int(time.time()) + days * 24 * 3600
+        self.user_profile = update_user_profile(
+            self.user_id, premium_until=until, is_premium=1
+        )
+        self.premium_var.set(self.is_premium_active())
+        self.refresh_generation_menu_state()
+        messagebox.showinfo("Pro активирован", "Пробный доступ Pro активирован.")
+
+    def guard_premium_and_spend(
+        self,
+        feature_key: str,
+        cost_credits: int,
+        require_premium: bool = True,
+        meta: dict | None = None,
+    ) -> bool:
+        self.user_profile = ensure_user_profile_row(self.user_id)
+        if require_premium and not self.is_premium_active():
+            if messagebox.askyesno(
+                "Нужна подписка",
+                "Эта функция доступна только в Pro.\nОткрыть личный кабинет?",
+            ):
+                self.open_personal_tab()
+            return False
+
+        balance = self.credits_service.get_balance(self.user_id)
+        if cost_credits > 0 and balance < cost_credits:
+            if messagebox.askyesno(
+                "Недостаточно кредитов",
+                "Не хватает кредитов для операции.\nОткрыть личный кабинет для пополнения?",
+            ):
+                self.open_personal_tab()
+            return False
+
+        if cost_credits > 0:
+            ok = self.credits_service.spend(
+                self.user_id,
+                cost_credits,
+                reason=feature_key,
+                meta=meta or {},
+            )
+            if not ok:
+                messagebox.showwarning(
+                    "Недостаточно кредитов",
+                    "Не удалось списать кредиты. Проверьте баланс.",
+                )
+                return False
+            self._after_balance_change()
+        return True
 
     def spend_credits_or_warn(self, amount: int, reason: str, meta: dict | None = None) -> bool:
-        ok = self.credits_service.spend_credits(self.user_id, amount, reason, meta)
-        if not ok:
-            messagebox.showwarning(
-                "Недостаточно кредитов",
-                "На балансе недостаточно кредитов для выполнения операции.\nПополните баланс и повторите.",
+        return self.guard_premium_and_spend(reason, amount, require_premium=False, meta=meta)
+
+    def consume_wikimedia_ticket(self) -> bool:
+        if not self.is_premium_active():
+            messagebox.showinfo(
+                "Нужна подписка",
+                "Wikimedia доступна только в Pro. Активируйте подписку в личном кабинете.",
             )
             return False
-        self._after_balance_change()
+        self.user_profile = ensure_user_profile_row(self.user_id)
+        tickets = int(self.user_profile.get("wikimedia_tickets") or 0)
+        if tickets > 0:
+            self.user_profile = update_user_profile(
+                self.user_id, wikimedia_tickets=max(0, tickets - 1)
+            )
+            return True
+        if not self.guard_premium_and_spend(
+            "wikimedia_bundle",
+            WIKIMEDIA_IMPORT_COST,
+            require_premium=True,
+            meta={"bundle": WIKIMEDIA_TICKET_SIZE},
+        ):
+            return False
+        self.user_profile = update_user_profile(
+            self.user_id, wikimedia_tickets=max(0, WIKIMEDIA_TICKET_SIZE - 1)
+        )
         return True
+
+    def mark_first_import(self):
+        self.user_profile = ensure_user_profile_row(self.user_id)
+        if self.user_profile.get("first_import_ts"):
+            return
+        self.user_profile = update_user_profile(
+            self.user_id, first_import_ts=int(time.time())
+        )
+        self.refresh_activation_progress_ui()
+
+    def _spend_for_ai_image(self, feature_key: str = "card_image_generation", meta: dict | None = None) -> bool:
+        return self.guard_premium_and_spend(
+            feature_key,
+            CARD_IMAGE_CREDIT_COST,
+            require_premium=True,
+            meta=meta or {},
+        )
+
+    def _count_cards_created(self) -> int:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM cards;")
+        val = cur.fetchone()[0] or 0
+        conn.close()
+        return int(val)
+
+    def _count_reviews_done(self) -> int:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM reviews;")
+        val = cur.fetchone()[0] or 0
+        conn.close()
+        return int(val)
+
+    def _has_first_import(self) -> bool:
+        self.user_profile = ensure_user_profile_row(self.user_id)
+        if self.user_profile.get("first_import_ts"):
+            return True
+        imported = get_imported_files()
+        return bool(imported)
+
+    def get_activation_progress(self) -> dict:
+        self.user_profile = ensure_user_profile_row(self.user_id)
+        created_at = int(self.user_profile.get("created_at") or int(time.time()))
+        age_hours = (int(time.time()) - created_at) / 3600
+        cards_created = self._count_cards_created()
+        reviews_done = self._count_reviews_done()
+        first_import = self._has_first_import()
+        steps = [
+            {
+                "title": "Аккаунт старше 24ч",
+                "done": age_hours >= ACTIVATION_MIN_HOURS,
+                "value": min(100.0, (age_hours / ACTIVATION_MIN_HOURS) * 100 if ACTIVATION_MIN_HOURS else 0),
+            },
+            {
+                "title": "Создано ≥ 10 карточек",
+                "done": cards_created >= ACTIVATION_MIN_CARDS,
+                "value": min(100.0, cards_created / ACTIVATION_MIN_CARDS * 100 if ACTIVATION_MIN_CARDS else 0),
+            },
+            {
+                "title": "Пройдено ≥ 20 повторений",
+                "done": reviews_done >= ACTIVATION_MIN_REVIEWS,
+                "value": min(100.0, reviews_done / ACTIVATION_MIN_REVIEWS * 100 if ACTIVATION_MIN_REVIEWS else 0),
+            },
+            {
+                "title": "Первый импорт / подтверждение",
+                "done": bool(first_import or cards_created >= 1),
+                "value": 100.0 if first_import or cards_created >= 1 else 0.0,
+            },
+        ]
+        overall = sum(1 for s in steps if s["done"]) / len(steps) * 100
+        return {"steps": steps, "overall": overall}
+
+    def refresh_activation_progress_ui(self):
+        progress = self.get_activation_progress()
+        for idx, step in enumerate(progress["steps"]):
+            var = self.activation_progress_vars.get(f"step_{idx}")
+            if var is None:
+                continue
+            var.set(step["value"])
+        claimed = bool(self.user_profile.get("activation_200_claimed"))
+        if claimed:
+            self.activation_status_var.set("Бонус +200 уже активирован ✔")
+        else:
+            self.activation_status_var.set(
+                f"Готовность: {progress['overall']:.0f}% · +200 кредитов после активации"
+            )
+
+    def check_activation_bonus(self):
+        self.user_profile = ensure_user_profile_row(self.user_id)
+        if self.user_profile.get("activation_200_claimed"):
+            messagebox.showinfo("Активация", "Бонус +200 уже был начислен.")
+            return
+        progress = self.get_activation_progress()
+        if all(step["done"] for step in progress["steps"]):
+            self.credits_service.add(
+                self.user_id,
+                200,
+                reason="Бонус за активацию",
+                meta={"source": "activation_bonus"},
+            )
+            self.user_profile = update_user_profile(self.user_id, activation_200_claimed=1)
+            self._after_balance_change()
+            messagebox.showinfo("Готово", "Условия выполнены! +200 кредитов начислены.")
+        else:
+            missing = [step["title"] for step in progress["steps"] if not step["done"]]
+            messagebox.showinfo(
+                "Не все условия",
+                "Завершите шаги для активации:\n- " + "\n- ".join(missing),
+            )
+        self.refresh_activation_progress_ui()
 
     def start_payment_flow(self, package_id: str):
         try:
@@ -5865,18 +6193,24 @@ class AnkiApp(tk.Tk):
         balance_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
         balance_card.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
         style_card(balance_card, self.palette, padded=False)
-        ttk.Label(balance_card, text="Баланс", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(balance_card, text="Баланс", style="Section.TLabel", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         balance_row = ttk.Frame(balance_card, style="CardInner.TFrame")
         balance_row.pack(fill=tk.X, pady=6)
-        icon = self._load_credit_icon()
+        icon = self.credit_icon_large or self._load_credit_icon(size=48)
         if icon:
-            self.credit_icon_image = icon
-            ttk.Label(balance_row, image=icon, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+            self.credit_icon_large = icon
+            ttk.Label(balance_row, image=icon, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 8))
         else:
             ttk.Label(balance_row, text="💠", style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        lbl_balance = ttk.Label(balance_row, textvariable=self.balance_var, style="Title.TLabel")
+        lbl_balance = ttk.Label(
+            balance_row,
+            textvariable=self.balance_var,
+            style="Title.TLabel",
+            font=("Segoe UI", 24, "bold"),
+        )
         lbl_balance.pack(side=tk.LEFT)
         self.balance_labels.append(self.balance_var)
+        self.balance_widgets.append(lbl_balance)
         ttk.Button(balance_row, text="Обновить", style="Secondary.TButton", command=self.refresh_balance_display).pack(
             side=tk.RIGHT
         )
@@ -5890,12 +6224,13 @@ class AnkiApp(tk.Tk):
         purchase_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
         purchase_card.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
         style_card(purchase_card, self.palette, padded=False)
-        ttk.Label(purchase_card, text="Купить кредиты", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(purchase_card, text="Купить кредиты", style="Section.TLabel", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         for package_id, data in PACKAGES.items():
             row = ttk.Frame(purchase_card, style="CardInner.TFrame")
             row.pack(fill=tk.X, pady=6)
-            if self.credit_icon_image:
-                ttk.Label(row, image=self.credit_icon_image, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+            icon_ref = self.credit_icon_small or self.credit_icon_image
+            if icon_ref:
+                ttk.Label(row, image=icon_ref, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
             else:
                 ttk.Label(row, text="💎", style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
             ttk.Label(
@@ -5933,11 +6268,54 @@ class AnkiApp(tk.Tk):
         ttk.Label(confirm_frame, textvariable=self.payment_status_var, style="Muted.TLabel").grid(
             row=2, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 0)
         )
+        ttk.Button(
+            purchase_card,
+            text="Активировать Pro (демо)",
+            style="Ghost.TButton",
+            command=lambda: self.grant_premium_trial(days=30),
+        ).pack(anchor="e", pady=(6, 0))
+
+        activation_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
+        activation_card.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 10))
+        style_card(activation_card, self.palette, padded=False)
+        ttk.Label(
+            activation_card,
+            text="Активация аккаунта (+200 кредитов)",
+            style="Section.TLabel",
+            font=("Segoe UI", 16, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            activation_card,
+            textvariable=self.activation_status_var,
+            style="HeaderSub.TLabel",
+        ).pack(anchor="w", pady=(2, 6))
+        steps_frame = ttk.Frame(activation_card, style="CardInner.TFrame")
+        steps_frame.pack(fill=tk.BOTH, expand=True)
+        titles = [
+            "Аккаунту ≥ 24 часов",
+            "Создано ≥ 10 карточек",
+            "Пройдено ≥ 20 повторений",
+            "Первый импорт / подтверждение",
+        ]
+        for idx, title in enumerate(titles):
+            row = ttk.Frame(steps_frame, style="CardInner.TFrame")
+            row.pack(fill=tk.X, pady=3)
+            ttk.Label(row, text=title, style="Muted.TLabel").pack(side=tk.LEFT)
+            var = tk.DoubleVar(value=0)
+            self.activation_progress_vars[f"step_{idx}"] = var
+            bar = ttk.Progressbar(row, maximum=100, variable=var, length=200)
+            bar.pack(side=tk.RIGHT, padx=6)
+        ttk.Button(
+            activation_card,
+            text="Проверить активацию",
+            style="Secondary.TButton",
+            command=self.check_activation_bonus,
+        ).pack(anchor="e", pady=(6, 0))
 
         history_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
-        history_card.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
+        history_card.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
         style_card(history_card, self.palette, padded=False)
-        ttk.Label(history_card, text="История операций", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(history_card, text="История операций", style="Section.TLabel", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         history_inner = ttk.Frame(history_card, style="CardInner.TFrame")
         history_inner.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
         columns = ("date", "delta", "note")
@@ -5954,9 +6332,9 @@ class AnkiApp(tk.Tk):
         )
 
         referral_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
-        referral_card.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 12))
+        referral_card.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 12))
         style_card(referral_card, self.palette, padded=False)
-        ttk.Label(referral_card, text="Реферальная система", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(referral_card, text="Реферальная система", style="Section.TLabel", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ref_inner = ttk.Frame(referral_card, style="CardInner.TFrame")
         ref_inner.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
 
@@ -5992,7 +6370,7 @@ class AnkiApp(tk.Tk):
 
         ttk.Label(
             ref_inner,
-            text="Условия активации: заглушка (TODO: 24 часа + 10 карточек + 20 повторений).",
+            text="Условия активации: 24 часа возраста, 10 карточек, 20 повторений, первый импорт.",
             style="Muted.TLabel",
             wraplength=900,
         ).pack(anchor="w", pady=(6, 0))
@@ -6000,6 +6378,7 @@ class AnkiApp(tk.Tk):
         self.refresh_balance_display()
         self.refresh_ledger_table()
         self.refresh_referral_info()
+        self.refresh_activation_progress_ui()
 
     def copy_ref_link(self):
         link = self.ref_summary_vars.get("link").get() if self.ref_summary_vars else ""
@@ -7148,6 +7527,7 @@ class AnkiApp(tk.Tk):
                     audio_path=None,
                     progress_queue=task_obj.queue,
                     cancel_check=task_obj.cancelled,
+                    image_spend_cb=self._spend_for_ai_image,
                 )
 
             btn_generate.config(state=tk.DISABLED)
@@ -7173,6 +7553,13 @@ class AnkiApp(tk.Tk):
     def open_generate_from_image_window(self):
         if self.selected_deck_id is None:
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
+            return
+
+        if not self.is_premium_active():
+            messagebox.showinfo(
+                "Нужна подписка",
+                "OCR доступен только в Pro. Откройте личный кабинет для активации.",
+            )
             return
 
         if not is_tesseract_available():
@@ -7373,10 +7760,11 @@ class AnkiApp(tk.Tk):
                     return
                 if not _ensure_required_lang_files():
                     return
-            if not self.spend_credits_or_warn(
+            if not self.guard_premium_and_spend(
+                "ocr_image",
                 OCR_CREDIT_COST,
-                "OCR распознавание изображения",
-                {"operation": "ocr_image"},
+                require_premium=True,
+                meta={"operation": "ocr_image"},
             ):
                 return
 
@@ -7547,6 +7935,7 @@ class AnkiApp(tk.Tk):
                     audio_path=None,
                     progress_queue=task_obj.queue,
                     cancel_check=task_obj.cancelled,
+                    image_spend_cb=self._spend_for_ai_image,
                 )
 
             btn_generate.config(state=tk.DISABLED)
@@ -7723,6 +8112,7 @@ class AnkiApp(tk.Tk):
                     one_sentence_one_card=one_sent,
                     progress_queue=task_obj.queue,
                     cancel_check=task_obj.cancelled,
+                    image_spend_cb=self._spend_for_ai_image,
                 )
 
             progress_var.set(0)

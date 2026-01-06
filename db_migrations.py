@@ -328,6 +328,27 @@ def run_migrations(conn: sqlite3.Connection):
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_profile (
+            user_id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            is_premium INTEGER DEFAULT 0,
+            premium_until INTEGER DEFAULT 0,
+            starter_50_claimed INTEGER DEFAULT 0,
+            activation_200_claimed INTEGER DEFAULT 0,
+            wikimedia_tickets INTEGER DEFAULT 0,
+            first_import_ts INTEGER DEFAULT 0
+        );
+        """
+    )
+    _add_column_if_missing(cur, "user_profile", "premium_until", "INTEGER DEFAULT 0")
+    _add_column_if_missing(cur, "user_profile", "is_premium", "INTEGER DEFAULT 0")
+    _add_column_if_missing(cur, "user_profile", "starter_50_claimed", "INTEGER DEFAULT 0")
+    _add_column_if_missing(cur, "user_profile", "activation_200_claimed", "INTEGER DEFAULT 0")
+    _add_column_if_missing(cur, "user_profile", "wikimedia_tickets", "INTEGER DEFAULT 0")
+    _add_column_if_missing(cur, "user_profile", "first_import_ts", "INTEGER DEFAULT 0")
+
     # Добавляем дефолтный тип заметки "Basic"
     cur.execute(
         "SELECT id FROM note_types WHERE name = 'Basic' LIMIT 1;"

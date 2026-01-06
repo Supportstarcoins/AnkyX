@@ -89,6 +89,16 @@ class CreditsService:
         commit_with_retry(conn, _op)
         conn.close()
 
+    # Aliases for a unified API naming
+    def add(
+        self,
+        user_id: str,
+        amount: int,
+        reason: str,
+        meta: Optional[Dict] = None,
+    ) -> None:
+        self.add_credits(user_id, amount, reason, meta)
+
     def spend_credits(
         self,
         user_id: str,
@@ -129,6 +139,15 @@ class CreditsService:
         result = commit_with_retry(conn, _op)
         conn.close()
         return bool(result)
+
+    def spend(
+        self,
+        user_id: str,
+        amount: int,
+        reason: str,
+        meta: Optional[Dict] = None,
+    ) -> bool:
+        return self.spend_credits(user_id, amount, reason, meta)
 
     def get_ledger(self, user_id: str, limit: int = 200) -> List[Dict]:
         conn = self._db_factory()
