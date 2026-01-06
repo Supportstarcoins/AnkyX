@@ -14,6 +14,7 @@ import json
 import csv
 import calendar
 import shutil
+import webbrowser
 from PIL import Image, ImageOps
 from pathlib import Path
 from uuid import uuid4
@@ -65,6 +66,10 @@ from stats_config import (
 )
 from db_migrations import ensure_schema_for_import, run_migrations
 from db_connect import DB_WRITE_LOCK, commit_with_retry, open_db
+from db_path import get_db_path
+from credits import CreditsService
+from referral import ReferralService
+from payments import PACKAGES, build_payment_url, verify_payment
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
 from ui_progress import BusyDialog, TaskRunner
@@ -1027,6 +1032,23 @@ LEITNER_SCHEDULE = {
     9: timedelta(days=56),
     10: timedelta(days=100),
 }
+
+DEFAULT_USER_ID_FILE = Path(get_db_path()).with_name("user_id.txt")
+TEXT_GEN_CREDIT_COST = 50
+OCR_CREDIT_COST = 30
+
+
+def get_local_user_id() -> str:
+    """Простой идентификатор пользователя на основе локального профиля."""
+    DEFAULT_USER_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if DEFAULT_USER_ID_FILE.exists():
+        try:
+            return DEFAULT_USER_ID_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    user_id = f"user-{uuid4().hex}"
+    DEFAULT_USER_ID_FILE.write_text(user_id, encoding="utf-8")
+    return user_id
 
 
 def get_next_review_for_level(level: int) -> datetime:
@@ -3512,12 +3534,28 @@ class AnkiApp(tk.Tk):
         # отображение id-элементов Treeview -> (deck_id, phase)
         self.deck_items = {}
 
+        self.user_id = get_local_user_id()
+        self.credits_service = CreditsService()
+        self.referral_service = ReferralService(credits_service=self.credits_service)
+        self.balance_var = tk.StringVar(value="—")
+        self.main_notebook: ttk.Notebook | None = None
+        self.personal_tab = None
+        self.ledger_tree: ttk.Treeview | None = None
+        self.ref_summary_vars: dict[str, tk.StringVar] = {}
+        self.payment_status_var = tk.StringVar(value="")
+        self.payment_code_var = tk.StringVar(value="")
+        self.package_choice_var = tk.StringVar(value="pack_500")
+        self.balance_labels: list[tk.Variable] = []
+        self.credit_icon_image = None
+        self._ensure_initial_credits()
+
         # Инициализируем словарь
         init_dictionary()
 
         self.create_menu()
         self.create_widgets()
         self.refresh_decks()
+        self.refresh_balance_display()
 
         self.after(500, self.warn_if_no_tesseract)
         self.after(50, self.poll_bg_queues)
@@ -5489,10 +5527,43 @@ class AnkiApp(tk.Tk):
         ttk.Button(quick_actions, text="Импорт CSV", style="Secondary.TButton", command=self.open_csv_import_window).pack(side=tk.LEFT, padx=6)
         ttk.Button(quick_actions, text="Новая колода", style="Primary.TButton", command=self.add_deck_window).pack(side=tk.LEFT, padx=(10, 0))
 
+        account_bar = ttk.Frame(header, style="Header.TFrame")
+        account_bar.pack(side=tk.RIGHT, padx=(0, 12))
+
+        balance_frame = ttk.Frame(account_bar, style="Header.TFrame")
+        balance_frame.pack(side=tk.RIGHT, padx=(0, 8))
+        balance_icon = self._load_credit_icon()
+        if balance_icon:
+            self.credit_icon_image = balance_icon
+            ttk.Label(balance_frame, image=balance_icon, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        else:
+            ttk.Label(balance_frame, text="ⓘ", style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        lbl_balance = ttk.Label(balance_frame, textvariable=self.balance_var, style="HeaderSub.TLabel")
+        lbl_balance.pack(side=tk.LEFT)
+        self.balance_labels.append(self.balance_var)
+
+        ttk.Button(
+            account_bar,
+            text="Личный кабинет",
+            style="Ghost.TButton",
+            command=self.open_personal_tab,
+        ).pack(side=tk.RIGHT)
+
         shell = ttk.Frame(self, style="Surface.TFrame")
         shell.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
-        main_container = ttk.PanedWindow(shell, orient=tk.HORIZONTAL)
+        self.main_notebook = ttk.Notebook(shell)
+        self.main_notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        dashboard_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
+        self.main_notebook.add(dashboard_tab, text="Главная")
+
+        self.personal_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
+        self.main_notebook.add(self.personal_tab, text="Личный кабинет")
+
+        self.build_personal_tab(self.personal_tab)
+
+        main_container = ttk.PanedWindow(dashboard_tab, orient=tk.HORIZONTAL)
         main_container.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         left_frame = ttk.Frame(main_container, style="Surface.TFrame")
@@ -5622,6 +5693,324 @@ class AnkiApp(tk.Tk):
             span = 2 if idx == 2 else 1
             btn = self._mk_wrapped_tk_button(action_frame, text, command, style_name, wraplength=180)
             btn.grid(row=row, column=col, columnspan=span, padx=6, pady=6, sticky="nsew")
+
+    def _load_credit_icon(self):
+        search_paths = [Path("iconcoin1.png"), Path("icon credits.jpeg")]
+        for path in search_paths:
+            if not path.exists():
+                continue
+            try:
+                if PIL_AVAILABLE:
+                    img = Image.open(path)
+                    img = img.resize((18, 18), Image.Resampling.LANCZOS)
+                    return ImageTk.PhotoImage(img)
+                if path.suffix.lower() in (".png", ".gif"):
+                    return tk.PhotoImage(file=str(path))
+            except Exception:
+                continue
+        return None
+
+    def open_personal_tab(self):
+        if self.main_notebook and self.personal_tab:
+            self.main_notebook.select(self.personal_tab)
+            self.refresh_balance_display()
+            self.refresh_ledger_table()
+            self.refresh_referral_info()
+
+    def refresh_balance_display(self):
+        balance = self.credits_service.get_balance(self.user_id)
+        formatted = f"{balance:,}".replace(",", " ")
+        self.balance_var.set(formatted)
+        for var in self.balance_labels:
+            var.set(formatted)
+
+    def _record_payment(
+        self,
+        package_id: str,
+        status: str,
+        external_id: str | None = None,
+        meta: dict | None = None,
+    ) -> None:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO payments (user_id, package_id, ts, status, external_id, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (
+                self.user_id,
+                package_id,
+                int(time.time()),
+                status,
+                external_id,
+                json.dumps(meta or {}, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def _after_balance_change(self):
+        self.refresh_balance_display()
+        self.refresh_ledger_table()
+        self.refresh_referral_info()
+
+    def _ensure_initial_credits(self):
+        balance = self.credits_service.get_balance(self.user_id)
+        existing_ledger = self.credits_service.get_ledger(self.user_id, limit=1)
+        if existing_ledger or balance > 0:
+            return
+        self.credits_service.add_credits(
+            self.user_id,
+            2000,
+            reason="Стартовый пакет Pro",
+            meta={"source": "bootstrap"},
+        )
+
+    def spend_credits_or_warn(self, amount: int, reason: str, meta: dict | None = None) -> bool:
+        ok = self.credits_service.spend_credits(self.user_id, amount, reason, meta)
+        if not ok:
+            messagebox.showwarning(
+                "Недостаточно кредитов",
+                "На балансе недостаточно кредитов для выполнения операции.\nПополните баланс и повторите.",
+            )
+            return False
+        self._after_balance_change()
+        return True
+
+    def start_payment_flow(self, package_id: str):
+        try:
+            url = build_payment_url(self.user_id, package_id)
+        except Exception as exc:
+            messagebox.showerror("Оплата", f"Не удалось подготовить платеж: {exc}")
+            return
+        package = PACKAGES.get(package_id, {})
+        self._record_payment(
+            package_id,
+            status="initiated",
+            meta={"url": url, "credits": package.get("credits")},
+        )
+        webbrowser.open(url)
+        messagebox.showinfo(
+            "Оплата",
+            "Ссылка на оплату открыта в браузере.\n"
+            "После завершения нажмите «Я оплатил» и введите ID/код платежа.",
+        )
+        self.package_choice_var.set(package_id)
+
+    def confirm_manual_payment(self):
+        package_id = self.package_choice_var.get() or "pack_500"
+        code = self.payment_code_var.get().strip()
+        success, details = verify_payment(self.user_id, package_id, code)
+        if not success:
+            self.payment_status_var.set("Не удалось подтвердить платёж (заглушка).")
+            messagebox.showerror("Оплата", "Платеж не подтвержден.")
+            return
+        package = PACKAGES.get(package_id, {})
+        credits_amount = int(package.get("credits", 0))
+        self.payment_status_var.set(f"Подтверждено: {credits_amount} кредитов")
+        self._record_payment(
+            package_id,
+            status="confirmed",
+            external_id=details.get("payment_id"),
+            meta=details,
+        )
+        self.credits_service.add_credits(
+            self.user_id,
+            credits_amount,
+            reason=f"Покупка пакета {package.get('title')}",
+            meta={"payment": details},
+        )
+        self._after_balance_change()
+
+    def refresh_ledger_table(self):
+        if not self.ledger_tree:
+            return
+        for item in self.ledger_tree.get_children():
+            self.ledger_tree.delete(item)
+        for row in self.credits_service.get_ledger(self.user_id, limit=200):
+            ts_str = datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d %H:%M")
+            delta = row["delta"]
+            sign = "+" if delta >= 0 else "−"
+            amount = f"{sign}{abs(delta)}"
+            note = row.get("reason") or ""
+            meta = row.get("meta") or {}
+            if meta.get("payment"):
+                note += " · оплата"
+            if meta.get("referee_id"):
+                note += " · реферал"
+            self.ledger_tree.insert(
+                "",
+                "end",
+                values=(ts_str, amount, note.strip()),
+            )
+
+    def refresh_referral_info(self):
+        if not self.ref_summary_vars:
+            return
+        summary = self.referral_service.get_summary(self.user_id)
+        self.ref_summary_vars["invited"].set(str(summary.get("invited", 0)))
+        self.ref_summary_vars["activated"].set(str(summary.get("activated", 0)))
+        self.ref_summary_vars["earned"].set(str(summary.get("earned", 0)))
+        ref_code = self.referral_service.get_ref_code(self.user_id)
+        ref_link = self.referral_service.get_ref_link(self.user_id)
+        if "code" in self.ref_summary_vars:
+            self.ref_summary_vars["code"].set(ref_code)
+        if "link" in self.ref_summary_vars:
+            self.ref_summary_vars["link"].set(ref_link)
+
+    def build_personal_tab(self, tab: ttk.Frame):
+        tab.grid_columnconfigure((0, 1), weight=1)
+
+        balance_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
+        balance_card.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        style_card(balance_card, self.palette, padded=False)
+        ttk.Label(balance_card, text="Баланс", style="Section.TLabel").pack(anchor="w")
+        balance_row = ttk.Frame(balance_card, style="CardInner.TFrame")
+        balance_row.pack(fill=tk.X, pady=6)
+        icon = self._load_credit_icon()
+        if icon:
+            self.credit_icon_image = icon
+            ttk.Label(balance_row, image=icon, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        else:
+            ttk.Label(balance_row, text="💠", style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        lbl_balance = ttk.Label(balance_row, textvariable=self.balance_var, style="Title.TLabel")
+        lbl_balance.pack(side=tk.LEFT)
+        self.balance_labels.append(self.balance_var)
+        ttk.Button(balance_row, text="Обновить", style="Secondary.TButton", command=self.refresh_balance_display).pack(
+            side=tk.RIGHT
+        )
+        ttk.Label(
+            balance_card,
+            text="Базовый пакет Pro: 2000 кредитов/мес (инфраструктура для пополнений готова).",
+            style="Muted.TLabel",
+            wraplength=320,
+        ).pack(anchor="w", pady=(6, 0))
+
+        purchase_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
+        purchase_card.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        style_card(purchase_card, self.palette, padded=False)
+        ttk.Label(purchase_card, text="Купить кредиты", style="Section.TLabel").pack(anchor="w")
+        for package_id, data in PACKAGES.items():
+            row = ttk.Frame(purchase_card, style="CardInner.TFrame")
+            row.pack(fill=tk.X, pady=6)
+            if self.credit_icon_image:
+                ttk.Label(row, image=self.credit_icon_image, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+            else:
+                ttk.Label(row, text="💎", style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Label(
+                row,
+                text=f"{data['title']} · ${data['price']}",
+                style="HeaderSub.TLabel",
+            ).pack(side=tk.LEFT)
+            ttk.Button(
+                row,
+                text="Купить",
+                style="Primary.TButton",
+                command=lambda pid=package_id: self.start_payment_flow(pid),
+            ).pack(side=tk.RIGHT)
+
+        confirm_frame = ttk.LabelFrame(purchase_card, text="Я оплатил / проверка оплаты", style="Card.TLabelframe")
+        confirm_frame.pack(fill=tk.X, pady=(8, 0))
+        style_card(confirm_frame, self.palette, padded=True)
+        ttk.Label(confirm_frame, text="Пакет:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        ttk.Combobox(
+            confirm_frame,
+            state="readonly",
+            values=list(PACKAGES.keys()),
+            textvariable=self.package_choice_var,
+            width=12,
+        ).grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        ttk.Label(confirm_frame, text="Payment ID / код:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(confirm_frame, textvariable=self.payment_code_var).grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        confirm_frame.columnconfigure(1, weight=1)
+        ttk.Button(
+            confirm_frame,
+            text="Я оплатил",
+            style="Secondary.TButton",
+            command=self.confirm_manual_payment,
+        ).grid(row=0, column=2, rowspan=2, sticky="e", padx=4, pady=4)
+        ttk.Label(confirm_frame, textvariable=self.payment_status_var, style="Muted.TLabel").grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 0)
+        )
+
+        history_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
+        history_card.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
+        style_card(history_card, self.palette, padded=False)
+        ttk.Label(history_card, text="История операций", style="Section.TLabel").pack(anchor="w")
+        history_inner = ttk.Frame(history_card, style="CardInner.TFrame")
+        history_inner.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        columns = ("date", "delta", "note")
+        self.ledger_tree = ttk.Treeview(history_inner, columns=columns, show="headings", height=10)
+        self.ledger_tree.heading("date", text="Дата")
+        self.ledger_tree.heading("delta", text="+/- кредиты")
+        self.ledger_tree.heading("note", text="Примечание")
+        self.ledger_tree.column("date", width=150, anchor="center")
+        self.ledger_tree.column("delta", width=100, anchor="center")
+        self.ledger_tree.column("note", width=520, anchor="w")
+        self.ledger_tree.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(history_card, text="Обновить историю", style="Ghost.TButton", command=self.refresh_ledger_table).pack(
+            anchor="e", pady=(6, 0)
+        )
+
+        referral_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
+        referral_card.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 12))
+        style_card(referral_card, self.palette, padded=False)
+        ttk.Label(referral_card, text="Реферальная система", style="Section.TLabel").pack(anchor="w")
+        ref_inner = ttk.Frame(referral_card, style="CardInner.TFrame")
+        ref_inner.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        self.ref_summary_vars = {
+            "code": tk.StringVar(value=""),
+            "link": tk.StringVar(value=""),
+            "invited": tk.StringVar(value="0"),
+            "activated": tk.StringVar(value="0"),
+            "earned": tk.StringVar(value="0"),
+        }
+
+        row_code = ttk.Frame(ref_inner, style="CardInner.TFrame")
+        row_code.pack(fill=tk.X, pady=4)
+        ttk.Label(row_code, text="Реф-код:", style="HeaderSub.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(row_code, textvariable=self.ref_summary_vars["code"], state="readonly", width=18).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Label(row_code, text="Ссылка:", style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Entry(row_code, textvariable=self.ref_summary_vars["link"], state="readonly").pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=4
+        )
+        ttk.Button(row_code, text="Скопировать ссылку", command=self.copy_ref_link, style="Secondary.TButton").pack(
+            side=tk.LEFT, padx=4
+        )
+
+        stats_row = ttk.Frame(ref_inner, style="CardInner.TFrame")
+        stats_row.pack(fill=tk.X, pady=4)
+        for label, key in (("Приглашено", "invited"), ("Активировано", "activated"), ("Заработано", "earned")):
+            stat_frame = ttk.Frame(stats_row, style="CardInner.TFrame")
+            stat_frame.pack(side=tk.LEFT, padx=8)
+            ttk.Label(stat_frame, text=label, style="Muted.TLabel").pack()
+            ttk.Label(stat_frame, textvariable=self.ref_summary_vars[key], style="HeaderSub.TLabel").pack()
+
+        ttk.Label(
+            ref_inner,
+            text="Условия активации: заглушка (TODO: 24 часа + 10 карточек + 20 повторений).",
+            style="Muted.TLabel",
+            wraplength=900,
+        ).pack(anchor="w", pady=(6, 0))
+
+        self.refresh_balance_display()
+        self.refresh_ledger_table()
+        self.refresh_referral_info()
+
+    def copy_ref_link(self):
+        link = self.ref_summary_vars.get("link").get() if self.ref_summary_vars else ""
+        if not link:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(link)
+            messagebox.showinfo("Реферальная ссылка", "Ссылка скопирована в буфер обмена.")
+        except Exception as exc:
+            messagebox.showerror("Буфер обмена", f"Не удалось скопировать: {exc}")
 
     def refresh_decks(self):
         if self._refresh_in_progress:
@@ -6699,6 +7088,12 @@ class AnkiApp(tk.Tk):
             if not text:
                 messagebox.showerror("Ошибка", "Текст пустой.")
                 return
+            if not self.spend_credits_or_warn(
+                TEXT_GEN_CREDIT_COST,
+                "Генерация карточек из текста",
+                {"operation": "generate_from_text"},
+            ):
+                return
 
             use_ai_images = use_ai_var.get()
             front_t = entry_front.get("1.0", tk.END).strip() or DEFAULT_FRONT_TEMPLATE
@@ -6978,6 +7373,12 @@ class AnkiApp(tk.Tk):
                     return
                 if not _ensure_required_lang_files():
                     return
+            if not self.spend_credits_or_warn(
+                OCR_CREDIT_COST,
+                "OCR распознавание изображения",
+                {"operation": "ocr_image"},
+            ):
+                return
 
             ocr_progress_var.set(0)
             ocr_progress_label.set("Запуск…")

@@ -271,6 +271,63 @@ def run_migrations(conn: sqlite3.Connection):
 
     migrate_media_note_nullable(conn)
 
+    # Балансы и платежи
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS credits_balance (
+            user_id TEXT PRIMARY KEY,
+            balance INTEGER NOT NULL
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS credits_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            delta INTEGER NOT NULL,
+            reason TEXT,
+            meta_json TEXT
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS referral_users (
+            user_id TEXT PRIMARY KEY,
+            ref_code TEXT UNIQUE,
+            referrer_id TEXT,
+            activated INTEGER DEFAULT 0
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS referral_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id TEXT NOT NULL,
+            referee_id TEXT,
+            ts INTEGER NOT NULL,
+            delta INTEGER NOT NULL,
+            reason TEXT
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            package_id TEXT,
+            ts INTEGER,
+            status TEXT,
+            external_id TEXT,
+            meta_json TEXT
+        );
+        """
+    )
+
     # Добавляем дефолтный тип заметки "Basic"
     cur.execute(
         "SELECT id FROM note_types WHERE name = 'Basic' LIMIT 1;"
