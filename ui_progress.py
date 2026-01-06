@@ -9,38 +9,69 @@ class BusyDialog:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.window: tk.Toplevel | None = None
-        self.label_var = tk.StringVar(value="")
+        self.label_var = tk.StringVar(value="Загрузка")
         self.progressbar: ttk.Progressbar | None = None
         self.mode = "indeterminate"
         self.palette = getattr(root, "palette", None)
+        self._root_bind_id: str | None = None
 
-    def show(self, title: str, mode: str, total: Optional[int] = None):
+    def _ensure_window(self):
         if self.window is None or not tk.Toplevel.winfo_exists(self.window):
             self.window = tk.Toplevel(self.root)
-            self.window.transient(self.root)
-            self.window.grab_set()
-            self.window.title(title)
-            self.window.resizable(False, False)
+            self.window.overrideredirect(True)
+            self.window.lift(self.root)
+            try:
+                self.window.attributes("-alpha", 0.82)
+            except tk.TclError:
+                pass
+            bg_color = "#0B0D12"
             if self.palette:
-                self.window.configure(bg=self.palette.get("panel", self.root.cget("bg")))
-            ttk.Label(self.window, textvariable=self.label_var).pack(padx=15, pady=(15, 5))
-            self.progressbar = ttk.Progressbar(self.window)
-            self.progressbar.pack(fill=tk.X, padx=15, pady=(0, 15))
-        else:
-            self.window.deiconify()
-            self.window.title(title)
+                bg_color = self.palette.get("backdrop", self.palette.get("panel", bg_color))
+            self.window.configure(bg=bg_color)
 
+            overlay = ttk.Frame(self.window, padding=24, style="Card.TFrame")
+            overlay.place(relx=0.5, rely=0.5, anchor="center")
+            ttk.Label(overlay, textvariable=self.label_var, style="Title.TLabel").pack(pady=(0, 10))
+            self.progressbar = ttk.Progressbar(overlay, length=320)
+            self.progressbar.pack(fill=tk.X)
+
+        if not self._root_bind_id:
+            self._root_bind_id = self.root.bind("<Configure>", self._sync_geometry, add="+")
+        self._sync_geometry()
+
+    def _sync_geometry(self, _event=None):
+        if not self.window:
+            return
+        try:
+            x = self.root.winfo_rootx()
+            y = self.root.winfo_rooty()
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            self.window.geometry(f"{w}x{h}+{x}+{y}")
+        except tk.TclError:
+            pass
+
+    def show(self, title: str = "Загрузка", mode: str = "indeterminate", total: Optional[int] = None):
+        self._ensure_window()
+        if not self.window:
+            return
+
+        self.window.deiconify()
         self.mode = mode
         if self.progressbar:
             self.progressbar.config(mode=mode)
             if mode == "determinate":
                 self.progressbar.config(maximum=max(total or 0, 1))
                 self.progressbar.stop()
-                self.progressbar['value'] = 0
+                self.progressbar["value"] = 0
             else:
                 self.progressbar.config(maximum=100)
                 self.progressbar.start(10)
-        self.label_var.set(title)
+        self.label_var.set(title or "Загрузка")
+        try:
+            self.window.grab_set()
+        except tk.TclError:
+            pass
         self.window.update_idletasks()
 
     def update_progress(self, done: int, total: Optional[int], text: Optional[str] = None):
@@ -48,7 +79,7 @@ class BusyDialog:
             return
         if self.mode == "determinate" and total:
             self.progressbar.config(maximum=max(total, 1))
-            self.progressbar['value'] = done
+            self.progressbar["value"] = done
         if text:
             self.label_var.set(text)
         self.window.update_idletasks()
@@ -64,6 +95,12 @@ class BusyDialog:
             self.window.destroy()
         self.window = None
         self.progressbar = None
+        if self._root_bind_id:
+            try:
+                self.root.unbind("<Configure>", self._root_bind_id)
+            except tk.TclError:
+                pass
+        self._root_bind_id = None
 
 
 class TaskRunner:
@@ -74,6 +111,7 @@ class TaskRunner:
         self._active_thread: threading.Thread | None = None
         self._disabled_widgets: list[tuple[tk.Widget, str]] = []
         self._disabled_menu_states: list[tuple[tk.Menu, int, str]] = []
+        self._loading_via_root = False
 
     def _walk_main_widgets(self) -> list[tk.Widget]:
         widgets: list[tk.Widget] = []
@@ -145,7 +183,13 @@ class TaskRunner:
             kind = event[0]
             if kind == "progress":
                 done, total, text = event[1:]
-                self.busy_dialog.update_progress(done, total, text)
+                if self._loading_via_root and hasattr(self.root, "update_loading"):
+                    try:
+                        self.root.update_loading(done, total, text)
+                    except Exception:
+                        self.busy_dialog.update_progress(done, total, text)
+                else:
+                    self.busy_dialog.update_progress(done, total, text)
             elif kind == "done":
                 result = event[1]
                 self._finish()
@@ -162,7 +206,13 @@ class TaskRunner:
             self._finish()
 
     def _finish(self):
-        self.busy_dialog.close()
+        if self._loading_via_root and hasattr(self.root, "hide_loading"):
+            try:
+                self.root.hide_loading()
+            except Exception:
+                self.busy_dialog.close()
+        else:
+            self.busy_dialog.close()
         self._set_controls_state(False)
         self._active_thread = None
 
@@ -178,7 +228,15 @@ class TaskRunner:
         if self._active_thread:
             return
 
-        self.busy_dialog.show(title, mode, total)
+        self._loading_via_root = False
+        if hasattr(self.root, "show_loading"):
+            try:
+                self.root.show_loading(title, mode == "determinate", total)
+                self._loading_via_root = True
+            except Exception:
+                self.busy_dialog.show(title, mode, total)
+        else:
+            self.busy_dialog.show(title, mode, total)
         self._set_controls_state(True)
 
         def progress(done: int, total_val: int | None = None, text: str | None = None):
