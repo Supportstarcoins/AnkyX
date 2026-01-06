@@ -3441,6 +3441,8 @@ class ResizableImageLabel(tk.Label):
         self.image_path = None
         self.scale_factor = 1.0
         self.drag_data = {"x": 0, "y": 0, "item": None}
+        self._container_size: tuple[int, int] = (0, 0)
+        self.configure(anchor="center")
         
         # Привязываем события мыши
         self.bind("<ButtonPress-1>", self.start_drag)
@@ -3449,13 +3451,27 @@ class ResizableImageLabel(tk.Label):
         self.bind("<MouseWheel>", self.on_mousewheel)  # Для Windows
         self.bind("<Button-4>", self.on_mousewheel)    # Для Linux, scroll up
         self.bind("<Button-5>", self.on_mousewheel)    # Для Linux, scroll down
+        self.bind("<Configure>", self._handle_configure)
+
+    def _handle_configure(self, event):
+        self.set_container_size(event.width, event.height)
+
+    def set_container_size(self, width: int, height: int):
+        """Установить размеры контейнера для подгонки изображения под доступную область."""
+        self._container_size = (max(1, int(width)), max(1, int(height)))
+        self.update_display()
         
     def load_image(self, image_path):
         """Загрузить изображение"""
         self.image_path = image_path
         if image_path and os.path.exists(image_path) and PIL_AVAILABLE:
             try:
-                self.original_image = Image.open(image_path)
+                img = Image.open(image_path)
+                try:
+                    img = ImageOps.exif_transpose(img)
+                except Exception:
+                    pass
+                self.original_image = img
                 self.scale_factor = 1.0
                 self.update_display()
                 return True
@@ -3469,9 +3485,21 @@ class ResizableImageLabel(tk.Label):
     def update_display(self):
         """Обновить отображение изображения"""
         if self.original_image:
-            # Вычисляем новые размеры
-            width = int(self.original_image.width * self.scale_factor)
-            height = int(self.original_image.height * self.scale_factor)
+            cont_w, cont_h = self._container_size
+            if cont_w <= 1 or cont_h <= 1:
+                cont_w = max(1, self.winfo_width() or self.winfo_reqwidth())
+                cont_h = max(1, self.winfo_height() or self.winfo_reqheight())
+            cont_w = max(1, cont_w - 6)
+            cont_h = max(1, cont_h - 6)
+
+            img_w, img_h = self.original_image.size
+            if img_w == 0 or img_h == 0:
+                return
+            base_ratio = min(cont_w / img_w, cont_h / img_h) if cont_w and cont_h else 1.0
+            desired_ratio = max(0.05, base_ratio * self.scale_factor)
+            clamped_ratio = min(desired_ratio, base_ratio)
+            width = max(1, int(img_w * clamped_ratio))
+            height = max(1, int(img_h * clamped_ratio))
             
             # Масштабируем изображение
             resized_image = self.original_image.resize((width, height), Image.Resampling.LANCZOS)
@@ -3577,6 +3605,7 @@ class AnkiApp(tk.Tk):
 
         self.busy_dialog = BusyDialog(self)
         self.task_runner = TaskRunner(self, self.busy_dialog)
+        self._loading_depth = 0
 
         self.image_import_watch_job = None
 
@@ -3592,6 +3621,7 @@ class AnkiApp(tk.Tk):
         self.balance_var = tk.StringVar(value="—")
         self.premium_var = tk.BooleanVar(value=False)
         self.main_notebook: ttk.Notebook | None = None
+        self.dashboard_tab: ttk.Frame | None = None
         self.personal_tab = None
         self.ledger_tree: ttk.Treeview | None = None
         self.ref_summary_vars: dict[str, tk.StringVar] = {}
@@ -3607,11 +3637,17 @@ class AnkiApp(tk.Tk):
         self.credit_icon_large = None
         self.generation_menu = None
         self.generation_menu_indexes: dict[str, int] = {}
+        self.mode_actions: dict[str, callable] = {}
         self._ensure_initial_credits()
         self.premium_var.set(self.is_premium_active())
 
         # Инициализируем словарь
         init_dictionary()
+
+        self.mode_actions = {
+            "repeat": self.start_repeat_mode,
+            "playback": self.start_playback_mode,
+        }
 
         self.create_menu()
         self.create_widgets()
@@ -3649,6 +3685,31 @@ class AnkiApp(tk.Tk):
                 except Exception:
                     pass
         self.after(50, self.poll_bg_queues)
+
+    def show_loading(self, title: str = "Загрузка", determinate: bool = False, total: int | None = None):
+        """Показать глобальный оверлей загрузки."""
+        self._loading_depth += 1
+        mode = "determinate" if determinate else "indeterminate"
+        try:
+            self.busy_dialog.show(title or "Загрузка", mode, total)
+        except Exception:
+            pass
+
+    def update_loading(self, done: int, total: int | None = None, text: str | None = None):
+        """Обновить состояние глобального прогресса."""
+        try:
+            self.busy_dialog.update_progress(done, total, text)
+        except Exception:
+            pass
+
+    def hide_loading(self):
+        """Спрятать оверлей загрузки."""
+        self._loading_depth = max(0, self._loading_depth - 1)
+        if self._loading_depth == 0:
+            try:
+                self.busy_dialog.close()
+            except Exception:
+                pass
 
     def run_task(self, title: str, mode: str, task_fn, on_success, on_error, total=None):
         self.task_runner.run_task(title, mode, task_fn, on_success, on_error, total)
@@ -3706,10 +3767,14 @@ class AnkiApp(tk.Tk):
         self.refresh_generation_menu_state()
 
         modes_menu = tk.Menu(menubar, tearoff=0)
-        modes_menu.add_command(label="Режим повторения (по дате)",
-                               command=self.start_repeat_mode)
-        modes_menu.add_command(label="Режим воспроизведения (по прогрессу)",
-                               command=self.start_playback_mode)
+        modes_menu.add_command(
+            label="Режим повторения (по дате)",
+            command=self.mode_actions.get("repeat", self.start_repeat_mode)
+        )
+        modes_menu.add_command(
+            label="Режим воспроизведения (по прогрессу)",
+            command=self.mode_actions.get("playback", self.start_playback_mode)
+        )
         modes_menu.add_command(label="Режим обзора / редактирования",
                                command=self.show_cards_window)
         modes_menu.add_command(label="Режим ознакомления",
@@ -3857,6 +3922,7 @@ class AnkiApp(tk.Tk):
                 progress_bar.configure(maximum=max(int(total), 1))
                 progress_var.set(int(done))
                 progress_label_var.set(f"{done}/{total} {label}")
+                self.update_loading(done, total, f"{label} {done}/{total}")
             elif kind == "log":
                 log_msg(str(event[1]))
             elif kind == "done":
@@ -3864,6 +3930,7 @@ class AnkiApp(tk.Tk):
                 if processing_task["task"]:
                     self.unregister_bg_handler(processing_task["task"].queue)
                     processing_task["task"] = None
+                self.hide_loading()
                 messagebox.showinfo(
                     "Импорт завершен",
                     (
@@ -3883,6 +3950,7 @@ class AnkiApp(tk.Tk):
                     messagebox.showerror("Неподдерживаемый формат", msg)
                 else:
                     messagebox.showerror("Ошибка импорта", msg)
+                self.hide_loading()
 
         def browse_file():
             path = filedialog.askopenfilename(filetypes=[("Anki .apkg", "*.apkg"), ("Все файлы", "*.*")])
@@ -3925,11 +3993,13 @@ class AnkiApp(tk.Tk):
             processing_task["task"] = task
             self.register_bg_handler(task.queue, handle_event)
             log_msg("Старт импорта…")
+            self.show_loading("Импорт .apkg", determinate=False)
 
         def cancel_import():
             if processing_task["task"]:
                 processing_task["task"].cancel()
                 log_msg("Отмена запрошена")
+            self.hide_loading()
 
         top_frame = ttk.Frame(win)
         top_frame.pack(fill=tk.X, padx=10, pady=10)
@@ -4017,6 +4087,7 @@ class AnkiApp(tk.Tk):
                 progress_bar.configure(maximum=max(total, 1))
                 progress_var.set(done)
                 progress_label_var.set(f"{label}: {done}/{total}")
+                self.update_loading(done, total, f"{label}: {done}/{total}")
             elif kind == "log":
                 log_msg(event[1])
             elif kind == "done":
@@ -4026,6 +4097,7 @@ class AnkiApp(tk.Tk):
                 btn_check.config(state=tk.NORMAL)
                 btn_import.config(state=tk.NORMAL)
                 btn_stop.config(state=tk.NORMAL)
+                self.hide_loading()
                 msg = (
                     f"Всего: {summary['total']}\n"
                     f"Создано: {summary['imported']}\n"
@@ -4045,6 +4117,7 @@ class AnkiApp(tk.Tk):
                 btn_import.config(state=tk.NORMAL)
                 btn_stop.config(state=tk.NORMAL)
                 messagebox.showerror("Ошибка", event[1])
+                self.hide_loading()
 
         def browse_csv():
             path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")])
@@ -4199,6 +4272,8 @@ class AnkiApp(tk.Tk):
                 ):
                     return
 
+            self.show_loading("Импорт картинок", determinate=True, total=max(len(files), 1))
+
             def worker(task_obj):
                 summary = {"total": 0, "imported": 0, "updated": 0, "skipped": 0, "errors": 0}
                 total_files = len(files)
@@ -4309,6 +4384,7 @@ class AnkiApp(tk.Tk):
                     pass
                 self.image_import_watch_job = None
             log_msg("[остановлено] Импорт остановлен пользователем")
+            self.hide_loading()
 
         def start_watch_loop():
             stop_flag["stop"] = False
@@ -5334,8 +5410,28 @@ class AnkiApp(tk.Tk):
         )
 
         # Фрейм для графиков
-        charts_frame = ttk.Frame(main_frame)
-        charts_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        charts_container = ttk.Frame(main_frame, style="Surface.TFrame")
+        charts_container.pack(fill=tk.BOTH, expand=True, pady=5)
+        charts_canvas = tk.Canvas(
+            charts_container,
+            bg=self.palette.get("panel", "#111522") if hasattr(self, "palette") else "white",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        charts_scrollbar = ttk.Scrollbar(charts_container, orient="vertical", command=charts_canvas.yview)
+        charts_frame = ttk.Frame(charts_canvas, style="Surface.TFrame")
+        charts_window = charts_canvas.create_window((0, 0), window=charts_frame, anchor="nw")
+        charts_frame.bind(
+            "<Configure>",
+            lambda e: charts_canvas.configure(scrollregion=charts_canvas.bbox("all")),
+        )
+        charts_canvas.bind(
+            "<Configure>",
+            lambda e: charts_canvas.itemconfig(charts_window, width=e.width),
+        )
+        charts_canvas.configure(yscrollcommand=charts_scrollbar.set)
+        charts_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        charts_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         def _safe_int(value, default=0):
             try:
@@ -5407,142 +5503,143 @@ class AnkiApp(tk.Tk):
 
             current_settings = collect_settings()
             save_stats_settings(current_settings)
-
-            # Получаем данные
             date_list = build_date_list(current_settings)
-            data = get_statistics_for_dates(deck_id, date_list)
+            self.show_loading("Загрузка статистики", determinate=False)
 
-            # Очищаем фрейм
-            for widget in charts_frame.winfo_children():
-                widget.destroy()
+            def render_charts(data):
+                for widget in charts_frame.winfo_children():
+                    widget.destroy()
 
-            if not data["dates"]:
-                ttk.Label(charts_frame, text="Нет данных для отображения").pack(pady=20)
-                return
+                if not data["dates"]:
+                    ttk.Label(charts_frame, text="Нет данных для отображения").pack(pady=20)
+                    self.hide_loading()
+                    return
 
-            from matplotlib import dates as mdates
+                from matplotlib import dates as mdates
 
-            grid_enabled = bool(show_grid_var.get())
-            y_limit = current_settings.y_max if current_settings.y_max and current_settings.y_max > 0 else None
+                grid_enabled = bool(show_grid_var.get())
+                y_limit = current_settings.y_max if current_settings.y_max and current_settings.y_max > 0 else None
 
-            # Создаем фигуру с четырьмя подграфиками
-            fig = Figure(figsize=(14, 16), dpi=100)
-            ax1 = fig.add_subplot(411)
-            ax2 = fig.add_subplot(412, sharex=ax1)
-            ax3 = fig.add_subplot(413, sharex=ax1)
-            ax4 = fig.add_subplot(414)
+                fig = Figure(figsize=(14, 16), dpi=100)
+                fig.subplots_adjust(hspace=0.6)
+                ax1 = fig.add_subplot(411)
+                ax2 = fig.add_subplot(412, sharex=ax1)
+                ax3 = fig.add_subplot(413, sharex=ax1)
+                ax4 = fig.add_subplot(414)
 
-            # Подготовка оси X
-            x_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in data["dates"]]
-            x_numeric = mdates.date2num(x_dates)
+                x_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in data["dates"]]
+                x_numeric = mdates.date2num(x_dates)
 
-            def apply_common_axis(ax):
-                locator = mdates.AutoDateLocator()
-                formatter = mdates.DateFormatter("%d.%m")
-                ax.xaxis.set_major_locator(locator)
-                ax.xaxis.set_major_formatter(formatter)
-                if current_settings.x_mode == "custom_dates":
-                    ax.set_xticks(x_numeric)
-                if y_limit:
-                    ax.set_ylim(0, y_limit)
+                def apply_common_axis(ax):
+                    locator = mdates.AutoDateLocator()
+                    formatter = mdates.DateFormatter("%d.%m")
+                    ax.xaxis.set_major_locator(locator)
+                    ax.xaxis.set_major_formatter(formatter)
+                    if current_settings.x_mode == "custom_dates":
+                        ax.set_xticks(x_numeric)
+                    if y_limit:
+                        ax.set_ylim(0, y_limit)
+                    if grid_enabled:
+                        ax.grid(True, alpha=0.3)
+
+                reviewed = data["reviewed"]
+                if current_settings.chart_type == "line":
+                    ax1.plot(x_dates, reviewed, marker="o", linewidth=2, color="blue", label="Просмотрено карточек")
+                else:
+                    ax1.bar(x_numeric, reviewed, width=0.6, color="blue", alpha=0.6, label="Просмотрено карточек")
+
+                if current_settings.norm_value:
+                    ax1.axhline(current_settings.norm_value, linestyle="--", color="gray", linewidth=1, label="Норма")
+
+                ax1.set_ylabel('Количество карточек')
+                ax1.set_title(f'Общая статистика повторений - {deck_name}')
+                apply_common_axis(ax1)
+                ax1.legend(loc='upper left')
+
+                remembered = data["remembered"]
+                forgotten = data["forgotten"]
+                if current_settings.chart_type == "line":
+                    ax2.plot(x_dates, remembered, marker="o", color='green', label='Помню')
+                    ax2.plot(x_dates, forgotten, marker="o", color='red', label='Забыл')
+                else:
+                    width = 0.35
+                    bars1 = ax2.bar(x_numeric - width/2, remembered, width, label='Помню', color='green', alpha=0.7)
+                    bars2 = ax2.bar(x_numeric + width/2, forgotten, width, label='Забыл', color='red', alpha=0.7)
+                    for bar in list(bars1) + list(bars2):
+                        height = bar.get_height()
+                        if height > 0:
+                            ax2.text(bar.get_x() + bar.get_width()/2., height, f'{int(height)}', ha='center', va='bottom', fontsize=8)
+
+                if current_settings.norm_value:
+                    ax2.axhline(current_settings.norm_value, linestyle="--", color="gray", linewidth=1)
+
+                ax2.set_ylabel('Количество карточек')
+                ax2.set_title('Сравнение запомненных и забытых карточек')
+                apply_common_axis(ax2)
+                ax2.legend(loc='upper left')
+
+                overview = data["overview"]
+                if current_settings.chart_type == "line":
+                    ax3.plot(x_dates, overview, marker="o", color='orange', label='Ознакомлено карточек')
+                else:
+                    bars3 = ax3.bar(x_numeric, overview, width=0.6, label='Ознакомлено карточек', color='orange', alpha=0.7)
+                    for bar in bars3:
+                        height = bar.get_height()
+                        if height > 0:
+                            ax3.text(bar.get_x() + bar.get_width()/2., height, f'{int(height)}', ha='center', va='bottom', fontsize=8)
+
+                if current_settings.norm_value:
+                    ax3.axhline(current_settings.norm_value, linestyle="--", color="gray", linewidth=1)
+
+                ax3.set_ylabel('Количество карточек')
+                ax3.set_title('Ознакомление с карточками')
+                ax3.set_xlabel('Дата')
+                apply_common_axis(ax3)
+                ax3.legend(loc='upper left')
+
+                fig.autofmt_xdate(rotation=30)
+
+                stats = get_deck_stats(deck_id)
+                phases = list(range(1, 11))
+                phase_counts = [stats["phase_stats"].get(phase, 0) for phase in phases]
+                
+                bars4 = ax4.bar(phases, phase_counts, width=0.6, color='purple', alpha=0.7)
+                
+                ax4.set_xlabel('Фаза Лейтнера')
+                ax4.set_ylabel('Количество карточек')
+                ax4.set_title('Распределение карточек по фазам')
+                ax4.set_xticks(phases)
+                ax4.set_xticklabels([f'Фаза {p}' for p in phases], rotation=45, fontsize=8)
                 if grid_enabled:
-                    ax.grid(True, alpha=0.3)
+                    ax4.grid(True, alpha=0.3)
 
-            # Подграфик 1: Общая статистика повторений
-            reviewed = data["reviewed"]
-            if current_settings.chart_type == "line":
-                ax1.plot(x_dates, reviewed, marker="o", linewidth=2, color="blue", label="Просмотрено карточек")
-            else:
-                ax1.bar(x_numeric, reviewed, width=0.6, color="blue", alpha=0.6, label="Просмотрено карточек")
-
-            if current_settings.norm_value:
-                ax1.axhline(current_settings.norm_value, linestyle="--", color="gray", linewidth=1, label="Норма")
-
-            ax1.set_ylabel('Количество карточек')
-            ax1.set_title(f'Общая статистика повторений - {deck_name}')
-            apply_common_axis(ax1)
-            ax1.legend(loc='upper left')
-
-            # Подграфик 2: Сравнение "помню" и "забыл"
-            remembered = data["remembered"]
-            forgotten = data["forgotten"]
-            if current_settings.chart_type == "line":
-                ax2.plot(x_dates, remembered, marker="o", color='green', label='Помню')
-                ax2.plot(x_dates, forgotten, marker="o", color='red', label='Забыл')
-            else:
-                width = 0.35
-                bars1 = ax2.bar(x_numeric - width/2, remembered, width, label='Помню', color='green', alpha=0.7)
-                bars2 = ax2.bar(x_numeric + width/2, forgotten, width, label='Забыл', color='red', alpha=0.7)
-                for bar in list(bars1) + list(bars2):
+                for bar in bars4:
                     height = bar.get_height()
                     if height > 0:
-                        ax2.text(bar.get_x() + bar.get_width()/2., height, f'{int(height)}', ha='center', va='bottom', fontsize=8)
+                        ax4.text(bar.get_x() + bar.get_width()/2., height,
+                                f'{int(height)}', ha='center', va='bottom', fontsize=8)
 
-            if current_settings.norm_value:
-                ax2.axhline(current_settings.norm_value, linestyle="--", color="gray", linewidth=1)
+                fig.tight_layout(pad=2.4)
+                
+                canvas = FigureCanvasTkAgg(fig, charts_frame)
+                canvas.draw()
+                canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=18)
+                charts_frame.update_charts = update_charts
+                self.hide_loading()
 
-            ax2.set_ylabel('Количество карточек')
-            ax2.set_title('Сравнение запомненных и забытых карточек')
-            apply_common_axis(ax2)
-            ax2.legend(loc='upper left')
+            def fetch_data():
+                try:
+                    data = get_statistics_for_dates(deck_id, date_list)
+                except Exception as exc:
+                    self.after(0, lambda: (self.hide_loading(), messagebox.showerror("Статистика", str(exc))))
+                    return
+                self.after(0, lambda: render_charts(data))
 
-            # Подграфик 3: Ознакомление
-            overview = data["overview"]
-            if current_settings.chart_type == "line":
-                ax3.plot(x_dates, overview, marker="o", color='orange', label='Ознакомлено карточек')
-            else:
-                bars3 = ax3.bar(x_numeric, overview, width=0.6, label='Ознакомлено карточек', color='orange', alpha=0.7)
-                for bar in bars3:
-                    height = bar.get_height()
-                    if height > 0:
-                        ax3.text(bar.get_x() + bar.get_width()/2., height, f'{int(height)}', ha='center', va='bottom', fontsize=8)
-
-            if current_settings.norm_value:
-                ax3.axhline(current_settings.norm_value, linestyle="--", color="gray", linewidth=1)
-
-            ax3.set_ylabel('Количество карточек')
-            ax3.set_title('Ознакомление с карточками')
-            ax3.set_xlabel('Дата')
-            apply_common_axis(ax3)
-            ax3.legend(loc='upper left')
-
-            fig.autofmt_xdate(rotation=30)
-
-            # Подграфик 4: Прогресс по фазам
-            # Получаем статистику по фазам
-            stats = get_deck_stats(deck_id)
-            phases = list(range(1, 11))
-            phase_counts = [stats["phase_stats"].get(phase, 0) for phase in phases]
-            
-            bars4 = ax4.bar(phases, phase_counts, width=0.6, color='purple', alpha=0.7)
-            
-            ax4.set_xlabel('Фаза Лейтнера')
-            ax4.set_ylabel('Количество карточек')
-            ax4.set_title('Распределение карточек по фазам')
-            ax4.set_xticks(phases)
-            ax4.set_xticklabels([f'Фаза {p}' for p in phases], rotation=45, fontsize=8)
-            if grid_enabled:
-                ax4.grid(True, alpha=0.3)
-
-            # Добавляем значения на столбцы
-            for bar in bars4:
-                height = bar.get_height()
-                if height > 0:
-                    ax4.text(bar.get_x() + bar.get_width()/2., height,
-                            f'{int(height)}', ha='center', va='bottom', fontsize=8)
-
-            fig.tight_layout(pad=2.0)
-            
-            # Размещаем график в Tkinter
-            canvas = FigureCanvasTkAgg(fig, charts_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-            # Добавляем функцию обновления в объект
-            charts_frame.update_charts = update_charts
+            threading.Thread(target=fetch_data, daemon=True).start()
 
         btn_update = ttk.Button(settings_frame, text="Сохранить и обновить", command=update_charts)
         btn_update.grid(row=0, column=4, padx=10, pady=5)
+        main_frame.update_charts = update_charts
 
         # Инициализируем диаграммы
         update_charts()
@@ -5664,10 +5761,13 @@ class AnkiApp(tk.Tk):
         self.main_notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         dashboard_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
+        self.dashboard_tab = dashboard_tab
         self.main_notebook.add(dashboard_tab, text="Главная")
 
         self.personal_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
         self.main_notebook.add(self.personal_tab, text="Личный кабинет")
+        self.main_notebook.bind("<<NotebookTabChanged>>", self._on_main_tab_changed)
+        self.main_notebook.select(self.dashboard_tab)
 
         self.build_personal_tab(self.personal_tab)
 
@@ -5719,7 +5819,7 @@ class AnkiApp(tk.Tk):
             ("Редактировать", self.edit_deck_window, "Secondary.TButton"),
             ("Удалить", self.delete_selected_deck, "Secondary.TButton"),
             ("Добавить карточку", self.add_card_window, "Secondary.TButton"),
-            ("Режим повторения", self.start_repeat_mode, "Ghost.TButton"),
+            ("Режим повторения", self.mode_actions.get("repeat", self.start_repeat_mode), "Ghost.TButton"),
         ]
 
         for idx, (text, command, style_name) in enumerate(buttons_config):
@@ -5791,7 +5891,7 @@ class AnkiApp(tk.Tk):
 
         action_buttons = [
             ("Просмотреть карточки", self.show_cards_window, "Primary.TButton"),
-            ("Режим воспроизведения", self.start_playback_mode, "Ghost.TButton"),
+            ("Режим воспроизведения", self.mode_actions.get("playback", self.start_playback_mode), "Ghost.TButton"),
             ("Режим ознакомления", self.start_overview_mode, "Ghost.TButton"),
         ]
 
@@ -5825,6 +5925,21 @@ class AnkiApp(tk.Tk):
             self.refresh_ledger_table()
             self.refresh_referral_info()
             self.refresh_activation_progress_ui()
+
+    def _on_main_tab_changed(self, event):
+        notebook: ttk.Notebook = event.widget
+        try:
+            current = notebook.nametowidget(notebook.select())
+        except Exception:
+            return
+        if current is self.personal_tab:
+            self.refresh_balance_display()
+            self.refresh_ledger_table()
+            self.refresh_referral_info()
+            self.refresh_activation_progress_ui()
+        elif current is self.dashboard_tab and self.selected_deck_id is None:
+            # Гарантируем, что видна актуальная главная вкладка.
+            self.update_deck_preview()
 
     def refresh_balance_display(self):
         balance = self.credits_service.get_balance(self.user_id)
@@ -6488,6 +6603,10 @@ class AnkiApp(tk.Tk):
         if selected_deck["icon_path"] and os.path.exists(selected_deck["icon_path"]) and PIL_AVAILABLE:
             try:
                 img = Image.open(selected_deck["icon_path"])
+                try:
+                    img = ImageOps.exif_transpose(img)
+                except Exception:
+                    pass
                 # Автоматически уменьшаем окно до размеров картинки
                 img_width, img_height = img.size
                 
@@ -6495,19 +6614,20 @@ class AnkiApp(tk.Tk):
                 max_width = 300
                 max_height = 200
                 
+                display_width, display_height = img_width, img_height
                 if img_width > max_width or img_height > max_height:
                     ratio = min(max_width / img_width, max_height / img_height)
-                    new_width = int(img_width * ratio)
-                    new_height = int(img_height * ratio)
-                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    display_width = int(img_width * ratio)
+                    display_height = int(img_height * ratio)
+                    img = img.resize((display_width, display_height), Image.Resampling.LANCZOS)
                 
                 photo = ImageTk.PhotoImage(img)
                 self.deck_preview_images[self.selected_deck_id] = photo
                 self.deck_preview_label.config(image=photo, text="")
                 
                 # Устанавливаем размер окна превью под изображение
-                self.image_frame.config(width=new_width, height=new_height)
-                self.deck_preview_label.config(width=new_width, height=new_height)
+                self.image_frame.config(width=display_width, height=display_height)
+                self.deck_preview_label.config(width=display_width, height=display_height)
                 
             except Exception as e:
                 self.deck_preview_label.config(
@@ -8673,14 +8793,18 @@ class RepeatWindow(tk.Toplevel):
 
         # Изображение с возможностью масштабирования
         self.image_frame = tk.Frame(self.content_frame, bg=colors["panel"] if colors else "white")
-        self.image_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        self.image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self.image_label = ResizableImageLabel(
             self.image_frame,
             bg=colors["panel"] if colors else "white",
             text=""
         )
-        self.image_label.pack()
+        self.image_label.pack(fill=tk.BOTH, expand=True)
+        self.image_frame.bind(
+            "<Configure>",
+            lambda e: self.image_label.set_container_size(e.width, e.height)
+        )
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
         self.checkpoint_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
@@ -9160,7 +9284,11 @@ class ReviewWindow(tk.Toplevel):
             bg=colors["panel"] if colors else "white",
             text=""
         )
-        self.image_label.pack(side=tk.RIGHT, fill=tk.Y)
+        self.image_label.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        content_frame.bind(
+            "<Configure>",
+            lambda e: self.image_label.set_container_size(e.width - 20, e.height)
+        )
 
         # Прогресс-бар
         progress_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
