@@ -6,10 +6,6 @@ from typing import Any, Dict, Optional
 
 QUILL_WEBVIEW_AVAILABLE = importlib.util.find_spec("webview") is not None
 
-_WEBVIEW_THREAD: threading.Thread | None = None
-_WEBVIEW_THREAD_LOCK = threading.Lock()
-_WEBVIEW_READY = threading.Event()
-
 
 class QuillEditorBridge:
     def __init__(self) -> None:
@@ -26,22 +22,6 @@ class QuillEditorBridge:
     def getSelectionHtmlOrDelta(self, payload: Dict[str, Any]) -> bool:
         self.last_selection = payload
         return True
-
-
-def _ensure_webview_thread() -> None:
-    if _WEBVIEW_THREAD and _WEBVIEW_THREAD.is_alive():
-        return
-    with _WEBVIEW_THREAD_LOCK:
-        if _WEBVIEW_THREAD and _WEBVIEW_THREAD.is_alive():
-            return
-        webview = importlib.import_module("webview")
-
-        def _start():
-            webview.start(lambda: _WEBVIEW_READY.set(), debug=False, gui="tkinter")
-
-        thread = threading.Thread(target=_start, daemon=True)
-        thread.start()
-        globals()["_WEBVIEW_THREAD"] = thread
 
 
 class QuillEditorWindow:
@@ -79,7 +59,6 @@ class QuillEditorWindow:
             self._window.events.closed += self._on_closed
         except Exception:
             pass
-        _ensure_webview_thread()
         self._bring_to_front()
 
     def _bring_to_front(self) -> None:
@@ -101,9 +80,6 @@ class QuillEditorWindow:
             self._on_close_callback()
 
     def wait_ready(self, timeout: float = 5.0) -> bool:
-        if _WEBVIEW_READY.is_set():
-            return self._ready_event.wait(timeout)
-        _WEBVIEW_READY.wait(timeout)
         return self._ready_event.wait(timeout)
 
     def set_html(self, html: str) -> None:

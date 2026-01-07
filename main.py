@@ -81,7 +81,14 @@ from importers import (
     import_odt,
     import_pdf,
 )
-from webview_editor import QuillEditorWindow, QUILL_WEBVIEW_AVAILABLE
+from webview_manager import (
+    get_editor_delta,
+    get_editor_html,
+    get_selection_delta,
+    get_selection_html,
+    open_editor_window,
+    set_editor_html,
+)
 from quill_cards import parse_quill_delta
 from overdue_badges import (
     PhaseOverdueBadges,
@@ -3906,7 +3913,6 @@ class AnkiApp(tk.Tk):
         self.generation_menu = None
         self.generation_menu_indexes: dict[str, int] = {}
         self.mode_actions: dict[str, callable] = {}
-        self.quill_editor: QuillEditorWindow | None = None
         self.user_id_var = tk.StringVar(value=self.user_id)
         self.account_status_var = tk.StringVar(value="")
         self.premium_timer_var = tk.StringVar(value="00:00:00")
@@ -8253,26 +8259,19 @@ class AnkiApp(tk.Tk):
             state["editor_open"] = False
             editor_status_var.set("Редактор: не открыт")
 
-        def ensure_editor() -> QuillEditorWindow | None:
-            if not QUILL_WEBVIEW_AVAILABLE:
-                messagebox.showerror("Редактор", "pywebview не установлен. Установите: pip install pywebview")
-                return None
-            if self.quill_editor is None or not self.quill_editor.is_running():
-                self.quill_editor = QuillEditorWindow(
-                    on_close=lambda: self.root.after(0, _mark_editor_closed)
-                )
-                try:
-                    self.quill_editor.show()
-                except RuntimeError as exc:
-                    messagebox.showerror("Редактор", str(exc))
-                    return None
+        def ensure_editor() -> bool:
+            open_editor_window(
+                self.root,
+                html=None,
+                title="Редактор конспекта (Quill)",
+                on_close=lambda: self.root.after(0, _mark_editor_closed),
+            )
             editor_status_var.set("Редактор: открыт")
             state["editor_open"] = True
-            return self.quill_editor
+            return True
 
         def load_selected_into_editor():
-            editor = ensure_editor()
-            if not editor:
+            if not ensure_editor():
                 return
             if not state["chunks"]:
                 messagebox.showwarning("Редактор", "Сначала импортируйте файл.")
@@ -8285,14 +8284,13 @@ class AnkiApp(tk.Tk):
             content = state["chunks"][index]
 
             def _task():
-                editor.set_html(content)
+                set_editor_html(content)
                 return True
 
             self.run_with_loading(_task)
 
         def sync_from_editor():
-            editor = ensure_editor()
-            if not editor:
+            if not ensure_editor():
                 return
             if not state["chunks"]:
                 messagebox.showwarning("Редактор", "Сначала импортируйте файл.")
@@ -8304,7 +8302,7 @@ class AnkiApp(tk.Tk):
             index = max(0, min(index, len(state["chunks"]) - 1))
 
             def _task():
-                return editor.get_html()
+                return get_editor_html()
 
             def _on_success(html):
                 if html is None:
@@ -8316,13 +8314,12 @@ class AnkiApp(tk.Tk):
             self.run_with_loading(_task, on_success=_on_success)
 
         def build_cards_from_selection() -> list[dict[str, str]]:
-            editor = ensure_editor()
-            if not editor:
+            if not ensure_editor():
                 return []
-            _ = editor.get_selection_html()
-            delta = editor.get_selection_delta()
+            _ = get_selection_html()
+            delta = get_selection_delta()
             if not delta:
-                delta = editor.get_delta()
+                delta = get_editor_delta()
             if not delta:
                 return []
             return parse_quill_delta(delta)
