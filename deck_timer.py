@@ -21,7 +21,9 @@ def ensure_deck_settings_table(conn: Optional[sqlite3.Connection] = None) -> Non
             deck_id INTEGER PRIMARY KEY,
             timer_sec INTEGER DEFAULT 0,
             timer_mode TEXT DEFAULT "reveal",
-            inherit_timer INTEGER DEFAULT 1
+            inherit_timer INTEGER DEFAULT 1,
+            review_timer_seconds INTEGER,
+            playback_timer_seconds INTEGER
         );
         """
     )
@@ -32,6 +34,8 @@ def ensure_deck_settings_table(conn: Optional[sqlite3.Connection] = None) -> Non
         "timer_sec": "INTEGER DEFAULT 0",
         "timer_mode": "TEXT DEFAULT 'reveal'",
         "inherit_timer": "INTEGER DEFAULT 1",
+        "review_timer_seconds": "INTEGER",
+        "playback_timer_seconds": "INTEGER",
     }
     for column, ddl in migrations.items():
         if column not in existing_columns:
@@ -96,25 +100,36 @@ def get_deck_parent_id(deck_id: int, conn: Optional[sqlite3.Connection] = None) 
 
 def get_deck_timer_settings(
     deck_id: int, conn: Optional[sqlite3.Connection] = None
-) -> dict[str, int | str]:
+) -> dict[str, int | str | None]:
     conn, created = _prepare_connection(conn)
     cur = conn.cursor()
     ensure_deck_settings_table(conn)
     ensure_deck_settings_row(deck_id, conn)
 
     cur.execute(
-        "SELECT timer_sec, timer_mode, inherit_timer FROM deck_settings WHERE deck_id = ?;",
+        """
+        SELECT timer_sec, timer_mode, inherit_timer, review_timer_seconds, playback_timer_seconds
+        FROM deck_settings WHERE deck_id = ?;
+        """,
         (deck_id,),
     )
     row = cur.fetchone()
     if created:
         conn.close()
     if not row:
-        return {"timer_sec": 0, "timer_mode": "reveal", "inherit_timer": 1}
+        return {
+            "timer_sec": 0,
+            "timer_mode": "reveal",
+            "inherit_timer": 1,
+            "review_timer_seconds": None,
+            "playback_timer_seconds": None,
+        }
     return {
         "timer_sec": row["timer_sec"],
         "timer_mode": row["timer_mode"],
         "inherit_timer": row["inherit_timer"],
+        "review_timer_seconds": row["review_timer_seconds"],
+        "playback_timer_seconds": row["playback_timer_seconds"],
     }
 
 
@@ -123,6 +138,8 @@ def update_deck_timer_settings(
     timer_sec: int,
     timer_mode: str,
     inherit_timer: int,
+    review_timer_seconds: Optional[int] = None,
+    playback_timer_seconds: Optional[int] = None,
     conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     conn, created = _prepare_connection(conn)
@@ -133,10 +150,18 @@ def update_deck_timer_settings(
     cur.execute(
         """
         UPDATE deck_settings
-        SET timer_sec = ?, timer_mode = ?, inherit_timer = ?
+        SET timer_sec = ?, timer_mode = ?, inherit_timer = ?,
+            review_timer_seconds = ?, playback_timer_seconds = ?
         WHERE deck_id = ?;
         """,
-        (timer_sec or 0, (timer_mode or "reveal").lower(), int(bool(inherit_timer)), deck_id),
+        (
+            timer_sec or 0,
+            (timer_mode or "reveal").lower(),
+            int(bool(inherit_timer)),
+            review_timer_seconds,
+            playback_timer_seconds,
+            deck_id,
+        ),
     )
 
     if created:
@@ -179,6 +204,51 @@ def get_effective_timer(
     if created:
         conn.close()
     return result
+
+
+def _normalize_optional_timer(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    return max(0, int(value))
+
+
+def get_effective_mode_timer(
+    deck_id: int,
+    mode: str,
+    conn: Optional[sqlite3.Connection] = None,
+    visited: Optional[Set[int]] = None,
+) -> int:
+    if deck_id is None:
+        return 0
+    if visited is None:
+        visited = set()
+    if deck_id in visited:
+        return 0
+    visited.add(deck_id)
+
+    mode_key = (mode or "").lower()
+    if mode_key == "review":
+        column = "review_timer_seconds"
+    elif mode_key == "playback":
+        column = "playback_timer_seconds"
+    else:
+        raise ValueError("mode must be 'review' or 'playback'")
+
+    conn, created = _prepare_connection(conn)
+    settings = get_deck_timer_settings(deck_id, conn)
+    raw_value = settings.get(column)
+    if raw_value is not None:
+        result = _normalize_optional_timer(raw_value) or 0
+    else:
+        parent_id = get_deck_parent_id(deck_id, conn)
+        if parent_id:
+            result = get_effective_mode_timer(parent_id, mode_key, conn, visited)
+        else:
+            result = 0
+
+    if created:
+        conn.close()
+    return int(result or 0)
 
 
 class DeckTimerController:

@@ -79,11 +79,10 @@ from overdue_badges import (
     fetch_overdue_counts_by_phase,
 )
 from deck_timer import (
-    DeckTimerController,
     ensure_deck_settings_row,
     ensure_deck_settings_table,
     get_deck_timer_settings,
-    get_effective_timer,
+    get_effective_mode_timer,
     update_deck_timer_settings,
 )
 from video_tools import (
@@ -93,7 +92,13 @@ from video_tools import (
     open_in_external_player,
 )
 from audio_player_widget import AudioPlayerWidget
-from ui_theme import apply_premium_dark_theme, style_card, style_text_widget
+from ui_theme import (
+    apply_premium_dark_theme,
+    style_card,
+    style_card_surface,
+    style_card_surface_text,
+    style_text_widget,
+)
 
 def _fix_tk_default_fonts(root: tk.Tk, family: str = "Segoe UI", size: int = 11) -> None:
     """Fix invalid global font settings that can break tk.Menu on Windows.
@@ -3431,6 +3436,15 @@ def create_context_menu(widget):
 # GUI
 # ==========================
 
+def get_card_surface_colors(master: tk.Misc | None = None) -> tuple[str, str, str]:
+    colors = getattr(master, "palette", None) or {}
+    return (
+        colors.get("card_surface", "#FFFFFF"),
+        colors.get("card_text", "#111111"),
+        colors.get("card_border", "#E0E0E0"),
+    )
+
+
 class ResizableImageLabel(tk.Label):
     """Label с изображением, которое можно масштабировать перетаскиванием за углы"""
     
@@ -3476,10 +3490,14 @@ class ResizableImageLabel(tk.Label):
                 self.update_display()
                 return True
             except Exception as e:
-                self.config(text=f"(Ошибка загрузки: {str(e)[:50]})", image="")
+                self.original_image = None
+                self.current_image = None
+                self.config(text="Нет изображения", image="")
                 return False
         else:
-            self.config(text="(Нет изображения)", image="")
+            self.original_image = None
+            self.current_image = None
+            self.config(text="Нет изображения", image="")
             return False
     
     def update_display(self):
@@ -6913,6 +6931,39 @@ class AnkiApp(tk.Tk):
         )
         inherit_cb.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="w")
 
+        mode_timer_frame = ttk.LabelFrame(win, text="Таймеры режимов")
+        mode_timer_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Label(mode_timer_frame, text="Таймер повторения (сек):").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        review_timer_var = tk.StringVar(
+            value=(
+                "" if timer_settings.get("review_timer_seconds") is None
+                else str(timer_settings.get("review_timer_seconds"))
+            )
+        )
+        ttk.Entry(mode_timer_frame, textvariable=review_timer_var, width=10).grid(
+            row=0, column=1, padx=5, pady=5, sticky="w"
+        )
+
+        ttk.Label(mode_timer_frame, text="Таймер воспроизведения (сек):").grid(
+            row=1, column=0, padx=5, pady=5, sticky="w"
+        )
+        playback_timer_var = tk.StringVar(
+            value=(
+                "" if timer_settings.get("playback_timer_seconds") is None
+                else str(timer_settings.get("playback_timer_seconds"))
+            )
+        )
+        ttk.Entry(mode_timer_frame, textvariable=playback_timer_var, width=10).grid(
+            row=1, column=1, padx=5, pady=5, sticky="w"
+        )
+
+        ttk.Label(
+            mode_timer_frame,
+            text="Пустое поле = наследовать от родительской колоды (если есть)",
+            foreground="gray",
+        ).grid(row=2, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="w")
+
         def save_changes():
             name = entry_name.get().strip()
             desc = entry_desc.get().strip()
@@ -6928,6 +6979,32 @@ class AnkiApp(tk.Tk):
                 messagebox.showerror("Ошибка", "Некорректное значение таймера.")
                 return
 
+            def parse_mode_timer(raw_value: str, label: str) -> int | None:
+                value = raw_value.strip()
+                if value == "":
+                    return None
+                try:
+                    parsed = int(value)
+                except ValueError:
+                    messagebox.showerror("Ошибка", f"{label}: значение должно быть целым числом.")
+                    return None
+                if parsed < 0:
+                    messagebox.showerror("Ошибка", f"{label}: значение должно быть >= 0.")
+                    return None
+                return parsed
+
+            review_timer_seconds = parse_mode_timer(
+                review_timer_var.get(), "Таймер повторения"
+            )
+            if review_timer_seconds is None and review_timer_var.get().strip():
+                return
+
+            playback_timer_seconds = parse_mode_timer(
+                playback_timer_var.get(), "Таймер воспроизведения"
+            )
+            if playback_timer_seconds is None and playback_timer_var.get().strip():
+                return
+
             conn = get_connection()
             cur = conn.cursor()
             cur.execute(
@@ -6939,6 +7016,8 @@ class AnkiApp(tk.Tk):
                 timer_sec,
                 timer_mode_var.get(),
                 1 if inherit_var.get() else 0,
+                review_timer_seconds,
+                playback_timer_seconds,
                 conn,
             )
             conn.commit()
@@ -8309,7 +8388,8 @@ class AnkiApp(tk.Tk):
                 phase_text = f" (фаза {phase_filter})" if phase_filter is not None else ""
                 messagebox.showinfo("Повторение", f"В этой колоде{phase_text} пока нет карточек.")
                 return
-            repeat_window = RepeatWindow(self, cards)
+            repeat_session = ReviewSession(self.selected_deck_id, cards)
+            repeat_window = RepeatWindow(self, repeat_session)
 
             if hasattr(repeat_window, 'btn_frame'):
                 ttk.Button(repeat_window.btn_frame, text="Добавить в ознакомление",
@@ -8394,12 +8474,24 @@ class OverviewWindow(tk.Toplevel):
         cards_container.pack(fill=tk.BOTH, expand=True)
         
         # Левая карточка - лицевая сторона
-        self.left_frame = ttk.LabelFrame(cards_container, text="ЛИЦЕВАЯ СТОРОНА", width=650, height=500)
+        self.left_frame = ttk.LabelFrame(
+            cards_container,
+            text="ЛИЦЕВАЯ СТОРОНА",
+            width=650,
+            height=500,
+            style="CardSurface.TLabelframe",
+        )
         self.left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         self.left_frame.pack_propagate(False)
         
         # Правая карточка - задняя сторона  
-        self.right_frame = ttk.LabelFrame(cards_container, text="ЗАДНЯЯ СТОРОНА", width=650, height=500)
+        self.right_frame = ttk.LabelFrame(
+            cards_container,
+            text="ЗАДНЯЯ СТОРОНА",
+            width=650,
+            height=500,
+            style="CardSurface.TLabelframe",
+        )
         self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
         self.right_frame.pack_propagate(False)
         
@@ -8432,23 +8524,26 @@ class OverviewWindow(tk.Toplevel):
             widget.destroy()
 
         colors = getattr(self.master, "palette", None)
+        card_bg, card_text, _ = get_card_surface_colors(self.master)
 
-        content = ttk.Frame(parent_frame, style="CardInner.TFrame")
+        content = ttk.Frame(parent_frame, style="CardSurface.TFrame")
+        style_card_surface(content, colors, padded=False)
         content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # Текст с прокруткой
-        text_frame = ttk.Frame(content, style="CardInner.TFrame")
+        text_frame = ttk.Frame(content, style="CardSurface.TFrame")
+        style_card_surface(text_frame, colors, padded=False)
         text_frame.pack(fill=tk.BOTH, expand=True)
 
         text_widget = tk.Text(
             text_frame,
             wrap=tk.WORD,
             font=("Arial", 12),
-            bg=colors["panel"] if colors else "white",
-            fg=colors["text"] if colors else "black",
+            bg=card_bg,
+            fg=card_text,
             height=10
         )
-        style_text_widget(text_widget, colors)
+        style_card_surface_text(text_widget, colors)
         text_widget.config(state='normal')
         scrollbar = ttk.Scrollbar(text_frame, command=text_widget.yview, style="Vertical.TScrollbar")
         text_widget.configure(yscrollcommand=scrollbar.set)
@@ -8459,21 +8554,23 @@ class OverviewWindow(tk.Toplevel):
         # Изображение
         image_label = ResizableImageLabel(
             content,
-            bg=colors["panel"] if colors else "white",
+            bg=card_bg,
             relief="flat",
             bd=0
         )
-        style_card(image_label, colors)
+        style_card_surface(image_label, colors)
         image_label.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
         # Аудио кнопка
-        audio_frame = ttk.Frame(content, style="CardInner.TFrame")
+        audio_frame = ttk.Frame(content, style="CardSurface.TFrame")
+        style_card_surface(audio_frame, colors, padded=False)
         audio_frame.pack(fill=tk.X, pady=(10, 0))
         audio_frame.audio_widget = AudioPlayerWidget(audio_frame, on_error_callback=self._show_audio_error)
         audio_frame.audio_widget.pack(fill=tk.X)
         audio_frame.audio_widget.pack_forget()
 
-        video_frame = ttk.Frame(content, style="CardInner.TFrame")
+        video_frame = ttk.Frame(content, style="CardSurface.TFrame")
+        style_card_surface(video_frame, colors, padded=False)
         video_frame.pack(fill=tk.X, pady=(5, 0))
 
         return text_widget, image_label, audio_frame, video_frame
@@ -8538,7 +8635,7 @@ class OverviewWindow(tk.Toplevel):
         if front_img_path:
             self.front_image_label.load_image(front_img_path)
         else:
-            self.front_image_label.config(image="", text="(Нет изображения)")
+            self.front_image_label.load_image(None)
         
         # Обновляем аудио плеер для лицевой стороны
         self.update_audio_player(self.front_audio_frame, c, prefer_side="front")
@@ -8569,7 +8666,7 @@ class OverviewWindow(tk.Toplevel):
         if back_img_path:
             self.back_image_label.load_image(back_img_path)
         else:
-            self.back_image_label.config(image="", text="(Нет изображения)")
+            self.back_image_label.load_image(None)
         
         # Обновляем аудио плеер для задней стороны
         self.update_audio_player(self.back_audio_frame, c, prefer_side="back")
@@ -8696,13 +8793,58 @@ class OverviewWindow(tk.Toplevel):
             self.update_view()
 
 
+class ReviewSession:
+    def __init__(self, deck_id: int, cards: list[dict]):
+        self.deck_id = deck_id
+        self.cards = [dict(card) for card in cards]
+        self.index = 0
+
+    @classmethod
+    def load_due_cards(cls, deck_id: int, phase_filter: int | None = None) -> "ReviewSession":
+        cards = get_cards_for_repeat(deck_id)
+        if phase_filter is not None:
+            cards = [card for card in cards if card["leitner_level"] == phase_filter]
+        return cls(deck_id, cards)
+
+    def current_card(self) -> dict | None:
+        if 0 <= self.index < len(self.cards):
+            return self.cards[self.index]
+        return None
+
+    def next_card(self) -> dict | None:
+        self.index += 1
+        return self.current_card()
+
+    def prev_card(self) -> dict | None:
+        if self.index > 0:
+            self.index -= 1
+        return self.current_card()
+
+    def mark_wrong(self) -> dict | None:
+        return self._apply_rating(0, remembered=False)
+
+    def mark_correct(self) -> dict | None:
+        return self._apply_rating(2, remembered=True)
+
+    def _apply_rating(self, rating: int, remembered: bool) -> dict | None:
+        card = self.current_card()
+        if not card:
+            return None
+        result = apply_srs_update(card["id"], rating)
+        update_statistics(self.deck_id, remembered=remembered, forgotten=not remembered, reviewed=True)
+        if result:
+            card["leitner_level"] = result.get("phase")
+            card["next_review"] = datetime.fromtimestamp(result.get("due", time.time())).isoformat()
+            card["state"] = result.get("state")
+        return result
+
+
 class RepeatWindow(tk.Toplevel):
-    def __init__(self, master, cards):
+    def __init__(self, master, session: ReviewSession):
         super().__init__(master)
         self.master = master
-        self.cards = [dict(c) for c in cards]
-        self.current_index = 0
-        self.current_card = self.cards[self.current_index]
+        self.session = session
+        self.current_card = self.session.current_card()
         self.show_back = False
         self.current_photo = None
         
@@ -8713,6 +8855,12 @@ class RepeatWindow(tk.Toplevel):
         # Для 6-клеточного чекпоинта
         self.checkpoint_vars = []
         self.checkpoint_states = {}
+
+        # Таймер повторения
+        self.timer_left = 0
+        self.timer_job = None
+        self.timer_flash_job = None
+        self.timer_label = None
         
         self.title("Режим повторения")
         self.geometry("1000x700")
@@ -8720,27 +8868,41 @@ class RepeatWindow(tk.Toplevel):
 
         self.create_widgets()
         self.update_view()
-        self.load_checkpoint_state()
+        if self.current_card:
+            self.load_checkpoint_state()
+            self.start_timer()
 
     def create_widgets(self):
         frame_main = ttk.Frame(self, style="Surface.TFrame")
         frame_main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         colors = getattr(self.master, "palette", None)
+        card_bg, card_text, _ = get_card_surface_colors(self.master)
 
         # Статус
         self.lbl_status = ttk.Label(frame_main, text="")
         self.lbl_status.pack(anchor="w")
 
+        # Таймер
+        self.timer_label = tk.Label(
+            frame_main,
+            text="⏰ 00:00",
+            bg=colors["background"] if colors else self.cget("bg"),
+            fg=colors["error"] if colors else "#FF4D4D",
+            font=("Segoe UI", 11, "bold"),
+        )
+        self.timer_label.pack(anchor="center", pady=(3, 5))
+
         # Основной фрейм карточки
         self.card_frame = tk.Frame(
             frame_main,
-            bg=colors["panel"] if colors else "white",
+            bg=card_bg,
             bd=0,
             relief="flat",
             width=800,
             height=520
         )
+        style_card_surface(self.card_frame, colors)
         self.card_frame.pack(pady=10)
         self.card_frame.pack_propagate(False)
 
@@ -8748,18 +8910,18 @@ class RepeatWindow(tk.Toplevel):
         self.lbl_level = tk.Label(
             self.card_frame,
             text="",
-            bg=colors["panel"] if colors else "white",
-            fg=colors["text"] if colors else "black",
+            bg=card_bg,
+            fg=card_text,
             font=("Segoe UI", 10, "bold"))
         self.lbl_level.place(x=5, y=5)
 
         # Контейнер для контента с прокруткой
-        content_container = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
+        content_container = tk.Frame(self.card_frame, bg=card_bg)
         content_container.place(x=10, y=40, width=780, height=300)
 
-        canvas = tk.Canvas(content_container, bg=colors["panel"] if colors else "white", highlightthickness=0, borderwidth=0)
+        canvas = tk.Canvas(content_container, bg=card_bg, highlightthickness=0, borderwidth=0)
         scrollbar = ttk.Scrollbar(content_container, orient="vertical", command=canvas.yview)
-        self.scrollable_frame = tk.Frame(canvas, bg=colors["panel"] if colors else "white")
+        self.scrollable_frame = tk.Frame(canvas, bg=card_bg)
 
         self.scrollable_frame.bind(
             "<Configure>",
@@ -8773,18 +8935,18 @@ class RepeatWindow(tk.Toplevel):
         scrollbar.pack(side="right", fill="y")
 
         # Фреймы для контента
-        self.content_frame = tk.Frame(self.scrollable_frame, bg=colors["panel"] if colors else "white")
+        self.content_frame = tk.Frame(self.scrollable_frame, bg=card_bg)
         self.content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # Текст
-        self.text_frame = tk.Frame(self.content_frame, bg=colors["panel"] if colors else "white")
+        self.text_frame = tk.Frame(self.content_frame, bg=card_bg)
         self.text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
         self.lbl_text = tk.Label(
             self.text_frame,
             text="",
-            bg=colors["panel"] if colors else "white",
-            fg=colors["text"] if colors else "black",
+            bg=card_bg,
+            fg=card_text,
             wraplength=400,
             justify="left",
             font=("Segoe UI", 12)
@@ -8792,14 +8954,15 @@ class RepeatWindow(tk.Toplevel):
         self.lbl_text.pack(anchor="w")
 
         # Изображение с возможностью масштабирования
-        self.image_frame = tk.Frame(self.content_frame, bg=colors["panel"] if colors else "white")
+        self.image_frame = tk.Frame(self.content_frame, bg=card_bg)
         self.image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self.image_label = ResizableImageLabel(
             self.image_frame,
-            bg=colors["panel"] if colors else "white",
+            bg=card_bg,
             text=""
         )
+        style_card_surface(self.image_label, colors)
         self.image_label.pack(fill=tk.BOTH, expand=True)
         self.image_frame.bind(
             "<Configure>",
@@ -8807,7 +8970,7 @@ class RepeatWindow(tk.Toplevel):
         )
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
-        self.checkpoint_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
+        self.checkpoint_frame = tk.Frame(self.card_frame, bg=card_bg)
         self.checkpoint_frame.place(x=250, y=470, width=300, height=40)
         
         # Создаем 6 чекбоксов в ряд
@@ -8819,8 +8982,8 @@ class RepeatWindow(tk.Toplevel):
                 self.checkpoint_frame,
                 text=f"✓{i+1}",
                 variable=var,
-                bg=colors["panel"] if colors else "white",
-                fg=colors["text"] if colors else "black",
+                bg=card_bg,
+                fg=card_text,
                 command=lambda idx=i: self.update_checkpoint_state(idx)
             )
             cb.pack(side=tk.LEFT, padx=5)
@@ -8908,6 +9071,8 @@ class RepeatWindow(tk.Toplevel):
 
     def load_checkpoint_state(self):
         """Загрузить состояние чекпоинтов для текущей карточки."""
+        if not self.current_card:
+            return
         card_id = self.current_card["id"]
         if card_id not in self.checkpoint_states:
             self.checkpoint_states[card_id] = [False] * 6
@@ -8949,14 +9114,15 @@ class RepeatWindow(tk.Toplevel):
             if translation:
                 # Создаем фрейм для слова и перевода
                 colors = getattr(self.master, "palette", None)
-                word_frame = tk.Frame(self.text_frame, bg=colors["panel"] if colors else "white")
+                card_bg, card_text, _ = get_card_surface_colors(self.master)
+                word_frame = tk.Frame(self.text_frame, bg=card_bg)
 
                 # Слово
                 word_label = tk.Label(
                     word_frame,
                     text=word,
-                    bg=colors["panel"] if colors else "white",
-                    fg=colors["text"] if colors else "black",
+                    bg=card_bg,
+                    fg=card_text,
                     font=("Segoe UI", 12)
                 )
                 word_label.pack(side=tk.LEFT, padx=(0, 5))
@@ -8966,7 +9132,7 @@ class RepeatWindow(tk.Toplevel):
                     trans_label = tk.Label(
                         word_frame,
                         text=f"({translation})",
-                        bg=colors["panel"] if colors else "white",
+                        bg=card_bg,
                         fg=colors["accent"] if colors else "blue",
                         font=("Segoe UI", 10, "italic")
                     )
@@ -8979,11 +9145,15 @@ class RepeatWindow(tk.Toplevel):
         return result
 
     def update_view(self):
-        total = len(self.cards)
-        idx = self.current_index + 1
+        total = len(self.session.cards)
+        idx = self.session.index + 1
         c = self.current_card
         colors = getattr(self.master, "palette", None)
-        colors = getattr(self.master, "palette", None)
+        card_bg, card_text, _ = get_card_surface_colors(self.master)
+
+        if not c:
+            self.show_end_state()
+            return
 
         self.lbl_status.config(
             text=f"Карточка {idx}/{total} | ID {c['id']}"
@@ -9012,8 +9182,8 @@ class RepeatWindow(tk.Toplevel):
             self.lbl_text = tk.Label(
                 self.text_frame,
                 text=text,
-                bg=colors["panel"] if colors else "white",
-                fg=colors["text"] if colors else "black",
+                bg=card_bg,
+                fg=card_text,
                 wraplength=400,
                 justify="left",
                 font=("Segoe UI", 12)
@@ -9024,7 +9194,7 @@ class RepeatWindow(tk.Toplevel):
             if img_path:
                 self.image_label.load_image(img_path)
             else:
-                self.image_label.config(image="", text="(Нет изображения)")
+                self.image_label.load_image(None)
                 
         else:
             # Показываем лицевую сторону
@@ -9055,8 +9225,8 @@ class RepeatWindow(tk.Toplevel):
                         label = tk.Label(
                             self.text_frame,
                             text=item,
-                            bg=colors["panel"] if colors else "white",
-                            fg=colors["text"] if colors else "black",
+                            bg=card_bg,
+                            fg=card_text,
                             font=("Segoe UI", 12)
                         )
                         label.grid(row=row, column=col, sticky="w", padx=5, pady=2)
@@ -9069,8 +9239,8 @@ class RepeatWindow(tk.Toplevel):
                 self.lbl_text = tk.Label(
                     self.text_frame,
                     text=text,
-                    bg=colors["panel"] if colors else "white",
-                    fg=colors["text"] if colors else "black",
+                    bg=card_bg,
+                    fg=card_text,
                     wraplength=400,
                     justify="left",
                     font=("Segoe UI", 12)
@@ -9081,62 +9251,139 @@ class RepeatWindow(tk.Toplevel):
             if img_path:
                 self.image_label.load_image(img_path)
             else:
-                self.image_label.config(image="", text="(Нет изображения)")
+                self.image_label.load_image(None)
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
+        self.after(
+            10,
+            lambda: self.image_label.set_container_size(
+                self.image_frame.winfo_width(), self.image_frame.winfo_height()
+            ),
+        )
         
         # Обновляем аудио-плеер
         self.update_audio_player()
+
+    def show_end_state(self):
+        self.stop_timer()
+        self.timer_left = 0
+        self.update_timer_label()
+        self.lbl_status.config(text="На сегодня всё")
+        self.lbl_level.config(text="")
+        for widget in self.text_frame.winfo_children():
+            widget.destroy()
+        self.lbl_text = tk.Label(
+            self.text_frame,
+            text="На сегодня всё",
+            bg=get_card_surface_colors(self.master)[0],
+            fg=get_card_surface_colors(self.master)[1],
+            wraplength=400,
+            justify="center",
+            font=("Segoe UI", 12, "bold"),
+        )
+        self.lbl_text.pack(expand=True)
+        self.image_label.load_image(None)
+        for btn in [
+            self.btn_prev,
+            self.btn_next,
+            self.btn_show,
+            self.btn_forget,
+            self.btn_remember,
+            self.btn_sound,
+            self.btn_translation,
+        ]:
+            btn.config(state=tk.DISABLED)
 
     def toggle_front_back(self):
         self.show_back = not self.show_back
         self.update_view()
 
-    def mark_forgotten(self):
-        card_id = self.current_card["id"]
-        result = apply_srs_update(card_id, 0)
-        update_statistics(self.master.selected_deck_id, remembered=False, forgotten=True, reviewed=True)
+    def start_timer(self):
+        self.stop_timer()
+        review_seconds = get_effective_mode_timer(
+            getattr(self.master, "selected_deck_id", None), "review"
+        )
+        self.timer_left = max(0, int(review_seconds or 0))
+        self.update_timer_label()
+        if self.timer_left > 0:
+            self.timer_job = self.after(1000, self.timer_tick)
 
-        if result:
-            self.current_card["leitner_level"] = result.get("phase")
-            self.current_card["next_review"] = datetime.fromtimestamp(result.get("due", time.time())).isoformat()
-            self.current_card["state"] = result.get("state")
-            self.update_view()
+    def stop_timer(self):
+        if self.timer_job is not None:
+            try:
+                self.after_cancel(self.timer_job)
+            except Exception:
+                pass
+            self.timer_job = None
+        if self.timer_flash_job is not None:
+            try:
+                self.after_cancel(self.timer_flash_job)
+            except Exception:
+                pass
+            self.timer_flash_job = None
+
+    def timer_tick(self):
+        if self.timer_left <= 0:
+            self.update_timer_label()
+            return
+        self.timer_left -= 1
+        self.update_timer_label()
+        if self.timer_left <= 0:
+            self.handle_timer_notify()
+            return
+        self.timer_job = self.after(1000, self.timer_tick)
+
+    def update_timer_label(self, seconds: int | None = None):
+        if self.timer_label is None:
+            return
+        if seconds is None:
+            seconds = max(0, int(self.timer_left))
+        m, s = divmod(max(0, int(seconds)), 60)
+        self.timer_label.config(text=f"⏰ {m:02d}:{s:02d}")
+
+    def handle_timer_notify(self):
+        if self.timer_label is None:
+            return
+        original_bg = self.timer_label.cget("bg")
+        self.timer_label.config(bg="#FFD966")
+
+        def reset_bg():
+            try:
+                self.timer_label.config(bg=original_bg)
+            except Exception:
+                pass
+
+        self.timer_flash_job = self.after(1500, reset_bg)
+
+    def mark_forgotten(self):
+        self.session.mark_wrong()
         self.master.update_overdue_badge()
-        messagebox.showinfo("Лейтнер", "Карточка отправлена в 1-й уровень (режим заучивания).")
+        self.goto_next_card()
 
     def mark_remembered(self):
-        card_id = self.current_card["id"]
-
-        result = apply_srs_update(card_id, 2)
-        update_statistics(self.master.selected_deck_id, remembered=True, forgotten=False, reviewed=True)
-
-        if result:
-            self.current_card["leitner_level"] = result.get("phase")
-            self.current_card["next_review"] = datetime.fromtimestamp(result.get("due", time.time())).isoformat()
-            self.current_card["state"] = result.get("state")
-            self.update_view()
+        self.session.mark_correct()
         self.master.update_overdue_badge()
-        messagebox.showinfo("Лейтнер", f"Отлично! Уровень карточки теперь: {self.current_card['leitner_level']}")
+        self.goto_next_card()
+
+    def goto_next_card(self):
+        self.current_card = self.session.next_card()
+        self.show_back = False
+        if not self.current_card:
+            self.show_end_state()
+            return
+        self.load_checkpoint_state()
+        self.update_view()
+        self.start_timer()
 
     def next_card(self):
-        self.current_index += 1
-        if self.current_index >= len(self.cards):
-            messagebox.showinfo("Готово", "Карточки в этом режиме закончились.")
-            self.destroy()
-            return
-        self.current_card = self.cards[self.current_index]
+        self.goto_next_card()
+
+    def prev_card(self):
+        self.current_card = self.session.prev_card()
         self.show_back = False
         self.load_checkpoint_state()
         self.update_view()
-
-    def prev_card(self):
-        if self.current_index > 0:
-            self.current_index -= 1
-            self.current_card = self.cards[self.current_index]
-            self.show_back = False
-            self.load_checkpoint_state()
-            self.update_view()
+        self.start_timer()
 
     def play_word(self):
         target_side = "back" if self.show_back else "front"
@@ -9173,25 +9420,14 @@ class ReviewWindow(tk.Toplevel):
         # Таймеры
         self.auto_flip_id = None
         self.auto_next_id = None
-        self.timer_total = 0
         self.timer_left = 0
         self.timer_job = None
         self.timer_label = None
-        self.deck_timer = DeckTimerController(
-            self,
-            self.update_timer_label,
-            self.auto_show_answer,
-            self.mark_forgotten,
-            self.handle_timer_notify,
-        )
+        self.timer_flash_job = None
 
         # Прогресс
         self.progress_canvas = None
         self.progress_label = None
-        
-        # Для 6-клеточного чекпоинта
-        self.checkpoint_vars = []
-        self.checkpoint_states = {}
 
         self.title("Режим воспроизведения (Лейтнер)")
         self.geometry("900x600")
@@ -9200,13 +9436,13 @@ class ReviewWindow(tk.Toplevel):
         self.create_widgets()
         self.update_view()
         self.schedule_timers_for_card()
-        self.load_checkpoint_state()
 
     def create_widgets(self):
         frame_main = ttk.Frame(self, style="Surface.TFrame")
         frame_main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         colors = getattr(self.master, "palette", None)
+        card_bg, card_text, _ = get_card_surface_colors(self.master)
 
         self.lbl_status = ttk.Label(frame_main, text="")
         self.lbl_status.pack(anchor="w")
@@ -9216,7 +9452,7 @@ class ReviewWindow(tk.Toplevel):
             frame_main,
             text="⏰ 00:00",
             bg=colors["background"] if colors else self.cget("bg"),
-            fg=colors["error"] if colors else "red",
+            fg=colors["error"] if colors else "#FF4D4D",
             font=("Segoe UI", 11, "bold")
         )
         self.timer_label.pack(anchor="center", pady=(3, 5))
@@ -9224,54 +9460,41 @@ class ReviewWindow(tk.Toplevel):
         # Фрейм карточки
         self.card_frame = tk.Frame(
             frame_main,
-            bg=colors["panel"] if colors else "white",
+            bg=card_bg,
             bd=0,
             relief="flat",
             width=700,
             height=420
         )
+        style_card_surface(self.card_frame, colors)
         self.card_frame.pack(pady=10)
         self.card_frame.pack_propagate(False)
 
         # Индикатор загрузки
         self.dot_canvas = tk.Canvas(self.card_frame, width=20, height=20,
-                                    bg=colors["panel"] if colors else "white", highlightthickness=0, borderwidth=0)
+                                    bg=card_bg, highlightthickness=0, borderwidth=0)
         self.dot_canvas.place(relx=0.5, rely=0.5, anchor="center")
         self.dot_canvas.create_oval(7, 7, 13, 13, fill="red", outline="red")
 
         # Уровень
-        self.lbl_level = tk.Label(self.card_frame, text="", bg=colors["panel"] if colors else "white",
-                                  fg=colors["text"] if colors else "black", font=("Segoe UI", 10, "bold"))
+        self.lbl_level = tk.Label(
+            self.card_frame,
+            text="",
+            bg=card_bg,
+            fg=card_text,
+            font=("Segoe UI", 10, "bold"),
+        )
         self.lbl_level.place(x=5, y=5)
 
-        # Фрейм для 6-клеточного чекпоинта (внизу карточки)
-        self.checkpoint_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
-        self.checkpoint_frame.place(x=200, y=280, width=300, height=30)
-
-        # Создаем 6 чекбоксов в ряд
-        self.checkpoint_vars = []
-        for i in range(6):
-            var = tk.BooleanVar(value=False)
-            self.checkpoint_vars.append(var)
-            cb = tk.Checkbutton(
-                self.checkpoint_frame,
-                text=f"✓{i+1}",
-                variable=var,
-                bg=colors["panel"] if colors else "white",
-                fg=colors["text"] if colors else "black",
-                command=lambda idx=i: self.update_checkpoint_state(idx)
-            )
-            cb.pack(side=tk.LEFT, padx=5)
-
         # Контент
-        content_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
+        content_frame = tk.Frame(self.card_frame, bg=card_bg)
         content_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=(25, 10))
 
         self.lbl_text = tk.Label(
             content_frame,
             text="",
-            bg=colors["panel"] if colors else "white",
-            fg=colors["text"] if colors else "black",
+            bg=card_bg,
+            fg=card_text,
             wraplength=420,
             justify="left",
             font=("Segoe UI", 12)
@@ -9281,9 +9504,10 @@ class ReviewWindow(tk.Toplevel):
         # Изображение с возможностью масштабирования
         self.image_label = ResizableImageLabel(
             content_frame,
-            bg=colors["panel"] if colors else "white",
+            bg=card_bg,
             text=""
         )
+        style_card_surface(self.image_label, colors)
         self.image_label.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         content_frame.bind(
             "<Configure>",
@@ -9291,18 +9515,21 @@ class ReviewWindow(tk.Toplevel):
         )
 
         # Прогресс-бар
-        progress_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
+        progress_frame = tk.Frame(self.card_frame, bg=card_bg)
         progress_frame.pack(side=tk.BOTTOM, pady=(0, 4))
 
         self.progress_canvas = tk.Canvas(
             progress_frame, width=260, height=14,
-            bg=colors["panel"] if colors else "white", highlightthickness=1, highlightbackground=colors["border"] if colors else "#cccccc"
+            bg=card_bg, highlightthickness=1, highlightbackground=colors["card_border"] if colors else "#cccccc"
         )
         self.progress_canvas.pack(side=tk.LEFT, padx=(10, 4))
 
         self.progress_label = tk.Label(
-            progress_frame, text="0 / 100",
-            bg=colors["panel"] if colors else "white", fg=colors["text"] if colors else "black", font=("Segoe UI", 9)
+            progress_frame,
+            text="0 / 100",
+            bg=card_bg,
+            fg=card_text,
+            font=("Segoe UI", 9),
         )
         self.progress_label.pack(side=tk.LEFT, padx=4)
 
@@ -9316,7 +9543,7 @@ class ReviewWindow(tk.Toplevel):
         self.audio_widget.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
 
         # Панель кнопок
-        bottom_frame = tk.Frame(self.card_frame, bg=colors["panel"] if colors else "white")
+        bottom_frame = tk.Frame(self.card_frame, bg=card_bg)
         bottom_frame.pack(side=tk.BOTTOM, pady=8)
 
         self.btn_audio_icon = ttk.Button(bottom_frame, text="🔊", width=3, command=self.play_word)
@@ -9371,25 +9598,7 @@ class ReviewWindow(tk.Toplevel):
         else:
             messagebox.showinfo("Ошибка", "Аудио система недоступна")
 
-    def load_checkpoint_state(self):
-        """Загрузить состояние чекпоинтов для текущей карточки."""
-        card_id = self.current_card["id"]
-        if card_id in self.checkpoint_states:
-            for i, state in enumerate(self.checkpoint_states[card_id]):
-                self.checkpoint_vars[i].set(state)
-        else:
-            for var in self.checkpoint_vars:
-                var.set(False)
-
-    def update_checkpoint_state(self, idx):
-        """Обновить состояние чекпоинта."""
-        card_id = self.current_card["id"]
-        if card_id not in self.checkpoint_states:
-            self.checkpoint_states[card_id] = [False] * 6
-        self.checkpoint_states[card_id][idx] = self.checkpoint_vars[idx].get()
-
     def cancel_timers(self):
-        self.deck_timer.cancel()
         if self.auto_flip_id is not None:
             try:
                 self.after_cancel(self.auto_flip_id)
@@ -9410,6 +9619,12 @@ class ReviewWindow(tk.Toplevel):
             except Exception:
                 pass
             self.timer_job = None
+        if self.timer_flash_job is not None:
+            try:
+                self.after_cancel(self.timer_flash_job)
+            except Exception:
+                pass
+            self.timer_flash_job = None
 
     def update_timer_label(self, seconds: int | None = None):
         if self.timer_label is None:
@@ -9423,15 +9638,14 @@ class ReviewWindow(tk.Toplevel):
         if self.timer_label is None:
             return
         original_bg = self.timer_label.cget("bg")
-        self.timer_label.config(bg="yellow")
+        self.timer_label.config(bg="#FFD966")
 
         def reset_bg():
             try:
                 self.timer_label.config(bg=original_bg)
             except Exception:
                 pass
-
-        self.after(1500, reset_bg)
+        self.timer_flash_job = self.after(1500, reset_bg)
 
     def timer_tick(self):
         if self.timer_left <= 0:
@@ -9439,15 +9653,18 @@ class ReviewWindow(tk.Toplevel):
             return
         self.timer_left -= 1
         self.update_timer_label()
+        if self.timer_left <= 0:
+            self.handle_timer_notify()
+            return
         self.timer_job = self.after(1000, self.timer_tick)
 
     def schedule_timers_for_card(self):
         self.cancel_timers()
-
-        timer_sec, timer_mode = get_effective_timer(getattr(self.master, "selected_deck_id", None))
-        if timer_sec and timer_sec > 0:
-            self.deck_timer.start(timer_sec, timer_mode)
-            return
+        playback_seconds = get_effective_mode_timer(getattr(self.master, "selected_deck_id", None), "playback")
+        self.timer_left = max(0, int(playback_seconds or 0))
+        self.update_timer_label()
+        if self.timer_left > 0:
+            self.timer_job = self.after(1000, self.timer_tick)
 
         front = self.current_card.get("front") or ""
         back = self.current_card.get("back") or ""
@@ -9471,11 +9688,6 @@ class ReviewWindow(tk.Toplevel):
             second_phase = int(min_second + factor * (max_second - min_second))
 
         total_time = first_phase + second_phase
-
-        self.timer_total = total_time
-        self.timer_left = total_time
-        self.update_timer_label()
-        self.timer_job = self.after(1000, self.timer_tick)
 
         self.auto_flip_id = self.after(first_phase * 1000, self.auto_show_answer)
         self.auto_next_id = self.after(total_time * 1000, self.auto_mark_and_next)
@@ -9541,9 +9753,6 @@ class ReviewWindow(tk.Toplevel):
         phase = romans[min(max(lvl, 1), 10) - 1]
         self.lbl_level.config(text=f"Фаза {phase} | след. повтор: {c['next_review']}")
 
-        # Загружаем состояние чекпоинтов
-        self.load_checkpoint_state()
-
         if self.show_back:
             text = c["back"]
             img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
@@ -9557,7 +9766,7 @@ class ReviewWindow(tk.Toplevel):
         if img_path:
             self.image_label.load_image(img_path)
         else:
-            self.image_label.config(image="", text="(Нет изображения)")
+            self.image_label.load_image(None)
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
 
@@ -9623,7 +9832,6 @@ class ReviewWindow(tk.Toplevel):
         self.show_back = False
         self.update_view()
         self.schedule_timers_for_card()
-        self.load_checkpoint_state()
 
     def play_word(self):
         target_side = "back" if self.show_back else "front"
