@@ -15,7 +15,7 @@ import csv
 import calendar
 import shutil
 import webbrowser
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 from pathlib import Path
 from uuid import uuid4
 csv.field_size_limit(10 * 1024 * 1024)
@@ -1051,6 +1051,7 @@ LEITNER_SCHEDULE = {
 }
 
 DEFAULT_USER_ID_FILE = Path(get_db_path()).with_name("user_id.txt")
+USER_META_CURRENT_ID = "current_user_id"
 TEXT_GEN_CREDIT_COST = 50
 OCR_CREDIT_COST = 1
 IMAGE_ID_IMPORT_COST = 5
@@ -1063,16 +1064,87 @@ ACTIVATION_MIN_REVIEWS = 20
 
 
 def get_local_user_id() -> str:
-    """Простой идентификатор пользователя на основе локального профиля."""
+    """Получить или создать локальный user_id (UUID4), сохранить в базе и на диске."""
     DEFAULT_USER_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            created_at INTEGER,
+            premium_until INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'обычный',
+            verified INTEGER DEFAULT 0,
+            starter_bonus_claimed INTEGER DEFAULT 0
+        );
+        """
+    )
+    cur.execute("SELECT value FROM user_meta WHERE key = ? LIMIT 1;", (USER_META_CURRENT_ID,))
+    row = cur.fetchone()
+    if row and row[0]:
+        conn.close()
+        return str(row[0])
+
+    legacy_id = None
     if DEFAULT_USER_ID_FILE.exists():
         try:
-            return DEFAULT_USER_ID_FILE.read_text(encoding="utf-8").strip()
+            legacy_id = DEFAULT_USER_ID_FILE.read_text(encoding="utf-8").strip()
         except Exception:
-            pass
-    user_id = f"user-{uuid4().hex}"
-    DEFAULT_USER_ID_FILE.write_text(user_id, encoding="utf-8")
+            legacy_id = None
+
+    user_id = legacy_id or str(uuid4())
+    cur.execute(
+        "INSERT OR REPLACE INTO user_meta (key, value) VALUES (?, ?);",
+        (USER_META_CURRENT_ID, user_id),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        DEFAULT_USER_ID_FILE.write_text(user_id, encoding="utf-8")
+    except Exception:
+        pass
     return user_id
+
+
+def ensure_user_account(user_id: str) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO users (
+            user_id, created_at, premium_until, status, verified, starter_bonus_claimed
+        )
+        VALUES (?, ?, 0, 'обычный', 0, 0);
+        """,
+        (user_id, int(time.time())),
+    )
+    conn.commit()
+    cur.execute("SELECT * FROM users WHERE user_id = ? LIMIT 1;", (user_id,))
+    row = cur.fetchone() or {}
+    conn.close()
+    return dict(row)
+
+
+def update_user_account(user_id: str, **fields) -> dict:
+    if not fields:
+        return ensure_user_account(user_id)
+    conn = get_connection()
+    cur = conn.cursor()
+    columns = ", ".join(f"{k} = ?" for k in fields.keys())
+    values = list(fields.values()) + [user_id]
+    cur.execute(f"UPDATE users SET {columns} WHERE user_id = ?;", values)
+    conn.commit()
+    conn.close()
+    return ensure_user_account(user_id)
 
 
 def ensure_user_profile_row(user_id: str) -> dict:
@@ -3736,6 +3808,7 @@ class AnkiApp(tk.Tk):
         self.deck_items = {}
 
         self.user_id = get_local_user_id()
+        self.user_account = ensure_user_account(self.user_id)
         self.user_profile = ensure_user_profile_row(self.user_id)
         self.credits_service = CreditsService()
         self.referral_service = ReferralService(credits_service=self.credits_service)
@@ -3747,7 +3820,10 @@ class AnkiApp(tk.Tk):
         self.ledger_tree: ttk.Treeview | None = None
         self.ref_summary_vars: dict[str, tk.StringVar] = {}
         self.activation_progress_vars: dict[str, tk.DoubleVar] = {}
+        self.activation_progress_labels: dict[str, tk.StringVar] = {}
         self.activation_status_var = tk.StringVar(value="")
+        self.activation_overall_var = tk.DoubleVar(value=0)
+        self.activation_overall_label_var = tk.StringVar(value="")
         self.payment_status_var = tk.StringVar(value="")
         self.payment_code_var = tk.StringVar(value="")
         self.package_choice_var = tk.StringVar(value="pack_500")
@@ -3759,6 +3835,10 @@ class AnkiApp(tk.Tk):
         self.generation_menu = None
         self.generation_menu_indexes: dict[str, int] = {}
         self.mode_actions: dict[str, callable] = {}
+        self.user_id_var = tk.StringVar(value=self.user_id)
+        self.account_status_var = tk.StringVar(value="")
+        self.premium_timer_var = tk.StringVar(value="00:00:00")
+        self.premium_timer_job: str | None = None
         self._ensure_initial_credits()
         self.premium_var.set(self.is_premium_active())
 
@@ -3774,6 +3854,7 @@ class AnkiApp(tk.Tk):
         self.create_widgets()
         self.refresh_decks()
         self.refresh_balance_display()
+        self.start_premium_timer()
 
         self.after(500, self.warn_if_no_tesseract)
         self.after(50, self.poll_bg_queues)
@@ -3862,6 +3943,11 @@ class AnkiApp(tk.Tk):
         self.generation_menu = gen_menu
         gen_menu.add_command(label="Генерация из текста…", command=self.open_generate_from_text_window)
         self.generation_menu_indexes["text"] = gen_menu.index("end")
+        gen_menu.add_command(
+            label="Режим генерация из текста AI 👑",
+            command=self.open_generate_from_text_ai_window,
+        )
+        self.generation_menu_indexes["text_ai"] = gen_menu.index("end")
         gen_menu.add_command(
             label="Генерация из изображения (OCR) 👑 (1⚡/стр)",
             command=self.open_generate_from_image_window,
@@ -6080,7 +6166,7 @@ class AnkiApp(tk.Tk):
         if not self.generation_menu:
             return
         state = tk.NORMAL if self.is_premium_active() else tk.DISABLED
-        for key in ("ocr", "image_id_import", "wikimedia"):
+        for key in ("ocr", "image_id_import", "wikimedia", "text_ai"):
             idx = self.generation_menu_indexes.get(key)
             if idx is None:
                 continue
@@ -6120,47 +6206,106 @@ class AnkiApp(tk.Tk):
         self.refresh_ledger_table()
         self.refresh_referral_info()
         self.refresh_activation_progress_ui()
+        self.refresh_account_status_vars()
 
     def _ensure_initial_credits(self):
         self.user_profile = ensure_user_profile_row(self.user_id)
-        created_at = self.user_profile.get("created_at") or int(time.time())
-        if not self.user_profile.get("created_at"):
+        self.user_account = ensure_user_account(self.user_id)
+        created_at = self.user_account.get("created_at") or int(time.time())
+        if not self.user_account.get("created_at"):
+            self.user_account = update_user_account(self.user_id, created_at=created_at)
             self.user_profile = update_user_profile(self.user_id, created_at=created_at)
 
-        if not self.user_profile.get("starter_50_claimed"):
+        if not self.user_account.get("starter_bonus_claimed"):
+            premium_until = int(time.time()) + 2 * 3600
+            self.user_account = update_user_account(
+                self.user_id,
+                premium_until=premium_until,
+                status="premium",
+                starter_bonus_claimed=1,
+            )
+            self.user_profile = update_user_profile(
+                self.user_id,
+                premium_until=premium_until,
+                is_premium=1,
+                starter_50_claimed=1,
+            )
             self.credits_service.add(
                 self.user_id,
-                50,
+                250,
                 reason="Стартовый бонус",
                 meta={"source": "starter_bonus"},
             )
-            self.user_profile = update_user_profile(self.user_id, starter_50_claimed=1)
+        self.refresh_account_status_vars()
         self.premium_var.set(self.is_premium_active())
 
     def is_premium_active(self) -> bool:
         now_ts = int(time.time())
-        premium_until = int(self.user_profile.get("premium_until") or 0)
-        is_flag = bool(self.user_profile.get("is_premium"))
-        return bool(is_flag or premium_until > now_ts)
+        self.user_account = ensure_user_account(self.user_id)
+        premium_until = int(self.user_account.get("premium_until") or 0)
+        return bool(premium_until > now_ts)
 
     def set_premium_until(self, timestamp: int | None):
         ts_val = int(timestamp or 0)
+        status = "premium" if ts_val > int(time.time()) else "обычный"
+        self.user_account = update_user_account(
+            self.user_id,
+            premium_until=ts_val,
+            status=status,
+        )
         self.user_profile = update_user_profile(
             self.user_id,
             premium_until=ts_val,
-            is_premium=1 if ts_val > int(time.time()) else self.user_profile.get("is_premium", 0),
+            is_premium=1 if ts_val > int(time.time()) else 0,
         )
+        self.refresh_account_status_vars()
         self.premium_var.set(self.is_premium_active())
         self.refresh_generation_menu_state()
 
     def grant_premium_trial(self, days: int = 30):
         until = int(time.time()) + days * 24 * 3600
+        self.user_account = update_user_account(
+            self.user_id, premium_until=until, status="premium"
+        )
         self.user_profile = update_user_profile(
             self.user_id, premium_until=until, is_premium=1
         )
+        self.refresh_account_status_vars()
         self.premium_var.set(self.is_premium_active())
         self.refresh_generation_menu_state()
         messagebox.showinfo("Pro активирован", "Пробный доступ Pro активирован.")
+
+    def refresh_account_status_vars(self):
+        self.user_account = ensure_user_account(self.user_id)
+        now_ts = int(time.time())
+        premium_until = int(self.user_account.get("premium_until") or 0)
+        premium_active = premium_until > now_ts
+        verified = bool(self.user_account.get("verified"))
+        status = "активен" if verified else ("premium" if premium_active else "обычный")
+        if status != self.user_account.get("status"):
+            self.user_account = update_user_account(self.user_id, status=status)
+        if int(self.user_profile.get("premium_until") or 0) != premium_until:
+            self.user_profile = update_user_profile(self.user_id, premium_until=premium_until)
+        if premium_active and not self.user_profile.get("is_premium"):
+            self.user_profile = update_user_profile(self.user_id, is_premium=1)
+        if not premium_active and self.user_profile.get("is_premium"):
+            self.user_profile = update_user_profile(self.user_id, is_premium=0)
+        self.account_status_var.set("Premium" if premium_active else "Обычный")
+        remaining = max(0, premium_until - now_ts)
+        hours, rem = divmod(remaining, 3600)
+        minutes, seconds = divmod(rem, 60)
+        self.premium_timer_var.set(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        self.user_id_var.set(self.user_id)
+
+    def start_premium_timer(self):
+        if self.premium_timer_job is not None:
+            try:
+                self.after_cancel(self.premium_timer_job)
+            except Exception:
+                pass
+        self.refresh_account_status_vars()
+        self.refresh_generation_menu_state()
+        self.premium_timer_job = self.after(1000, self.start_premium_timer)
 
     def guard_premium_and_spend(
         self,
@@ -6170,6 +6315,7 @@ class AnkiApp(tk.Tk):
         meta: dict | None = None,
     ) -> bool:
         self.user_profile = ensure_user_profile_row(self.user_id)
+        self.refresh_account_status_vars()
         if require_premium and not self.is_premium_active():
             if messagebox.askyesno(
                 "Нужна подписка",
@@ -6275,33 +6421,41 @@ class AnkiApp(tk.Tk):
     def get_activation_progress(self) -> dict:
         self.user_profile = ensure_user_profile_row(self.user_id)
         created_at = int(self.user_profile.get("created_at") or int(time.time()))
-        age_hours = (int(time.time()) - created_at) / 3600
+        age_seconds = int(time.time()) - created_at
+        age_hours = age_seconds / 3600
         cards_created = self._count_cards_created()
         reviews_done = self._count_reviews_done()
         first_import = self._has_first_import()
+        remaining_seconds = max(0, int(ACTIVATION_MIN_HOURS * 3600 - age_seconds))
+        rem_hours = remaining_seconds // 3600
+        rem_minutes = (remaining_seconds % 3600) // 60
         steps = [
             {
                 "title": "Аккаунт старше 24ч",
                 "done": age_hours >= ACTIVATION_MIN_HOURS,
                 "value": min(100.0, (age_hours / ACTIVATION_MIN_HOURS) * 100 if ACTIVATION_MIN_HOURS else 0),
+                "progress_text": "Готово" if age_hours >= ACTIVATION_MIN_HOURS else f"Осталось {rem_hours}ч {rem_minutes}м",
             },
             {
                 "title": "Создано ≥ 10 карточек",
                 "done": cards_created >= ACTIVATION_MIN_CARDS,
                 "value": min(100.0, cards_created / ACTIVATION_MIN_CARDS * 100 if ACTIVATION_MIN_CARDS else 0),
+                "progress_text": f"{cards_created}/{ACTIVATION_MIN_CARDS}",
             },
             {
                 "title": "Пройдено ≥ 20 повторений",
                 "done": reviews_done >= ACTIVATION_MIN_REVIEWS,
                 "value": min(100.0, reviews_done / ACTIVATION_MIN_REVIEWS * 100 if ACTIVATION_MIN_REVIEWS else 0),
+                "progress_text": f"{reviews_done}/{ACTIVATION_MIN_REVIEWS}",
             },
             {
                 "title": "Первый импорт / подтверждение",
                 "done": bool(first_import or cards_created >= 1),
                 "value": 100.0 if first_import or cards_created >= 1 else 0.0,
+                "progress_text": "1/1" if first_import or cards_created >= 1 else "0/1",
             },
         ]
-        overall = sum(1 for s in steps if s["done"]) / len(steps) * 100
+        overall = sum(step["value"] for step in steps) / len(steps) if steps else 0
         return {"steps": steps, "overall": overall}
 
     def refresh_activation_progress_ui(self):
@@ -6311,13 +6465,25 @@ class AnkiApp(tk.Tk):
             if var is None:
                 continue
             var.set(step["value"])
+            text_var = self.activation_progress_labels.get(f"step_{idx}")
+            if text_var is not None:
+                text_var.set(step.get("progress_text", ""))
+        self.activation_overall_var.set(progress["overall"])
+        self.activation_overall_label_var.set(f"{progress['overall']:.0f}%")
         claimed = bool(self.user_profile.get("activation_200_claimed"))
-        if claimed:
-            self.activation_status_var.set("Бонус +200 уже активирован ✔")
+        all_done = all(step["done"] for step in progress["steps"])
+        if all_done and not bool(self.user_account.get("verified")):
+            self.user_account = update_user_account(self.user_id, verified=1, status="активен")
+        if all_done:
+            self.activation_status_var.set("Статус аккаунта активен")
         else:
-            self.activation_status_var.set(
-                f"Готовность: {progress['overall']:.0f}% · +200 кредитов после активации"
-            )
+            self.activation_status_var.set("Статус аккаунта не верифицирован")
+        if claimed:
+            self.activation_status_var.set(f"{self.activation_status_var.get()} · Бонус +200 уже активирован ✔")
+        if getattr(self, "activation_status_label", None) is not None:
+            color = self.palette["success"] if all_done else self.palette["muted"]
+            self.activation_status_label.config(fg=color)
+        self.refresh_account_status_vars()
 
     def check_activation_bonus(self):
         self.user_profile = ensure_user_profile_row(self.user_id)
@@ -6425,10 +6591,67 @@ class AnkiApp(tk.Tk):
             self.ref_summary_vars["link"].set(ref_link)
 
     def build_personal_tab(self, tab: ttk.Frame):
-        tab.grid_columnconfigure((0, 1), weight=1)
+        for child in tab.winfo_children():
+            child.destroy()
 
-        balance_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
-        balance_card.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        container = ttk.Frame(tab, style="Surface.TFrame")
+        container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(container, highlightthickness=0, bg=self.palette["background"])
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas, style="Surface.TFrame")
+
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_mousewheel(event):
+            try:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        scroll_frame.grid_columnconfigure((0, 1), weight=1)
+
+        account_card = ttk.Frame(scroll_frame, style="Card.TFrame", padding=14)
+        account_card.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
+        style_card(account_card, self.palette, padded=False)
+        ttk.Label(
+            account_card,
+            text="Профиль",
+            style="Section.TLabel",
+            font=("Segoe UI", 16, "bold"),
+        ).pack(anchor="w")
+        user_row = ttk.Frame(account_card, style="CardInner.TFrame")
+        user_row.pack(fill=tk.X, pady=(6, 4))
+        ttk.Label(user_row, text="User ID:", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(user_row, textvariable=self.user_id_var, state="readonly", width=36).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(user_row, text="Копировать", style="Secondary.TButton", command=self.copy_user_id).pack(
+            side=tk.LEFT, padx=6
+        )
+        status_row = ttk.Frame(account_card, style="CardInner.TFrame")
+        status_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(status_row, text="Статус:", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(status_row, textvariable=self.account_status_var, style="HeaderSub.TLabel").pack(
+            side=tk.LEFT, padx=(6, 12)
+        )
+        ttk.Label(status_row, text="До конца Premium:", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(status_row, textvariable=self.premium_timer_var, style="HeaderSub.TLabel").pack(
+            side=tk.LEFT, padx=6
+        )
+
+        balance_card = ttk.Frame(scroll_frame, style="Card.TFrame", padding=14)
+        balance_card.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
         style_card(balance_card, self.palette, padded=False)
         ttk.Label(balance_card, text="Баланс", style="Section.TLabel", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         balance_row = ttk.Frame(balance_card, style="CardInner.TFrame")
@@ -6458,8 +6681,8 @@ class AnkiApp(tk.Tk):
             wraplength=320,
         ).pack(anchor="w", pady=(6, 0))
 
-        purchase_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
-        purchase_card.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        purchase_card = ttk.Frame(scroll_frame, style="Card.TFrame", padding=14)
+        purchase_card.grid(row=1, column=1, sticky="nsew", padx=10, pady=10)
         style_card(purchase_card, self.palette, padded=False)
         ttk.Label(purchase_card, text="Купить кредиты", style="Section.TLabel", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         for package_id, data in PACKAGES.items():
@@ -6512,8 +6735,8 @@ class AnkiApp(tk.Tk):
             command=lambda: self.grant_premium_trial(days=30),
         ).pack(anchor="e", pady=(6, 0))
 
-        activation_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
-        activation_card.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 10))
+        activation_card = ttk.Frame(scroll_frame, style="Card.TFrame", padding=14)
+        activation_card.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 10))
         style_card(activation_card, self.palette, padded=False)
         ttk.Label(
             activation_card,
@@ -6521,11 +6744,27 @@ class AnkiApp(tk.Tk):
             style="Section.TLabel",
             font=("Segoe UI", 16, "bold"),
         ).pack(anchor="w")
-        ttk.Label(
+        self.activation_status_label = tk.Label(
             activation_card,
             textvariable=self.activation_status_var,
-            style="HeaderSub.TLabel",
-        ).pack(anchor="w", pady=(2, 6))
+            bg=self.palette["panel"],
+            fg=self.palette["muted"],
+            font=("Segoe UI", 12, "bold"),
+        )
+        self.activation_status_label.pack(anchor="w", pady=(2, 6))
+        overall_row = ttk.Frame(activation_card, style="CardInner.TFrame")
+        overall_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(overall_row, text="Общий прогресс:", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Progressbar(
+            overall_row,
+            maximum=100,
+            variable=self.activation_overall_var,
+            length=240,
+        ).pack(side=tk.LEFT, padx=8)
+        ttk.Label(overall_row, textvariable=self.activation_overall_label_var, style="HeaderSub.TLabel").pack(
+            side=tk.LEFT
+        )
+
         steps_frame = ttk.Frame(activation_card, style="CardInner.TFrame")
         steps_frame.pack(fill=tk.BOTH, expand=True)
         titles = [
@@ -6542,6 +6781,9 @@ class AnkiApp(tk.Tk):
             self.activation_progress_vars[f"step_{idx}"] = var
             bar = ttk.Progressbar(row, maximum=100, variable=var, length=200)
             bar.pack(side=tk.RIGHT, padx=6)
+            text_var = tk.StringVar(value="")
+            self.activation_progress_labels[f"step_{idx}"] = text_var
+            ttk.Label(row, textvariable=text_var, style="HeaderSub.TLabel").pack(side=tk.RIGHT, padx=6)
         ttk.Button(
             activation_card,
             text="Проверить активацию",
@@ -6549,8 +6791,8 @@ class AnkiApp(tk.Tk):
             command=self.check_activation_bonus,
         ).pack(anchor="e", pady=(6, 0))
 
-        history_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
-        history_card.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
+        history_card = ttk.Frame(scroll_frame, style="Card.TFrame", padding=14)
+        history_card.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
         style_card(history_card, self.palette, padded=False)
         ttk.Label(history_card, text="История операций", style="Section.TLabel", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         history_inner = ttk.Frame(history_card, style="CardInner.TFrame")
@@ -6568,8 +6810,8 @@ class AnkiApp(tk.Tk):
             anchor="e", pady=(6, 0)
         )
 
-        referral_card = ttk.Frame(tab, style="Card.TFrame", padding=14)
-        referral_card.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 12))
+        referral_card = ttk.Frame(scroll_frame, style="Card.TFrame", padding=14)
+        referral_card.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 12))
         style_card(referral_card, self.palette, padded=False)
         ttk.Label(referral_card, text="Реферальная система", style="Section.TLabel", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ref_inner = ttk.Frame(referral_card, style="CardInner.TFrame")
@@ -6625,6 +6867,17 @@ class AnkiApp(tk.Tk):
             self.clipboard_clear()
             self.clipboard_append(link)
             messagebox.showinfo("Реферальная ссылка", "Ссылка скопирована в буфер обмена.")
+        except Exception as exc:
+            messagebox.showerror("Буфер обмена", f"Не удалось скопировать: {exc}")
+
+    def copy_user_id(self):
+        user_id = self.user_id_var.get()
+        if not user_id:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(user_id)
+            messagebox.showinfo("User ID", "ID скопирован в буфер обмена.")
         except Exception as exc:
             messagebox.showerror("Буфер обмена", f"Не удалось скопировать: {exc}")
 
@@ -7682,6 +7935,33 @@ class AnkiApp(tk.Tk):
 
     # --------- генерация из текста ---------
 
+    def _create_ai_placeholder_image(self, prompt: str) -> str | None:
+        if not PIL_AVAILABLE:
+            return None
+        ensure_media_dir()
+        img = Image.new("RGB", (640, 360), color="#E5E7EB")
+        draw = ImageDraw.Draw(img)
+        text = "AI Image Preview\n\n" + (prompt[:120] + "…" if len(prompt) > 120 else prompt)
+        draw.text((20, 20), text, fill="#111827")
+        filename = f"ai_image_{uuid4().hex}.png"
+        path = os.path.join(MEDIA_FOLDER, filename)
+        try:
+            img.save(path, format="PNG")
+        except Exception:
+            return None
+        return path
+
+    def _create_ai_placeholder_video(self) -> str | None:
+        ensure_media_dir()
+        filename = f"ai_video_{uuid4().hex}.mp4"
+        path = os.path.join(MEDIA_FOLDER, filename)
+        try:
+            with open(path, "wb") as handle:
+                handle.write(b"")
+        except Exception:
+            return None
+        return path
+
     def open_generate_from_text_window(self):
         if self.selected_deck_id is None:
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
@@ -7691,28 +7971,66 @@ class AnkiApp(tk.Tk):
         win.title("Авто-генерация из текста")
         win.geometry("650x580")
         win.grab_set()
+        canvas = tk.Canvas(win, highlightthickness=0, bg=self.palette["background"])
+        scrollbar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas, style="Surface.TFrame")
 
-        ttk.Label(win, text="Вставь текст (немецкие предложения):").pack(anchor="w", padx=10, pady=(10, 0))
-        txt = tk.Text(win, height=10)
-        txt.pack(fill=tk.BOTH, expand=True, padx=10)
-        create_context_menu(txt)  # Добавляем контекстное меню
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_mousewheel(event):
+            try:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        ttk.Label(scroll_frame, text="Front text (лицевая сторона):").pack(anchor="w", padx=10, pady=(10, 0))
+        front_text = tk.Text(scroll_frame, height=4)
+        style_text_widget(front_text, self.palette)
+        front_text.pack(fill=tk.X, padx=10)
+        create_context_menu(front_text)
+
+        ttk.Label(scroll_frame, text="Back text (обратная сторона):").pack(anchor="w", padx=10, pady=(8, 0))
+        back_text = tk.Text(scroll_frame, height=4)
+        style_text_widget(back_text, self.palette)
+        back_text.pack(fill=tk.X, padx=10)
+        create_context_menu(back_text)
 
         # Кнопка вставки из буфера обмена
-        insert_frame = ttk.Frame(win)
-        insert_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
-        
+        insert_frame = ttk.Frame(scroll_frame)
+        insert_frame.pack(fill=tk.X, padx=10, pady=(6, 5))
+
         def paste_from_clipboard():
             try:
                 clipboard_text = win.clipboard_get()
-                txt.delete("1.0", tk.END)
-                txt.insert("1.0", clipboard_text)
+                front_text.delete("1.0", tk.END)
+                front_text.insert("1.0", clipboard_text)
             except tk.TclError:
                 pass
-        
-        ttk.Button(insert_frame, text="📋 Вставить из буфера обмена", 
-                   command=paste_from_clipboard).pack(side=tk.LEFT)
 
-        frame_opts = ttk.LabelFrame(win, text="Настройки")
+        ttk.Button(
+            insert_frame,
+            text="📋 Вставить в Front text",
+            command=paste_from_clipboard,
+        ).pack(side=tk.LEFT)
+
+        ttk.Label(
+            scroll_frame,
+            text="Если заполнен Back text, сохранится одна карточка. Для авто-генерации используйте Front text.",
+            style="Muted.TLabel",
+            wraplength=520,
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+
+        frame_opts = ttk.LabelFrame(scroll_frame, text="Настройки")
         frame_opts.pack(fill=tk.X, padx=10, pady=10)
 
         use_ai_var = tk.BooleanVar(value=True)
@@ -7783,12 +8101,14 @@ class AnkiApp(tk.Tk):
 
         ttk.Label(frame_opts, text="Шаблон FRONT:").pack(anchor="w", padx=5)
         entry_front = tk.Text(frame_opts, height=2)
+        style_text_widget(entry_front, self.palette)
         entry_front.pack(fill=tk.X, padx=5)
         entry_front.insert("1.0", self.front_template)
         create_context_menu(entry_front)  # Добавляем контекстное меню
 
         ttk.Label(frame_opts, text="Шаблон BACK:").pack(anchor="w", padx=5, pady=(5, 0))
         entry_back = tk.Text(frame_opts, height=2)
+        style_text_widget(entry_back, self.palette)
         entry_back.pack(fill=tk.X, padx=5)
         entry_back.insert("1.0", self.back_template)
         create_context_menu(entry_back)  # Добавляем контекстное меню
@@ -7798,7 +8118,7 @@ class AnkiApp(tk.Tk):
             text="Переменные: {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
         ).pack(anchor="w", padx=5, pady=(5, 0))
 
-        progress_frame = ttk.LabelFrame(win, text="Прогресс")
+        progress_frame = ttk.LabelFrame(scroll_frame, text="Прогресс")
         progress_frame.pack(fill=tk.X, padx=10, pady=5)
         progress_var = tk.DoubleVar(value=0)
         progress_label_var = tk.StringVar(value="")
@@ -7806,7 +8126,8 @@ class AnkiApp(tk.Tk):
         progress_bar.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(progress_frame, textvariable=progress_label_var).pack(anchor="w", padx=5)
 
-        log_box = tk.Text(win, height=6, state="disabled")
+        log_box = tk.Text(scroll_frame, height=6, state="disabled")
+        style_text_widget(log_box, self.palette)
         log_box.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 10))
 
         def append_log(message: str):
@@ -7818,9 +8139,10 @@ class AnkiApp(tk.Tk):
         task_holder = {"task": None}
 
         def build_local_cards():
-            text = txt.get("1.0", tk.END).strip()
-            if not text:
-                raise ValueError("Текст пустой.")
+            front_value = front_text.get("1.0", tk.END).strip()
+            back_value = back_text.get("1.0", tk.END).strip()
+            if not front_value:
+                raise ValueError("Front text пустой.")
 
             front_t = entry_front.get("1.0", tk.END).strip() or DEFAULT_FRONT_TEMPLATE
             back_t = entry_back.get("1.0", tk.END).strip() or DEFAULT_BACK_TEMPLATE
@@ -7829,8 +8151,22 @@ class AnkiApp(tk.Tk):
             if self.selected_deck_id is not None:
                 save_deck_templates(self.selected_deck_id, front_t, back_t)
 
+            if back_value:
+                base_word = front_value.splitlines()[0].strip() or front_value
+                cards = [
+                    {
+                        "front": front_value,
+                        "back": back_value,
+                        "word": base_word,
+                        "translation": back_value,
+                        "sentence": front_value,
+                        "sentence_with_gap": front_value,
+                    }
+                ]
+                return cards, set(), front_t, back_t
+
             one_sent = one_sent_var.get()
-            cards, new_words = build_local_cards_from_text(text, front_t, back_t, one_sent)
+            cards, new_words = build_local_cards_from_text(front_value, front_t, back_t, one_sent)
             return cards, new_words, front_t, back_t
 
         def open_preview_window(cards, front_image_path: str, back_image_path: str):
@@ -8006,6 +8342,7 @@ class AnkiApp(tk.Tk):
                         messagebox.showinfo("Сохранено", f"Сохранено: {created} карточек")
                         self.refresh_decks()
                         self.update_overdue_badge()
+                        self.refresh_activation_progress_ui()
 
                     self.after(0, on_done)
                 except Exception as exc:
@@ -8014,9 +8351,9 @@ class AnkiApp(tk.Tk):
             threading.Thread(target=worker, daemon=True).start()
 
         def run_generation():
-            text = txt.get("1.0", tk.END).strip()
+            text = front_text.get("1.0", tk.END).strip()
             if not text:
-                messagebox.showerror("Ошибка", "Текст пустой.")
+                messagebox.showerror("Ошибка", "Front text пустой.")
                 return
             if not self.spend_credits_or_warn(
                 TEXT_GEN_CREDIT_COST,
@@ -8092,7 +8429,7 @@ class AnkiApp(tk.Tk):
                 append_log("Отмена запрошена…")
                 btn_cancel.config(state=tk.DISABLED)
 
-        btn_frame = ttk.Frame(win)
+        btn_frame = ttk.Frame(scroll_frame)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
         btn_preview = ttk.Button(btn_frame, text="Предпросмотр карточек", command=preview_cards)
         btn_preview.pack(side=tk.LEFT)
@@ -8102,6 +8439,164 @@ class AnkiApp(tk.Tk):
         btn_cancel.pack(side=tk.RIGHT, padx=5)
         btn_generate = ttk.Button(btn_frame, text="Сгенерировать", command=run_generation)
         btn_generate.pack(side=tk.RIGHT)
+
+    def open_generate_from_text_ai_window(self):
+        if self.selected_deck_id is None:
+            messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
+            return
+        if not self.is_premium_active():
+            messagebox.showinfo(
+                "Нужен Premium",
+                "Режим генерации из текста AI доступен только для Premium.",
+            )
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Режим генерация из текста AI 👑")
+        win.geometry("760x620")
+        win.grab_set()
+        win._preview_img_ref = None
+
+        form_frame = ttk.Frame(win, style="Surface.TFrame")
+        form_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        ttk.Label(form_frame, text="Front text (PROMPT для Stable Diffusion):").pack(anchor="w")
+        prompt_text = tk.Text(form_frame, height=4)
+        style_text_widget(prompt_text, self.palette)
+        prompt_text.pack(fill=tk.X, pady=(4, 10))
+        create_context_menu(prompt_text)
+
+        ttk.Label(form_frame, text="Back text (обратная сторона):").pack(anchor="w")
+        back_text = tk.Text(form_frame, height=4)
+        style_text_widget(back_text, self.palette)
+        back_text.pack(fill=tk.X, pady=(4, 10))
+        create_context_menu(back_text)
+
+        action_frame = ttk.LabelFrame(form_frame, text="Генерация")
+        action_frame.pack(fill=tk.X, pady=6)
+        action_row = ttk.Frame(action_frame)
+        action_row.pack(fill=tk.X, padx=6, pady=6)
+
+        preview_frame = ttk.LabelFrame(form_frame, text="Preview")
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        style_card(preview_frame, self.palette, padded=True)
+
+        preview_label = tk.Label(
+            preview_frame,
+            text="Нет превью",
+            bg=self.palette["panel"],
+            fg=self.palette["muted"],
+            justify="center",
+        )
+        preview_label.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        media_state = {"image_path": None, "video_path": None}
+
+        def update_preview_image(path: str | None):
+            if not path or not os.path.exists(path) or not PIL_AVAILABLE:
+                preview_label.config(image="", text="Нет превью")
+                win._preview_img_ref = None
+                return
+            try:
+                img = Image.open(path)
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((520, 320), Image.Resampling.LANCZOS)
+                win._preview_img_ref = ImageTk.PhotoImage(img)
+                preview_label.config(image=win._preview_img_ref, text="")
+            except Exception:
+                preview_label.config(image="", text="Не удалось загрузить превью")
+                win._preview_img_ref = None
+
+        def set_preview_text(text: str):
+            preview_label.config(image="", text=text)
+            win._preview_img_ref = None
+
+        def generate_image():
+            if not self.guard_premium_and_spend(
+                "AI image generation",
+                2,
+                require_premium=True,
+                meta={"operation": "ai_image"},
+            ):
+                return
+            set_preview_text("Генерация изображения…")
+
+            def finish():
+                prompt = prompt_text.get("1.0", tk.END).strip()
+                path = self._create_ai_placeholder_image(prompt) or ""
+                media_state["image_path"] = path
+                media_state["video_path"] = None
+                update_preview_image(path)
+
+            win.after(1200, finish)
+
+        def generate_video():
+            if not self.guard_premium_and_spend(
+                "AI video generation",
+                20,
+                require_premium=True,
+                meta={"operation": "ai_video"},
+            ):
+                return
+            set_preview_text("Генерация видео…")
+
+            def finish():
+                path = self._create_ai_placeholder_video() or ""
+                media_state["video_path"] = path
+                media_state["image_path"] = None
+                set_preview_text("Видео создано (заглушка)")
+
+            win.after(1500, finish)
+
+        def save_card():
+            front = prompt_text.get("1.0", tk.END).strip()
+            back = back_text.get("1.0", tk.END).strip()
+            if not front:
+                messagebox.showerror("Ошибка", "Front text пустой.")
+                return
+
+            note_fields = {
+                "word": front,
+                "translation": back,
+                "example": "",
+                "level": 1,
+                "image": media_state["image_path"] or "",
+                "front_image_path": media_state["image_path"] or "",
+                "back_image_path": "",
+                "audio_path": None,
+                "front": front,
+                "back": back,
+            }
+            note_id, created = create_note_with_cards(
+                self.selected_deck_id,
+                note_fields,
+                note_type_id=ensure_generated_note_type_id(),
+            )
+            if media_state["video_path"]:
+                attach_media_to_note(note_id, [(media_state["video_path"], "video")])
+            messagebox.showinfo("Сохранено", f"Сохранено {created} карточек")
+            self.refresh_decks()
+            self.update_overdue_badge()
+            self.refresh_activation_progress_ui()
+
+        ttk.Button(
+            action_row,
+            text="Сгенерировать видео (10 сек) — 20 ⚡",
+            style="Secondary.TButton",
+            command=generate_video,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            action_row,
+            text="Сгенерировать картинку — 2 ⚡",
+            style="Secondary.TButton",
+            command=generate_image,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            action_row,
+            text="Сохранить карточку",
+            style="Primary.TButton",
+            command=save_card,
+        ).pack(side=tk.RIGHT, padx=4)
 
     # --------- генерация из изображения ---------
 
@@ -9205,6 +9700,12 @@ class RepeatWindow(tk.Toplevel):
         self.current_photo = None
         self._img_ref = None
         self._image_path = None
+        self.image_mode = "fit"
+        self.zoom_factor = 1.0
+        self._last_fit_scale = 1.0
+        self.image_canvas = None
+        self.image_scroll_x = None
+        self.image_scroll_y = None
         
         # Состояние переводов
         self.show_translations = TRANSLATION_SETTINGS.show_translations
@@ -9314,16 +9815,54 @@ class RepeatWindow(tk.Toplevel):
         # Изображение
         self.image_frame = tk.Frame(self.content_frame, bg=card_bg)
         self.image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        toolbar = ttk.Frame(self.image_frame, style="CardInner.TFrame")
+        toolbar.pack(fill=tk.X, pady=(0, 6))
 
-        self.image_label = tk.Label(
-            self.image_frame,
+        ttk.Button(
+            toolbar,
+            text="Вписать",
+            style="Secondary.TButton",
+            command=lambda: self.set_image_mode("fit"),
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            toolbar,
+            text="1:1",
+            style="Secondary.TButton",
+            command=lambda: self.set_image_mode("actual"),
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            toolbar,
+            text="Zoom +",
+            style="Secondary.TButton",
+            command=lambda: self.zoom_image(1.12),
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            toolbar,
+            text="Zoom -",
+            style="Secondary.TButton",
+            command=lambda: self.zoom_image(0.88),
+        ).pack(side=tk.LEFT, padx=2)
+
+        canvas_container = tk.Frame(self.image_frame, bg=card_bg)
+        canvas_container.pack(fill=tk.BOTH, expand=True)
+        canvas_container.grid_rowconfigure(0, weight=1)
+        canvas_container.grid_columnconfigure(0, weight=1)
+
+        self.image_canvas = tk.Canvas(
+            canvas_container,
             bg=card_bg,
-            fg=card_text,
-            text=""
+            highlightthickness=0,
+            borderwidth=0,
         )
-        style_card_surface(self.image_label, colors)
-        self.image_label.pack(fill=tk.BOTH, expand=True)
-        self.image_frame.bind(
+        self.image_scroll_y = ttk.Scrollbar(canvas_container, orient="vertical", command=self.image_canvas.yview)
+        self.image_scroll_x = ttk.Scrollbar(canvas_container, orient="horizontal", command=self.image_canvas.xview)
+        self.image_canvas.configure(yscrollcommand=self.image_scroll_y.set, xscrollcommand=self.image_scroll_x.set)
+
+        self.image_canvas.grid(row=0, column=0, sticky="nsew")
+        self.image_scroll_y.grid(row=0, column=1, sticky="ns")
+        self.image_scroll_x.grid(row=1, column=0, sticky="ew")
+
+        self.image_canvas.bind(
             "<Configure>",
             lambda e: self._render_card_image()
         )
@@ -9390,13 +9929,37 @@ class RepeatWindow(tk.Toplevel):
         entries = get_card_audio_entries(self.current_card, prefer_side="back" if self.show_back else "front")
         display_audio_entries_on_frame(self.card_frame, entries)
 
+    def set_image_mode(self, mode: str):
+        if mode not in ("fit", "actual", "zoom"):
+            return
+        if mode == "actual":
+            self.zoom_factor = 1.0
+        self.image_mode = mode
+        self._render_card_image()
+
+    def zoom_image(self, factor: float):
+        if not self._image_path:
+            return
+        if self.image_mode == "fit":
+            self.image_mode = "zoom"
+            self.zoom_factor = max(0.1, self._last_fit_scale)
+        elif self.image_mode == "actual":
+            self.image_mode = "zoom"
+            self.zoom_factor = 1.0
+        self.zoom_factor = max(0.1, min(6.0, self.zoom_factor * factor))
+        self._render_card_image()
+
     def _render_card_image(self, image_path: str | None = None):
         if image_path is not None:
             self._image_path = image_path
         path = self._image_path
         if not path or not os.path.exists(path) or not PIL_AVAILABLE:
             self._img_ref = None
-            self.image_label.config(image="", text="Нет изображения")
+            if self.image_canvas is not None:
+                self.image_canvas.delete("all")
+                self.image_canvas.create_text(
+                    10, 10, anchor="nw", text="Нет изображения", fill="#666666"
+                )
             return
 
         try:
@@ -9405,24 +9968,47 @@ class RepeatWindow(tk.Toplevel):
                 img = ImageOps.exif_transpose(img)
             except Exception:
                 pass
-            cont_w = max(1, self.image_frame.winfo_width())
-            cont_h = max(1, self.image_frame.winfo_height())
-            if cont_w <= 1 or cont_h <= 1:
-                cont_w = max(1, self.image_label.winfo_width())
-                cont_h = max(1, self.image_label.winfo_height())
+            if self.image_canvas is None:
+                return
+            cont_w = max(1, self.image_canvas.winfo_width())
+            cont_h = max(1, self.image_canvas.winfo_height())
             cont_w = max(1, cont_w - 10)
             cont_h = max(1, cont_h - 10)
             img_w, img_h = img.size
             if img_w <= 0 or img_h <= 0:
                 raise ValueError("Invalid image size")
-            scale = min(cont_w / img_w, cont_h / img_h)
+            fit_scale = min(cont_w / img_w, cont_h / img_h)
+            self._last_fit_scale = fit_scale
+            if self.image_mode == "fit":
+                scale = fit_scale
+            elif self.image_mode == "actual":
+                scale = 1.0
+            else:
+                scale = max(0.1, self.zoom_factor)
             new_size = (max(1, int(img_w * scale)), max(1, int(img_h * scale)))
             resized = img.resize(new_size, Image.Resampling.LANCZOS)
             self._img_ref = ImageTk.PhotoImage(resized)
-            self.image_label.config(image=self._img_ref, text="")
+            self.image_canvas.delete("all")
+            self.image_canvas.create_image(0, 0, anchor="nw", image=self._img_ref)
+            self.image_canvas.config(scrollregion=(0, 0, new_size[0], new_size[1]))
+
+            if self.image_mode == "fit":
+                if self.image_scroll_x is not None:
+                    self.image_scroll_x.grid_remove()
+                if self.image_scroll_y is not None:
+                    self.image_scroll_y.grid_remove()
+            else:
+                if self.image_scroll_x is not None:
+                    self.image_scroll_x.grid()
+                if self.image_scroll_y is not None:
+                    self.image_scroll_y.grid()
         except Exception:
             self._img_ref = None
-            self.image_label.config(image="", text="Нет изображения")
+            if self.image_canvas is not None:
+                self.image_canvas.delete("all")
+                self.image_canvas.create_text(
+                    10, 10, anchor="nw", text="Нет изображения", fill="#666666"
+                )
 
     def _show_audio_error(self, title: str, message: str):
         try:
