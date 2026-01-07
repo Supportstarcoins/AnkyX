@@ -683,6 +683,18 @@ def copy_image_to_media(src: str, target_id: int, move: bool = False) -> str:
         dest_path = src
     return dest_path
 
+
+def copy_image_asset_to_media(src: str, prefix: str = "img") -> str:
+    ensure_media_dir()
+    ext = os.path.splitext(src)[1].lower() or ".png"
+    target_name = f"{prefix}_{uuid4().hex}{ext}"
+    dest_path = os.path.join(MEDIA_FOLDER, target_name)
+    try:
+        shutil.copy2(src, dest_path)
+    except Exception:
+        dest_path = src
+    return dest_path
+
 # ==========================
 # НАСТРОЙКИ ПЕРЕВОДА И СЛОВАРИ
 # ==========================
@@ -2890,6 +2902,97 @@ def insert_card(
 # Авто-генерация
 # ==========================
 
+def build_local_cards_from_text(
+    text: str,
+    front_template: str,
+    back_template: str,
+    one_sentence_one_card: bool = False,
+) -> tuple[list[dict], set[str]]:
+    sentences = split_into_sentences(text)
+    if not sentences:
+        return [], set()
+
+    known = get_known_words()
+    cards: list[dict] = []
+    all_new_words: set[str] = set()
+
+    def make_base_card(sentence: str, target_word: str):
+        sentence_with_gap = sentence
+        if target_word:
+            pattern = re.compile(re.escape(target_word), re.IGNORECASE)
+            sentence_with_gap = pattern.sub("____", sentence, count=1)
+
+        translation = get_translation(target_word, use_openai=False) if target_word else ""
+        sentence_translation = translate_sentence(sentence, use_openai=False)
+
+        front = front_template.format(
+            translation="",
+            sentence_with_gap=sentence_with_gap,
+            word=target_word,
+            ipa="",
+            gender="?",
+            plural="?",
+            sentence=sentence,
+        )
+
+        back = back_template.format(
+            translation=sentence_translation,
+            sentence_with_gap=sentence_with_gap,
+            word=target_word,
+            ipa="",
+            gender="?",
+            plural="?",
+            sentence=sentence,
+        )
+
+        cards.append(
+            {
+                "front": front,
+                "back": back,
+                "word": target_word or sentence,
+                "translation": translation,
+                "sentence": sentence,
+                "sentence_with_gap": sentence_with_gap,
+            }
+        )
+
+    if one_sentence_one_card:
+        for sentence in sentences:
+            words = extract_words_from_text(sentence)
+            if not words:
+                continue
+            target_word = None
+            for w in words:
+                if w not in known:
+                    target_word = w
+                    break
+            if target_word is None:
+                target_word = words[0]
+
+            new_in_sentence = {w for w in words if w not in known}
+            all_new_words.update(new_in_sentence)
+            make_base_card(sentence, target_word)
+    else:
+        all_words = extract_words_from_text(text)
+        new_words = {w for w in all_words if w and w not in known}
+        if not new_words:
+            return [], set()
+
+        for word in sorted(new_words):
+            sentence_for_word = None
+            for s in sentences:
+                if normalize_word(word) in [normalize_word(w) for w in extract_words_from_text(s)]:
+                    sentence_for_word = s
+                    break
+            if not sentence_for_word:
+                sentence_for_word = text.strip()
+
+            make_base_card(sentence_for_word, word)
+        all_new_words.update(new_words)
+
+    return cards, all_new_words
+
+
 def auto_generate_cards_from_text(deck_id: int,
                                   text: str,
                                   use_ai_images: bool,
@@ -3709,14 +3812,14 @@ class AnkiApp(tk.Tk):
         self._loading_depth += 1
         mode = "determinate" if determinate else "indeterminate"
         try:
-            self.busy_dialog.show(title or "Загрузка", mode, total)
+            self.busy_dialog.show("Загрузка", mode, total)
         except Exception:
             pass
 
     def update_loading(self, done: int, total: int | None = None, text: str | None = None):
         """Обновить состояние глобального прогресса."""
         try:
-            self.busy_dialog.update_progress(done, total, text)
+            self.busy_dialog.update_progress(done, total, "Загрузка")
         except Exception:
             pass
 
@@ -5511,18 +5614,19 @@ class AnkiApp(tk.Tk):
             return dates
 
         def update_charts():
+            self.show_loading("Загрузка", determinate=False)
             if not MATPLOTLIB_AVAILABLE:
                 for widget in charts_frame.winfo_children():
                     widget.destroy()
                 ttk.Label(charts_frame,
                          text="Графики недоступны: установите Matplotlib (pip install matplotlib) и перезапустите приложение.",
                          foreground="red").pack(pady=20)
+                self.hide_loading()
                 return
 
             current_settings = collect_settings()
             save_stats_settings(current_settings)
             date_list = build_date_list(current_settings)
-            self.show_loading("Загрузка статистики", determinate=False)
 
             def render_charts(data):
                 for widget in charts_frame.winfo_children():
@@ -7625,6 +7729,58 @@ class AnkiApp(tk.Tk):
             variable=one_sent_var
         ).pack(anchor="w")
 
+        front_image_var = tk.StringVar(value="")
+        back_image_var = tk.StringVar(value="")
+
+        frame_images = ttk.LabelFrame(frame_opts, text="Изображения карточки")
+        frame_images.pack(fill=tk.X, padx=5, pady=(5, 0))
+
+        ttk.Label(frame_images, text="Лицевая сторона:").grid(row=0, column=0, sticky="w", pady=3)
+        front_image_label = ttk.Label(frame_images, text="(нет)")
+        front_image_label.grid(row=0, column=1, sticky="w", padx=5)
+
+        def select_front_image():
+            filename = filedialog.askopenfilename(
+                title="Прикрепить изображение (лицевая сторона)",
+                filetypes=[
+                    ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if filename:
+                front_image_var.set(filename)
+                front_image_label.config(text=os.path.basename(filename))
+
+        ttk.Button(
+            frame_images,
+            text="Прикрепить изображение (лицевая сторона)",
+            command=select_front_image,
+        ).grid(row=0, column=2, padx=5, pady=3, sticky="e")
+
+        ttk.Label(frame_images, text="Обратная сторона:").grid(row=1, column=0, sticky="w", pady=3)
+        back_image_label = ttk.Label(frame_images, text="(нет)")
+        back_image_label.grid(row=1, column=1, sticky="w", padx=5)
+
+        def select_back_image():
+            filename = filedialog.askopenfilename(
+                title="Прикрепить изображение (обратная сторона)",
+                filetypes=[
+                    ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if filename:
+                back_image_var.set(filename)
+                back_image_label.config(text=os.path.basename(filename))
+
+        ttk.Button(
+            frame_images,
+            text="Прикрепить изображение (обратная сторона)",
+            command=select_back_image,
+        ).grid(row=1, column=2, padx=5, pady=3, sticky="e")
+
+        frame_images.columnconfigure(1, weight=1)
+
         ttk.Label(frame_opts, text="Шаблон FRONT:").pack(anchor="w", padx=5)
         entry_front = tk.Text(frame_opts, height=2)
         entry_front.pack(fill=tk.X, padx=5)
@@ -7660,6 +7816,202 @@ class AnkiApp(tk.Tk):
             log_box.configure(state="disabled")
 
         task_holder = {"task": None}
+
+        def build_local_cards():
+            text = txt.get("1.0", tk.END).strip()
+            if not text:
+                raise ValueError("Текст пустой.")
+
+            front_t = entry_front.get("1.0", tk.END).strip() or DEFAULT_FRONT_TEMPLATE
+            back_t = entry_back.get("1.0", tk.END).strip() or DEFAULT_BACK_TEMPLATE
+            self.front_template = front_t
+            self.back_template = back_t
+            if self.selected_deck_id is not None:
+                save_deck_templates(self.selected_deck_id, front_t, back_t)
+
+            one_sent = one_sent_var.get()
+            cards, new_words = build_local_cards_from_text(text, front_t, back_t, one_sent)
+            return cards, new_words, front_t, back_t
+
+        def open_preview_window(cards, front_image_path: str, back_image_path: str):
+            preview_win = tk.Toplevel(self)
+            preview_win.title("Предпросмотр карточек")
+            preview_win.geometry("900x650")
+            preview_win.grab_set()
+            preview_win._img_refs = []
+
+            palette = getattr(self, "palette", None) or {}
+            bg = palette.get("background", "#0B0D12")
+            panel = palette.get("panel", "#111522")
+            text_color = palette.get("text", "#E8ECF4")
+
+            preview_win.configure(bg=bg)
+
+            container = ttk.Frame(preview_win)
+            container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            canvas = tk.Canvas(container, bg=bg, highlightthickness=0)
+            scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+            list_frame = ttk.Frame(canvas)
+
+            list_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+            )
+            canvas.create_window((0, 0), window=list_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scroll.set)
+
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+            def build_thumbnail(path: str):
+                if not path or not os.path.exists(path) or not PIL_AVAILABLE:
+                    return None
+                try:
+                    img = Image.open(path)
+                    img = ImageOps.exif_transpose(img)
+                    img.thumbnail((140, 140), Image.Resampling.LANCZOS)
+                    return ImageTk.PhotoImage(img)
+                except Exception:
+                    return None
+
+            front_thumb = build_thumbnail(front_image_path)
+            back_thumb = build_thumbnail(back_image_path)
+            if front_thumb:
+                preview_win._img_refs.append(front_thumb)
+            if back_thumb:
+                preview_win._img_refs.append(back_thumb)
+
+            for idx, card in enumerate(cards, start=1):
+                row = tk.Frame(list_frame, bg=panel, bd=1, relief="flat")
+                row.pack(fill=tk.X, pady=6)
+
+                left = tk.Frame(row, bg=panel)
+                left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+                right = tk.Frame(row, bg=panel)
+                right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+                tk.Label(
+                    left,
+                    text=f"{idx}. Front text",
+                    bg=panel,
+                    fg=text_color,
+                    font=("Segoe UI", 10, "bold"),
+                ).pack(anchor="w")
+                tk.Label(
+                    left,
+                    text=card.get("front", ""),
+                    bg=panel,
+                    fg=text_color,
+                    wraplength=360,
+                    justify="left",
+                ).pack(anchor="w", pady=(4, 8))
+
+                if front_thumb:
+                    tk.Label(left, image=front_thumb, bg=panel).pack(anchor="w")
+                else:
+                    tk.Label(left, text="Нет изображения", bg=panel, fg=text_color).pack(anchor="w")
+
+                tk.Label(
+                    right,
+                    text="Back text",
+                    bg=panel,
+                    fg=text_color,
+                    font=("Segoe UI", 10, "bold"),
+                ).pack(anchor="w")
+                tk.Label(
+                    right,
+                    text=card.get("back", ""),
+                    bg=panel,
+                    fg=text_color,
+                    wraplength=360,
+                    justify="left",
+                ).pack(anchor="w", pady=(4, 8))
+
+                if back_thumb:
+                    tk.Label(right, image=back_thumb, bg=panel).pack(anchor="w")
+                else:
+                    tk.Label(right, text="Нет изображения", bg=panel, fg=text_color).pack(anchor="w")
+
+        def preview_cards():
+            self.show_loading("Загрузка")
+
+            def worker():
+                try:
+                    cards, _new_words, _front_t, _back_t = build_local_cards()
+                    if not cards:
+                        raise ValueError("Новых слов/предложений не найдено.")
+                    self.after(
+                        0,
+                        lambda: open_preview_window(
+                            cards,
+                            front_image_var.get(),
+                            back_image_var.get(),
+                        ),
+                    )
+                except Exception as exc:
+                    self.after(0, lambda: messagebox.showerror("Предпросмотр", str(exc)))
+                finally:
+                    self.after(0, self.hide_loading)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def save_cards():
+            self.show_loading("Загрузка")
+
+            def worker():
+                try:
+                    cards, new_words, _front_t, _back_t = build_local_cards()
+                    if not cards:
+                        raise ValueError("Новых слов/предложений не найдено.")
+
+                    front_image_path = front_image_var.get()
+                    back_image_path = back_image_var.get()
+                    stored_front = (
+                        copy_image_asset_to_media(front_image_path, "front")
+                        if front_image_path
+                        else None
+                    )
+                    stored_back = (
+                        copy_image_asset_to_media(back_image_path, "back")
+                        if back_image_path
+                        else None
+                    )
+
+                    created = 0
+                    for card in cards:
+                        note_fields = {
+                            "word": card.get("word") or card.get("sentence"),
+                            "translation": card.get("translation") or "",
+                            "example": card.get("sentence") or "",
+                            "level": 1,
+                            "image": stored_front or "",
+                            "front_image_path": stored_front or "",
+                            "back_image_path": stored_back or "",
+                            "audio_path": None,
+                            "front": card.get("front", ""),
+                            "back": card.get("back", ""),
+                        }
+                        _, cards_created = create_note_with_cards(
+                            self.selected_deck_id,
+                            note_fields,
+                            note_type_id=ensure_generated_note_type_id(),
+                        )
+                        created += cards_created
+
+                    add_new_words(new_words)
+
+                    def on_done():
+                        self.hide_loading()
+                        messagebox.showinfo("Сохранено", f"Сохранено: {created} карточек")
+                        self.refresh_decks()
+                        self.update_overdue_badge()
+
+                    self.after(0, on_done)
+                except Exception as exc:
+                    self.after(0, lambda: (self.hide_loading(), messagebox.showerror("Сохранение", str(exc))))
+
+            threading.Thread(target=worker, daemon=True).start()
 
         def run_generation():
             text = txt.get("1.0", tk.END).strip()
@@ -7742,6 +8094,10 @@ class AnkiApp(tk.Tk):
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        btn_preview = ttk.Button(btn_frame, text="Предпросмотр карточек", command=preview_cards)
+        btn_preview.pack(side=tk.LEFT)
+        btn_save = ttk.Button(btn_frame, text="Сохранить", command=save_cards)
+        btn_save.pack(side=tk.LEFT, padx=5)
         btn_cancel = ttk.Button(btn_frame, text="Отмена", command=cancel_generation, state=tk.DISABLED)
         btn_cancel.pack(side=tk.RIGHT, padx=5)
         btn_generate = ttk.Button(btn_frame, text="Сгенерировать", command=run_generation)
@@ -8847,6 +9203,8 @@ class RepeatWindow(tk.Toplevel):
         self.current_card = self.session.current_card()
         self.show_back = False
         self.current_photo = None
+        self._img_ref = None
+        self._image_path = None
         
         # Состояние переводов
         self.show_translations = TRANSLATION_SETTINGS.show_translations
@@ -8953,20 +9311,21 @@ class RepeatWindow(tk.Toplevel):
         )
         self.lbl_text.pack(anchor="w")
 
-        # Изображение с возможностью масштабирования
+        # Изображение
         self.image_frame = tk.Frame(self.content_frame, bg=card_bg)
         self.image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        self.image_label = ResizableImageLabel(
+        self.image_label = tk.Label(
             self.image_frame,
             bg=card_bg,
+            fg=card_text,
             text=""
         )
         style_card_surface(self.image_label, colors)
         self.image_label.pack(fill=tk.BOTH, expand=True)
         self.image_frame.bind(
             "<Configure>",
-            lambda e: self.image_label.set_container_size(e.width, e.height)
+            lambda e: self._render_card_image()
         )
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
@@ -9030,6 +9389,40 @@ class RepeatWindow(tk.Toplevel):
         """Обновить аудио-плеер для текущей карточки"""
         entries = get_card_audio_entries(self.current_card, prefer_side="back" if self.show_back else "front")
         display_audio_entries_on_frame(self.card_frame, entries)
+
+    def _render_card_image(self, image_path: str | None = None):
+        if image_path is not None:
+            self._image_path = image_path
+        path = self._image_path
+        if not path or not os.path.exists(path) or not PIL_AVAILABLE:
+            self._img_ref = None
+            self.image_label.config(image="", text="Нет изображения")
+            return
+
+        try:
+            img = Image.open(path)
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+            cont_w = max(1, self.image_frame.winfo_width())
+            cont_h = max(1, self.image_frame.winfo_height())
+            if cont_w <= 1 or cont_h <= 1:
+                cont_w = max(1, self.image_label.winfo_width())
+                cont_h = max(1, self.image_label.winfo_height())
+            cont_w = max(1, cont_w - 10)
+            cont_h = max(1, cont_h - 10)
+            img_w, img_h = img.size
+            if img_w <= 0 or img_h <= 0:
+                raise ValueError("Invalid image size")
+            scale = min(cont_w / img_w, cont_h / img_h)
+            new_size = (max(1, int(img_w * scale)), max(1, int(img_h * scale)))
+            resized = img.resize(new_size, Image.Resampling.LANCZOS)
+            self._img_ref = ImageTk.PhotoImage(resized)
+            self.image_label.config(image=self._img_ref, text="")
+        except Exception:
+            self._img_ref = None
+            self.image_label.config(image="", text="Нет изображения")
 
     def _show_audio_error(self, title: str, message: str):
         try:
@@ -9190,11 +9583,8 @@ class RepeatWindow(tk.Toplevel):
             )
             self.lbl_text.pack(anchor="w")
             
-            # Загружаем изображение с возможностью масштабирования
-            if img_path:
-                self.image_label.load_image(img_path)
-            else:
-                self.image_label.load_image(None)
+            # Загружаем изображение
+            self._render_card_image(img_path)
                 
         else:
             # Показываем лицевую сторону
@@ -9247,19 +9637,11 @@ class RepeatWindow(tk.Toplevel):
                 )
                 self.lbl_text.pack(anchor="w")
             
-            # Загружаем изображение с возможностью масштабирования
-            if img_path:
-                self.image_label.load_image(img_path)
-            else:
-                self.image_label.load_image(None)
+            # Загружаем изображение
+            self._render_card_image(img_path)
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
-        self.after(
-            10,
-            lambda: self.image_label.set_container_size(
-                self.image_frame.winfo_width(), self.image_frame.winfo_height()
-            ),
-        )
+        self.after(10, self._render_card_image)
         
         # Обновляем аудио-плеер
         self.update_audio_player()
@@ -9282,7 +9664,7 @@ class RepeatWindow(tk.Toplevel):
             font=("Segoe UI", 12, "bold"),
         )
         self.lbl_text.pack(expand=True)
-        self.image_label.load_image(None)
+        self._render_card_image(None)
         for btn in [
             self.btn_prev,
             self.btn_next,
@@ -9762,11 +10144,8 @@ class ReviewWindow(tk.Toplevel):
 
         self.lbl_text.config(text=text)
 
-        # Загружаем изображение с возможностью масштабирования
-        if img_path:
-            self.image_label.load_image(img_path)
-        else:
-            self.image_label.load_image(None)
+            # Загружаем изображение
+            self._render_card_image(img_path)
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
 
