@@ -349,6 +349,28 @@ def run_migrations(conn: sqlite3.Connection):
     _add_column_if_missing(cur, "user_profile", "wikimedia_tickets", "INTEGER DEFAULT 0")
     _add_column_if_missing(cur, "user_profile", "first_import_ts", "INTEGER DEFAULT 0")
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            created_at INTEGER,
+            premium_until INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'обычный',
+            verified INTEGER DEFAULT 0,
+            starter_bonus_claimed INTEGER DEFAULT 0
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """
+    )
+    _add_column_if_missing(cur, "users", "starter_bonus_claimed", "INTEGER DEFAULT 0")
+
     # Добавляем дефолтный тип заметки "Basic"
     cur.execute(
         "SELECT id FROM note_types WHERE name = 'Basic' LIMIT 1;"
