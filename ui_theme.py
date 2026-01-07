@@ -17,6 +17,9 @@ PALETTE = {
     "success": "#2EE59D",
     "warning": "#F59E0B",
     "error": "#FF4D4D",
+    "card_surface": "#FFFFFF",
+    "card_text": "#111111",
+    "card_border": "#E0E0E0",
 }
 
 
@@ -60,6 +63,12 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     style.configure(
         "Card.TFrame",
         background=PALETTE["panel"],
+        relief="flat",
+        borderwidth=1,
+    )
+    style.configure(
+        "CardSurface.TFrame",
+        background=PALETTE["card_surface"],
         relief="flat",
         borderwidth=1,
     )
@@ -231,6 +240,14 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
         labeloutside=False,
     )
     style.configure(
+        "CardSurface.TLabelframe",
+        background=PALETTE["card_surface"],
+        bordercolor=PALETTE["card_border"],
+        relief="solid",
+        padding=14,
+        labeloutside=False,
+    )
+    style.configure(
         "TLabelframe.Label",
         background=PALETTE["panel"],
         foreground=PALETTE["muted"],
@@ -239,6 +256,16 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
         "Card.TLabelframe.Label",
         background=PALETTE["panel"],
         foreground=PALETTE["muted"],
+    )
+    style.configure(
+        "CardSurface.TLabelframe.Label",
+        background=PALETTE["card_surface"],
+        foreground=PALETTE["card_text"],
+    )
+    style.configure(
+        "CardSurface.TLabel",
+        background=PALETTE["card_surface"],
+        foreground=PALETTE["card_text"],
     )
 
     return style, PALETTE
@@ -269,3 +296,33 @@ def style_card(widget: tk.Widget, palette: dict | None = None, padded: bool = Fa
             pass
     if padded and isinstance(widget, (ttk.Frame, ttk.LabelFrame)):
         widget.configure(padding=14)
+
+
+def style_card_surface(widget: tk.Widget, palette: dict | None = None, padded: bool = False) -> None:
+    colors = palette or PALETTE
+    try:
+        widget.configure(
+            bg=colors["card_surface"],
+            highlightthickness=1,
+            highlightbackground=colors["card_border"],
+            relief="flat",
+        )
+    except tk.TclError:
+        try:
+            widget.configure(style="CardSurface.TFrame")
+        except tk.TclError:
+            pass
+    if padded and isinstance(widget, (ttk.Frame, ttk.LabelFrame)):
+        widget.configure(padding=14)
+
+
+def style_card_surface_text(widget: tk.Text, palette: dict | None = None) -> None:
+    colors = palette or PALETTE
+    widget.configure(
+        bg=colors["card_surface"],
+        fg=colors["card_text"],
+        insertbackground=colors["card_text"],
+        highlightthickness=1,
+        highlightbackground=colors["card_border"],
+        relief="flat",
+    )
