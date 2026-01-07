@@ -73,7 +73,14 @@ from payments import PACKAGES, build_payment_url, verify_payment
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
 from ui_progress import BusyDialog, TaskRunner
-from importers import import_docx, import_odt, import_pdf
+from importers import (
+    DEFAULT_CHUNK_CHARS,
+    DEFAULT_MAX_PDF_PAGES_SOFT,
+    DEFAULT_MAX_TOTAL_CHARS_SOFT,
+    import_docx,
+    import_odt,
+    import_pdf,
+)
 from webview_editor import QuillEditorWindow, QUILL_WEBVIEW_AVAILABLE
 from quill_cards import parse_quill_delta
 from overdue_badges import (
@@ -1063,6 +1070,9 @@ WIKIMEDIA_TICKET_SIZE = 10
 CARD_IMAGE_CREDIT_COST = 1
 NOTES_PAGE_COST_BASIC = 49
 NOTES_PAGE_COST_PRO = 25
+SAFE_IMPORT_CHUNK_CHARS = DEFAULT_CHUNK_CHARS
+SAFE_IMPORT_MAX_TOTAL_CHARS = DEFAULT_MAX_TOTAL_CHARS_SOFT
+SAFE_IMPORT_MAX_PDF_PAGES = DEFAULT_MAX_PDF_PAGES_SOFT
 ACTIVATION_MIN_HOURS = 24
 ACTIVATION_MIN_CARDS = 10
 ACTIVATION_MIN_REVIEWS = 20
@@ -8041,6 +8051,7 @@ class AnkiApp(tk.Tk):
 
         file_var = tk.StringVar(value="Файл не выбран")
         page_var = tk.StringVar(value="")
+        page_range_var = tk.StringVar(value="")
         cost_var = tk.StringVar(value=f"Стоимость: {compute_cost()} ⚡ за страницу")
         editor_status_var = tk.StringVar(value="Редактор: не открыт")
 
@@ -8056,6 +8067,14 @@ class AnkiApp(tk.Tk):
             width=14,
         )
         page_combo.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+
+        ttk.Label(import_frame, text="Диапазон страниц (PDF):").grid(row=2, column=0, sticky="w", padx=6, pady=6)
+        page_range_entry = ttk.Entry(import_frame, textvariable=page_range_var, width=24)
+        page_range_entry.grid(row=2, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(
+            import_frame,
+            text=f"Напр.: 1-5,8. Пусто = первые {SAFE_IMPORT_MAX_PDF_PAGES} стр.",
+        ).grid(row=3, column=1, sticky="w", padx=6, pady=(0, 6))
 
         def update_cost_label():
             cost_var.set(f"Стоимость: {compute_cost()} ⚡ за страницу")
@@ -8076,17 +8095,36 @@ class AnkiApp(tk.Tk):
             ext = Path(path).suffix.lower()
             try:
                 if ext == ".docx":
-                    chunks = import_docx(path)
+                    chunks = import_docx(
+                        path,
+                        chunk_chars=SAFE_IMPORT_CHUNK_CHARS,
+                        max_total_chars=SAFE_IMPORT_MAX_TOTAL_CHARS,
+                    )
                     state["file_kind"] = "docx"
                 elif ext == ".odt":
-                    chunks = import_odt(path)
+                    chunks = import_odt(
+                        path,
+                        chunk_chars=SAFE_IMPORT_CHUNK_CHARS,
+                        max_total_chars=SAFE_IMPORT_MAX_TOTAL_CHARS,
+                    )
                     state["file_kind"] = "odt"
                 elif ext == ".pdf":
-                    chunks = import_pdf(path)
+                    chunks = import_pdf(
+                        path,
+                        page_range=page_range_var.get(),
+                        max_pages=SAFE_IMPORT_MAX_PDF_PAGES,
+                        max_total_chars=SAFE_IMPORT_MAX_TOTAL_CHARS,
+                    )
                     state["file_kind"] = "pdf"
                 else:
                     messagebox.showerror("Импорт", "Поддерживаются только .docx, .odt, .pdf.")
                     return
+            except MemoryError:
+                messagebox.showerror(
+                    "Импорт",
+                    "Недостаточно памяти. Укажите меньший файл или диапазон страниц.",
+                )
+                return
             except RuntimeError as exc:
                 messagebox.showerror("Импорт", str(exc))
                 return
