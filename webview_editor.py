@@ -2,9 +2,13 @@ import importlib
 import importlib.util
 import json
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 QUILL_WEBVIEW_AVAILABLE = importlib.util.find_spec("webview") is not None
+
+_WEBVIEW_THREAD: threading.Thread | None = None
+_WEBVIEW_THREAD_LOCK = threading.Lock()
+_WEBVIEW_READY = threading.Event()
 
 
 class QuillEditorBridge:
@@ -24,52 +28,110 @@ class QuillEditorBridge:
         return True
 
 
+def _ensure_webview_thread() -> None:
+    if _WEBVIEW_THREAD and _WEBVIEW_THREAD.is_alive():
+        return
+    with _WEBVIEW_THREAD_LOCK:
+        if _WEBVIEW_THREAD and _WEBVIEW_THREAD.is_alive():
+            return
+        webview = importlib.import_module("webview")
+
+        def _start():
+            webview.start(lambda: _WEBVIEW_READY.set(), debug=False, gui="tkinter")
+
+        thread = threading.Thread(target=_start, daemon=True)
+        thread.start()
+        globals()["_WEBVIEW_THREAD"] = thread
+
+
 class QuillEditorWindow:
-    def __init__(self, title: str = "Редактор конспекта") -> None:
+    def __init__(self, title: str = "Редактор конспекта", on_close: Optional[callable] = None) -> None:
         self.title = title
         self.bridge = QuillEditorBridge()
         self._window = None
-        self._thread: threading.Thread | None = None
         self._ready_event = threading.Event()
+        self._closed = True
+        self._on_close_callback = on_close
 
     def is_running(self) -> bool:
-        return self._window is not None
+        return self._window is not None and not self._closed
 
     def show(self) -> None:
         if not QUILL_WEBVIEW_AVAILABLE:
             raise RuntimeError("pywebview не установлен. Установите: pip install pywebview")
-        if self._thread and self._thread.is_alive():
-            return
         webview = importlib.import_module("webview")
+        if self._window is not None and not self._closed:
+            self._bring_to_front()
+            return
         html = self._build_html()
+        self._ready_event.clear()
         self._window = webview.create_window(
-            self.title,
+            "Редактор конспекта (Quill)",
             html=html,
-            width=980,
-            height=720,
+            width=1100,
+            height=700,
+            resizable=True,
             js_api=self.bridge,
         )
+        self._closed = False
+        try:
+            self._window.events.loaded += self._on_ready
+            self._window.events.closed += self._on_closed
+        except Exception:
+            pass
+        _ensure_webview_thread()
+        self._bring_to_front()
 
-        def _start():
-            webview.start(self._on_ready, debug=False, gui="tkinter")
-
-        self._thread = threading.Thread(target=_start, daemon=True)
-        self._thread.start()
+    def _bring_to_front(self) -> None:
+        if not self._window:
+            return
+        try:
+            self._window.bring_to_front()
+        except Exception:
+            pass
 
     def _on_ready(self) -> None:
         self._ready_event.set()
 
+    def _on_closed(self) -> None:
+        self._closed = True
+        self._window = None
+        self._ready_event.clear()
+        if self._on_close_callback:
+            self._on_close_callback()
+
     def wait_ready(self, timeout: float = 5.0) -> bool:
+        if _WEBVIEW_READY.is_set():
+            return self._ready_event.wait(timeout)
+        _WEBVIEW_READY.wait(timeout)
         return self._ready_event.wait(timeout)
 
-    def set_content(self, payload: Dict[str, Any]) -> None:
+    def set_html(self, html: str) -> None:
         if not self._window:
             return
         self.wait_ready()
-        data = json.dumps(payload, ensure_ascii=False)
+        data = json.dumps({"html": html}, ensure_ascii=False)
         self._window.evaluate_js(f"setEditorContent({data});")
 
-    def get_content(self) -> Dict[str, Any]:
+    def get_html(self) -> str:
+        payload = self._get_content_payload()
+        return payload.get("html", "")
+
+    def get_delta(self) -> Dict[str, Any]:
+        payload = self._get_content_payload()
+        delta = payload.get("delta")
+        return delta if isinstance(delta, dict) else {}
+
+    def get_selection_html(self) -> str:
+        payload = self._get_selection_payload()
+        return payload.get("html", "")
+
+    def get_selection_delta(self) -> Dict[str, Any]:
+        payload = self._get_selection_payload()
+        delta = payload.get("delta")
+        return delta if isinstance(delta, dict) else {}
+
+    def _get_content_payload(self) -> Dict[str, Any]:
         if not self._window:
             return {}
         self.wait_ready()
@@ -79,7 +141,7 @@ class QuillEditorWindow:
         except json.JSONDecodeError:
             return {}
 
-    def get_selection(self) -> Dict[str, Any]:
+    def _get_selection_payload(self) -> Dict[str, Any]:
         if not self._window:
             return {}
         self.wait_ready()
