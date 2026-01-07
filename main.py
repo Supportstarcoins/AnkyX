@@ -6240,10 +6240,10 @@ class AnkiApp(tk.Tk):
                 is_premium=1,
                 starter_50_claimed=1,
             )
-            self.credits_service.add(
+            self.credits_service.add_credits(
                 self.user_id,
                 250,
-                reason="Стартовый бонус",
+                reason="Бонус регистрации: 250 ⚡",
                 meta={"source": "starter_bonus"},
             )
         self.refresh_account_status_vars()
@@ -6344,13 +6344,15 @@ class AnkiApp(tk.Tk):
             return False
 
         if cost_credits > 0:
-            ok = self.credits_service.spend(
-                self.user_id,
-                cost_credits,
-                reason=feature_key,
-                meta=meta or {},
-            )
-            if not ok:
+            reason = self._build_credit_reason(feature_key, cost_credits, meta or {})
+            try:
+                self.credits_service.spend_credits(
+                    self.user_id,
+                    cost_credits,
+                    reason=reason,
+                    meta=meta or {},
+                )
+            except ValueError:
                 messagebox.showwarning(
                     "Недостаточно кредитов",
                     "Не удалось списать кредиты. Проверьте баланс.",
@@ -6398,11 +6400,13 @@ class AnkiApp(tk.Tk):
         self.refresh_activation_progress_ui()
 
     def _spend_for_ai_image(self, feature_key: str = "card_image_generation", meta: dict | None = None) -> bool:
+        payload = meta or {}
+        payload.setdefault("images", 1)
         return self.guard_premium_and_spend(
             feature_key,
             CARD_IMAGE_CREDIT_COST,
             require_premium=True,
-            meta=meta or {},
+            meta=payload,
         )
 
     def _count_cards_created(self) -> int:
@@ -6502,10 +6506,10 @@ class AnkiApp(tk.Tk):
             return
         progress = self.get_activation_progress()
         if all(step["done"] for step in progress["steps"]):
-            self.credits_service.add(
+            self.credits_service.add_credits(
                 self.user_id,
                 200,
-                reason="Бонус за активацию",
+                reason="Активация аккаунта: +200 ⚡",
                 meta={"source": "activation_bonus"},
             )
             self.user_profile = update_user_profile(self.user_id, activation_200_claimed=1)
@@ -6559,8 +6563,8 @@ class AnkiApp(tk.Tk):
         self.credits_service.add_credits(
             self.user_id,
             credits_amount,
-            reason=f"Покупка пакета {package.get('title')}",
-            meta={"payment": details},
+            reason=self._build_purchase_reason(package),
+            meta={"payment": details, "package_id": package_id},
         )
         self._after_balance_change()
 
@@ -6585,6 +6589,41 @@ class AnkiApp(tk.Tk):
                 "end",
                 values=(ts_str, amount, note.strip()),
             )
+
+    def _build_credit_reason(self, feature_key: str, cost_credits: int, meta: dict) -> str:
+        key = (feature_key or "").strip()
+        lowered = key.lower()
+        if lowered in {"ocr_image", "ocr"}:
+            mode = (meta.get("ocr_mode") or "").lower()
+            pages = int(meta.get("pages") or 1)
+            if mode == "pro":
+                return f"OCR PRO 👑: {pages} стр ({cost_credits} ⚡)"
+            return f"OCR: {pages} стр ({cost_credits} ⚡)"
+        if lowered == "image_id_import":
+            files = int(meta.get("files") or 1)
+            return f"Импорт изображений: {files} шт ({cost_credits} ⚡)"
+        if lowered == "wikimedia_bundle":
+            bundle = int(meta.get("bundle") or 0)
+            if bundle:
+                return f"Wikimedia: {bundle} стр ({cost_credits} ⚡)"
+            return f"Wikimedia: {cost_credits} ⚡"
+        if lowered in {"card_image_generation", "ai image generation"}:
+            images = int(meta.get("images") or 1)
+            return f"AI-картинки: +{images} шт (доплата {cost_credits} ⚡)"
+        if lowered == "ai video generation":
+            videos = int(meta.get("videos") or 1)
+            return f"AI-видео: +{videos} шт (доплата {cost_credits} ⚡)"
+        return key or "Операция"
+
+    def _build_purchase_reason(self, package: dict) -> str:
+        credits = int(package.get("credits") or 0)
+        price = package.get("price")
+        currency = package.get("currency") or "USD"
+        currency_symbols = {"USD": "$", "EUR": "€", "RUB": "₽"}
+        if price is None:
+            return f"Покупка: {credits} ⚡"
+        symbol = currency_symbols.get(currency, currency)
+        return f"Покупка: {credits} ⚡ ({symbol}{price:.2f})"
 
     def refresh_referral_info(self):
         if not self.ref_summary_vars:
@@ -8826,7 +8865,7 @@ class AnkiApp(tk.Tk):
                 "AI image generation",
                 2,
                 require_premium=True,
-                meta={"operation": "ai_image"},
+                meta={"operation": "ai_image", "images": 1},
             ):
                 return
             set_preview_text("Генерация изображения…")
@@ -8845,7 +8884,7 @@ class AnkiApp(tk.Tk):
                 "AI video generation",
                 20,
                 require_premium=True,
-                meta={"operation": "ai_video"},
+                meta={"operation": "ai_video", "videos": 1},
             ):
                 return
             set_preview_text("Генерация видео…")
@@ -9124,7 +9163,11 @@ class AnkiApp(tk.Tk):
                 "ocr_image",
                 OCR_CREDIT_COST,
                 require_premium=True,
-                meta={"operation": "ocr_image"},
+                meta={
+                    "operation": "ocr_image",
+                    "ocr_mode": selected_mode,
+                    "pages": 1,
+                },
             ):
                 return
 
