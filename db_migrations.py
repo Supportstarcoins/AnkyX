@@ -286,12 +286,14 @@ def run_migrations(conn: sqlite3.Connection):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
             ts INTEGER NOT NULL,
-            delta INTEGER NOT NULL,
+            delta INTEGER NOT NULL CHECK (delta != 0),
             reason TEXT,
-            meta_json TEXT
+            meta TEXT
         );
         """
     )
+    _add_column_if_missing(cur, "credits_ledger", "delta", "INTEGER")
+    _add_column_if_missing(cur, "credits_ledger", "meta", "TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS referral_users (
