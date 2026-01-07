@@ -8249,15 +8249,15 @@ class AnkiApp(tk.Tk):
                 row.pack(fill=tk.X, pady=6)
                 ttk.Label(
                     row,
-                    text=f\"{idx}. Front: {card.get('front', '')}\",
+                    text=f"{idx}. Front: {card.get('front', '')}",
                     wraplength=720,
-                ).pack(anchor=\"w\")
+                ).pack(anchor="w")
                 ttk.Label(
                     row,
-                    text=f\"Back: {card.get('back', '')}\",
-                    style=\"Muted.TLabel\",
+                    text=f"Back: {card.get('back', '')}",
+                    style="Muted.TLabel",
                     wraplength=720,
-                ).pack(anchor=\"w\", pady=(4, 0))
+                ).pack(anchor="w", pady=(4, 0))
 
         def save_cards():
             if not state["cards"]:
@@ -11121,8 +11121,8 @@ class ReviewWindow(tk.Toplevel):
 
         self.lbl_text.config(text=text)
 
-            # Загружаем изображение
-            self._render_card_image(img_path)
+        # Загружаем изображение
+        self._render_card_image(img_path)
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
 
