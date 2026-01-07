@@ -73,6 +73,9 @@ from payments import PACKAGES, build_payment_url, verify_payment
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
 from ui_progress import BusyDialog, TaskRunner
+from importers import import_docx, import_odt, import_pdf
+from webview_editor import QuillEditorWindow, QUILL_WEBVIEW_AVAILABLE
+from quill_cards import parse_quill_delta
 from overdue_badges import (
     PhaseOverdueBadges,
     ensure_due_column,
@@ -1058,6 +1061,8 @@ IMAGE_ID_IMPORT_COST = 5
 WIKIMEDIA_IMPORT_COST = 5
 WIKIMEDIA_TICKET_SIZE = 10
 CARD_IMAGE_CREDIT_COST = 1
+NOTES_PAGE_COST_BASIC = 49
+NOTES_PAGE_COST_PRO = 25
 ACTIVATION_MIN_HOURS = 24
 ACTIVATION_MIN_CARDS = 10
 ACTIVATION_MIN_REVIEWS = 20
@@ -3835,6 +3840,7 @@ class AnkiApp(tk.Tk):
         self.generation_menu = None
         self.generation_menu_indexes: dict[str, int] = {}
         self.mode_actions: dict[str, callable] = {}
+        self.quill_editor: QuillEditorWindow | None = None
         self.user_id_var = tk.StringVar(value=self.user_id)
         self.account_status_var = tk.StringVar(value="")
         self.premium_timer_var = tk.StringVar(value="00:00:00")
@@ -3943,6 +3949,10 @@ class AnkiApp(tk.Tk):
         self.generation_menu = gen_menu
         gen_menu.add_command(label="Генерация из текста…", command=self.open_generate_from_text_window)
         self.generation_menu_indexes["text"] = gen_menu.index("end")
+        gen_menu.add_command(
+            label="Генерация по конспекту AI + картинки…",
+            command=self.open_generate_from_notes_window,
+        )
         gen_menu.add_command(
             label="Режим генерация из текста AI 👑",
             command=self.open_generate_from_text_ai_window,
@@ -7961,6 +7971,306 @@ class AnkiApp(tk.Tk):
         except Exception:
             return None
         return path
+
+    def open_generate_from_notes_window(self):
+        if self.selected_deck_id is None:
+            messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Генерация по конспекту АИ+ картинки")
+        win.geometry("980x740")
+        win.grab_set()
+
+        main_frame = ttk.Frame(win, style="Surface.TFrame")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        ttk.Label(
+            main_frame,
+            text="Генерация по конспекту АИ+ картинки",
+            style="Section.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+
+        state = {"chunks": [], "file_path": None, "file_kind": None, "cards": []}
+
+        def compute_cost() -> int:
+            return NOTES_PAGE_COST_PRO if self.is_premium_active() else NOTES_PAGE_COST_BASIC
+
+        import_frame = ttk.LabelFrame(main_frame, text="Импорт файла")
+        import_frame.pack(fill=tk.X, padx=4, pady=6)
+        import_frame.columnconfigure(1, weight=1)
+
+        file_var = tk.StringVar(value="Файл не выбран")
+        page_var = tk.StringVar(value="")
+        cost_var = tk.StringVar(value=f"Стоимость: {compute_cost()} ⚡ за страницу")
+        editor_status_var = tk.StringVar(value="Редактор: не открыт")
+
+        ttk.Label(import_frame, text="Файл:").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(import_frame, textvariable=file_var).grid(row=0, column=1, sticky="w", padx=6, pady=6)
+
+        ttk.Label(import_frame, text="Страница/чанк:").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        page_combo = ttk.Combobox(
+            import_frame,
+            textvariable=page_var,
+            values=[],
+            state="readonly",
+            width=14,
+        )
+        page_combo.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+
+        def update_cost_label():
+            cost_var.set(f"Стоимость: {compute_cost()} ⚡ за страницу")
+
+        def import_file():
+            path = filedialog.askopenfilename(
+                title="Импорт файла",
+                filetypes=[
+                    ("Документы", "*.docx *.odt *.pdf"),
+                    ("DOCX", "*.docx"),
+                    ("ODT", "*.odt"),
+                    ("PDF", "*.pdf"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if not path:
+                return
+            ext = Path(path).suffix.lower()
+            try:
+                if ext == ".docx":
+                    chunks = import_docx(path)
+                    state["file_kind"] = "docx"
+                elif ext == ".odt":
+                    chunks = import_odt(path)
+                    state["file_kind"] = "odt"
+                elif ext == ".pdf":
+                    chunks = import_pdf(path)
+                    state["file_kind"] = "pdf"
+                else:
+                    messagebox.showerror("Импорт", "Поддерживаются только .docx, .odt, .pdf.")
+                    return
+            except RuntimeError as exc:
+                messagebox.showerror("Импорт", str(exc))
+                return
+
+            if not chunks:
+                messagebox.showwarning("Импорт", "Текст не найден.")
+                return
+
+            state["chunks"] = chunks
+            state["file_path"] = path
+            file_var.set(os.path.basename(path))
+            page_values = [str(i + 1) for i in range(len(chunks))]
+            page_combo.configure(values=page_values)
+            page_var.set(page_values[0])
+            update_cost_label()
+
+            if state["file_kind"] == "pdf":
+                empty_pages = [idx + 1 for idx, text in enumerate(chunks) if not text.strip()]
+                if empty_pages:
+                    messagebox.showwarning(
+                        "PDF",
+                        "Некоторые страницы без текста. Возможно, это скан.\n"
+                        "Для сканов нужен OCR.",
+                    )
+
+        def ensure_editor() -> QuillEditorWindow | None:
+            if not QUILL_WEBVIEW_AVAILABLE:
+                messagebox.showerror("Редактор", "pywebview не установлен. Установите: pip install pywebview")
+                return None
+            if self.quill_editor is None or not self.quill_editor.is_running():
+                self.quill_editor = QuillEditorWindow()
+                try:
+                    self.quill_editor.show()
+                except RuntimeError as exc:
+                    messagebox.showerror("Редактор", str(exc))
+                    return None
+            editor_status_var.set("Редактор: открыт")
+            return self.quill_editor
+
+        def load_selected_into_editor():
+            editor = ensure_editor()
+            if not editor:
+                return
+            if not state["chunks"]:
+                messagebox.showwarning("Редактор", "Сначала импортируйте файл.")
+                return
+            try:
+                index = int(page_var.get()) - 1
+            except ValueError:
+                index = 0
+            index = max(0, min(index, len(state["chunks"]) - 1))
+            content = state["chunks"][index]
+            editor.set_content({"html": content})
+
+        def build_cards_from_selection() -> list[dict[str, str]]:
+            editor = ensure_editor()
+            if not editor:
+                return []
+            payload = editor.get_selection()
+            if not payload:
+                payload = editor.get_content()
+            delta = payload.get("delta") or {}
+            if not delta:
+                return []
+            return parse_quill_delta(delta)
+
+        def charge_for_page() -> bool:
+            cost = compute_cost()
+            meta = {
+                "operation": "notes_wysiwyg_generation",
+                "file": state["file_path"],
+                "page": page_var.get(),
+            }
+            return self.guard_premium_and_spend(
+                "Генерация карточек из конспекта",
+                cost,
+                require_premium=False,
+                meta=meta,
+            )
+
+        def generate_cards():
+            if not state["chunks"]:
+                messagebox.showwarning("Генерация", "Сначала импортируйте файл и загрузите страницу в редактор.")
+                return
+            update_cost_label()
+            if not charge_for_page():
+                return
+            cards = build_cards_from_selection()
+            if not cards:
+                messagebox.showinfo("Генерация", "Карточки не найдены. Проверьте разметку (bold/underline/цвет).")
+                return
+            state["cards"] = cards
+            messagebox.showinfo("Генерация", f"Сформировано карточек: {len(cards)}")
+
+        def open_preview_window():
+            if not state["cards"]:
+                messagebox.showwarning("Предпросмотр", "Сначала сформируйте карточки.")
+                return
+            preview_win = tk.Toplevel(self)
+            preview_win.title("Предпросмотр карточек")
+            preview_win.geometry("800x600")
+            preview_win.grab_set()
+
+            container = ttk.Frame(preview_win)
+            container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            canvas = tk.Canvas(container, highlightthickness=0)
+            scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+            list_frame = ttk.Frame(canvas)
+
+            list_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+            )
+            canvas.create_window((0, 0), window=list_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scroll.set)
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+            for idx, card in enumerate(state["cards"], start=1):
+                row = ttk.Frame(list_frame, style="Card.TFrame", padding=8)
+                row.pack(fill=tk.X, pady=6)
+                ttk.Label(
+                    row,
+                    text=f\"{idx}. Front: {card.get('front', '')}\",
+                    wraplength=720,
+                ).pack(anchor=\"w\")
+                ttk.Label(
+                    row,
+                    text=f\"Back: {card.get('back', '')}\",
+                    style=\"Muted.TLabel\",
+                    wraplength=720,
+                ).pack(anchor=\"w\", pady=(4, 0))
+
+        def save_cards():
+            if not state["cards"]:
+                messagebox.showwarning("Сохранение", "Сначала сформируйте карточки.")
+                return
+            add_images = add_images_var.get()
+            image_limit = max(0, min(10, int(image_limit_var.get() or 0)))
+
+            created = 0
+            for idx, card in enumerate(state["cards"]):
+                image_path = ""
+                if add_images and idx < image_limit:
+                    image_path = self._create_ai_placeholder_image(card.get("front", "")) or ""
+
+                note_fields = {
+                    "word": card.get("front", ""),
+                    "translation": card.get("back", ""),
+                    "example": "",
+                    "level": 1,
+                    "image": image_path,
+                    "front_image_path": image_path,
+                    "back_image_path": "",
+                    "audio_path": None,
+                    "front": card.get("front", ""),
+                    "back": card.get("back", ""),
+                }
+                _, cards_created = create_note_with_cards(
+                    self.selected_deck_id,
+                    note_fields,
+                    note_type_id=ensure_generated_note_type_id(),
+                )
+                created += cards_created
+
+            messagebox.showinfo("Сохранено", f"Сохранено карточек: {created}")
+            self.refresh_decks()
+            self.update_overdue_badge()
+            self.refresh_activation_progress_ui()
+
+        ttk.Button(import_frame, text="Импорт файла", command=import_file).grid(
+            row=0, column=2, padx=6, pady=6
+        )
+        ttk.Button(import_frame, text="Загрузить в редактор", command=load_selected_into_editor).grid(
+            row=1, column=2, padx=6, pady=6
+        )
+
+        editor_frame = ttk.LabelFrame(main_frame, text="Редактор конспекта (Quill)")
+        editor_frame.pack(fill=tk.X, padx=4, pady=6)
+
+        ttk.Label(editor_frame, textvariable=editor_status_var).pack(anchor="w", padx=6, pady=(6, 2))
+        ttk.Button(editor_frame, text="Открыть редактор", command=ensure_editor).pack(
+            anchor="w", padx=6, pady=(0, 6)
+        )
+
+        actions_frame = ttk.LabelFrame(main_frame, text="Генерация карточек")
+        actions_frame.pack(fill=tk.X, padx=4, pady=6)
+
+        add_images_var = tk.BooleanVar(value=True)
+        image_limit_var = tk.StringVar(value="10")
+
+        add_images_row = ttk.Frame(actions_frame)
+        add_images_row.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Checkbutton(
+            add_images_row,
+            text="Добавлять AI-картинки (до 10 на страницу)",
+            variable=add_images_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(add_images_row, text="Лимит:").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Spinbox(
+            add_images_row,
+            from_=0,
+            to=10,
+            textvariable=image_limit_var,
+            width=5,
+        ).pack(side=tk.LEFT)
+
+        buttons_row = ttk.Frame(actions_frame)
+        buttons_row.pack(fill=tk.X, padx=6, pady=6)
+
+        ttk.Button(
+            buttons_row,
+            text="Сделать карточки из выделенного",
+            command=generate_cards,
+        ).pack(side=tk.LEFT)
+        ttk.Label(buttons_row, textvariable=cost_var).pack(side=tk.LEFT, padx=10)
+        ttk.Button(buttons_row, text="Предпросмотр", command=open_preview_window).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Button(buttons_row, text="Сохранить в колоду", command=save_cards).pack(
+            side=tk.RIGHT, padx=4
+        )
 
     def open_generate_from_text_window(self):
         if self.selected_deck_id is None:
