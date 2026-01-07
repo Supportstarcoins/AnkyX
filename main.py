@@ -140,6 +140,61 @@ def _fix_tk_default_fonts(root: tk.Tk, family: str = "Segoe UI", size: int = 11)
             pass
 
 
+class GlobalLoadingOverlay:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self._visible = False
+        self._determinate = False
+        self._overlay = tk.Frame(root, bg="#0B0D12")
+        self._overlay.place_forget()
+        self._overlay.bind("<Button-1>", lambda _e: "break")
+        self._overlay.bind("<ButtonRelease-1>", lambda _e: "break")
+        self._overlay.bind("<Key>", lambda _e: "break")
+        self._overlay.bind("<MouseWheel>", lambda _e: "break")
+        self._overlay.bind("<Button-2>", lambda _e: "break")
+        self._overlay.bind("<Button-3>", lambda _e: "break")
+
+        container = ttk.Frame(self._overlay)
+        container.place(relx=0.5, rely=0.5, anchor="center")
+
+        self._progress = ttk.Progressbar(container, mode="indeterminate", length=260)
+        self._progress.pack(pady=(0, 8))
+        self._label = ttk.Label(container, text="Загрузка")
+        self._label.pack()
+
+    def show(self, parent: tk.Widget | None = None, determinate: bool = False, maximum: int = 100) -> None:
+        _ = parent
+        self._determinate = determinate
+        self._overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._overlay.lift()
+        try:
+            self._overlay.grab_set()
+        except Exception:
+            pass
+        self._progress.configure(mode="determinate" if determinate else "indeterminate", maximum=maximum)
+        if determinate:
+            self._progress.stop()
+            self._progress["value"] = 0
+        else:
+            self._progress.start(10)
+        self._visible = True
+
+    def set_progress(self, value: float) -> None:
+        if self._determinate:
+            self._progress["value"] = value
+
+    def hide(self) -> None:
+        if not self._visible:
+            return
+        try:
+            self._overlay.grab_release()
+        except Exception:
+            pass
+        self._progress.stop()
+        self._overlay.place_forget()
+        self._visible = False
+
+
 # ==========================
 # OCR: pytesseract + автопоиск tesseract.exe
 # ==========================
@@ -3814,6 +3869,7 @@ class AnkiApp(tk.Tk):
         self.busy_dialog = BusyDialog(self)
         self.task_runner = TaskRunner(self, self.busy_dialog)
         self._loading_depth = 0
+        self.global_loading_overlay = GlobalLoadingOverlay(self)
 
         self.image_import_watch_job = None
 
@@ -3928,6 +3984,43 @@ class AnkiApp(tk.Tk):
                 self.busy_dialog.close()
             except Exception:
                 pass
+
+    def run_with_loading(
+        self,
+        fn,
+        *args,
+        determinate: bool = False,
+        maximum: int = 100,
+        on_success=None,
+        on_error=None,
+        **kwargs,
+    ) -> None:
+        self.global_loading_overlay.show(self, determinate=determinate, maximum=maximum)
+
+        def _worker():
+            result = None
+            error = None
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as exc:
+                error = exc
+
+            def _finish():
+                try:
+                    if error is not None:
+                        if on_error:
+                            on_error(error)
+                        else:
+                            messagebox.showerror("Ошибка", str(error))
+                    else:
+                        if on_success:
+                            on_success(result)
+                finally:
+                    self.global_loading_overlay.hide()
+
+            self.after(0, _finish)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def run_task(self, title: str, mode: str, task_fn, on_success, on_error, total=None):
         self.task_runner.run_task(title, mode, task_fn, on_success, on_error, total)
@@ -8040,7 +8133,7 @@ class AnkiApp(tk.Tk):
             style="Section.TLabel",
         ).pack(anchor="w", pady=(0, 8))
 
-        state = {"chunks": [], "file_path": None, "file_kind": None, "cards": []}
+        state = {"chunks": [], "file_path": None, "file_kind": None, "cards": [], "editor_open": False}
 
         def compute_cost() -> int:
             return NOTES_PAGE_COST_PRO if self.is_premium_active() else NOTES_PAGE_COST_BASIC
@@ -8093,21 +8186,22 @@ class AnkiApp(tk.Tk):
             if not path:
                 return
             ext = Path(path).suffix.lower()
-            try:
+
+            def _task():
                 if ext == ".docx":
                     chunks = import_docx(
                         path,
                         chunk_chars=SAFE_IMPORT_CHUNK_CHARS,
                         max_total_chars=SAFE_IMPORT_MAX_TOTAL_CHARS,
                     )
-                    state["file_kind"] = "docx"
+                    file_kind = "docx"
                 elif ext == ".odt":
                     chunks = import_odt(
                         path,
                         chunk_chars=SAFE_IMPORT_CHUNK_CHARS,
                         max_total_chars=SAFE_IMPORT_MAX_TOTAL_CHARS,
                     )
-                    state["file_kind"] = "odt"
+                    file_kind = "odt"
                 elif ext == ".pdf":
                     chunks = import_pdf(
                         path,
@@ -8115,53 +8209,65 @@ class AnkiApp(tk.Tk):
                         max_pages=SAFE_IMPORT_MAX_PDF_PAGES,
                         max_total_chars=SAFE_IMPORT_MAX_TOTAL_CHARS,
                     )
-                    state["file_kind"] = "pdf"
+                    file_kind = "pdf"
                 else:
-                    messagebox.showerror("Импорт", "Поддерживаются только .docx, .odt, .pdf.")
+                    raise RuntimeError("Поддерживаются только .docx, .odt, .pdf.")
+                return {"chunks": chunks, "file_kind": file_kind, "path": path}
+
+            def _on_success(result):
+                chunks = result.get("chunks") or []
+                file_kind = result.get("file_kind")
+                if not chunks:
+                    messagebox.showwarning("Импорт", "Текст не найден.")
                     return
-            except MemoryError:
-                messagebox.showerror(
-                    "Импорт",
-                    "Недостаточно памяти. Укажите меньший файл или диапазон страниц.",
-                )
-                return
-            except RuntimeError as exc:
-                messagebox.showerror("Импорт", str(exc))
-                return
+                state["chunks"] = chunks
+                state["file_path"] = result.get("path")
+                state["file_kind"] = file_kind
+                file_var.set(os.path.basename(result.get("path") or ""))
+                page_values = [str(i + 1) for i in range(len(chunks))]
+                page_combo.configure(values=page_values)
+                page_var.set(page_values[0])
+                update_cost_label()
 
-            if not chunks:
-                messagebox.showwarning("Импорт", "Текст не найден.")
-                return
+                if file_kind == "pdf":
+                    empty_pages = [idx + 1 for idx, text in enumerate(chunks) if not text.strip()]
+                    if empty_pages:
+                        messagebox.showwarning(
+                            "PDF",
+                            "Некоторые страницы без текста. Возможно, это скан.\n"
+                            "Для сканов нужен OCR.",
+                        )
 
-            state["chunks"] = chunks
-            state["file_path"] = path
-            file_var.set(os.path.basename(path))
-            page_values = [str(i + 1) for i in range(len(chunks))]
-            page_combo.configure(values=page_values)
-            page_var.set(page_values[0])
-            update_cost_label()
-
-            if state["file_kind"] == "pdf":
-                empty_pages = [idx + 1 for idx, text in enumerate(chunks) if not text.strip()]
-                if empty_pages:
-                    messagebox.showwarning(
-                        "PDF",
-                        "Некоторые страницы без текста. Возможно, это скан.\n"
-                        "Для сканов нужен OCR.",
+            def _on_error(exc):
+                if isinstance(exc, MemoryError):
+                    messagebox.showerror(
+                        "Импорт",
+                        "Недостаточно памяти. Укажите меньший файл или диапазон страниц.",
                     )
+                else:
+                    messagebox.showerror("Импорт", str(exc))
+
+            self.run_with_loading(_task, on_success=_on_success, on_error=_on_error)
+
+        def _mark_editor_closed():
+            state["editor_open"] = False
+            editor_status_var.set("Редактор: не открыт")
 
         def ensure_editor() -> QuillEditorWindow | None:
             if not QUILL_WEBVIEW_AVAILABLE:
                 messagebox.showerror("Редактор", "pywebview не установлен. Установите: pip install pywebview")
                 return None
             if self.quill_editor is None or not self.quill_editor.is_running():
-                self.quill_editor = QuillEditorWindow()
+                self.quill_editor = QuillEditorWindow(
+                    on_close=lambda: self.root.after(0, _mark_editor_closed)
+                )
                 try:
                     self.quill_editor.show()
                 except RuntimeError as exc:
                     messagebox.showerror("Редактор", str(exc))
                     return None
             editor_status_var.set("Редактор: открыт")
+            state["editor_open"] = True
             return self.quill_editor
 
         def load_selected_into_editor():
@@ -8177,16 +8283,46 @@ class AnkiApp(tk.Tk):
                 index = 0
             index = max(0, min(index, len(state["chunks"]) - 1))
             content = state["chunks"][index]
-            editor.set_content({"html": content})
+
+            def _task():
+                editor.set_html(content)
+                return True
+
+            self.run_with_loading(_task)
+
+        def sync_from_editor():
+            editor = ensure_editor()
+            if not editor:
+                return
+            if not state["chunks"]:
+                messagebox.showwarning("Редактор", "Сначала импортируйте файл.")
+                return
+            try:
+                index = int(page_var.get()) - 1
+            except ValueError:
+                index = 0
+            index = max(0, min(index, len(state["chunks"]) - 1))
+
+            def _task():
+                return editor.get_html()
+
+            def _on_success(html):
+                if html is None:
+                    messagebox.showwarning("Редактор", "Не удалось получить контент.")
+                    return
+                state["chunks"][index] = html
+                messagebox.showinfo("Редактор", "Контент обновлён из редактора.")
+
+            self.run_with_loading(_task, on_success=_on_success)
 
         def build_cards_from_selection() -> list[dict[str, str]]:
             editor = ensure_editor()
             if not editor:
                 return []
-            payload = editor.get_selection()
-            if not payload:
-                payload = editor.get_content()
-            delta = payload.get("delta") or {}
+            _ = editor.get_selection_html()
+            delta = editor.get_selection_delta()
+            if not delta:
+                delta = editor.get_delta()
             if not delta:
                 return []
             return parse_quill_delta(delta)
@@ -8212,52 +8348,68 @@ class AnkiApp(tk.Tk):
             update_cost_label()
             if not charge_for_page():
                 return
-            cards = build_cards_from_selection()
-            if not cards:
-                messagebox.showinfo("Генерация", "Карточки не найдены. Проверьте разметку (bold/underline/цвет).")
-                return
-            state["cards"] = cards
-            messagebox.showinfo("Генерация", f"Сформировано карточек: {len(cards)}")
+
+            def _task():
+                return build_cards_from_selection()
+
+            def _on_success(cards):
+                if not cards:
+                    messagebox.showinfo(
+                        "Генерация",
+                        "Карточки не найдены. Проверьте разметку (bold/underline/цвет).",
+                    )
+                    return
+                state["cards"] = cards
+                messagebox.showinfo("Генерация", f"Сформировано карточек: {len(cards)}")
+
+            self.run_with_loading(_task, on_success=_on_success)
 
         def open_preview_window():
             if not state["cards"]:
                 messagebox.showwarning("Предпросмотр", "Сначала сформируйте карточки.")
                 return
-            preview_win = tk.Toplevel(self)
-            preview_win.title("Предпросмотр карточек")
-            preview_win.geometry("800x600")
-            preview_win.grab_set()
 
-            container = ttk.Frame(preview_win)
-            container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            def _task():
+                return list(state["cards"])
 
-            canvas = tk.Canvas(container, highlightthickness=0)
-            scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-            list_frame = ttk.Frame(canvas)
+            def _on_success(cards):
+                preview_win = tk.Toplevel(self)
+                preview_win.title("Предпросмотр карточек")
+                preview_win.geometry("800x600")
+                preview_win.grab_set()
 
-            list_frame.bind(
-                "<Configure>",
-                lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
-            )
-            canvas.create_window((0, 0), window=list_frame, anchor="nw")
-            canvas.configure(yscrollcommand=scroll.set)
-            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+                container = ttk.Frame(preview_win)
+                container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-            for idx, card in enumerate(state["cards"], start=1):
-                row = ttk.Frame(list_frame, style="Card.TFrame", padding=8)
-                row.pack(fill=tk.X, pady=6)
-                ttk.Label(
-                    row,
-                    text=f"{idx}. Front: {card.get('front', '')}",
-                    wraplength=720,
-                ).pack(anchor="w")
-                ttk.Label(
-                    row,
-                    text=f"Back: {card.get('back', '')}",
-                    style="Muted.TLabel",
-                    wraplength=720,
-                ).pack(anchor="w", pady=(4, 0))
+                canvas = tk.Canvas(container, highlightthickness=0)
+                scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+                list_frame = ttk.Frame(canvas)
+
+                list_frame.bind(
+                    "<Configure>",
+                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+                )
+                canvas.create_window((0, 0), window=list_frame, anchor="nw")
+                canvas.configure(yscrollcommand=scroll.set)
+                canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+                for idx, card in enumerate(cards, start=1):
+                    row = ttk.Frame(list_frame, style="Card.TFrame", padding=8)
+                    row.pack(fill=tk.X, pady=6)
+                    ttk.Label(
+                        row,
+                        text=f"{idx}. Front: {card.get('front', '')}",
+                        wraplength=720,
+                    ).pack(anchor="w")
+                    ttk.Label(
+                        row,
+                        text=f"Back: {card.get('back', '')}",
+                        style="Muted.TLabel",
+                        wraplength=720,
+                    ).pack(anchor="w", pady=(4, 0))
+
+            self.run_with_loading(_task, on_success=_on_success)
 
         def save_cards():
             if not state["cards"]:
@@ -8266,35 +8418,40 @@ class AnkiApp(tk.Tk):
             add_images = add_images_var.get()
             image_limit = max(0, min(10, int(image_limit_var.get() or 0)))
 
-            created = 0
-            for idx, card in enumerate(state["cards"]):
-                image_path = ""
-                if add_images and idx < image_limit:
-                    image_path = self._create_ai_placeholder_image(card.get("front", "")) or ""
+            def _task():
+                created = 0
+                for idx, card in enumerate(state["cards"]):
+                    image_path = ""
+                    if add_images and idx < image_limit:
+                        image_path = self._create_ai_placeholder_image(card.get("front", "")) or ""
 
-                note_fields = {
-                    "word": card.get("front", ""),
-                    "translation": card.get("back", ""),
-                    "example": "",
-                    "level": 1,
-                    "image": image_path,
-                    "front_image_path": image_path,
-                    "back_image_path": "",
-                    "audio_path": None,
-                    "front": card.get("front", ""),
-                    "back": card.get("back", ""),
-                }
-                _, cards_created = create_note_with_cards(
-                    self.selected_deck_id,
-                    note_fields,
-                    note_type_id=ensure_generated_note_type_id(),
-                )
-                created += cards_created
+                    note_fields = {
+                        "word": card.get("front", ""),
+                        "translation": card.get("back", ""),
+                        "example": "",
+                        "level": 1,
+                        "image": image_path,
+                        "front_image_path": image_path,
+                        "back_image_path": "",
+                        "audio_path": None,
+                        "front": card.get("front", ""),
+                        "back": card.get("back", ""),
+                    }
+                    _, cards_created = create_note_with_cards(
+                        self.selected_deck_id,
+                        note_fields,
+                        note_type_id=ensure_generated_note_type_id(),
+                    )
+                    created += cards_created
+                return created
 
-            messagebox.showinfo("Сохранено", f"Сохранено карточек: {created}")
-            self.refresh_decks()
-            self.update_overdue_badge()
-            self.refresh_activation_progress_ui()
+            def _on_success(created):
+                messagebox.showinfo("Сохранено", f"Сохранено карточек: {created}")
+                self.refresh_decks()
+                self.update_overdue_badge()
+                self.refresh_activation_progress_ui()
+
+            self.run_with_loading(_task, on_success=_on_success)
 
         ttk.Button(import_frame, text="Импорт файла", command=import_file).grid(
             row=0, column=2, padx=6, pady=6
@@ -8308,6 +8465,9 @@ class AnkiApp(tk.Tk):
 
         ttk.Label(editor_frame, textvariable=editor_status_var).pack(anchor="w", padx=6, pady=(6, 2))
         ttk.Button(editor_frame, text="Открыть редактор", command=ensure_editor).pack(
+            anchor="w", padx=6, pady=(0, 6)
+        )
+        ttk.Button(editor_frame, text="Обновить из редактора", command=sync_from_editor).pack(
             anchor="w", padx=6, pady=(0, 6)
         )
 
@@ -10277,6 +10437,9 @@ class RepeatWindow(tk.Toplevel):
             )
             cb.pack(side=tk.LEFT, padx=5)
 
+        # Панель аудио (ниже контента)
+        self.audio_frame = ttk.Frame(frame_main, style="Surface.TFrame")
+
         # Панель кнопок
         self.btn_frame = ttk.Frame(frame_main, style="Surface.TFrame")
         self.btn_frame.pack(pady=10)
@@ -10310,15 +10473,20 @@ class RepeatWindow(tk.Toplevel):
         self.btn_sound = ttk.Button(self.btn_frame, text="🔊 Слово", command=self.play_word)
         self.btn_sound.grid(row=0, column=6, padx=5)
 
-        # Добавить аудио-плеер
-        self.audio_widget = AudioPlayerWidget(self.card_frame, on_error_callback=self._show_audio_error)
-        self.card_frame.audio_widget = self.audio_widget
+        # Инициализация аудио-плеера
         self.update_audio_player()
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
         entries = get_card_audio_entries(self.current_card, prefer_side="back" if self.show_back else "front")
-        display_audio_entries_on_frame(self.card_frame, entries)
+        display_audio_entries_on_frame(self.audio_frame, entries)
+        self.audio_widget = getattr(self.audio_frame, "audio_widget", None)
+        if entries:
+            if not self.audio_frame.winfo_ismapped():
+                self.audio_frame.pack(fill=tk.X, padx=10, pady=(0, 6), before=self.btn_frame)
+        else:
+            if self.audio_frame.winfo_ismapped():
+                self.audio_frame.pack_forget()
 
     def set_image_mode(self, mode: str):
         if mode not in ("fit", "actual", "zoom"):
