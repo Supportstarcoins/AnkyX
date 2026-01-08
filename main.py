@@ -8362,7 +8362,13 @@ class AnkiApp(tk.Tk):
                 return True
 
             editor_path = os.path.abspath(os.path.join(BASE_DIR, "editor_quill.html"))
-            editor_url = "file:///" + editor_path.replace("\\", "/")
+            if not os.path.exists(editor_path):
+                messagebox.showerror(
+                    "Редактор",
+                    f"Файл редактора не найден:\n{editor_path}",
+                )
+                return False
+            editor_url = editor_path
             editor_manager = _ensure_editor_manager()
             try:
                 state["editor_window"] = webview.create_window(
@@ -8402,7 +8408,15 @@ class AnkiApp(tk.Tk):
 
                 def _start_webview() -> None:
                     try:
-                        webview.start(debug=False, gui="tkinter")
+                        try:
+                            webview.settings["OPEN_DEVTOOLS_IN_DEBUG"] = True
+                        except Exception:
+                            pass
+                        try:
+                            webview.settings["ALLOW_FILE_URLS"] = True
+                        except Exception:
+                            pass
+                        webview.start(debug=True, gui="tkinter", http_server=True)
                         state["webview_started"] = True
                     except Exception:
                         messagebox.showwarning(

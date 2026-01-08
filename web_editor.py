@@ -78,11 +78,8 @@ class WebEditorManager:
         self.editor_window = window
         self.api._ready = False
         self._apply_pending_timer = None
-        self.api._on_ready_cb = lambda: self._safe_callback("notify_editor_ready", self._apply_pending_now)
-        self.api._make_cards_cb = lambda: self._safe_callback(
-            "make_cards_from_selection",
-            self.make_cards_from_selection,
-        )
+        self.api._on_ready_cb = lambda: self._apply_pending_now()
+        self.api._make_cards_cb = lambda: self.make_cards_from_selection()
         if self.editor_window is None:
             return
         try:
@@ -112,43 +109,50 @@ class WebEditorManager:
         return result or ""
 
     def make_cards_from_selection(self) -> bool:
-        selection_html = self.get_selection_html()
-        if not selection_html:
-            selection_html = self.get_html()
-        if self.on_make_cards:
-            self.root.after(0, lambda: self.on_make_cards(selection_html))
-        else:
-            length = len(selection_html or "")
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Выделение",
-                    f"Получено HTML символов: {length}",
-                ),
-            )
-        return True
+        try:
+            selection_html = self.get_selection_html()
+            if not selection_html:
+                selection_html = self.get_html()
+            if self.on_make_cards:
+                self.root.after(0, lambda: self.on_make_cards(selection_html))
+            else:
+                length = len(selection_html or "")
+                self.root.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "Выделение",
+                        f"Получено HTML символов: {length}",
+                    ),
+                )
+            return True
+        except Exception:
+            self._log_exc("make_cards_from_selection")
+            return False
 
     def _apply_pending_now(self) -> None:
-        html = self.api._pending_html or ""
-        self.api._pending_html = ""
-        if self._apply_pending_timer is not None:
-            try:
-                self.root.after_cancel(self._apply_pending_timer)
-            except Exception:
-                pass
-            self._apply_pending_timer = None
-        if not self.editor_window:
-            return
-        payload = json.dumps(html)
-        js = f"window.setHtml && window.setHtml({payload});"
+        try:
+            html = self.api._pending_html or ""
+            self.api._pending_html = ""
+            if self._apply_pending_timer is not None:
+                try:
+                    self.root.after_cancel(self._apply_pending_timer)
+                except Exception:
+                    pass
+                self._apply_pending_timer = None
+            if not self.editor_window:
+                return
+            payload = json.dumps(html)
+            js = f"window.setHtml && window.setHtml({payload});"
 
-        def _run() -> None:
-            try:
-                self.editor_window.evaluate_js(js)
-            except Exception:
-                self._log_exc("evaluate_js failed")
+            def _run() -> None:
+                try:
+                    self.editor_window.evaluate_js(js)
+                except Exception:
+                    self._log_exc("evaluate_js failed")
 
-        self.root.after(0, _run)
+            self.root.after(0, _run)
+        except Exception:
+            self._log_exc("apply_pending_now failed")
 
     def _schedule_apply_when_ready(self) -> None:
         if self._apply_pending_timer is not None:
