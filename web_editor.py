@@ -15,14 +15,13 @@ LOG_PATH = os.path.abspath("web_editor_error.log")
 
 
 class QuillAPI:
-    __slots__ = ("_pending_html", "_ready", "_log_path", "_on_ready_cb", "_make_cards_cb")
+    __slots__ = ("_pending_html", "_ready", "_log_path", "_make_cards_event")
 
     def __init__(self) -> None:
         self._pending_html = ""
         self._ready = False
         self._log_path = LOG_PATH
-        self._on_ready_cb: Optional[Callable[[], None]] = None
-        self._make_cards_cb: Optional[Callable[[], bool]] = None
+        self._make_cards_event = threading.Event()
 
     def __dir__(self) -> list[str]:
         return ["pull_initial_html", "notify_editor_ready", "log_js_error", "make_cards_from_selection"]
@@ -34,28 +33,11 @@ class QuillAPI:
 
     def notify_editor_ready(self) -> bool:
         self._ready = True
-        if self._on_ready_cb:
-            try:
-                self._on_ready_cb()
-            except Exception:
-                try:
-                    with open(self._log_path, "a", encoding="utf-8") as handle:
-                        handle.write(f"\n[notify_editor_ready]\n{traceback.format_exc()}\n")
-                except Exception:
-                    pass
         return True
 
     def make_cards_from_selection(self) -> bool:
-        if self._make_cards_cb:
-            try:
-                return bool(self._make_cards_cb())
-            except Exception:
-                try:
-                    with open(self._log_path, "a", encoding="utf-8") as handle:
-                        handle.write(f"\n[make_cards_from_selection]\n{traceback.format_exc()}\n")
-                except Exception:
-                    pass
-        return False
+        self._make_cards_event.set()
+        return True
 
     def log_js_error(self, message: str) -> bool:
         try:
@@ -73,13 +55,12 @@ class WebEditorManager:
         self.editor_window: Any | None = None
         self.api = QuillAPI()
         self._apply_pending_timer: Optional[str] = None
+        self.root.after(100, self._poll_make_cards_request)
 
     def attach_window(self, window: Any, on_close: Optional[Callable[[], None]] = None) -> None:
         self.editor_window = window
         self.api._ready = False
         self._apply_pending_timer = None
-        self.api._on_ready_cb = lambda: self._apply_pending_now()
-        self.api._make_cards_cb = lambda: self.make_cards_from_selection()
         if self.editor_window is None:
             return
         try:
@@ -173,6 +154,17 @@ class WebEditorManager:
             self._apply_pending_timer = self.root.after(100, _check)
 
         self._apply_pending_timer = self.root.after(100, _check)
+
+    def _poll_make_cards_request(self) -> None:
+        try:
+            if self.api._make_cards_event.is_set():
+                self.api._make_cards_event.clear()
+                self.make_cards_from_selection()
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self.root.after(100, self._poll_make_cards_request)
 
     def _safe_callback(self, tag: str, callback: Callable[[], Any]) -> Any:
         try:

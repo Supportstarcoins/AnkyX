@@ -67,7 +67,7 @@ class BusyDialog:
             else:
                 self.progressbar.config(maximum=100)
                 self.progressbar.start(10)
-        self.label_var.set("Загрузка")
+        self.label_var.set(title)
         try:
             self.window.grab_set()
         except tk.TclError:
@@ -80,8 +80,8 @@ class BusyDialog:
         if self.mode == "determinate" and total:
             self.progressbar.config(maximum=max(total, 1))
             self.progressbar["value"] = done
-        if text:
-            self.label_var.set("Загрузка")
+        if text is not None:
+            self.label_var.set(text)
         self.window.update_idletasks()
 
     def close(self):
