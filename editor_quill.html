@@ -199,6 +199,9 @@
     }
 
     document.addEventListener('pywebviewready', onPywebviewReady);
+    if (window.pywebview && window.pywebview.api) {
+      onPywebviewReady();
+    }
 
     window.setHtml = function(html) {
       if (!window.quill) return;
@@ -222,9 +225,6 @@
           toolbar: '#toolbar'
         }
       });
-      if (window.pywebview && window.pywebview.api) {
-        onPywebviewReady();
-      }
     }
 
     window.getHtml = function() {
