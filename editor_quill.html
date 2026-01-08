@@ -136,6 +136,12 @@
       errorBanner.style.display = 'block';
     }
 
+    window.onerror = function(msg, src, line, col, err) {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.log_js_error) {
+        window.pywebview.api.log_js_error(`JS error: ${msg} @ ${line}:${col}`);
+      }
+    };
+
     function stylesheetLooksEmpty(fragment) {
       const sheet = Array.from(document.styleSheets).find(
         (item) => item.href && item.href.includes(fragment)
@@ -171,6 +177,9 @@
           toolbar: '#toolbar'
         }
       });
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.notify_editor_ready) {
+        window.pywebview.api.notify_editor_ready();
+      }
     }
 
     function normalizeHtml(html) {
@@ -193,8 +202,8 @@
 
     window.setHtml = function(html) {
       if (!quill) return;
-      const normalized = normalizeHtml(html);
-      quill.clipboard.dangerouslyPasteHTML(normalized || '');
+      const normalizedHtml = normalizeHtml(html);
+      quill.clipboard.dangerouslyPasteHTML(normalizedHtml || '');
     };
 
     window.getHtml = function() {
@@ -218,12 +227,18 @@
       }
     });
 
-    if (window.pywebview && window.pywebview.api) {
-      window.pywebview.api.pull_initial_html().then((html) => {
-        if (html) {
-          window.setHtml(html);
-        }
-      });
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.pull_initial_html) {
+      window.pywebview.api.pull_initial_html()
+        .then((html) => {
+          if (html) {
+            window.setHtml(html);
+          }
+        })
+        .catch((e) => {
+          if (window.pywebview.api.log_js_error) {
+            window.pywebview.api.log_js_error(`pull_initial_html error: ${e}`);
+          }
+        });
     }
   </script>
 </body>

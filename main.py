@@ -5,6 +5,7 @@ safe = tempfile.gettempdir()
 os.environ["TEMP"] = safe
 os.environ["TMP"] = safe
 import time
+import traceback
 import base64
 import sqlite3
 import re
@@ -82,7 +83,7 @@ from importers import (
     import_odt,
     import_pdf,
 )
-from web_editor import EditorAPI, QUILL_WEBVIEW_AVAILABLE, open_fallback_editor
+from web_editor import QUILL_WEBVIEW_AVAILABLE, WebEditorManager, open_fallback_editor
 from quill_cards import parse_quill_html_to_cards
 from overdue_badges import (
     PhaseOverdueBadges,
@@ -8139,7 +8140,7 @@ class AnkiApp(tk.Tk):
             "file_kind": None,
             "cards": [],
             "editor_open": False,
-            "editor_api": None,
+            "editor_manager": None,
             "editor_window": None,
             "fallback_window": None,
             "fallback_text": None,
@@ -8279,10 +8280,10 @@ class AnkiApp(tk.Tk):
             state["cards"] = cards
             open_preview_window(limit=20)
 
-        def _ensure_editor_api() -> EditorAPI:
-            if state["editor_api"] is None:
-                state["editor_api"] = EditorAPI(self.root, _handle_editor_make_cards)
-            return state["editor_api"]
+        def _ensure_editor_manager() -> WebEditorManager:
+            if state["editor_manager"] is None:
+                state["editor_manager"] = WebEditorManager(self.root, _handle_editor_make_cards)
+            return state["editor_manager"]
 
         def ensure_editor() -> bool:
             if not QUILL_WEBVIEW_AVAILABLE:
@@ -8345,16 +8346,16 @@ class AnkiApp(tk.Tk):
 
             editor_path = os.path.abspath(os.path.join(BASE_DIR, "editor_quill.html"))
             editor_url = "file:///" + editor_path.replace("\\", "/")
-            editor_api = _ensure_editor_api()
+            editor_manager = _ensure_editor_manager()
             try:
                 state["editor_window"] = webview.create_window(
                     "Редактор конспекта (Quill)",
                     url=editor_url,
-                    js_api=editor_api,
+                    js_api=editor_manager.api,
                     width=1100,
                     height=700,
                 )
-                editor_api.attach_window(
+                editor_manager.attach_window(
                     state["editor_window"],
                     on_close=lambda: self.root.after(0, _mark_editor_closed),
                 )
@@ -8426,16 +8427,26 @@ class AnkiApp(tk.Tk):
                 index = 0
             index = max(0, min(index, len(state["chunks"]) - 1))
             content = state["chunks"][index]
-
-            editor_api = _ensure_editor_api()
+            editor_manager = _ensure_editor_manager()
 
             def _task():
-                editor_api.initial_html = content
-                if state["fallback_text"] is not None:
-                    state["fallback_text"].delete("1.0", tk.END)
-                    state["fallback_text"].insert("1.0", content)
-                elif state["editor_window"] is not None:
-                    editor_api.set_html(content)
+                try:
+                    html = content
+                    if state["fallback_text"] is not None:
+                        state["fallback_text"].delete("1.0", tk.END)
+                        state["fallback_text"].insert("1.0", html)
+                    else:
+                        editor_manager.set_html_safe(html)
+                except Exception:
+                    with open("web_editor_error.log", "a", encoding="utf-8") as handle:
+                        handle.write(traceback.format_exc() + "\n")
+                    self.root.after(
+                        0,
+                        lambda: messagebox.showerror(
+                            "Ошибка",
+                            "Загрузка в редактор не удалась. См. web_editor_error.log",
+                        ),
+                    )
                 return True
 
             self.run_with_loading(_task)
@@ -8455,8 +8466,8 @@ class AnkiApp(tk.Tk):
             def _task():
                 if state["fallback_text"] is not None:
                     return state["fallback_text"].get("1.0", tk.END).strip()
-                editor_api = _ensure_editor_api()
-                return editor_api.get_html()
+                editor_manager = _ensure_editor_manager()
+                return editor_manager.get_html()
 
             def _on_success(html):
                 if html is None:
@@ -8478,10 +8489,10 @@ class AnkiApp(tk.Tk):
                 if not selection_html:
                     selection_html = state["fallback_text"].get("1.0", tk.END).strip()
             else:
-                editor_api = _ensure_editor_api()
-                selection_html = editor_api.get_selection_html()
+                editor_manager = _ensure_editor_manager()
+                selection_html = editor_manager.get_selection_html()
                 if not selection_html:
-                    selection_html = editor_api.get_html()
+                    selection_html = editor_manager.get_html()
             if not selection_html:
                 return []
             return parse_quill_html_to_cards(selection_html)
