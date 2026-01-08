@@ -174,9 +174,23 @@
       showError(errorMessage);
     }
 
-    let quill = null;
+    window.setHtml = function(html) {
+      if (!window.quill) return;
+      if (typeof html !== "string") html = String(html || "");
+      const m = html.match(/^<pre[^>]*>([\s\S]*)<\/pre>$/i);
+      if (m) {
+        const text = m[1]
+          .replace(/<\/?[^>]+>/g, "")
+          .replace(/\n/g, "<br>");
+        html = "<p>" + text + "</p>";
+      }
+      window.quill.setText("");
+      window.quill.clipboard.dangerouslyPasteHTML(html);
+    };
+
+    window.quill = null;
     if (typeof Quill !== 'undefined') {
-      quill = new Quill('#editor', {
+      window.quill = new Quill('#editor', {
         theme: 'snow',
         modules: {
           toolbar: '#toolbar'
@@ -200,32 +214,8 @@
       }
     }
 
-    function normalizeHtml(html) {
-      if (!html) return '';
-      const wrapper = document.createElement('div');
-      wrapper.innerHTML = html;
-      const pres = wrapper.querySelectorAll('pre');
-      pres.forEach((pre) => {
-        const text = pre.textContent || '';
-        const paragraph = document.createElement('p');
-        const lines = text.split('\n');
-        lines.forEach((line, index) => {
-          if (index > 0) paragraph.appendChild(document.createElement('br'));
-          paragraph.appendChild(document.createTextNode(line));
-        });
-        pre.replaceWith(paragraph);
-      });
-      return wrapper.innerHTML;
-    }
-
-    window.setHtml = function(html) {
-      if (!quill) return;
-      const normalizedHtml = normalizeHtml(html);
-      quill.clipboard.dangerouslyPasteHTML(normalizedHtml || '');
-    };
-
     window.getHtml = function() {
-      return quill ? quill.root.innerHTML : '';
+      return window.quill ? window.quill.root.innerHTML : '';
     };
 
     window.getSelectionHtml = function() {
