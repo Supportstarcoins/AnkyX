@@ -8428,28 +8428,23 @@ class AnkiApp(tk.Tk):
             index = max(0, min(index, len(state["chunks"]) - 1))
             content = state["chunks"][index]
             editor_manager = _ensure_editor_manager()
-
-            def _task():
-                try:
-                    html = content
-                    if state["fallback_text"] is not None:
-                        state["fallback_text"].delete("1.0", tk.END)
-                        state["fallback_text"].insert("1.0", html)
-                    else:
-                        editor_manager.set_html_safe(html)
-                except Exception:
-                    with open("web_editor_error.log", "a", encoding="utf-8") as handle:
-                        handle.write(traceback.format_exc() + "\n")
-                    self.root.after(
-                        0,
-                        lambda: messagebox.showerror(
-                            "Ошибка",
-                            "Загрузка в редактор не удалась. См. web_editor_error.log",
-                        ),
-                    )
-                return True
-
-            self.run_with_loading(_task)
+            try:
+                html = content
+                if state["fallback_text"] is not None:
+                    state["fallback_text"].delete("1.0", tk.END)
+                    state["fallback_text"].insert("1.0", html)
+                else:
+                    editor_manager.set_html_safe(html)
+            except Exception:
+                with open("web_editor_error.log", "a", encoding="utf-8") as handle:
+                    handle.write(traceback.format_exc() + "\n")
+                self.root.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Ошибка",
+                        "Загрузка в редактор не удалась. См. web_editor_error.log",
+                    ),
+                )
 
         def sync_from_editor():
             if not ensure_editor():

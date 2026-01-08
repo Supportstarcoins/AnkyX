@@ -14,25 +14,33 @@ QUILL_WEBVIEW_AVAILABLE = importlib.util.find_spec("webview") is not None
 LOG_PATH = os.path.abspath("web_editor_error.log")
 
 
-class EditorAPI:
-    def __init__(self, manager: "WebEditorManager") -> None:
-        self.m = manager
+class QuillAPI:
+    __slots__ = ("_pending_html", "_ready", "_log_path")
+
+    def __init__(self) -> None:
+        self._pending_html: Optional[str] = None
+        self._ready = False
+        self._log_path = LOG_PATH
+
+    def __dir__(self) -> list[str]:
+        return ["pull_initial_html", "notify_editor_ready", "log_js_error"]
 
     def pull_initial_html(self) -> str:
-        html = self.m.pending_html or ""
-        self.m.pending_html = None
+        html = self._pending_html or ""
+        self._pending_html = None
         return html
 
     def notify_editor_ready(self) -> bool:
-        self.m.editor_ready.set()
+        self._ready = True
         return True
 
     def log_js_error(self, message: str) -> bool:
-        self.m._log_message(message)
+        try:
+            with open(self._log_path, "a", encoding="utf-8") as handle:
+                handle.write(str(message) + "\n")
+        except Exception:
+            pass
         return True
-
-    def make_cards_from_selection(self) -> bool:
-        return self.m.make_cards_from_selection()
 
 
 class WebEditorManager:
@@ -40,13 +48,11 @@ class WebEditorManager:
         self.root = root
         self.on_make_cards = on_make_cards
         self.editor_window: Any | None = None
-        self.editor_ready = threading.Event()
-        self.pending_html: Optional[str] = None
-        self.api = EditorAPI(self)
+        self.api = QuillAPI()
 
     def attach_window(self, window: Any, on_close: Optional[Callable[[], None]] = None) -> None:
         self.editor_window = window
-        self.editor_ready.clear()
+        self.api._ready = False
         if self.editor_window is None:
             return
         try:
@@ -55,10 +61,10 @@ class WebEditorManager:
             pass
 
     def set_html_safe(self, html: str) -> None:
-        self.pending_html = html or ""
+        self.api._pending_html = html or ""
         if not self.editor_window:
             return
-        if not self.editor_ready.is_set():
+        if not self.api._ready:
             self._schedule_apply_when_ready()
             return
         self._apply_pending_now()
@@ -67,7 +73,7 @@ class WebEditorManager:
         def tick() -> None:
             if not self.editor_window:
                 return
-            if self.editor_ready.is_set():
+            if self.api._ready:
                 self._apply_pending_now()
             else:
                 self.root.after(100, tick)
@@ -77,10 +83,10 @@ class WebEditorManager:
     def _apply_pending_now(self) -> None:
         if not self.editor_window:
             return
-        if self.pending_html is None:
+        if self.api._pending_html is None:
             return
-        html = self.pending_html or ""
-        self.pending_html = None
+        html = self.api._pending_html or ""
+        self.api._pending_html = None
         js = f"window.setHtml && window.setHtml({json.dumps(html)});"
         try:
             self.root.after(0, lambda: self.editor_window.evaluate_js(js))
@@ -118,12 +124,24 @@ class WebEditorManager:
 
     def _on_closed(self, on_close: Optional[Callable[[], None]]) -> None:
         self.editor_window = None
-        self.editor_ready.clear()
+        self.api._ready = False
         if on_close:
             on_close()
 
     def _wait_ready(self, timeout: float = 5.0) -> bool:
-        return self.editor_ready.is_set() or self.editor_ready.wait(timeout)
+        if self.api._ready:
+            return True
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.api._ready:
+                return True
+            if threading.current_thread() is threading.main_thread():
+                try:
+                    self.root.update()
+                except tk.TclError:
+                    break
+            time.sleep(0.01)
+        return self.api._ready
 
     def _evaluate_js_sync(self, js: str, timeout: float = 5.0) -> Optional[str]:
         if not self.editor_window:
@@ -156,14 +174,14 @@ class WebEditorManager:
 
     def _log_message(self, message: str) -> None:
         try:
-            with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            with open(self.api._log_path, "a", encoding="utf-8") as handle:
                 handle.write(message + "\n")
         except Exception:
             pass
 
     def _log_exc(self, tag: str) -> None:
         try:
-            with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            with open(self.api._log_path, "a", encoding="utf-8") as handle:
                 handle.write(f"\n[{tag}]\n{traceback.format_exc()}\n")
         except Exception:
             pass
