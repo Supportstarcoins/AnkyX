@@ -8622,13 +8622,13 @@ class AnkiApp(tk.Tk):
                 created = 0
                 done = 0
                 for idx, card in enumerate(state["cards"], start=1):
-                    progress_cb(done, total_steps, f"Подготовка карточки {idx}/{total_cards}")
+                    progress_cb(done, total_steps, f"Подготовка карточки {idx}/{total_steps}")
                     image_path = ""
                     if add_images and idx <= image_limit:
-                        progress_cb(done, total_steps, f"AI-картинка {idx}/{total_cards}")
+                        progress_cb(done, total_steps, f"AI-картинка {idx}/{total_steps}")
                         image_path = self._create_ai_placeholder_image(card.get("front", "")) or ""
                         done += 1
-                        progress_cb(done, total_steps, f"AI-картинка готова {idx}/{total_cards}")
+                        progress_cb(done, total_steps, f"AI-картинка готова {idx}/{total_steps}")
 
                     note_fields = {
                         "word": card.get("front", ""),
@@ -8649,7 +8649,7 @@ class AnkiApp(tk.Tk):
                     )
                     created += cards_created
                     done += 1
-                    progress_cb(done, total_steps, f"Готово {idx}/{total_cards}")
+                    progress_cb(done, total_steps, f"Готово {idx}/{total_steps}")
                 return created
 
             def _on_success(created):
