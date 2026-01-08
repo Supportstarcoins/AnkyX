@@ -137,9 +137,14 @@
     }
 
     window.onerror = function(msg, src, line, col, err) {
-      if (window.pywebview && window.pywebview.api && window.pywebview.api.log_js_error) {
-        window.pywebview.api.log_js_error(`JS error: ${msg} @ ${line}:${col}`);
+      try {
+        if (window.pywebview && window.pywebview.api && window.pywebview.api.log_js_error) {
+          window.pywebview.api.log_js_error(`JS error: ${msg} @ ${line}:${col}`);
+        }
+      } catch (_) {
+        return false;
       }
+      return false;
     };
 
     function stylesheetLooksEmpty(fragment) {
@@ -179,6 +184,19 @@
       });
       if (window.pywebview && window.pywebview.api && window.pywebview.api.notify_editor_ready) {
         window.pywebview.api.notify_editor_ready();
+      }
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.pull_initial_html) {
+        window.pywebview.api.pull_initial_html()
+          .then((html) => {
+            if (html) {
+              window.setHtml(html);
+            }
+          })
+          .catch((e) => {
+            if (window.pywebview.api.log_js_error) {
+              window.pywebview.api.log_js_error(`pull_initial_html error: ${e}`);
+            }
+          });
       }
     }
 
@@ -222,24 +240,10 @@
     };
 
     document.getElementById('make-cards').addEventListener('click', () => {
-      if (window.pywebview && window.pywebview.api) {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.make_cards_from_selection) {
         window.pywebview.api.make_cards_from_selection();
       }
     });
-
-    if (window.pywebview && window.pywebview.api && window.pywebview.api.pull_initial_html) {
-      window.pywebview.api.pull_initial_html()
-        .then((html) => {
-          if (html) {
-            window.setHtml(html);
-          }
-        })
-        .catch((e) => {
-          if (window.pywebview.api.log_js_error) {
-            window.pywebview.api.log_js_error(`pull_initial_html error: ${e}`);
-          }
-        });
-    }
   </script>
 </body>
 </html>
