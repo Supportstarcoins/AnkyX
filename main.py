@@ -19,6 +19,7 @@ from PIL import Image, ImageOps, ImageDraw
 from pathlib import Path
 from uuid import uuid4
 csv.field_size_limit(10 * 1024 * 1024)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import gzip
 import pickle
 from datetime import date, datetime, timedelta
@@ -81,13 +82,7 @@ from importers import (
     import_odt,
     import_pdf,
 )
-from web_editor import (
-    EditorAPI,
-    get_editor_html,
-    get_selection_html,
-    open_editor_window,
-    set_editor_html,
-)
+from web_editor import EditorAPI, QUILL_WEBVIEW_AVAILABLE, open_fallback_editor
 from quill_cards import parse_quill_html_to_cards
 from overdue_badges import (
     PhaseOverdueBadges,
@@ -8145,6 +8140,11 @@ class AnkiApp(tk.Tk):
             "cards": [],
             "editor_open": False,
             "editor_api": None,
+            "editor_window": None,
+            "fallback_window": None,
+            "fallback_text": None,
+            "webview_started": False,
+            "webview_starting": False,
         }
 
         def compute_cost() -> int:
@@ -8263,6 +8263,9 @@ class AnkiApp(tk.Tk):
 
         def _mark_editor_closed():
             state["editor_open"] = False
+            state["editor_window"] = None
+            state["fallback_window"] = None
+            state["fallback_text"] = None
             editor_status_var.set("Редактор: не открыт")
 
         def _handle_editor_make_cards(selection_html: str) -> None:
@@ -8282,16 +8285,133 @@ class AnkiApp(tk.Tk):
             return state["editor_api"]
 
         def ensure_editor() -> bool:
+            if not QUILL_WEBVIEW_AVAILABLE:
+                if state["fallback_window"] is None or not state["fallback_window"].winfo_exists():
+                    fallback_window, fallback_text = open_fallback_editor(
+                        self.root,
+                        "",
+                        "Редактор конспекта (Quill)",
+                        "pywebview не установлен или не запускается.",
+                        on_close=lambda: self.root.after(0, _mark_editor_closed),
+                    )
+                    state["fallback_window"] = fallback_window
+                    state["fallback_text"] = fallback_text
+                else:
+                    state["fallback_window"].deiconify()
+                    state["fallback_window"].lift()
+                editor_status_var.set("Редактор: открыт (упрощенный)")
+                state["editor_open"] = True
+                return True
+
+            quill_files = [
+                os.path.join(BASE_DIR, "vendor", "quill", "quill.min.js"),
+                os.path.join(BASE_DIR, "vendor", "quill", "quill.snow.css"),
+            ]
+            too_small = [path for path in quill_files if not os.path.exists(path) or os.path.getsize(path) < 10 * 1024]
+            if too_small:
+                messagebox.showwarning(
+                    "Редактор",
+                    "Quill не найден / пустые файлы. Проверьте vendor/quill/*.",
+                )
+
+            if state["editor_window"] is not None:
+                try:
+                    state["editor_window"].bring_to_front()
+                except Exception:
+                    pass
+                editor_status_var.set("Редактор: открыт")
+                state["editor_open"] = True
+                return True
+
+            try:
+                import webview
+            except Exception:
+                if state["fallback_window"] is None or not state["fallback_window"].winfo_exists():
+                    fallback_window, fallback_text = open_fallback_editor(
+                        self.root,
+                        "",
+                        "Редактор конспекта (Quill)",
+                        "Не удалось загрузить pywebview.",
+                        on_close=lambda: self.root.after(0, _mark_editor_closed),
+                    )
+                    state["fallback_window"] = fallback_window
+                    state["fallback_text"] = fallback_text
+                else:
+                    state["fallback_window"].deiconify()
+                    state["fallback_window"].lift()
+                editor_status_var.set("Редактор: открыт (упрощенный)")
+                state["editor_open"] = True
+                return True
+
+            editor_path = os.path.abspath(os.path.join(BASE_DIR, "editor_quill.html"))
+            editor_url = "file:///" + editor_path.replace("\\", "/")
             editor_api = _ensure_editor_api()
-            open_editor_window(
-                self.root,
-                api=editor_api,
-                html=None,
-                title="Редактор конспекта (Quill)",
-                on_close=lambda: self.root.after(0, _mark_editor_closed),
-            )
+            try:
+                state["editor_window"] = webview.create_window(
+                    "Редактор конспекта (Quill)",
+                    url=editor_url,
+                    js_api=editor_api,
+                    width=1100,
+                    height=700,
+                )
+                editor_api.attach_window(
+                    state["editor_window"],
+                    on_close=lambda: self.root.after(0, _mark_editor_closed),
+                )
+            except Exception:
+                if state["fallback_window"] is None or not state["fallback_window"].winfo_exists():
+                    fallback_window, fallback_text = open_fallback_editor(
+                        self.root,
+                        "",
+                        "Редактор конспекта (Quill)",
+                        "Не удалось открыть окно редактора через pywebview.",
+                        on_close=lambda: self.root.after(0, _mark_editor_closed),
+                    )
+                    state["fallback_window"] = fallback_window
+                    state["fallback_text"] = fallback_text
+                else:
+                    state["fallback_window"].deiconify()
+                    state["fallback_window"].lift()
+                editor_status_var.set("Редактор: открыт (упрощенный)")
+                state["editor_open"] = True
+                return True
+
             editor_status_var.set("Редактор: открыт")
             state["editor_open"] = True
+
+            if not state["webview_started"] and not state["webview_starting"]:
+                state["webview_starting"] = True
+
+                def _start_webview() -> None:
+                    try:
+                        webview.start(debug=False, gui="tkinter")
+                        state["webview_started"] = True
+                    except Exception:
+                        messagebox.showwarning(
+                            "Редактор",
+                            "pywebview не смог стартовать. Открыт упрощенный редактор.",
+                        )
+                        state["editor_window"] = None
+                        if state["fallback_window"] is None or not state["fallback_window"].winfo_exists():
+                            fallback_window, fallback_text = open_fallback_editor(
+                                self.root,
+                                "",
+                                "Редактор конспекта (Quill)",
+                                "pywebview не стартовал.",
+                                on_close=lambda: self.root.after(0, _mark_editor_closed),
+                            )
+                            state["fallback_window"] = fallback_window
+                            state["fallback_text"] = fallback_text
+                        else:
+                            state["fallback_window"].deiconify()
+                            state["fallback_window"].lift()
+                        editor_status_var.set("Редактор: открыт (упрощенный)")
+                        state["editor_open"] = True
+                    finally:
+                        state["webview_starting"] = False
+
+                self.root.after(0, _start_webview)
+
             return True
 
         def load_selected_into_editor():
@@ -8307,8 +8427,15 @@ class AnkiApp(tk.Tk):
             index = max(0, min(index, len(state["chunks"]) - 1))
             content = state["chunks"][index]
 
+            editor_api = _ensure_editor_api()
+
             def _task():
-                set_editor_html(content)
+                editor_api.initial_html = content
+                if state["fallback_text"] is not None:
+                    state["fallback_text"].delete("1.0", tk.END)
+                    state["fallback_text"].insert("1.0", content)
+                elif state["editor_window"] is not None:
+                    editor_api.set_html(content)
                 return True
 
             self.run_with_loading(_task)
@@ -8326,7 +8453,10 @@ class AnkiApp(tk.Tk):
             index = max(0, min(index, len(state["chunks"]) - 1))
 
             def _task():
-                return get_editor_html()
+                if state["fallback_text"] is not None:
+                    return state["fallback_text"].get("1.0", tk.END).strip()
+                editor_api = _ensure_editor_api()
+                return editor_api.get_html()
 
             def _on_success(html):
                 if html is None:
@@ -8340,9 +8470,18 @@ class AnkiApp(tk.Tk):
         def build_cards_from_selection() -> list[dict[str, str]]:
             if not ensure_editor():
                 return []
-            selection_html = get_selection_html()
-            if not selection_html:
-                selection_html = get_editor_html() or ""
+            if state["fallback_text"] is not None:
+                try:
+                    selection_html = state["fallback_text"].get("sel.first", "sel.last")
+                except tk.TclError:
+                    selection_html = ""
+                if not selection_html:
+                    selection_html = state["fallback_text"].get("1.0", tk.END).strip()
+            else:
+                editor_api = _ensure_editor_api()
+                selection_html = editor_api.get_selection_html()
+                if not selection_html:
+                    selection_html = editor_api.get_html()
             if not selection_html:
                 return []
             return parse_quill_html_to_cards(selection_html)
