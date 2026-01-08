@@ -4,6 +4,7 @@ import io
 safe = tempfile.gettempdir()
 os.environ["TEMP"] = safe
 os.environ["TMP"] = safe
+import hashlib
 import time
 import traceback
 import base64
@@ -16,6 +17,8 @@ import csv
 import calendar
 import shutil
 import webbrowser
+import urllib.parse
+import urllib.request
 from PIL import Image, ImageOps, ImageDraw
 from pathlib import Path
 from uuid import uuid4
@@ -2067,12 +2070,13 @@ def init_db():
             description TEXT,
             front_template TEXT,
             back_template TEXT,
-            icon_path TEXT
+            icon_path TEXT,
+            tts_lang TEXT
         );
     """)
 
     # миграция для старых БД: добавляем колонки шаблонов, если их нет
-    for col in ("front_template", "back_template", "icon_path"):
+    for col in ("front_template", "back_template", "icon_path", "tts_lang"):
         try:
             cur.execute(f"ALTER TABLE decks ADD COLUMN {col} TEXT;")
         except sqlite3.OperationalError:
@@ -3529,6 +3533,118 @@ def auto_generate_cards_from_video(deck_id: int,
 # ==========================
 # TTS
 # ==========================
+
+TTS_CACHE_TTL = 120
+_TTS_CACHE: dict[str, dict[str, object]] = {}
+
+
+def get_tts_url(text: str, lang: str) -> str:
+    clean = text.strip()
+    if not clean:
+        return ""
+    lang_value = (lang or "de").strip() or "de"
+    query = urllib.parse.quote(clean)
+    return (
+        "https://translate.google.com/translate_tts"
+        f"?ie=UTF-8&q={query}&tl={lang_value}&client=tw-ob"
+    )
+
+
+def _cleanup_tts_cache() -> None:
+    now = time.time()
+    for key, entry in list(_TTS_CACHE.items()):
+        ts = float(entry.get("ts", 0))
+        path = entry.get("path")
+        if now - ts > TTS_CACHE_TTL:
+            if isinstance(path, str) and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            _TTS_CACHE.pop(key, None)
+
+
+def get_deck_tts_lang(deck_id: int | None, fallback: str = "de") -> str:
+    if not deck_id:
+        return fallback
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("PRAGMA table_info(decks);")
+        columns = {row[1] for row in cur.fetchall()}
+        if "tts_lang" not in columns:
+            conn.close()
+            return fallback
+        cur.execute("SELECT tts_lang FROM decks WHERE id = ?;", (deck_id,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            value = row["tts_lang"] if isinstance(row, sqlite3.Row) else row[0]
+            if value:
+                return str(value).strip() or fallback
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return fallback
+
+
+def get_selected_text_from_widget(widget: tk.Misc | None) -> str:
+    targets = []
+    if widget is not None:
+        targets.append(widget)
+        try:
+            top = widget.winfo_toplevel()
+        except Exception:
+            top = None
+        if top is not None and top not in targets:
+            targets.append(top)
+    for target in targets:
+        try:
+            selection = target.selection_get()
+        except Exception:
+            continue
+        if selection:
+            return selection.strip()
+    return ""
+
+
+def speak_google_tts(text: str, lang: str = "de") -> None:
+    cleaned = SOUND_TAG_PATTERN.sub("", text or "").strip()
+    if not cleaned:
+        messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
+        return
+    _cleanup_tts_cache()
+    cache_key = hashlib.sha1(f"{lang}:{cleaned}".encode("utf-8")).hexdigest()
+    cached = _TTS_CACHE.get(cache_key)
+    if cached:
+        cached_path = cached.get("path")
+        cached_ts = float(cached.get("ts", 0))
+        if isinstance(cached_path, str) and os.path.exists(cached_path):
+            if time.time() - cached_ts <= TTS_CACHE_TTL:
+                play_audio_file(cached_path)
+                return
+
+    url = get_tts_url(cleaned, lang)
+    if not url:
+        messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
+        return
+    temp_path = os.path.join(tempfile.gettempdir(), f"xflash_tts_{cache_key}.mp3")
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = response.read()
+        with open(temp_path, "wb") as fh:
+            fh.write(data)
+        _TTS_CACHE[cache_key] = {"path": temp_path, "ts": time.time()}
+        play_audio_file(temp_path)
+    except Exception as exc:
+        messagebox.showerror("Озвучка", f"Не удалось озвучить текст: {exc}")
+
 
 def speak_text(text: str):
     if not TTS_AVAILABLE or not _tts_engine:
@@ -7282,7 +7398,7 @@ class AnkiApp(tk.Tk):
     def add_deck_window(self):
         win = tk.Toplevel(self)
         win.title("Новая колода")
-        win.geometry("400x280")
+        win.geometry("400x340")
         win.grab_set()
 
         ttk.Label(win, text="Название колоды:").pack(anchor="w", padx=10, pady=(10, 0))
@@ -7294,6 +7410,12 @@ class AnkiApp(tk.Tk):
         entry_desc = ttk.Entry(win)
         entry_desc.pack(fill=tk.X, padx=10)
         create_context_menu(entry_desc)  # Добавляем контекстное меню
+
+        ttk.Label(win, text="Язык озвучки (TTS):").pack(anchor="w", padx=10, pady=(10, 0))
+        tts_lang_var = tk.StringVar(value="de")
+        entry_tts_lang = ttk.Entry(win, textvariable=tts_lang_var)
+        entry_tts_lang.pack(fill=tk.X, padx=10)
+        create_context_menu(entry_tts_lang)
 
         # Иконка колоды
         icon_path_var = tk.StringVar()
@@ -7324,6 +7446,7 @@ class AnkiApp(tk.Tk):
             name = entry_name.get().strip()
             desc = entry_desc.get().strip()
             icon_path = icon_path_var.get().strip() or None
+            tts_lang = tts_lang_var.get().strip() or "de"
 
             if not name:
                 messagebox.showerror("Ошибка", "Название не может быть пустым.")
@@ -7335,15 +7458,15 @@ class AnkiApp(tk.Tk):
             try:
                 cur.execute(
                     """INSERT INTO decks
-                       (name, description, front_template, back_template, icon_path)
-                       VALUES (?, ?, ?, ?, ?);""",
-                    (name, desc or None, self.front_template, self.back_template, icon_path)
+                       (name, description, front_template, back_template, icon_path, tts_lang)
+                       VALUES (?, ?, ?, ?, ?, ?);""",
+                    (name, desc or None, self.front_template, self.back_template, icon_path, tts_lang)
                 )
                 deck_id = cur.lastrowid
             except sqlite3.OperationalError:
                 cur.execute(
-                    "INSERT INTO decks (name, description, icon_path) VALUES (?, ?, ?);",
-                    (name, desc or None, icon_path)
+                    "INSERT INTO decks (name, description, icon_path, tts_lang) VALUES (?, ?, ?, ?);",
+                    (name, desc or None, icon_path, tts_lang)
                 )
                 deck_id = cur.lastrowid
             if deck_id:
@@ -7366,13 +7489,16 @@ class AnkiApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Редактирование колоды")
-        win.geometry("420x420")
+        win.geometry("420x460")
         win.grab_set()
 
         # Получаем текущие данные колоды
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT name, description, icon_path FROM decks WHERE id = ?;", (self.selected_deck_id,))
+        cur.execute(
+            "SELECT name, description, icon_path, tts_lang FROM decks WHERE id = ?;",
+            (self.selected_deck_id,),
+        )
         deck_data = cur.fetchone()
         conn.close()
 
@@ -7389,6 +7515,12 @@ class AnkiApp(tk.Tk):
         entry_desc.insert(0, deck_data["description"] or "")
         entry_desc.pack(fill=tk.X, padx=10)
         create_context_menu(entry_desc)  # Добавляем контекстное меню
+
+        ttk.Label(win, text="Язык озвучки (TTS):").pack(anchor="w", padx=10, pady=(10, 0))
+        tts_lang_var = tk.StringVar(value=deck_data["tts_lang"] or "de")
+        entry_tts_lang = ttk.Entry(win, textvariable=tts_lang_var)
+        entry_tts_lang.pack(fill=tk.X, padx=10)
+        create_context_menu(entry_tts_lang)
 
         # Иконка колоды
         icon_path_var = tk.StringVar(value=deck_data["icon_path"] or "")
@@ -7480,6 +7612,7 @@ class AnkiApp(tk.Tk):
             name = entry_name.get().strip()
             desc = entry_desc.get().strip()
             icon_path = icon_path_var.get().strip() or None
+            tts_lang = tts_lang_var.get().strip() or "de"
 
             if not name:
                 messagebox.showerror("Ошибка", "Название не может быть пустым.")
@@ -7520,8 +7653,8 @@ class AnkiApp(tk.Tk):
             conn = get_connection()
             cur = conn.cursor()
             cur.execute(
-                "UPDATE decks SET name = ?, description = ?, icon_path = ? WHERE id = ?;",
-                (name, desc or None, icon_path, self.selected_deck_id)
+                "UPDATE decks SET name = ?, description = ?, icon_path = ?, tts_lang = ? WHERE id = ?;",
+                (name, desc or None, icon_path, tts_lang, self.selected_deck_id)
             )
             update_deck_timer_settings(
                 self.selected_deck_id,
@@ -10497,7 +10630,7 @@ class RepeatWindow(tk.Toplevel):
         self.update_view()
         if self.current_card:
             self.load_checkpoint_state()
-            self.start_timer()
+            self.reset_timer_for_card()
 
     def create_widgets(self):
         frame_main = ttk.Frame(self, style="Surface.TFrame")
@@ -10654,41 +10787,42 @@ class RepeatWindow(tk.Toplevel):
             )
             cb.pack(side=tk.LEFT, padx=5)
 
-        # Панель аудио (ниже контента)
-        self.audio_frame = ttk.Frame(frame_main, style="Surface.TFrame")
+        # Встроенная аудио-панель внутри карточки (под контентом)
+        self.audio_inline_frame = ttk.Frame(self.card_frame, style="CardInner.TFrame")
+        self.audio_inline_frame.place_forget()
 
-        # Панель кнопок
-        self.btn_frame = ttk.Frame(frame_main, style="Surface.TFrame")
-        self.btn_frame.pack(pady=10)
+        # Нижний бар управления (всегда видим)
+        self.controls_bar = ttk.Frame(self, style="Surface.TFrame")
+        self.controls_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
 
         # Кнопка перевода (для лицевой стороны)
         self.btn_translation = ttk.Button(
-            self.btn_frame, 
+            self.controls_bar, 
             text="Скрыть перевод слов" if self.show_translations else "Показать перевод слов",
             command=self.toggle_translations
         )
-        self.btn_translation.grid(row=0, column=0, padx=5)
+        self.btn_translation.pack(side=tk.LEFT, padx=5)
 
         # Кнопки навигации
-        self.btn_prev = ttk.Button(self.btn_frame, text="← Назад", command=self.prev_card)
-        self.btn_prev.grid(row=0, column=1, padx=5)
+        self.btn_prev = ttk.Button(self.controls_bar, text="← Назад", command=self.prev_card)
+        self.btn_prev.pack(side=tk.LEFT, padx=5)
 
-        self.btn_next = ttk.Button(self.btn_frame, text="Вперед →", command=self.next_card)
-        self.btn_next.grid(row=0, column=2, padx=5)
+        self.btn_next = ttk.Button(self.controls_bar, text="Вперед →", command=self.next_card)
+        self.btn_next.pack(side=tk.LEFT, padx=5)
 
-        self.btn_show = ttk.Button(self.btn_frame, text="Показать ответ", command=self.toggle_front_back)
-        self.btn_show.grid(row=0, column=3, padx=5)
+        self.btn_show = ttk.Button(self.controls_bar, text="Показать ответ", command=self.toggle_front_back)
+        self.btn_show.pack(side=tk.LEFT, padx=5)
 
         # Кнопки фаз
-        self.btn_forget = ttk.Button(self.btn_frame, text="Забыл (Фаза 1)", command=self.mark_forgotten)
-        self.btn_forget.grid(row=0, column=4, padx=5)
+        self.btn_forget = ttk.Button(self.controls_bar, text="Забыл (Фаза 1)", command=self.mark_forgotten)
+        self.btn_forget.pack(side=tk.LEFT, padx=5)
 
-        self.btn_remember = ttk.Button(self.btn_frame, text="Повторить (Фаза +1)", command=self.mark_remembered)
-        self.btn_remember.grid(row=0, column=5, padx=5)
+        self.btn_remember = ttk.Button(self.controls_bar, text="Повторить (Фаза 2)", command=self.mark_remembered)
+        self.btn_remember.pack(side=tk.LEFT, padx=5)
 
         # Кнопка звука
-        self.btn_sound = ttk.Button(self.btn_frame, text="🔊 Слово", command=self.play_word)
-        self.btn_sound.grid(row=0, column=6, padx=5)
+        self.btn_sound = ttk.Button(self.controls_bar, text="🔊 Слово", command=self.play_word)
+        self.btn_sound.pack(side=tk.RIGHT, padx=5)
 
         # Инициализация аудио-плеера
         self.update_audio_player()
@@ -10696,14 +10830,14 @@ class RepeatWindow(tk.Toplevel):
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
         entries = get_card_audio_entries(self.current_card, prefer_side="back" if self.show_back else "front")
-        display_audio_entries_on_frame(self.audio_frame, entries)
-        self.audio_widget = getattr(self.audio_frame, "audio_widget", None)
+        display_audio_entries_on_frame(self.audio_inline_frame, entries)
+        self.audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
         if entries:
-            if not self.audio_frame.winfo_ismapped():
-                self.audio_frame.pack(fill=tk.X, padx=10, pady=(0, 6), before=self.btn_frame)
+            if not self.audio_inline_frame.winfo_ismapped():
+                self.audio_inline_frame.place(x=10, y=350, width=780, height=90)
         else:
-            if self.audio_frame.winfo_ismapped():
-                self.audio_frame.pack_forget()
+            if self.audio_inline_frame.winfo_ismapped():
+                self.audio_inline_frame.place_forget()
 
     def set_image_mode(self, mode: str):
         if mode not in ("fit", "actual", "zoom"):
@@ -11042,13 +11176,16 @@ class RepeatWindow(tk.Toplevel):
         self.show_back = not self.show_back
         self.update_view()
 
-    def start_timer(self):
+    def reset_timer_for_card(self):
         self.stop_timer()
         review_seconds = get_effective_mode_timer(
             getattr(self.master, "selected_deck_id", None), "review"
         )
         self.timer_left = max(0, int(review_seconds or 0))
         self.update_timer_label()
+        self.start_timer()
+
+    def start_timer(self):
         if self.timer_left > 0:
             self.timer_job = self.after(1000, self.timer_tick)
 
@@ -11117,7 +11254,7 @@ class RepeatWindow(tk.Toplevel):
             return
         self.load_checkpoint_state()
         self.update_view()
-        self.start_timer()
+        self.reset_timer_for_card()
 
     def next_card(self):
         self.goto_next_card()
@@ -11127,28 +11264,18 @@ class RepeatWindow(tk.Toplevel):
         self.show_back = False
         self.load_checkpoint_state()
         self.update_view()
-        self.start_timer()
+        self.reset_timer_for_card()
 
     def play_word(self):
-        target_side = "back" if self.show_back else "front"
-        audio_path = get_card_audio_path(self.current_card, prefer_side=target_side)
-        if getattr(self, "audio_widget", None) and self.audio_widget.is_loaded():
-            self.audio_widget.play()
+        selection = get_selected_text_from_widget(self.focus_get())
+        back_text = self.current_card.get("back") or ""
+        text = selection or back_text
+        if not text.strip():
+            messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
             return
-        if audio_path and os.path.exists(audio_path) and WINSOUND_AVAILABLE:
-            try:
-                winsound.PlaySound(audio_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                return
-            except Exception:
-                pass
-
-        back = self.current_card["back"]
-        first_line = back.splitlines()[0] if back else ""
-        word = first_line.split()[0] if first_line else ""
-        if not word:
-            messagebox.showinfo("Озвучка", "Не удалось выделить слово для озвучки.")
-            return
-        speak_text(word)
+        deck_id = self.current_card.get("deck_id") or getattr(self.master, "selected_deck_id", None)
+        lang = get_deck_tts_lang(deck_id, "de")
+        speak_google_tts(text, lang)
 
 
 class ReviewWindow(tk.Toplevel):
@@ -11283,18 +11410,18 @@ class ReviewWindow(tk.Toplevel):
         )
         self.btn_progress_plus.pack(side=tk.LEFT, padx=(4, 10))
 
-        self.audio_widget = AudioPlayerWidget(self.card_frame, on_error_callback=self._show_audio_error)
-        self.audio_widget.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
+        self.audio_inline_frame = ttk.Frame(self.card_frame, style="CardInner.TFrame")
+        self.audio_inline_frame.pack_forget()
 
         # Панель кнопок
-        bottom_frame = tk.Frame(self.card_frame, bg=card_bg)
-        bottom_frame.pack(side=tk.BOTTOM, pady=8)
+        self.bottom_frame = tk.Frame(self.card_frame, bg=card_bg)
+        self.bottom_frame.pack(side=tk.BOTTOM, pady=8)
 
-        self.btn_audio_icon = ttk.Button(bottom_frame, text="🔊", width=3, command=self.play_word)
+        self.btn_audio_icon = ttk.Button(self.bottom_frame, text="🔊", width=3, command=self.play_word)
         self.btn_audio_icon.pack(side=tk.LEFT, padx=5)
 
         self.btn_checkpoint = ttk.Button(
-            bottom_frame,
+            self.bottom_frame,
             text="✅ Следующая карточка",
             command=self.goto_next_card
         )
@@ -11315,14 +11442,24 @@ class ReviewWindow(tk.Toplevel):
         self.btn_sound = ttk.Button(btn_frame, text="🔊 Слово", command=self.play_word)
         self.btn_sound.grid(row=0, column=3, padx=5)
 
-        # Добавить аудио-плеер
-        self.card_frame.audio_widget = self.audio_widget
         self.update_audio_player()
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
         entries = get_card_audio_entries(self.current_card, prefer_side="back" if self.show_back else "front")
-        display_audio_entries_on_frame(self.card_frame, entries)
+        display_audio_entries_on_frame(self.audio_inline_frame, entries)
+        if entries:
+            if not self.audio_inline_frame.winfo_ismapped():
+                self.audio_inline_frame.pack(
+                    side=tk.BOTTOM,
+                    fill=tk.X,
+                    padx=10,
+                    pady=(0, 5),
+                    before=self.bottom_frame,
+                )
+        else:
+            if self.audio_inline_frame.winfo_ismapped():
+                self.audio_inline_frame.pack_forget()
 
     def _show_audio_error(self, title: str, message: str):
         try:
@@ -11575,25 +11712,15 @@ class ReviewWindow(tk.Toplevel):
         self.schedule_timers_for_card()
 
     def play_word(self):
-        target_side = "back" if self.show_back else "front"
-        audio_path = get_card_audio_path(self.current_card, prefer_side=target_side)
-        if getattr(self, "audio_widget", None) and self.audio_widget.is_loaded():
-            self.audio_widget.play()
+        selection = get_selected_text_from_widget(self.focus_get())
+        back_text = self.current_card.get("back") or ""
+        text = selection or back_text
+        if not text.strip():
+            messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
             return
-        if audio_path and os.path.exists(audio_path) and WINSOUND_AVAILABLE:
-            try:
-                winsound.PlaySound(audio_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                return
-            except Exception:
-                pass
-
-        back = self.current_card["back"]
-        first_line = back.splitlines()[0] if back else ""
-        word = first_line.split()[0] if first_line else ""
-        if not word:
-            messagebox.showinfo("Озвучка", "Не удалось выделить слово для озвучки.")
-            return
-        speak_text(word)
+        deck_id = self.current_card.get("deck_id") or getattr(self.master, "selected_deck_id", None)
+        lang = get_deck_tts_lang(deck_id, "de")
+        speak_google_tts(text, lang)
 
 
 class AudioEditorWindow:
