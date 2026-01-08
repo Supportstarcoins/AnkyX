@@ -3968,14 +3968,14 @@ class AnkiApp(tk.Tk):
         self._loading_depth += 1
         mode = "determinate" if determinate else "indeterminate"
         try:
-            self.busy_dialog.show("Загрузка", mode, total)
+            self.busy_dialog.show(title, mode, total)
         except Exception:
             pass
 
     def update_loading(self, done: int, total: int | None = None, text: str | None = None):
         """Обновить состояние глобального прогресса."""
         try:
-            self.busy_dialog.update_progress(done, total, "Загрузка")
+            self.busy_dialog.update_progress(done, total, text)
         except Exception:
             pass
 
@@ -8614,13 +8614,21 @@ class AnkiApp(tk.Tk):
                 return
             add_images = add_images_var.get()
             image_limit = max(0, min(10, int(image_limit_var.get() or 0)))
+            total_cards = len(state["cards"])
+            image_steps = min(image_limit, total_cards) if add_images else 0
+            total_steps = max(total_cards + image_steps, 1)
 
-            def _task():
+            def _task(progress_cb):
                 created = 0
-                for idx, card in enumerate(state["cards"]):
+                done = 0
+                for idx, card in enumerate(state["cards"], start=1):
+                    progress_cb(done, total_steps, f"Подготовка карточки {idx}/{total_cards}")
                     image_path = ""
-                    if add_images and idx < image_limit:
+                    if add_images and idx <= image_limit:
+                        progress_cb(done, total_steps, f"AI-картинка {idx}/{total_cards}")
                         image_path = self._create_ai_placeholder_image(card.get("front", "")) or ""
+                        done += 1
+                        progress_cb(done, total_steps, f"AI-картинка готова {idx}/{total_cards}")
 
                     note_fields = {
                         "word": card.get("front", ""),
@@ -8640,6 +8648,8 @@ class AnkiApp(tk.Tk):
                         note_type_id=ensure_generated_note_type_id(),
                     )
                     created += cards_created
+                    done += 1
+                    progress_cb(done, total_steps, f"Готово {idx}/{total_cards}")
                 return created
 
             def _on_success(created):
@@ -8648,7 +8658,17 @@ class AnkiApp(tk.Tk):
                 self.update_overdue_badge()
                 self.refresh_activation_progress_ui()
 
-            self.run_with_loading(_task, on_success=_on_success)
+            def _on_error(exc):
+                messagebox.showerror("Сохранение", str(exc))
+
+            self.task_runner.run_task(
+                "Сохранение карточек",
+                "determinate",
+                _task,
+                on_success=_on_success,
+                on_error=_on_error,
+                total=total_steps,
+            )
 
         ttk.Button(import_frame, text="Импорт файла", command=import_file).grid(
             row=0, column=2, padx=6, pady=6
