@@ -18,7 +18,7 @@ class QuillAPI:
     __slots__ = ("_pending_html", "_ready", "_log_path")
 
     def __init__(self) -> None:
-        self._pending_html: Optional[str] = None
+        self._pending_html = ""
         self._ready = False
         self._log_path = LOG_PATH
 
@@ -27,7 +27,7 @@ class QuillAPI:
 
     def pull_initial_html(self) -> str:
         html = self._pending_html or ""
-        self._pending_html = None
+        self._pending_html = ""
         return html
 
     def notify_editor_ready(self) -> bool:
@@ -61,37 +61,13 @@ class WebEditorManager:
             pass
 
     def set_html_safe(self, html: str) -> None:
-        self.api._pending_html = html or ""
-        if not self.editor_window:
-            return
-        if not self.api._ready:
-            self._schedule_apply_when_ready()
-            return
-        self._apply_pending_now()
-
-    def _schedule_apply_when_ready(self) -> None:
-        def tick() -> None:
-            if not self.editor_window:
-                return
-            if self.api._ready:
-                self._apply_pending_now()
-            else:
-                self.root.after(100, tick)
-
-        self.root.after(0, tick)
-
-    def _apply_pending_now(self) -> None:
-        if not self.editor_window:
-            return
-        if self.api._pending_html is None:
-            return
-        html = self.api._pending_html or ""
-        self.api._pending_html = None
-        js = f"window.setHtml && window.setHtml({json.dumps(html)});"
-        try:
+        html = html or ""
+        self.api._pending_html = html
+        if self.editor_window is not None and self.api._ready:
+            payload = json.dumps(html)
+            js = f"window.setHtml && window.setHtml({payload});"
+            self.api._pending_html = ""
             self.root.after(0, lambda: self.editor_window.evaluate_js(js))
-        except Exception:
-            self._log_exc("apply_pending_now failed")
 
     def get_html(self) -> str:
         if not self.editor_window or not self._wait_ready():

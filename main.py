@@ -3855,6 +3855,8 @@ class AnkiApp(tk.Tk):
         self.deck_icons = {}
         self.deck_preview_images = {}
 
+        self.current_chunk_html = ""
+
         global MIC_DEVICE_INDEX
         MIC_DEVICE_INDEX = detect_default_mic_index()
         self.microphone_index = MIC_DEVICE_INDEX
@@ -8173,6 +8175,7 @@ class AnkiApp(tk.Tk):
             width=14,
         )
         page_combo.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+        page_combo.bind("<<ComboboxSelected>>", lambda _e: update_current_chunk_html())
 
         ttk.Label(import_frame, text="Диапазон страниц (PDF):").grid(row=2, column=0, sticky="w", padx=6, pady=6)
         page_range_entry = ttk.Entry(import_frame, textvariable=page_range_var, width=24)
@@ -8184,6 +8187,19 @@ class AnkiApp(tk.Tk):
 
         def update_cost_label():
             cost_var.set(f"Стоимость: {compute_cost()} ⚡ за страницу")
+
+        def update_current_chunk_html() -> str:
+            if not state["chunks"]:
+                self.current_chunk_html = ""
+                return ""
+            try:
+                index = int(page_var.get()) - 1
+            except ValueError:
+                index = 0
+            index = max(0, min(index, len(state["chunks"]) - 1))
+            html = state["chunks"][index] or ""
+            self.current_chunk_html = html
+            return html
 
         def import_file():
             path = filedialog.askopenfilename(
@@ -8241,6 +8257,7 @@ class AnkiApp(tk.Tk):
                 page_combo.configure(values=page_values)
                 page_var.set(page_values[0])
                 update_cost_label()
+                update_current_chunk_html()
 
                 if file_kind == "pdf":
                     empty_pages = [idx + 1 for idx, text in enumerate(chunks) if not text.strip()]
@@ -8416,20 +8433,20 @@ class AnkiApp(tk.Tk):
             return True
 
         def load_selected_into_editor():
-            if not ensure_editor():
-                return
             if not state["chunks"]:
                 messagebox.showwarning("Редактор", "Сначала импортируйте файл.")
                 return
-            try:
-                index = int(page_var.get()) - 1
-            except ValueError:
-                index = 0
-            index = max(0, min(index, len(state["chunks"]) - 1))
-            content = state["chunks"][index]
+            html = (update_current_chunk_html() or "").strip()
+            if not html:
+                messagebox.showwarning(
+                    "Пусто",
+                    "Сначала импортируйте страницу/чанк, чтобы появился текст для редактора.",
+                )
+                return
+            if not ensure_editor():
+                return
             editor_manager = _ensure_editor_manager()
             try:
-                html = content
                 if state["fallback_text"] is not None:
                     state["fallback_text"].delete("1.0", tk.END)
                     state["fallback_text"].insert("1.0", html)
@@ -8469,6 +8486,7 @@ class AnkiApp(tk.Tk):
                     messagebox.showwarning("Редактор", "Не удалось получить контент.")
                     return
                 state["chunks"][index] = html
+                update_current_chunk_html()
                 messagebox.showinfo("Редактор", "Контент обновлён из редактора.")
 
             self.run_with_loading(_task, on_success=_on_success)
