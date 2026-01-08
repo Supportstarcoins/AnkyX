@@ -202,9 +202,7 @@
       if (window.pywebview && window.pywebview.api && window.pywebview.api.pull_initial_html) {
         window.pywebview.api.pull_initial_html()
           .then((html) => {
-            if (html) {
-              window.setHtml(html);
-            }
+            window.setHtml(html);
           })
           .catch((e) => {
             if (window.pywebview.api.log_js_error) {
