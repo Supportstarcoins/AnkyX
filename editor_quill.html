@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link href="vendor/quill/quill.snow.css" rel="stylesheet">
-  <link href="vendor/quill/quill.core.css" rel="stylesheet">
+  <link rel="stylesheet" href="vendor/quill/quill.snow.css">
+  <link rel="stylesheet" href="vendor/quill/quill.core.css">
   <style>
     :root {
       color-scheme: dark;
@@ -14,6 +14,15 @@
       font-family: "Segoe UI", sans-serif;
       background: #0b0d12;
       color: #e8ecf4;
+    }
+    #error-banner {
+      display: none;
+      padding: 16px 20px;
+      background: #3b0a0a;
+      color: #ffbcbc;
+      font-weight: 600;
+      font-size: 16px;
+      border-bottom: 2px solid #d94f4f;
     }
     .toolbar-wrapper {
       display: flex;
@@ -53,12 +62,12 @@
     }
     .ql-container.ql-snow {
       border: none;
-      background: #0f1422;
-      color: #e8ecf4;
+      background: #ffffff;
+      color: #111827;
     }
     .ql-editor {
       min-height: 100%;
-      color: #e8ecf4;
+      color: #111827;
     }
     .ql-toolbar.ql-snow {
       border: none;
@@ -92,6 +101,7 @@
   </style>
 </head>
 <body>
+  <div id="error-banner"></div>
   <div class="toolbar-wrapper">
     <div id="toolbar">
       <span class="ql-formats">
@@ -108,29 +118,60 @@
       </span>
       <span class="ql-formats">
         <button class="ql-link"></button>
-        <button class="ql-code-block"></button>
         <button class="ql-clean"></button>
       </span>
     </div>
     <div class="toolbar-actions">
-      <button id="make-cards" type="button">Выделение -> карточки</button>
-      <button id="copy-selection" type="button">Копировать HTML выделения</button>
+      <button id="make-cards" type="button">Выделение → карточки</button>
     </div>
   </div>
   <div id="editor"></div>
 
   <script src="vendor/quill/quill.min.js"></script>
   <script>
-    if (typeof Quill === 'undefined') {
-      alert('Quill не найден. Проверьте vendor/quill/.');
+    const errorBanner = document.getElementById('error-banner');
+
+    function showError(message) {
+      errorBanner.textContent = message;
+      errorBanner.style.display = 'block';
     }
 
-    const quill = new Quill('#editor', {
-      theme: 'snow',
-      modules: {
-        toolbar: '#toolbar'
+    function stylesheetLooksEmpty(fragment) {
+      const sheet = Array.from(document.styleSheets).find(
+        (item) => item.href && item.href.includes(fragment)
+      );
+      if (!sheet) {
+        return true;
       }
-    });
+      try {
+        return sheet.cssRules.length === 0;
+      } catch (err) {
+        return false;
+      }
+    }
+
+    let errorMessage = '';
+    if (typeof Quill === 'undefined') {
+      errorMessage = 'Quill не загружен. Проверьте vendor/quill/quill.min.js и пути.';
+    }
+    if (stylesheetLooksEmpty('quill.snow.css')) {
+      errorMessage = errorMessage
+        ? `${errorMessage}\nQuill не найден / пустые файлы`
+        : 'Quill не найден / пустые файлы';
+    }
+    if (errorMessage) {
+      showError(errorMessage);
+    }
+
+    let quill = null;
+    if (typeof Quill !== 'undefined') {
+      quill = new Quill('#editor', {
+        theme: 'snow',
+        modules: {
+          toolbar: '#toolbar'
+        }
+      });
+    }
 
     function normalizeHtml(html) {
       if (!html) return '';
@@ -151,16 +192,13 @@
     }
 
     window.setHtml = function(html) {
+      if (!quill) return;
       const normalized = normalizeHtml(html);
       quill.clipboard.dangerouslyPasteHTML(normalized || '');
     };
 
     window.getHtml = function() {
-      return quill.root.innerHTML;
-    };
-
-    window.getText = function() {
-      return quill.getText();
+      return quill ? quill.root.innerHTML : '';
     };
 
     window.getSelectionHtml = function() {
@@ -174,33 +212,19 @@
       return container.innerHTML;
     };
 
-    window.getSelectionText = function() {
-      const selection = window.getSelection();
-      return selection ? selection.toString() : '';
-    };
-
-    window.getDelta = function() {
-      return JSON.stringify(quill.getContents());
-    };
-
     document.getElementById('make-cards').addEventListener('click', () => {
       if (window.pywebview && window.pywebview.api) {
         window.pywebview.api.make_cards_from_selection();
       }
     });
 
-    document.getElementById('copy-selection').addEventListener('click', async () => {
-      const html = window.getSelectionHtml();
-      if (!html) {
-        alert('Нет выделения.');
-        return;
-      }
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(html);
-      } else {
-        window.prompt('HTML выделения:', html);
-      }
-    });
+    if (window.pywebview && window.pywebview.api) {
+      window.pywebview.api.pull_initial_html().then((html) => {
+        if (html) {
+          window.setHtml(html);
+        }
+      });
+    }
   </script>
 </body>
 </html>
