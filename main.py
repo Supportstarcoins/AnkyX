@@ -81,15 +81,14 @@ from importers import (
     import_odt,
     import_pdf,
 )
-from webview_manager import (
-    get_editor_delta,
+from web_editor import (
+    EditorAPI,
     get_editor_html,
-    get_selection_delta,
     get_selection_html,
     open_editor_window,
     set_editor_html,
 )
-from quill_cards import parse_quill_delta
+from quill_cards import parse_quill_html_to_cards
 from overdue_badges import (
     PhaseOverdueBadges,
     ensure_due_column,
@@ -8139,7 +8138,14 @@ class AnkiApp(tk.Tk):
             style="Section.TLabel",
         ).pack(anchor="w", pady=(0, 8))
 
-        state = {"chunks": [], "file_path": None, "file_kind": None, "cards": [], "editor_open": False}
+        state = {
+            "chunks": [],
+            "file_path": None,
+            "file_kind": None,
+            "cards": [],
+            "editor_open": False,
+            "editor_api": None,
+        }
 
         def compute_cost() -> int:
             return NOTES_PAGE_COST_PRO if self.is_premium_active() else NOTES_PAGE_COST_BASIC
@@ -8259,9 +8265,27 @@ class AnkiApp(tk.Tk):
             state["editor_open"] = False
             editor_status_var.set("Редактор: не открыт")
 
+        def _handle_editor_make_cards(selection_html: str) -> None:
+            cards = parse_quill_html_to_cards(selection_html)
+            if not cards:
+                messagebox.showinfo(
+                    "Предпросмотр",
+                    "Карточки не найдены. Проверьте разметку (bold/underline/цвет).",
+                )
+                return
+            state["cards"] = cards
+            open_preview_window(limit=20)
+
+        def _ensure_editor_api() -> EditorAPI:
+            if state["editor_api"] is None:
+                state["editor_api"] = EditorAPI(self.root, _handle_editor_make_cards)
+            return state["editor_api"]
+
         def ensure_editor() -> bool:
+            editor_api = _ensure_editor_api()
             open_editor_window(
                 self.root,
+                api=editor_api,
                 html=None,
                 title="Редактор конспекта (Quill)",
                 on_close=lambda: self.root.after(0, _mark_editor_closed),
@@ -8316,13 +8340,12 @@ class AnkiApp(tk.Tk):
         def build_cards_from_selection() -> list[dict[str, str]]:
             if not ensure_editor():
                 return []
-            _ = get_selection_html()
-            delta = get_selection_delta()
-            if not delta:
-                delta = get_editor_delta()
-            if not delta:
+            selection_html = get_selection_html()
+            if not selection_html:
+                selection_html = get_editor_html() or ""
+            if not selection_html:
                 return []
-            return parse_quill_delta(delta)
+            return parse_quill_html_to_cards(selection_html)
 
         def charge_for_page() -> bool:
             cost = compute_cost()
@@ -8361,13 +8384,13 @@ class AnkiApp(tk.Tk):
 
             self.run_with_loading(_task, on_success=_on_success)
 
-        def open_preview_window():
+        def open_preview_window(limit: int = 20):
             if not state["cards"]:
                 messagebox.showwarning("Предпросмотр", "Сначала сформируйте карточки.")
                 return
 
             def _task():
-                return list(state["cards"])
+                return list(state["cards"])[:limit]
 
             def _on_success(cards):
                 preview_win = tk.Toplevel(self)

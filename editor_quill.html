@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="vendor/quill/quill.snow.css" rel="stylesheet">
+  <link href="vendor/quill/quill.core.css" rel="stylesheet">
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", sans-serif;
+      background: #0b0d12;
+      color: #e8ecf4;
+    }
+    .toolbar-wrapper {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 12px;
+      background: #111522;
+      border-bottom: 1px solid #1f2638;
+    }
+    #toolbar {
+      border: none;
+      background: transparent;
+    }
+    #toolbar .ql-formats {
+      margin-right: 10px;
+    }
+    .toolbar-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .toolbar-actions button {
+      background: #1f2937;
+      color: #e8ecf4;
+      border: 1px solid #2b3348;
+      padding: 6px 12px;
+      cursor: pointer;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .toolbar-actions button:hover {
+      background: #2a3546;
+    }
+    #editor {
+      height: calc(100vh - 74px);
+    }
+    .ql-container.ql-snow {
+      border: none;
+      background: #0f1422;
+      color: #e8ecf4;
+    }
+    .ql-editor {
+      min-height: 100%;
+      color: #e8ecf4;
+    }
+    .ql-toolbar.ql-snow {
+      border: none;
+      background: transparent;
+    }
+    .ql-toolbar.ql-snow .ql-picker-label,
+    .ql-toolbar.ql-snow .ql-picker-item,
+    .ql-toolbar.ql-snow button {
+      color: #e8ecf4;
+      fill: #e8ecf4;
+      stroke: #e8ecf4;
+    }
+    .ql-toolbar.ql-snow .ql-picker-options {
+      background: #1a1f2f;
+      border: 1px solid #2a3248;
+    }
+    .ql-toolbar.ql-snow .ql-picker-item:hover,
+    .ql-toolbar.ql-snow .ql-picker-label:hover,
+    .ql-toolbar.ql-snow button:hover {
+      color: #ffffff;
+    }
+    .ql-snow .ql-stroke {
+      stroke: #e8ecf4;
+    }
+    .ql-snow .ql-fill {
+      fill: #e8ecf4;
+    }
+    .ql-snow .ql-picker-options .ql-picker-item {
+      color: #e8ecf4;
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar-wrapper">
+    <div id="toolbar">
+      <span class="ql-formats">
+        <button class="ql-bold"></button>
+        <button class="ql-underline"></button>
+      </span>
+      <span class="ql-formats">
+        <select class="ql-color"></select>
+        <select class="ql-background"></select>
+      </span>
+      <span class="ql-formats">
+        <button class="ql-list" value="ordered"></button>
+        <button class="ql-list" value="bullet"></button>
+      </span>
+      <span class="ql-formats">
+        <button class="ql-link"></button>
+        <button class="ql-code-block"></button>
+        <button class="ql-clean"></button>
+      </span>
+    </div>
+    <div class="toolbar-actions">
+      <button id="make-cards" type="button">Выделение -> карточки</button>
+      <button id="copy-selection" type="button">Копировать HTML выделения</button>
+    </div>
+  </div>
+  <div id="editor"></div>
+
+  <script src="vendor/quill/quill.min.js"></script>
+  <script>
+    if (typeof Quill === 'undefined') {
+      alert('Quill не найден. Проверьте vendor/quill/.');
+    }
+
+    const quill = new Quill('#editor', {
+      theme: 'snow',
+      modules: {
+        toolbar: '#toolbar'
+      }
+    });
+
+    function normalizeHtml(html) {
+      if (!html) return '';
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = html;
+      const pres = wrapper.querySelectorAll('pre');
+      pres.forEach((pre) => {
+        const text = pre.textContent || '';
+        const paragraph = document.createElement('p');
+        const lines = text.split('\n');
+        lines.forEach((line, index) => {
+          if (index > 0) paragraph.appendChild(document.createElement('br'));
+          paragraph.appendChild(document.createTextNode(line));
+        });
+        pre.replaceWith(paragraph);
+      });
+      return wrapper.innerHTML;
+    }
+
+    window.setHtml = function(html) {
+      const normalized = normalizeHtml(html);
+      quill.clipboard.dangerouslyPasteHTML(normalized || '');
+    };
+
+    window.getHtml = function() {
+      return quill.root.innerHTML;
+    };
+
+    window.getText = function() {
+      return quill.getText();
+    };
+
+    window.getSelectionHtml = function() {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) {
+        return '';
+      }
+      const range = selection.getRangeAt(0);
+      const container = document.createElement('div');
+      container.appendChild(range.cloneContents());
+      return container.innerHTML;
+    };
+
+    window.getSelectionText = function() {
+      const selection = window.getSelection();
+      return selection ? selection.toString() : '';
+    };
+
+    window.getDelta = function() {
+      return JSON.stringify(quill.getContents());
+    };
+
+    document.getElementById('make-cards').addEventListener('click', () => {
+      if (window.pywebview && window.pywebview.api) {
+        window.pywebview.api.make_cards_from_selection();
+      }
+    });
+
+    document.getElementById('copy-selection').addEventListener('click', async () => {
+      const html = window.getSelectionHtml();
+      if (!html) {
+        alert('Нет выделения.');
+        return;
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(html);
+      } else {
+        window.prompt('HTML выделения:', html);
+      }
+    });
+  </script>
+</body>
+</html>
