@@ -39,7 +39,7 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
 
     root.configure(bg=PALETTE["background"])
 
-    root.option_add("*Font", "Segoe UI 12")
+    root.option_add("*Font", "{Segoe UI} 12")
     root.option_add("*background", PALETTE["background"])
     root.option_add("*foreground", PALETTE["text"])
     root.option_add("*Entry*foreground", PALETTE["text"])
