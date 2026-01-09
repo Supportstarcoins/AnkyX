@@ -7583,226 +7583,267 @@ class AnkiApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Редактирование колоды")
-        win.geometry("520x640")
+        win.geometry("900x600")
+        win.minsize(700, 450)
         win.grab_set()
 
-        # Получаем текущие данные колоды
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT name, description, icon_path, tts_lang FROM decks WHERE id = ?;",
-            (self.selected_deck_id,),
-        )
-        deck_data = cur.fetchone()
-        conn.close()
-
-        timer_settings = get_deck_timer_settings(self.selected_deck_id)
-        phase_intervals = get_deck_phase_intervals(self.selected_deck_id)
-
-        ttk.Label(win, text="Название колоды:").pack(anchor="w", padx=10, pady=(10, 0))
-        entry_name = ttk.Entry(win)
-        entry_name.insert(0, deck_data["name"])
-        entry_name.pack(fill=tk.X, padx=10)
-        create_context_menu(entry_name)  # Добавляем контекстное меню
-
-        ttk.Label(win, text="Описание:").pack(anchor="w", padx=10, pady=(10, 0))
-        entry_desc = ttk.Entry(win)
-        entry_desc.insert(0, deck_data["description"] or "")
-        entry_desc.pack(fill=tk.X, padx=10)
-        create_context_menu(entry_desc)  # Добавляем контекстное меню
-
-        ttk.Label(win, text="Язык озвучки (TTS):").pack(anchor="w", padx=10, pady=(10, 0))
-        tts_lang_var = tk.StringVar(value=deck_data["tts_lang"] or "de")
-        entry_tts_lang = ttk.Entry(win, textvariable=tts_lang_var)
-        entry_tts_lang.pack(fill=tk.X, padx=10)
-        create_context_menu(entry_tts_lang)
-
-        # Иконка колоды
-        icon_path_var = tk.StringVar(value=deck_data["icon_path"] or "")
-        
-        icon_frame = ttk.Frame(win)
-        icon_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        ttk.Label(icon_frame, text="Изображение колоды:").pack(side=tk.LEFT)
-        lbl_icon = ttk.Label(icon_frame, 
-                           text=os.path.basename(icon_path_var.get()) if icon_path_var.get() else "не выбрана")
-        lbl_icon.pack(side=tk.LEFT, padx=5)
-        
-        def select_icon():
-            filetypes = [
-                ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp *.ico"),
-                ("Все файлы", "*.*"),
-            ]
-            filename = filedialog.askopenfilename(
-                title="Выбрать изображение для колоды",
-                filetypes=filetypes
-            )
-            if filename:
-                icon_path_var.set(filename)
-                lbl_icon.config(text=os.path.basename(filename))
-
-        ttk.Button(icon_frame, text="Выбрать", command=select_icon).pack(side=tk.RIGHT, padx=5)
-
-        timer_frame = ttk.LabelFrame(win, text="Таймер колоды")
-        timer_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        ttk.Label(timer_frame, text="Секунды:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        timer_sec_var = tk.IntVar(value=timer_settings.get("timer_sec") or 0)
-        timer_spin = ttk.Spinbox(timer_frame, from_=0, to=3600, textvariable=timer_sec_var, width=10)
-        timer_spin.grid(row=0, column=1, padx=5, pady=5, sticky="w")
-
-        ttk.Label(timer_frame, text="Режим:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-        timer_mode_var = tk.StringVar(value=(timer_settings.get("timer_mode") or "reveal"))
-        mode_combo = ttk.Combobox(
-            timer_frame,
-            state="readonly",
-            values=["reveal", "fail", "notify"],
-            textvariable=timer_mode_var,
-            width=12,
-        )
-        mode_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
-
-        inherit_var = tk.BooleanVar(value=bool(timer_settings.get("inherit_timer", 1)))
-        inherit_cb = ttk.Checkbutton(
-            timer_frame,
-            text="Наследовать от родителя, если свой таймер пуст",
-            variable=inherit_var,
-        )
-        inherit_cb.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="w")
-
-        mode_timer_frame = ttk.LabelFrame(win, text="Таймеры режимов")
-        mode_timer_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        ttk.Label(mode_timer_frame, text="Таймер повторения (сек):").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        review_timer_var = tk.StringVar(
-            value=(
-                "" if timer_settings.get("review_timer_seconds") is None
-                else str(timer_settings.get("review_timer_seconds"))
-            )
-        )
-        ttk.Entry(mode_timer_frame, textvariable=review_timer_var, width=10).grid(
-            row=0, column=1, padx=5, pady=5, sticky="w"
-        )
-
-        ttk.Label(mode_timer_frame, text="Таймер воспроизведения (сек):").grid(
-            row=1, column=0, padx=5, pady=5, sticky="w"
-        )
-        playback_timer_var = tk.StringVar(
-            value=(
-                "" if timer_settings.get("playback_timer_seconds") is None
-                else str(timer_settings.get("playback_timer_seconds"))
-            )
-        )
-        ttk.Entry(mode_timer_frame, textvariable=playback_timer_var, width=10).grid(
-            row=1, column=1, padx=5, pady=5, sticky="w"
-        )
-
-        ttk.Label(
-            mode_timer_frame,
-            text="Пустое поле = наследовать от родительской колоды (если есть)",
-            foreground="gray",
-        ).grid(row=2, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="w")
-
-        phase_frame = ttk.LabelFrame(win, text="Интервалы повторений по фазам")
-        phase_frame.pack(fill=tk.BOTH, padx=10, pady=10, expand=False)
-        phase_frame.columnconfigure(1, weight=1)
-
-        phase_vars = []
-        for idx in range(10):
-            seconds = phase_intervals[idx] if idx < len(phase_intervals) else DEFAULT_PHASE_INTERVALS[idx]
-            days = int(seconds // 86400)
-            hours = int((seconds % 86400) // 3600)
-            days_var = tk.IntVar(value=days)
-            hours_var = tk.IntVar(value=hours)
-            phase_vars.append((days_var, hours_var))
-            ttk.Label(phase_frame, text=f"Фаза {idx + 1}:").grid(row=idx, column=0, padx=5, pady=3, sticky="w")
-            ttk.Label(phase_frame, text="дней").grid(row=idx, column=2, padx=2, sticky="w")
-            ttk.Label(phase_frame, text="часов").grid(row=idx, column=4, padx=2, sticky="w")
-            ttk.Spinbox(phase_frame, from_=0, to=999, textvariable=days_var, width=6).grid(
-                row=idx, column=1, padx=(5, 2), pady=3, sticky="w"
-            )
-            ttk.Spinbox(phase_frame, from_=0, to=23, textvariable=hours_var, width=6).grid(
-                row=idx, column=3, padx=(5, 2), pady=3, sticky="w"
-            )
-
-        def reset_phase_intervals():
-            for idx, (days_var, hours_var) in enumerate(phase_vars):
-                seconds = DEFAULT_PHASE_INTERVALS[idx]
-                days_var.set(int(seconds // 86400))
-                hours_var.set(int((seconds % 86400) // 3600))
-            reset_deck_phase_intervals(self.selected_deck_id)
-
-        def save_changes():
-            name = entry_name.get().strip()
-            desc = entry_desc.get().strip()
-            icon_path = icon_path_var.get().strip() or None
-            tts_lang = tts_lang_var.get().strip() or "de"
-
-            if not name:
-                messagebox.showerror("Ошибка", "Название не может быть пустым.")
-                return
-
+        def log_deck_editor(message: str, exc: BaseException | None = None) -> None:
             try:
-                timer_sec = int(timer_sec_var.get())
-            except tk.TclError:
-                messagebox.showerror("Ошибка", "Некорректное значение таймера.")
-                return
+                with open("deck_editor_error.log", "a", encoding="utf-8") as log_file:
+                    log_file.write(f"{datetime.now().isoformat()} {message}\n")
+                    if exc is not None:
+                        log_file.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                        log_file.write("\n")
+            except Exception:
+                pass
 
-            def parse_mode_timer(raw_value: str, label: str) -> int | None:
-                value = raw_value.strip()
-                if value == "":
-                    return None
-                try:
-                    parsed = int(value)
-                except ValueError:
-                    messagebox.showerror("Ошибка", f"{label}: значение должно быть целым числом.")
-                    return None
-                if parsed < 0:
-                    messagebox.showerror("Ошибка", f"{label}: значение должно быть >= 0.")
-                    return None
-                return parsed
+        def build_ui() -> None:
+            log_deck_editor("build_ui started")
+            try:
+                # Получаем текущие данные колоды
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT name, description, icon_path, tts_lang FROM decks WHERE id = ?;",
+                    (self.selected_deck_id,),
+                )
+                deck_data = cur.fetchone()
+                conn.close()
 
-            review_timer_seconds = parse_mode_timer(
-                review_timer_var.get(), "Таймер повторения"
-            )
-            if review_timer_seconds is None and review_timer_var.get().strip():
-                return
+                if not deck_data:
+                    raise ValueError("Deck not found for editor UI.")
 
-            playback_timer_seconds = parse_mode_timer(
-                playback_timer_var.get(), "Таймер воспроизведения"
-            )
-            if playback_timer_seconds is None and playback_timer_var.get().strip():
-                return
+                timer_settings = get_deck_timer_settings(self.selected_deck_id)
+                phase_intervals = get_deck_phase_intervals(self.selected_deck_id)
 
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE decks SET name = ?, description = ?, icon_path = ?, tts_lang = ? WHERE id = ?;",
-                (name, desc or None, icon_path, tts_lang, self.selected_deck_id)
-            )
-            update_deck_timer_settings(
-                self.selected_deck_id,
-                timer_sec,
-                timer_mode_var.get(),
-                1 if inherit_var.get() else 0,
-                review_timer_seconds,
-                playback_timer_seconds,
-                conn,
-            )
-            intervals = []
-            for days_var, hours_var in phase_vars:
-                seconds = max(0, int(days_var.get()) * 86400 + int(hours_var.get()) * 3600)
-                intervals.append(seconds)
-            save_deck_phase_intervals(self.selected_deck_id, intervals, conn)
-            conn.commit()
-            conn.close()
-            self.refresh_decks()
-            win.destroy()
+                main_frame = ttk.Frame(win, padding=12)
+                main_frame.pack(fill=tk.BOTH, expand=True)
 
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Button(btn_frame, text="Сбросить настройки сроков", command=reset_phase_intervals).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="Сохранить изменения", command=save_changes).pack(side=tk.RIGHT)
+                ttk.Label(main_frame, text="Deck editor loaded OK").pack(anchor="w", pady=(0, 8))
+
+                fields_frame = ttk.LabelFrame(main_frame, text="Поля колоды")
+                fields_frame.pack(fill=tk.X, pady=(0, 10))
+                fields_frame.columnconfigure(1, weight=1)
+
+                ttk.Label(fields_frame, text="Название колоды:").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+                entry_name = ttk.Entry(fields_frame)
+                entry_name.insert(0, deck_data["name"])
+                entry_name.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+                create_context_menu(entry_name)
+
+                ttk.Label(fields_frame, text="Описание:").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+                entry_desc = ttk.Entry(fields_frame)
+                entry_desc.insert(0, deck_data["description"] or "")
+                entry_desc.grid(row=1, column=1, sticky="ew", padx=6, pady=6)
+                create_context_menu(entry_desc)
+
+                ttk.Label(fields_frame, text="Язык озвучки (TTS):").grid(row=2, column=0, sticky="w", padx=6, pady=6)
+                tts_lang_var = tk.StringVar(value=deck_data["tts_lang"] or "de")
+                entry_tts_lang = ttk.Entry(fields_frame, textvariable=tts_lang_var)
+                entry_tts_lang.grid(row=2, column=1, sticky="ew", padx=6, pady=6)
+                create_context_menu(entry_tts_lang)
+
+                icon_path_var = tk.StringVar(value=deck_data["icon_path"] or "")
+                icon_row = ttk.Frame(fields_frame)
+                icon_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=6)
+                icon_row.columnconfigure(1, weight=1)
+                ttk.Label(icon_row, text="Изображение колоды:").grid(row=0, column=0, sticky="w")
+                lbl_icon = ttk.Label(
+                    icon_row,
+                    text=os.path.basename(icon_path_var.get()) if icon_path_var.get() else "не выбрана",
+                )
+                lbl_icon.grid(row=0, column=1, sticky="w", padx=5)
+
+                def select_icon():
+                    filetypes = [
+                        ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp *.ico"),
+                        ("Все файлы", "*.*"),
+                    ]
+                    filename = filedialog.askopenfilename(
+                        title="Выбрать изображение для колоды",
+                        filetypes=filetypes,
+                    )
+                    if filename:
+                        icon_path_var.set(filename)
+                        lbl_icon.config(text=os.path.basename(filename))
+
+                ttk.Button(icon_row, text="Выбрать", command=select_icon).grid(row=0, column=2, sticky="e")
+
+                timer_frame = ttk.LabelFrame(main_frame, text="Таймер колоды")
+                timer_frame.pack(fill=tk.X, pady=(0, 10))
+
+                ttk.Label(timer_frame, text="Секунды:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+                timer_sec_var = tk.IntVar(value=timer_settings.get("timer_sec") or 0)
+                timer_spin = ttk.Spinbox(timer_frame, from_=0, to=3600, textvariable=timer_sec_var, width=10)
+                timer_spin.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+
+                ttk.Label(timer_frame, text="Режим:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+                timer_mode_var = tk.StringVar(value=(timer_settings.get("timer_mode") or "reveal"))
+                mode_combo = ttk.Combobox(
+                    timer_frame,
+                    state="readonly",
+                    values=["reveal", "fail", "notify"],
+                    textvariable=timer_mode_var,
+                    width=12,
+                )
+                mode_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+
+                inherit_var = tk.BooleanVar(value=bool(timer_settings.get("inherit_timer", 1)))
+                inherit_cb = ttk.Checkbutton(
+                    timer_frame,
+                    text="Наследовать от родителя, если свой таймер пуст",
+                    variable=inherit_var,
+                )
+                inherit_cb.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="w")
+
+                mode_timer_frame = ttk.LabelFrame(main_frame, text="Таймеры режимов")
+                mode_timer_frame.pack(fill=tk.X, pady=(0, 10))
+
+                ttk.Label(mode_timer_frame, text="Таймер повторения (сек):").grid(
+                    row=0, column=0, padx=5, pady=5, sticky="w"
+                )
+                review_timer_var = tk.StringVar(
+                    value=(
+                        "" if timer_settings.get("review_timer_seconds") is None
+                        else str(timer_settings.get("review_timer_seconds"))
+                    )
+                )
+                ttk.Entry(mode_timer_frame, textvariable=review_timer_var, width=10).grid(
+                    row=0, column=1, padx=5, pady=5, sticky="w"
+                )
+
+                ttk.Label(mode_timer_frame, text="Таймер воспроизведения (сек):").grid(
+                    row=1, column=0, padx=5, pady=5, sticky="w"
+                )
+                playback_timer_var = tk.StringVar(
+                    value=(
+                        "" if timer_settings.get("playback_timer_seconds") is None
+                        else str(timer_settings.get("playback_timer_seconds"))
+                    )
+                )
+                ttk.Entry(mode_timer_frame, textvariable=playback_timer_var, width=10).grid(
+                    row=1, column=1, padx=5, pady=5, sticky="w"
+                )
+
+                ttk.Label(
+                    mode_timer_frame,
+                    text="Пустое поле = наследовать от родительской колоды (если есть)",
+                    foreground="gray",
+                ).grid(row=2, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="w")
+
+                phase_frame = ttk.LabelFrame(main_frame, text="Интервалы повторений по фазам")
+                phase_frame.pack(fill=tk.BOTH, pady=(0, 10), expand=True)
+                phase_frame.columnconfigure(1, weight=1)
+
+                phase_vars = []
+                for idx in range(10):
+                    seconds = phase_intervals[idx] if idx < len(phase_intervals) else DEFAULT_PHASE_INTERVALS[idx]
+                    days = int(seconds // 86400)
+                    hours = int((seconds % 86400) // 3600)
+                    days_var = tk.IntVar(value=days)
+                    hours_var = tk.IntVar(value=hours)
+                    phase_vars.append((days_var, hours_var))
+                    ttk.Label(phase_frame, text=f"Фаза {idx + 1}:").grid(row=idx, column=0, padx=5, pady=3, sticky="w")
+                    ttk.Label(phase_frame, text="дней").grid(row=idx, column=2, padx=2, sticky="w")
+                    ttk.Label(phase_frame, text="часов").grid(row=idx, column=4, padx=2, sticky="w")
+                    ttk.Spinbox(phase_frame, from_=0, to=999, textvariable=days_var, width=6).grid(
+                        row=idx, column=1, padx=(5, 2), pady=3, sticky="w"
+                    )
+                    ttk.Spinbox(phase_frame, from_=0, to=23, textvariable=hours_var, width=6).grid(
+                        row=idx, column=3, padx=(5, 2), pady=3, sticky="w"
+                    )
+
+                def reset_phase_intervals():
+                    for idx, (days_var, hours_var) in enumerate(phase_vars):
+                        seconds = DEFAULT_PHASE_INTERVALS[idx]
+                        days_var.set(int(seconds // 86400))
+                        hours_var.set(int((seconds % 86400) // 3600))
+                    reset_deck_phase_intervals(self.selected_deck_id)
+
+                def save_changes():
+                    name = entry_name.get().strip()
+                    desc = entry_desc.get().strip()
+                    icon_path = icon_path_var.get().strip() or None
+                    tts_lang = tts_lang_var.get().strip() or "de"
+
+                    if not name:
+                        messagebox.showerror("Ошибка", "Название не может быть пустым.")
+                        return
+
+                    try:
+                        timer_sec = int(timer_sec_var.get())
+                    except tk.TclError:
+                        messagebox.showerror("Ошибка", "Некорректное значение таймера.")
+                        return
+
+                    def parse_mode_timer(raw_value: str, label: str) -> int | None:
+                        value = raw_value.strip()
+                        if value == "":
+                            return None
+                        try:
+                            parsed = int(value)
+                        except ValueError:
+                            messagebox.showerror("Ошибка", f"{label}: значение должно быть целым числом.")
+                            return None
+                        if parsed < 0:
+                            messagebox.showerror("Ошибка", f"{label}: значение должно быть >= 0.")
+                            return None
+                        return parsed
+
+                    review_timer_seconds = parse_mode_timer(
+                        review_timer_var.get(), "Таймер повторения"
+                    )
+                    if review_timer_seconds is None and review_timer_var.get().strip():
+                        return
+
+                    playback_timer_seconds = parse_mode_timer(
+                        playback_timer_var.get(), "Таймер воспроизведения"
+                    )
+                    if playback_timer_seconds is None and playback_timer_var.get().strip():
+                        return
+
+                    conn = get_connection()
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE decks SET name = ?, description = ?, icon_path = ?, tts_lang = ? WHERE id = ?;",
+                        (name, desc or None, icon_path, tts_lang, self.selected_deck_id),
+                    )
+                    update_deck_timer_settings(
+                        self.selected_deck_id,
+                        timer_sec,
+                        timer_mode_var.get(),
+                        1 if inherit_var.get() else 0,
+                        review_timer_seconds,
+                        playback_timer_seconds,
+                        conn,
+                    )
+                    intervals = []
+                    for days_var, hours_var in phase_vars:
+                        seconds = max(0, int(days_var.get()) * 86400 + int(hours_var.get()) * 3600)
+                        intervals.append(seconds)
+                    save_deck_phase_intervals(self.selected_deck_id, intervals, conn)
+                    conn.commit()
+                    conn.close()
+                    self.refresh_decks()
+                    win.destroy()
+
+                btn_frame = ttk.Frame(main_frame)
+                btn_frame.pack(fill=tk.X, pady=(0, 4))
+                ttk.Button(
+                    btn_frame, text="Сбросить настройки сроков", command=reset_phase_intervals
+                ).pack(side=tk.LEFT)
+                ttk.Button(btn_frame, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT, padx=(5, 0))
+                ttk.Button(btn_frame, text="Сохранить изменения", command=save_changes).pack(side=tk.RIGHT)
+            except Exception as exc:
+                log_deck_editor("build_ui exception", exc)
+                messagebox.showerror(
+                    "Ошибка",
+                    "Не удалось построить окно редактора колоды. См. deck_editor_error.log",
+                )
+            finally:
+                log_deck_editor("build_ui finished")
+
+        build_ui()
 
     def delete_selected_deck(self):
         if self.selected_deck_id is None:
