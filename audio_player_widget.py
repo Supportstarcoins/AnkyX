@@ -65,9 +65,12 @@ except Exception:
 
 
 class AudioPlayerWidget(ttk.Frame):
-    def __init__(self, master, on_error_callback=None, **kwargs):
+    SPEED_OPTIONS = ["0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", "2"]
+
+    def __init__(self, master, on_error_callback=None, on_state_change=None, **kwargs):
         super().__init__(master, **kwargs)
         self.on_error_callback = on_error_callback
+        self.on_state_change = on_state_change
         self._after_id = None
         self._duration_ms = 0
         self._seeking = False
@@ -75,6 +78,7 @@ class AudioPlayerWidget(ttk.Frame):
         self._resolved_path: str | None = None
         self._volume = 70.0
         self._rate = 1.0
+        self.media_key: str | None = None
 
         self._vlc_ready = False
         self._vlc_instance = None
@@ -119,25 +123,31 @@ class AudioPlayerWidget(ttk.Frame):
         self.stop_btn = ttk.Button(control_frame, text="⏹ Stop", command=self.stop)
         self.stop_btn.pack(side=tk.LEFT, padx=2)
 
-        vol_frame = ttk.Frame(self, style="CardInner.TFrame")
-        vol_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(vol_frame, text="Громкость").pack(side=tk.LEFT, padx=(0, 5))
+        self.volume_btn = ttk.Button(control_frame, text="🔊 Громкость", command=self._toggle_volume_panel)
+        self.volume_btn.pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(control_frame, text="Скорость").pack(side=tk.LEFT, padx=(10, 5))
+        self.rate_var = tk.StringVar(value="1")
+        self.rate_combo = ttk.Combobox(
+            control_frame,
+            values=self.SPEED_OPTIONS,
+            textvariable=self.rate_var,
+            state="readonly",
+            width=6,
+        )
+        self.rate_combo.pack(side=tk.LEFT)
+        self.rate_combo.bind("<<ComboboxSelected>>", lambda _e: self.set_rate(float(self.rate_var.get())))
+
+        self.volume_panel = ttk.Frame(self, style="CardInner.TFrame")
+        self.volume_panel.pack(fill=tk.X, pady=2)
+        self.volume_panel.pack_forget()
+        ttk.Label(self.volume_panel, text="Громкость").pack(side=tk.LEFT, padx=(0, 5))
         self.volume_var = tk.DoubleVar(value=70)
         self.volume_scale = ttk.Scale(
-            vol_frame, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.volume_var,
+            self.volume_panel, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.volume_var,
             command=lambda _v: self.set_volume(self.volume_var.get())
         )
         self.volume_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        rate_frame = ttk.Frame(self, style="CardInner.TFrame")
-        rate_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(rate_frame, text="Скорость").pack(side=tk.LEFT, padx=(0, 5))
-        self.rate_var = tk.DoubleVar(value=1.0)
-        self.rate_scale = ttk.Scale(
-            rate_frame, from_=0.5, to=2.0, orient=tk.HORIZONTAL, variable=self.rate_var,
-            command=lambda _v: self.set_rate(self.rate_var.get())
-        )
-        self.rate_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         seek_frame = ttk.Frame(self, style="CardInner.TFrame")
         seek_frame.pack(fill=tk.X, pady=2)
@@ -212,10 +222,11 @@ class AudioPlayerWidget(ttk.Frame):
         for widget in (
             self.pause_btn,
             self.volume_scale,
-            self.rate_scale,
+            self.rate_combo,
             self.seek_scale,
         ):
             widget.config(state=advanced_state)
+        self.volume_btn.config(state=advanced_state)
 
     def _start_seeking(self):
         self._seeking = True
@@ -231,6 +242,13 @@ class AudioPlayerWidget(ttk.Frame):
             return
         position_ms = min(max(self.seek_var.get(), 0), self._duration_ms)
         self._player.set_time(int(position_ms))
+        self._emit_state()
+
+    def _toggle_volume_panel(self):
+        if self.volume_panel.winfo_ismapped():
+            self.volume_panel.pack_forget()
+        else:
+            self.volume_panel.pack(fill=tk.X, pady=2)
 
     def load(self, path: str | None):
         self.stop()
@@ -271,7 +289,7 @@ class AudioPlayerWidget(ttk.Frame):
                     self._duration_ms = duration
                     self.seek_scale.config(to=self._duration_ms)
                 self.set_volume(self.volume_var.get())
-                self.set_rate(self.rate_var.get())
+                self.set_rate(float(self.rate_var.get() or 1))
                 self._set_status(os.path.basename(path))
             except Exception as exc:
                 self._handle_error("Не удалось загрузить аудио", exc)
@@ -350,6 +368,7 @@ class AudioPlayerWidget(ttk.Frame):
                 self._set_status("Пауза")
             except Exception as exc:
                 self._handle_error("Не удалось поставить на паузу", exc)
+        self._emit_state()
 
     def stop(self):
         if self._vlc_ready and self._player:
@@ -365,6 +384,7 @@ class AudioPlayerWidget(ttk.Frame):
         self._cancel_after()
         self._update_time_label(0, self._duration_ms)
         self.seek_var.set(0)
+        self._emit_state()
 
     def set_volume(self, value: float):
         self._volume = float(value)
@@ -373,6 +393,7 @@ class AudioPlayerWidget(ttk.Frame):
                 self._player.audio_set_volume(int(self._volume))
             except Exception:
                 pass
+        self._emit_state()
 
     def set_rate(self, value: float):
         self._rate = float(value)
@@ -386,11 +407,49 @@ class AudioPlayerWidget(ttk.Frame):
                     )
             except Exception as exc:
                 self._handle_error("Не удалось изменить скорость", exc)
+        self._emit_state()
 
     def seek(self, seconds: float):
         if not (self._vlc_ready and self._player):
             return
         self._player.set_time(int(seconds * 1000))
+        self._emit_state()
+
+    def set_media_key(self, media_key: str | None):
+        self.media_key = media_key
+
+    def get_state(self) -> dict:
+        pos_ms = int(self.seek_var.get() or 0)
+        if self._vlc_ready and self._player:
+            try:
+                pos_ms = int(self._player.get_time())
+            except Exception:
+                pass
+        return {
+            "pos_ms": pos_ms,
+            "volume": float(self._volume),
+            "speed": float(self._rate),
+        }
+
+    def apply_state(self, state: dict | None):
+        if not state:
+            return
+        try:
+            volume = float(state.get("volume", self._volume))
+            speed = float(state.get("speed", self._rate))
+            pos_ms = int(state.get("pos_ms", 0))
+        except Exception:
+            return
+        self.volume_var.set(volume)
+        self.set_volume(volume)
+        self.rate_var.set(str(speed))
+        self.set_rate(speed)
+        if self._vlc_ready and self._player and pos_ms > 0:
+            try:
+                self._player.set_time(pos_ms)
+                self.seek_var.set(pos_ms)
+            except Exception:
+                pass
 
     def _schedule_progress_update(self):
         self._cancel_after()
@@ -419,6 +478,7 @@ class AudioPlayerWidget(ttk.Frame):
                 self._cancel_after()
                 return
             self._after_id = self.after(200, self._update_progress)
+            self._emit_state()
         except Exception:
             self._cancel_after()
 
@@ -429,6 +489,14 @@ class AudioPlayerWidget(ttk.Frame):
             except Exception:
                 pass
             self._after_id = None
+
+    def _emit_state(self):
+        if not self.on_state_change:
+            return
+        try:
+            self.on_state_change(self.media_key, self.get_state())
+        except Exception:
+            pass
 
     def destroy(self):  # noqa: D401 - Tkinter lifecycle
         self._cancel_after()

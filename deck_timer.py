@@ -1,7 +1,21 @@
 import sqlite3
+import json
 from typing import Callable, Optional, Set, Tuple
 
 from db_path import connect_to_db
+
+DEFAULT_PHASE_INTERVALS = [
+    30,  # 1: 30 seconds
+    25 * 60,  # 2: 25 minutes
+    60 * 60,  # 3: 1 hour
+    24 * 60 * 60,  # 4: 1 day
+    3 * 24 * 60 * 60,  # 5: 3 days
+    9 * 24 * 60 * 60,  # 6: 9 days
+    16 * 24 * 60 * 60,  # 7: 16 days
+    36 * 24 * 60 * 60,  # 8: 36 days
+    56 * 24 * 60 * 60,  # 9: 56 days
+    100 * 24 * 60 * 60,  # 10: 100 days
+]
 
 
 def _prepare_connection(conn: Optional[sqlite3.Connection]) -> tuple[sqlite3.Connection, bool]:
@@ -23,7 +37,8 @@ def ensure_deck_settings_table(conn: Optional[sqlite3.Connection] = None) -> Non
             timer_mode TEXT DEFAULT "reveal",
             inherit_timer INTEGER DEFAULT 1,
             review_timer_seconds INTEGER,
-            playback_timer_seconds INTEGER
+            playback_timer_seconds INTEGER,
+            user_phase_intervals TEXT
         );
         """
     )
@@ -36,6 +51,7 @@ def ensure_deck_settings_table(conn: Optional[sqlite3.Connection] = None) -> Non
         "inherit_timer": "INTEGER DEFAULT 1",
         "review_timer_seconds": "INTEGER",
         "playback_timer_seconds": "INTEGER",
+        "user_phase_intervals": "TEXT",
     }
     for column, ddl in migrations.items():
         if column not in existing_columns:
@@ -123,6 +139,7 @@ def get_deck_timer_settings(
             "inherit_timer": 1,
             "review_timer_seconds": None,
             "playback_timer_seconds": None,
+            "user_phase_intervals": None,
         }
     return {
         "timer_sec": row["timer_sec"],
@@ -130,6 +147,7 @@ def get_deck_timer_settings(
         "inherit_timer": row["inherit_timer"],
         "review_timer_seconds": row["review_timer_seconds"],
         "playback_timer_seconds": row["playback_timer_seconds"],
+        "user_phase_intervals": row["user_phase_intervals"],
     }
 
 
@@ -204,6 +222,73 @@ def get_effective_timer(
     if created:
         conn.close()
     return result
+
+
+def get_deck_phase_intervals(
+    deck_id: int, conn: Optional[sqlite3.Connection] = None
+) -> list[int]:
+    conn, created = _prepare_connection(conn)
+    cur = conn.cursor()
+    ensure_deck_settings_table(conn)
+    ensure_deck_settings_row(deck_id, conn)
+    cur.execute(
+        "SELECT user_phase_intervals FROM deck_settings WHERE deck_id = ?;",
+        (deck_id,),
+    )
+    row = cur.fetchone()
+    if created:
+        conn.close()
+    raw = row["user_phase_intervals"] if row else None
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list) and data:
+                result = [max(0, int(val)) for val in data][: len(DEFAULT_PHASE_INTERVALS)]
+                if len(result) < len(DEFAULT_PHASE_INTERVALS):
+                    result.extend(DEFAULT_PHASE_INTERVALS[len(result) :])
+                return result
+        except Exception:
+            pass
+    return list(DEFAULT_PHASE_INTERVALS)
+
+
+def save_deck_phase_intervals(
+    deck_id: int,
+    intervals: list[int],
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    conn, created = _prepare_connection(conn)
+    cur = conn.cursor()
+    ensure_deck_settings_table(conn)
+    ensure_deck_settings_row(deck_id, conn)
+    payload = json.dumps([max(0, int(val)) for val in intervals], ensure_ascii=False)
+    cur.execute(
+        "UPDATE deck_settings SET user_phase_intervals = ? WHERE deck_id = ?;",
+        (payload, deck_id),
+    )
+    if created:
+        conn.commit()
+        conn.close()
+    else:
+        conn.commit()
+
+
+def reset_deck_phase_intervals(
+    deck_id: int, conn: Optional[sqlite3.Connection] = None
+) -> None:
+    conn, created = _prepare_connection(conn)
+    cur = conn.cursor()
+    ensure_deck_settings_table(conn)
+    ensure_deck_settings_row(deck_id, conn)
+    cur.execute(
+        "UPDATE deck_settings SET user_phase_intervals = NULL WHERE deck_id = ?;",
+        (deck_id,),
+    )
+    if created:
+        conn.commit()
+        conn.close()
+    else:
+        conn.commit()
 
 
 def _normalize_optional_timer(value: Optional[int]) -> Optional[int]:
