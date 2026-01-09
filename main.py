@@ -119,39 +119,47 @@ except Exception:
     _ui_theme = None
 
 
-def load_app_logo(base_dir: str):
+def _logo_debug(msg):
+    try:
+        print("[LOGO]", msg)
+    except Exception:
+        pass
+
+
+def load_app_logo(master: tk.Misc, base_dir: str):
     logo_path = os.path.join(base_dir, "assets", "logo.png")
+    _logo_debug(f"logo_path={logo_path} exists={os.path.exists(logo_path)}")
     if not os.path.exists(logo_path):
         return None, None
     try:
-        logo = tk.PhotoImage(file=logo_path)
-    except Exception:
+        big = tk.PhotoImage(master=master, file=logo_path)
+        small = big.subsample(3, 3)
+        return small, big
+    except Exception as e:
+        _logo_debug(f"PhotoImage load failed: {e}")
         return None, None
 
-    def _scale_photo(photo: tk.PhotoImage, target_size: int) -> tk.PhotoImage:
-        width = photo.width() or target_size
-        if width == target_size:
-            return photo
-        if width > target_size:
-            factor = max(1, int(round(width / target_size)))
-            return photo.subsample(factor, factor)
-        factor = max(1, int(round(target_size / width)))
-        return photo.zoom(factor, factor)
 
-    return _scale_photo(logo, 36), _scale_photo(logo, 64)
-
-
-def apply_window_icon(win: tk.Misc, photo_big: tk.PhotoImage | None, ico_path: str | None = None) -> None:
-    if ico_path and os.path.exists(ico_path):
-        try:
-            win.iconbitmap(ico_path)
-        except Exception:
-            pass
-    if photo_big:
-        try:
-            win.iconphoto(True, photo_big)
-        except Exception:
-            pass
+def apply_window_icon(win: tk.Misc, big_photo: tk.PhotoImage | None, ico_path: str | None = None) -> None:
+    try:
+        if ico_path and os.path.exists(ico_path):
+            try:
+                win.iconbitmap(ico_path)
+                _logo_debug(f"iconbitmap OK: {ico_path}")
+            except Exception as e:
+                _logo_debug(f"iconbitmap failed: {e}")
+        if big_photo is not None:
+            try:
+                win.iconphoto(True, big_photo)
+                try:
+                    win.tk.call('wm', 'iconphoto', win._w, big_photo)
+                except Exception:
+                    pass
+                _logo_debug("iconphoto OK")
+            except Exception as e:
+                _logo_debug(f"iconphoto failed: {e}")
+    except Exception as e:
+        _logo_debug(f"apply_window_icon error: {e}")
 
 def apply_dark_theme_to_window(window, *args, **kwargs):
     # Best-effort применение тёмной темы (совместимость между версиями).
@@ -4159,8 +4167,9 @@ class AnkiApp(tk.Tk):
 
         self.root = self
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-        self._logo_small, self._logo_big = load_app_logo(BASE_DIR)
-        apply_window_icon(self, self._logo_big, ico_path=os.path.join(BASE_DIR, "assets", "app.ico"))
+        self._logo_small, self._logo_big = load_app_logo(self, BASE_DIR)
+        self._ico_path = os.path.join(BASE_DIR, "assets", "app.ico")
+        _logo_debug(f"loaded small={self._logo_small is not None} big={self._logo_big is not None}")
 
         try:
             _fix_tk_default_fonts(self)
@@ -4173,6 +4182,8 @@ class AnkiApp(tk.Tk):
             _fix_tk_default_fonts(self)
         except Exception:
             pass
+
+        self.after(0, lambda: apply_window_icon(self, self._logo_big, self._ico_path))
 
         self.decks = []
         self.selected_deck_id = None
@@ -6374,10 +6385,11 @@ class AnkiApp(tk.Tk):
     def create_widgets(self):
         header = ttk.Frame(self, style="Header.TFrame")
         header.pack(fill=tk.X, padx=16, pady=(12, 8))
-        if self._logo_small:
+        title_lbl = ttk.Label(header, text="X-FLASH", style="Title.TLabel")
+        title_lbl.pack(side=tk.LEFT, padx=(0, 12))
+        if self._logo_small is not None:
             logo_lbl = ttk.Label(header, image=self._logo_small)
-            logo_lbl.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(header, text="X-FLASH", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 12))
+            logo_lbl.pack(side=tk.LEFT, padx=(0, 8), before=title_lbl)
         ttk.Label(header, text="Цифровой слух · OCR · Wiktionary · AI", style="HeaderSub.TLabel").pack(side=tk.LEFT)
 
         quick_actions = ttk.Frame(header, style="Header.TFrame")
@@ -7618,7 +7630,7 @@ class AnkiApp(tk.Tk):
 
     def add_deck_window(self):
         win = tk.Toplevel(self)
-        apply_window_icon(win, self._logo_big, ico_path=os.path.join(BASE_DIR, "assets", "app.ico"))
+        win.after(0, lambda w=win: apply_window_icon(w, self._logo_big, self._ico_path))
         win.title("Новая колода")
         win.geometry("400x340")
         win.grab_set()
@@ -7710,7 +7722,7 @@ class AnkiApp(tk.Tk):
             return
 
         win = tk.Toplevel(self)
-        apply_window_icon(win, self._logo_big, ico_path=os.path.join(BASE_DIR, "assets", "app.ico"))
+        win.after(0, lambda w=win: apply_window_icon(w, self._logo_big, self._ico_path))
         win.title("Редактирование колоды")
         win.geometry("900x600")
         win.minsize(700, 450)
@@ -8136,6 +8148,7 @@ class AnkiApp(tk.Tk):
         win.title("Новая карточка (ручной режим)")
         win.geometry("950x760")
         win.grab_set()
+        win.after(0, lambda w=win: apply_window_icon(w, self._logo_big, self._ico_path))
 
         def log_ui_error(exc: BaseException) -> None:
             try:
