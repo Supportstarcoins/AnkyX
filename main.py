@@ -111,15 +111,48 @@ from video_tools import (
     open_in_external_player,
 )
 from audio_player_widget import AudioPlayerWidget
-from ui_theme import (
-    apply_dark_theme_to_window,
-    apply_premium_dark_theme,
-    get_card_surface_colors,
-    style_card,
-    style_card_surface,
-    style_card_surface_text,
-    style_text_widget,
-)
+# ui_theme: в разных версиях проекта функции темы могут называться иначе.
+# Нельзя падать на ImportError — интерфейс должен запускаться даже без темы.
+try:
+    import ui_theme as _ui_theme
+except Exception:
+    _ui_theme = None
+
+def apply_dark_theme_to_window(window):
+    # Best-effort применение тёмной темы (совместимость между версиями).
+    try:
+        mod = _ui_theme
+        if mod is None:
+            return None
+        fn = getattr(mod, 'apply_dark_theme_to_window', None)
+        if fn is None:
+            fn = getattr(mod, 'apply_dark_theme', None)
+        if fn is None:
+            fn = getattr(mod, 'apply_premium_dark_theme', None)
+        if callable(fn):
+            try:
+                return fn(window)
+            except TypeError:
+                # некоторые реализации могут не принимать аргументы
+                try:
+                    return fn()
+                except Exception:
+                    return None
+    except Exception:
+        return None
+    return None
+
+apply_premium_dark_theme = (getattr(_ui_theme, 'apply_premium_dark_theme', None) if _ui_theme else None) or (lambda *_a, **_k: None)
+style_card = (getattr(_ui_theme, 'style_card', None) if _ui_theme else None) or (lambda *_a, **_k: None)
+style_card_surface = (getattr(_ui_theme, 'style_card_surface', None) if _ui_theme else None) or (lambda *_a, **_k: None)
+style_card_surface_text = (getattr(_ui_theme, 'style_card_surface_text', None) if _ui_theme else None) or (lambda *_a, **_k: None)
+style_text_widget = (getattr(_ui_theme, 'style_text_widget', None) if _ui_theme else None) or (lambda *_a, **_k: None)
+
+get_card_surface_colors = (getattr(_ui_theme, 'get_card_surface_colors', None) if _ui_theme else None)
+if get_card_surface_colors is None:
+    def get_card_surface_colors(*_a, **_k):
+        # (bg, card_bg, text)
+        return ('#0f1115', '#ffffff', '#111111')
 from card_widget import CardWidget
 from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
 
@@ -7638,8 +7671,45 @@ class AnkiApp(tk.Tk):
                 if not deck_data:
                     raise ValueError("Deck not found for editor UI.")
 
-                timer_settings = get_deck_timer_settings(self.selected_deck_id)
-                phase_intervals = get_deck_phase_intervals(self.selected_deck_id)
+                try:
+                    timer_settings = get_deck_timer_settings(self.selected_deck_id)
+                except Exception as e:
+                    # Fallback for legacy deck_timer / older DB schema (pre user_phase_intervals).
+                    try:
+                        log_deck_editor("get_deck_timer_settings failed, using defaults", e)
+                    except Exception:
+                        pass
+                    try:
+                        conn_fix = get_connection()
+                        ensure_deck_settings_table(conn_fix)
+                        ensure_deck_settings_row(self.selected_deck_id, conn_fix)
+                        try:
+                            conn_fix.commit()
+                        except Exception:
+                            pass
+                        try:
+                            conn_fix.close()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    timer_settings = {
+                        "timer_sec": 0,
+                        "timer_mode": "reveal",
+                        "inherit_timer": 1,
+                        "review_timer_seconds": None,
+                        "playback_timer_seconds": None,
+                        "user_phase_intervals": None,
+                    }
+
+                try:
+                    phase_intervals = get_deck_phase_intervals(self.selected_deck_id)
+                except Exception as e:
+                    try:
+                        log_deck_editor("get_deck_phase_intervals failed, using defaults", e)
+                    except Exception:
+                        pass
+                    phase_intervals = list(DEFAULT_PHASE_INTERVALS)
 
                 main_frame = ttk.Frame(win, padding=12)
                 main_frame.pack(fill=tk.BOTH, expand=True)
