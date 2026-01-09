@@ -112,6 +112,7 @@ from video_tools import (
 )
 from audio_player_widget import AudioPlayerWidget
 from ui_theme import (
+    apply_dark_theme_to_window,
     apply_premium_dark_theme,
     get_card_surface_colors,
     style_card,
@@ -120,6 +121,7 @@ from ui_theme import (
     style_text_widget,
 )
 from card_widget import CardWidget
+from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
 
 def _fix_tk_default_fonts(root: tk.Tk, family: str = "Segoe UI", size: int = 11) -> None:
     """Fix invalid global font settings that can break tk.Menu on Windows.
@@ -3913,6 +3915,7 @@ class ResizableImageLabel(tk.Label):
         self.scale_factor = 1.0
         self.drag_data = {"x": 0, "y": 0, "item": None}
         self._container_size: tuple[int, int] = (0, 0)
+        self._warned_large_path: str | None = None
         self.configure(anchor="center")
         
         # Привязываем события мыши
@@ -3937,23 +3940,42 @@ class ResizableImageLabel(tk.Label):
         self.image_path = image_path
         if image_path and os.path.exists(image_path) and PIL_AVAILABLE:
             try:
-                img = Image.open(image_path)
-                try:
-                    img = ImageOps.exif_transpose(img)
-                except Exception:
-                    pass
+                cont_w, cont_h = self._container_size
+                if cont_w <= 1 or cont_h <= 1:
+                    cont_w = max(1, self.winfo_width() or self.winfo_reqwidth() or 800)
+                    cont_h = max(1, self.winfo_height() or self.winfo_reqheight() or 600)
+                max_zoom = 3.0
+                max_preview = (int(cont_w * max_zoom), int(cont_h * max_zoom))
+                img, resized_for_pixels = load_preview_image(
+                    image_path,
+                    max_preview,
+                    max_pixels=MAX_PREVIEW_PIXELS,
+                )
+                if resized_for_pixels and self._warned_large_path != image_path:
+                    messagebox.showinfo(
+                        "Большое изображение",
+                        "Изображение слишком большое, будет сжато для превью.",
+                    )
+                    self._warned_large_path = image_path
                 self.original_image = img
                 self.scale_factor = 1.0
                 self.update_display()
                 return True
             except Exception as e:
+                log_image_error(image_path, e)
+                try:
+                    messagebox.showerror("Ошибка", "Не удалось загрузить изображение.")
+                except Exception:
+                    pass
                 self.original_image = None
                 self.current_image = None
+                self.image = None
                 self.config(text="Нет изображения", image="")
                 return False
         else:
             self.original_image = None
             self.current_image = None
+            self.image = None
             self.config(text="Нет изображения", image="")
             return False
     
@@ -3978,7 +4000,9 @@ class ResizableImageLabel(tk.Label):
             
             # Масштабируем изображение
             resized_image = self.original_image.resize((width, height), Image.Resampling.LANCZOS)
+            self.config(image="", text="")
             self.current_image = ImageTk.PhotoImage(resized_image)
+            self.image = self.current_image
             self.config(image=self.current_image, text="")
     
     def start_drag(self, event):
@@ -4353,6 +4377,7 @@ class AnkiApp(tk.Tk):
         win.title("Видео → клипы → карточки")
         win.geometry("520x260")
         win.grab_set()
+        apply_dark_theme_to_window(win, self.palette)
 
         video_path_var = tk.StringVar()
         start_var = tk.StringVar(value="00:00:00")
@@ -8194,9 +8219,12 @@ class AnkiApp(tk.Tk):
         win.geometry("950x600")
         win.grab_set()
 
-        canvas = tk.Canvas(win)
+        palette = getattr(self, "palette", None) or {}
+        apply_dark_theme_to_window(win, palette)
+
+        canvas = tk.Canvas(win, highlightthickness=0, bg=palette.get("background", "#0B0D12"))
         scrollbar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
+        scroll_frame = ttk.Frame(canvas, style="Surface.TFrame")
 
         scroll_frame.bind(
             "<Configure>",
@@ -8213,12 +8241,14 @@ class AnkiApp(tk.Tk):
             c = sanitize_card_sounds(dict(c))
             card_frame = ttk.LabelFrame(
                 scroll_frame,
-                text=f"ID {c['id']} (уровень {c['leitner_level']}, next {c['next_review']}, prog {c['progress']})"
+                text=f"ID {c['id']} (уровень {c['leitner_level']}, next {c['next_review']}, prog {c['progress']})",
+                style="Card.TLabelframe",
             )
             card_frame.pack(fill=tk.X, padx=10, pady=5)
 
             ttk.Label(card_frame, text="FRONT:").pack(anchor="w")
             txt_front = tk.Text(card_frame, height=3)
+            style_text_widget(txt_front, palette)
             txt_front.pack(fill=tk.X, padx=5)
             txt_front.insert("1.0", c["front"])
             create_context_menu(txt_front)  # Добавляем контекстное меню
@@ -8226,6 +8256,7 @@ class AnkiApp(tk.Tk):
 
             ttk.Label(card_frame, text="BACK:").pack(anchor="w")
             txt_back = tk.Text(card_frame, height=3)
+            style_text_widget(txt_back, palette)
             txt_back.pack(fill=tk.X, padx=5)
             txt_back.insert("1.0", c["back"])
             create_context_menu(txt_back)  # Добавляем контекстное меню
@@ -8234,7 +8265,7 @@ class AnkiApp(tk.Tk):
             front_img_var = tk.StringVar(value=c["front_image_path"] or "")
             back_img_var = tk.StringVar(value=c["back_image_path"] or "")
 
-            frame_img = ttk.Frame(card_frame)
+            frame_img = ttk.Frame(card_frame, style="CardInner.TFrame")
             frame_img.pack(fill=tk.X, padx=5, pady=5)
 
             ttk.Label(frame_img, text="Картинка FRONT:").grid(row=0, column=0, sticky="w")
@@ -8285,7 +8316,7 @@ class AnkiApp(tk.Tk):
 
             audio_entries = get_card_audio_entries(c)
 
-            audio_frame = ttk.LabelFrame(card_frame, text="Аудио")
+            audio_frame = ttk.LabelFrame(card_frame, text="Аудио", style="Card.TLabelframe")
             audio_frame.pack(fill=tk.X, padx=5, pady=5)
 
             if audio_entries:
@@ -8370,7 +8401,7 @@ class AnkiApp(tk.Tk):
                     frame.destroy()
                 return handler
 
-            btns_frame = ttk.Frame(card_frame)
+            btns_frame = ttk.Frame(card_frame, style="CardInner.TFrame")
             btns_frame.pack(anchor="e", padx=5, pady=3)
 
             ttk.Button(
@@ -8424,6 +8455,7 @@ class AnkiApp(tk.Tk):
         win.title("Генерация по конспекту АИ+ картинки")
         win.geometry("980x740")
         win.grab_set()
+        apply_dark_theme_to_window(win, self.palette)
 
         main_frame = ttk.Frame(win, style="Surface.TFrame")
         main_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
@@ -8872,13 +8904,18 @@ class AnkiApp(tk.Tk):
                 preview_win.title("Предпросмотр карточек")
                 preview_win.geometry("800x600")
                 preview_win.grab_set()
+                apply_dark_theme_to_window(preview_win, self.palette)
 
-                container = ttk.Frame(preview_win)
+                container = ttk.Frame(preview_win, style="Surface.TFrame")
                 container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-                canvas = tk.Canvas(container, highlightthickness=0)
+                canvas = tk.Canvas(
+                    container,
+                    highlightthickness=0,
+                    bg=self.palette.get("background", "#0B0D12"),
+                )
                 scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-                list_frame = ttk.Frame(canvas)
+                list_frame = ttk.Frame(canvas, style="Surface.TFrame")
 
                 list_frame.bind(
                     "<Configure>",
@@ -9039,6 +9076,7 @@ class AnkiApp(tk.Tk):
         win.title("Авто-генерация из текста")
         win.geometry("650x580")
         win.grab_set()
+        apply_dark_theme_to_window(win, self.palette)
         canvas = tk.Canvas(win, highlightthickness=0, bg=self.palette["background"])
         scrollbar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
         scroll_frame = ttk.Frame(canvas, style="Surface.TFrame")
@@ -9594,6 +9632,7 @@ class AnkiApp(tk.Tk):
         win.geometry("760x620")
         win.grab_set()
         win._preview_img_ref = None
+        apply_dark_theme_to_window(win, self.palette)
 
         form_frame = ttk.Frame(win, style="Surface.TFrame")
         form_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
@@ -9769,7 +9808,9 @@ class AnkiApp(tk.Tk):
         win.geometry("900x650")
         win.grab_set()
 
-        main_frame = ttk.Frame(win)
+        apply_dark_theme_to_window(win, self.palette)
+
+        main_frame = ttk.Frame(win, style="Surface.TFrame")
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # Настройки OCR
@@ -9858,6 +9899,7 @@ class AnkiApp(tk.Tk):
         log_frame = ttk.Frame(ocr_status_frame)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 5))
         log_text = tk.Text(log_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
+        style_text_widget(log_text, self.palette)
         log_text.pack(fill=tk.BOTH, expand=True)
 
         ocr_task_holder = {"task": None}
@@ -9870,6 +9912,7 @@ class AnkiApp(tk.Tk):
         text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         txt_ocr = tk.Text(text_frame, height=15, wrap=tk.WORD)
+        style_text_widget(txt_ocr, self.palette)
         create_context_menu(txt_ocr)
         scrollbar = ttk.Scrollbar(text_frame, command=txt_ocr.yview)
         txt_ocr.configure(yscrollcommand=scrollbar.set)
@@ -10034,12 +10077,14 @@ class AnkiApp(tk.Tk):
 
         ttk.Label(settings_frame, text="Шаблон FRONT:").pack(anchor="w", padx=10, pady=(5, 0))
         entry_front = tk.Text(settings_frame, height=2)
+        style_text_widget(entry_front, self.palette)
         entry_front.pack(fill=tk.X, padx=10, pady=(0, 5))
         entry_front.insert("1.0", self.front_template)
         create_context_menu(entry_front)  # Добавляем контекстное меню
 
         ttk.Label(settings_frame, text="Шаблон BACK:").pack(anchor="w", padx=10)
         entry_back = tk.Text(settings_frame, height=2)
+        style_text_widget(entry_back, self.palette)
         entry_back.pack(fill=tk.X, padx=10, pady=(0, 5))
         entry_back.insert("1.0", self.back_template)
         create_context_menu(entry_back)  # Добавляем контекстное меню
@@ -10058,6 +10103,7 @@ class AnkiApp(tk.Tk):
         ttk.Label(progress_frame, textvariable=progress_label_var).pack(anchor="w", padx=10)
 
         log_box = tk.Text(main_frame, height=6, state="disabled")
+        style_text_widget(log_box, self.palette)
         log_box.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 10))
 
         def append_log(message: str):
@@ -10179,6 +10225,7 @@ class AnkiApp(tk.Tk):
         win.title("Авто-генерация через цифровой слух")
         win.geometry("520x500")
         win.grab_set()
+        apply_dark_theme_to_window(win, self.palette)
 
         ttk.Label(win, text="Длительность записи (сек):").pack(anchor="w", padx=10, pady=(10, 0))
         entry_dur = ttk.Entry(win)
@@ -10223,12 +10270,14 @@ class AnkiApp(tk.Tk):
 
         ttk.Label(frame_opts, text="Шаблон FRONT:").pack(anchor="w", padx=5)
         entry_front = tk.Text(frame_opts, height=2)
+        style_text_widget(entry_front, self.palette)
         entry_front.pack(fill=tk.X, padx=5)
         entry_front.insert("1.0", self.front_template)
         create_context_menu(entry_front)  # Добавляем контекстное меню
 
         ttk.Label(frame_opts, text="Шаблон BACK:").pack(anchor="w", padx=5, pady=(5, 0))
         entry_back = tk.Text(frame_opts, height=2)
+        style_text_widget(entry_back, self.palette)
         entry_back.pack(fill=tk.X, padx=5)
         entry_back.insert("1.0", self.back_template)
         create_context_menu(entry_back)  # Добавляем контекстное меню

@@ -1,8 +1,10 @@
+import os
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 from ui_theme import get_card_surface_colors, style_card_surface, style_card_surface_text
-from PIL import Image, ImageTk, ImageOps
+from PIL import Image, ImageTk
+from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
 
 PIL_AVAILABLE = True
 
@@ -32,6 +34,7 @@ class CardWidget(tk.Frame):
         self._last_fit_scale = 1.0
         self._image_path: str | None = None
         self._img_ref = None
+        self._warned_large_path: str | None = None
 
         self._build_layout()
 
@@ -222,31 +225,41 @@ class CardWidget(tk.Frame):
 
     def render_image(self) -> None:
         path = self._image_path
-        if not path or not PIL_AVAILABLE:
+        if not path or not PIL_AVAILABLE or not os.path.exists(path):
             self._img_ref = None
             if self.image_canvas is not None:
-                self.image_canvas.delete("all")
+                self.image_canvas.delete("card_preview")
                 self.image_canvas.create_text(
                     10,
                     10,
                     anchor="nw",
                     text="Нет изображения",
                     fill="#666666",
+                    tags=("card_preview",),
                 )
             return
 
         try:
-            img = Image.open(path)
-            try:
-                img = ImageOps.exif_transpose(img)
-            except Exception:
-                pass
             if self.image_canvas is None:
                 return
             cont_w = max(1, self.image_canvas.winfo_width())
             cont_h = max(1, self.image_canvas.winfo_height())
             cont_w = max(1, cont_w - 10)
             cont_h = max(1, cont_h - 10)
+            max_zoom = 6.0
+            max_preview = (int(cont_w * max_zoom), int(cont_h * max_zoom))
+            img, resized_for_pixels = load_preview_image(
+                path,
+                max_preview,
+                max_pixels=MAX_PREVIEW_PIXELS,
+            )
+            if resized_for_pixels and self._warned_large_path != path:
+                messagebox.showinfo(
+                    "Большое изображение",
+                    "Изображение слишком большое, будет сжато для превью.",
+                )
+                self._warned_large_path = path
+
             img_w, img_h = img.size
             if img_w <= 0 or img_h <= 0:
                 raise ValueError("Invalid image size")
@@ -261,8 +274,15 @@ class CardWidget(tk.Frame):
             new_size = (max(1, int(img_w * scale)), max(1, int(img_h * scale)))
             resized = img.resize(new_size, Image.Resampling.LANCZOS)
             self._img_ref = ImageTk.PhotoImage(resized)
-            self.image_canvas.delete("all")
-            self.image_canvas.create_image(0, 0, anchor="nw", image=self._img_ref)
+            self.image_canvas.delete("card_preview")
+            self.image_canvas.create_image(
+                0,
+                0,
+                anchor="nw",
+                image=self._img_ref,
+                tags=("card_preview",),
+            )
+            self.image_canvas._preview_ref = self._img_ref
             self.image_canvas.config(scrollregion=(0, 0, new_size[0], new_size[1]))
 
             if self.image_mode == "fit":
@@ -275,16 +295,22 @@ class CardWidget(tk.Frame):
                     self.image_scroll_x.grid()
                 if self.image_scroll_y is not None:
                     self.image_scroll_y.grid()
-        except Exception:
+        except Exception as exc:
+            log_image_error(path, exc)
+            try:
+                messagebox.showerror("Ошибка", "Не удалось загрузить изображение.")
+            except Exception:
+                pass
             self._img_ref = None
             if self.image_canvas is not None:
-                self.image_canvas.delete("all")
+                self.image_canvas.delete("card_preview")
                 self.image_canvas.create_text(
                     10,
                     10,
                     anchor="nw",
                     text="Нет изображения",
                     fill="#666666",
+                    tags=("card_preview",),
                 )
 
     def show_audio_frame(self, visible: bool) -> None:
