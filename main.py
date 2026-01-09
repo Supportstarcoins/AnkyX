@@ -4251,6 +4251,11 @@ class AnkiApp(tk.Tk):
         self.credit_icon_large = None
         self.generation_menu = None
         self.generation_menu_indexes: dict[str, int] = {}
+        self._file_menu = None
+        self._settings_menu = None
+        self._modes_menu = None
+        self._stats_menu = None
+        self._gen_menu_open = False
         self.mode_actions: dict[str, callable] = {}
         self.user_id_var = tk.StringVar(value=self.user_id)
         self.account_status_var = tk.StringVar(value="")
@@ -4373,17 +4378,15 @@ class AnkiApp(tk.Tk):
     # --------- меню ---------
 
     def create_menu(self):
-        menubar = tk.Menu(self)
-
-        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu = tk.Menu(self, tearoff=0)
         file_menu.add_command(label="Импорт Anki (.apkg)", command=self.open_apkg_import_window)
         file_menu.add_separator()
         file_menu.add_command(label="Новая колода", command=self.add_deck_window)
         file_menu.add_command(label="Редактировать колоду", command=self.edit_deck_window)
         file_menu.add_command(label="Удалить выбранную колоду", command=self.delete_selected_deck)
-        menubar.add_cascade(label="Файл", menu=file_menu)
+        self._file_menu = file_menu
 
-        settings_menu = tk.Menu(menubar, tearoff=0)
+        settings_menu = tk.Menu(self, tearoff=0)
         settings_menu.add_command(label="OpenAI API ключ", command=self.open_settings_window)
         settings_menu.add_command(label="Аудиоустройство (цифровой слух)",
                                   command=self.open_audio_device_window)
@@ -4391,9 +4394,9 @@ class AnkiApp(tk.Tk):
                                   command=self.open_translation_settings_window)
         settings_menu.add_command(label="Управление словарями",
                                   command=self.open_dictionary_manager_window)
-        menubar.add_cascade(label="Настройки", menu=settings_menu)
+        self._settings_menu = settings_menu
 
-        gen_menu = tk.Menu(menubar, tearoff=0)
+        gen_menu = tk.Menu(self, tearoff=0)
         self.generation_menu = gen_menu
         gen_menu.add_command(label="Генерация из текста…", command=self.open_generate_from_text_window)
         self.generation_menu_indexes["text"] = gen_menu.index("end")
@@ -4428,10 +4431,9 @@ class AnkiApp(tk.Tk):
             command=self.open_wikimedia_csv_window,
         )
         self.generation_menu_indexes["wikimedia"] = gen_menu.index("end")
-        menubar.add_cascade(label="Режим генерации", menu=gen_menu)
         self.refresh_generation_menu_state()
 
-        modes_menu = tk.Menu(menubar, tearoff=0)
+        modes_menu = tk.Menu(self, tearoff=0)
         modes_menu.add_command(
             label="Режим повторения (по дате)",
             command=self.mode_actions.get("repeat", self.start_repeat_mode)
@@ -4444,15 +4446,34 @@ class AnkiApp(tk.Tk):
                                command=self.show_cards_window)
         modes_menu.add_command(label="Режим ознакомления",
                                command=self.start_overview_mode)
-        menubar.add_cascade(label="Режимы", menu=modes_menu)
+        self._modes_menu = modes_menu
 
         # Добавляем меню статистики
-        stats_menu = tk.Menu(menubar, tearoff=0)
+        stats_menu = tk.Menu(self, tearoff=0)
         stats_menu.add_command(label="Показать статистику", command=self.show_statistics_window)
         stats_menu.add_command(label="Статистика словаря", command=self.show_dictionary_stats_window)
-        menubar.add_cascade(label="Статистика", menu=stats_menu)
+        self._stats_menu = stats_menu
 
-        self.config(menu=menubar)
+        gen_menu.bind("<Unmap>", lambda _e: self._set_gen_menu_open(False))
+        self.config(menu=None)
+
+    def _set_gen_menu_open(self, value: bool) -> None:
+        self._gen_menu_open = value
+
+    def _popup_menu(self, menu: tk.Menu, widget: tk.Widget, guard_generation: bool = False) -> None:
+        if menu is None:
+            return
+        if guard_generation and self._gen_menu_open:
+            return
+        if guard_generation:
+            self._set_gen_menu_open(True)
+        try:
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            if guard_generation:
+                self._set_gen_menu_open(False)
     
     def open_generate_from_video_window(self):
         """Открыть окно генерации из видео"""
@@ -6383,9 +6404,6 @@ class AnkiApp(tk.Tk):
         return btn
 
     def create_widgets(self):
-        menu_divider = tk.Frame(self, height=1, bg=self.palette["border"])
-        menu_divider.pack(fill=tk.X)
-
         header_pad = (8, 8)
         header = ttk.Frame(self, style="Header.TFrame")
         header.pack(fill=tk.X, padx=16, pady=(12, 8))
@@ -6397,6 +6415,50 @@ class AnkiApp(tk.Tk):
             logo_lbl.pack(fill="both", expand=True)
         title_lbl = ttk.Label(header, text="X-FLASH", style="Title.TLabel")
         title_lbl.pack(side=tk.LEFT, padx=(0, 12), pady=header_pad)
+
+        menu_bar = ttk.Frame(header, style="Header.TFrame")
+        menu_bar.pack(side=tk.LEFT, padx=(0, 12), pady=header_pad)
+
+        file_btn = ttk.Button(
+            menu_bar,
+            text="Файл",
+            style="Ghost.TButton",
+            command=lambda b=None: None,
+        )
+        file_btn.configure(command=lambda b=file_btn: self._popup_menu(self._file_menu, b))
+        file_btn.pack(side=tk.LEFT, padx=4)
+        settings_btn = ttk.Button(
+            menu_bar,
+            text="Настройки",
+            style="Ghost.TButton",
+            command=lambda b=None: None,
+        )
+        settings_btn.configure(command=lambda b=settings_btn: self._popup_menu(self._settings_menu, b))
+        settings_btn.pack(side=tk.LEFT, padx=4)
+        gen_btn = ttk.Button(
+            menu_bar,
+            text="Режим генерации",
+            style="Ghost.TButton",
+            command=lambda b=None: None,
+        )
+        gen_btn.configure(command=lambda b=gen_btn: self._popup_menu(self.generation_menu, b, guard_generation=True))
+        gen_btn.pack(side=tk.LEFT, padx=4)
+        modes_btn = ttk.Button(
+            menu_bar,
+            text="Режимы",
+            style="Ghost.TButton",
+            command=lambda b=None: None,
+        )
+        modes_btn.configure(command=lambda b=modes_btn: self._popup_menu(self._modes_menu, b))
+        modes_btn.pack(side=tk.LEFT, padx=4)
+        stats_btn = ttk.Button(
+            menu_bar,
+            text="Статистика",
+            style="Ghost.TButton",
+            command=lambda b=None: None,
+        )
+        stats_btn.configure(command=lambda b=stats_btn: self._popup_menu(self._stats_menu, b))
+        stats_btn.pack(side=tk.LEFT, padx=4)
 
         quick_actions = ttk.Frame(header, style="Header.TFrame")
         quick_actions.pack(side=tk.RIGHT, pady=header_pad)
@@ -6432,6 +6494,9 @@ class AnkiApp(tk.Tk):
             style="Ghost.TButton",
             command=self.open_personal_tab,
         ).pack(side=tk.RIGHT)
+
+        menu_divider = tk.Frame(self, height=1, bg=self.palette["border"])
+        menu_divider.pack(fill=tk.X, padx=16)
 
         shell = ttk.Frame(self, style="Surface.TFrame")
         shell.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
@@ -6480,11 +6545,26 @@ class AnkiApp(tk.Tk):
 
         decks_tree_frame = ttk.Frame(frame_top, style="CardInner.TFrame")
         decks_tree_frame.pack(fill=tk.BOTH, expand=True)
+        decks_tree_frame.grid_rowconfigure(0, weight=1)
+        decks_tree_frame.grid_columnconfigure(0, weight=1)
         self.decks_tree = ttk.Treeview(decks_tree_frame, show="tree", selectmode="browse")
-        decks_tree_vbar = ttk.Scrollbar(decks_tree_frame, orient="vertical", command=self.decks_tree.yview)
+        scroll_bg = self.palette.get("panel2", self.palette["panel"])
+        scroll_trough = self.palette.get("border", "#242A3A")
+        scroll_active = self.palette.get("panel", scroll_bg)
+        decks_tree_vbar = tk.Scrollbar(
+            decks_tree_frame,
+            orient="vertical",
+            command=self.decks_tree.yview,
+            bg=scroll_bg,
+            troughcolor=scroll_trough,
+            activebackground=scroll_active,
+            highlightthickness=0,
+            bd=0,
+            width=12,
+        )
         self.decks_tree.configure(yscrollcommand=decks_tree_vbar.set)
-        self.decks_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        decks_tree_vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.decks_tree.grid(row=0, column=0, sticky="nsew")
+        decks_tree_vbar.grid(row=0, column=1, sticky="ns")
         decks_tree_frame.pack_propagate(False)
         # ttk.Treeview doesn't support classic Tk options like borderwidth/highlightthickness.
         try:
