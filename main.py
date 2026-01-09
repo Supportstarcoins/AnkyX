@@ -131,14 +131,32 @@ def apply_dark_theme_to_window(window, *args, **kwargs):
             fn = getattr(mod, 'apply_premium_dark_theme', None)
         if callable(fn):
             try:
-                return fn(window, *args, **kwargs)
+                result = fn(window, *args, **kwargs)
+                try:
+                    root = window.winfo_toplevel() if hasattr(window, "winfo_toplevel") else window
+                    _fix_tk_default_fonts(root)
+                except Exception:
+                    pass
+                return result
             except TypeError:
                 try:
-                    return fn(window)
+                    result = fn(window)
+                    try:
+                        root = window.winfo_toplevel() if hasattr(window, "winfo_toplevel") else window
+                        _fix_tk_default_fonts(root)
+                    except Exception:
+                        pass
+                    return result
                 except TypeError:
                     # некоторые реализации могут не принимать аргументы
                     try:
-                        return fn()
+                        result = fn()
+                        try:
+                            root = window.winfo_toplevel() if hasattr(window, "winfo_toplevel") else window
+                            _fix_tk_default_fonts(root)
+                        except Exception:
+                            pass
+                        return result
                     except Exception:
                         return None
     except Exception:
@@ -4106,6 +4124,11 @@ class AnkiApp(tk.Tk):
 
         self.root = self
 
+        try:
+            _fix_tk_default_fonts(self)
+        except Exception:
+            pass
+
         self.style, self.palette = apply_premium_dark_theme(self)
 
         try:
@@ -7948,7 +7971,9 @@ class AnkiApp(tk.Tk):
                     btn_frame, text="Сбросить настройки сроков", command=reset_phase_intervals
                 ).pack(side=tk.LEFT)
                 ttk.Button(btn_frame, text="Отмена", command=win.destroy).pack(side=tk.RIGHT, padx=(5, 0))
-                ttk.Button(btn_frame, text="Сохранить", command=save_changes).pack(side=tk.RIGHT)
+                ttk.Button(btn_frame, text="Сохранить", style="Primary.TButton", command=save_changes).pack(
+                    side=tk.RIGHT
+                )
             except Exception as exc:
                 log_deck_settings("build_ui exception", exc)
                 messagebox.showerror(
