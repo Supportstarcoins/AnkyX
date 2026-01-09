@@ -271,6 +271,18 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     return style, PALETTE
 
 
+def apply_dark_theme_to_window(window: tk.Misc, palette: dict | None = None) -> None:
+    colors = palette or PALETTE
+    try:
+        window.configure(bg=colors.get("background", "#0B0D12"))
+    except tk.TclError:
+        pass
+    try:
+        setattr(window, "palette", colors)
+    except Exception:
+        pass
+
+
 def style_text_widget(widget: tk.Text, palette: dict | None = None) -> None:
     """Применить тёмную палитру к Text."""
 
