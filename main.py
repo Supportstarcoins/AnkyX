@@ -118,6 +118,41 @@ try:
 except Exception:
     _ui_theme = None
 
+
+def load_app_logo(base_dir: str):
+    logo_path = os.path.join(base_dir, "assets", "logo.png")
+    if not os.path.exists(logo_path):
+        return None, None
+    try:
+        logo = tk.PhotoImage(file=logo_path)
+    except Exception:
+        return None, None
+
+    def _scale_photo(photo: tk.PhotoImage, target_size: int) -> tk.PhotoImage:
+        width = photo.width() or target_size
+        if width == target_size:
+            return photo
+        if width > target_size:
+            factor = max(1, int(round(width / target_size)))
+            return photo.subsample(factor, factor)
+        factor = max(1, int(round(target_size / width)))
+        return photo.zoom(factor, factor)
+
+    return _scale_photo(logo, 36), _scale_photo(logo, 64)
+
+
+def apply_window_icon(win: tk.Misc, photo_big: tk.PhotoImage | None, ico_path: str | None = None) -> None:
+    if ico_path and os.path.exists(ico_path):
+        try:
+            win.iconbitmap(ico_path)
+        except Exception:
+            pass
+    if photo_big:
+        try:
+            win.iconphoto(True, photo_big)
+        except Exception:
+            pass
+
 def apply_dark_theme_to_window(window, *args, **kwargs):
     # Best-effort применение тёмной темы (совместимость между версиями).
     try:
@@ -4123,6 +4158,9 @@ class AnkiApp(tk.Tk):
         self.minsize(1100, 700)
 
         self.root = self
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        self._logo_small, self._logo_big = load_app_logo(BASE_DIR)
+        apply_window_icon(self, self._logo_big, ico_path=os.path.join(BASE_DIR, "assets", "app.ico"))
 
         try:
             _fix_tk_default_fonts(self)
@@ -4512,6 +4550,7 @@ class AnkiApp(tk.Tk):
 
     def open_apkg_import_window(self):
         win = tk.Toplevel(self)
+        apply_window_icon(win, self._logo_big, ico_path=os.path.join(BASE_DIR, "assets", "app.ico"))
         win.title("Импорт Anki (.apkg)")
         win.geometry("720x520")
         win.grab_set()
@@ -5218,6 +5257,7 @@ class AnkiApp(tk.Tk):
 
     def open_csv_import_window(self):
         win = tk.Toplevel(self)
+        apply_window_icon(win, self._logo_big, ico_path=os.path.join(BASE_DIR, "assets", "app.ico"))
         win.title("Импорт CSV колоды")
         win.geometry("880x740")
         win.grab_set()
@@ -6334,6 +6374,9 @@ class AnkiApp(tk.Tk):
     def create_widgets(self):
         header = ttk.Frame(self, style="Header.TFrame")
         header.pack(fill=tk.X, padx=16, pady=(12, 8))
+        if self._logo_small:
+            logo_lbl = ttk.Label(header, image=self._logo_small)
+            logo_lbl.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(header, text="X-FLASH", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(header, text="Цифровой слух · OCR · Wiktionary · AI", style="HeaderSub.TLabel").pack(side=tk.LEFT)
 
@@ -7575,6 +7618,7 @@ class AnkiApp(tk.Tk):
 
     def add_deck_window(self):
         win = tk.Toplevel(self)
+        apply_window_icon(win, self._logo_big, ico_path=os.path.join(BASE_DIR, "assets", "app.ico"))
         win.title("Новая колода")
         win.geometry("400x340")
         win.grab_set()
@@ -7666,6 +7710,7 @@ class AnkiApp(tk.Tk):
             return
 
         win = tk.Toplevel(self)
+        apply_window_icon(win, self._logo_big, ico_path=os.path.join(BASE_DIR, "assets", "app.ico"))
         win.title("Редактирование колоды")
         win.geometry("900x600")
         win.minsize(700, 450)
@@ -9242,6 +9287,7 @@ class AnkiApp(tk.Tk):
             return
 
         win = tk.Toplevel(self)
+        apply_window_icon(win, self._logo_big, ico_path=os.path.join(BASE_DIR, "assets", "app.ico"))
         win.title("Авто-генерация из текста")
         win.geometry("650x580")
         win.grab_set()
