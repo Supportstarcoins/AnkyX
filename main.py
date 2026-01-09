@@ -133,7 +133,7 @@ def load_app_logo(master: tk.Misc, base_dir: str):
         return None, None
     try:
         big = tk.PhotoImage(master=master, file=logo_path)
-        small = big.subsample(3, 3)
+        small = big.subsample(4, 4)
         return small, big
     except Exception as e:
         _logo_debug(f"PhotoImage load failed: {e}")
@@ -6388,8 +6388,8 @@ class AnkiApp(tk.Tk):
         title_lbl = ttk.Label(header, text="X-FLASH", style="Title.TLabel")
         title_lbl.pack(side=tk.LEFT, padx=(0, 12))
         if self._logo_small is not None:
-            logo_lbl = ttk.Label(header, image=self._logo_small)
-            logo_lbl.pack(side=tk.LEFT, padx=(0, 8), before=title_lbl)
+            logo_lbl = ttk.Label(header, image=self._logo_small, anchor="center")
+            logo_lbl.pack(side=tk.LEFT, padx=(0, 8), pady=0, before=title_lbl)
         ttk.Label(header, text="Цифровой слух · OCR · Wiktionary · AI", style="HeaderSub.TLabel").pack(side=tk.LEFT)
 
         quick_actions = ttk.Frame(header, style="Header.TFrame")
