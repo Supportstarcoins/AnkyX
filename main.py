@@ -118,7 +118,7 @@ try:
 except Exception:
     _ui_theme = None
 
-def apply_dark_theme_to_window(window):
+def apply_dark_theme_to_window(window, *args, **kwargs):
     # Best-effort применение тёмной темы (совместимость между версиями).
     try:
         mod = _ui_theme
@@ -131,13 +131,16 @@ def apply_dark_theme_to_window(window):
             fn = getattr(mod, 'apply_premium_dark_theme', None)
         if callable(fn):
             try:
-                return fn(window)
+                return fn(window, *args, **kwargs)
             except TypeError:
-                # некоторые реализации могут не принимать аргументы
                 try:
-                    return fn()
-                except Exception:
-                    return None
+                    return fn(window)
+                except TypeError:
+                    # некоторые реализации могут не принимать аргументы
+                    try:
+                        return fn()
+                    except Exception:
+                        return None
     except Exception:
         return None
     return None
@@ -7645,9 +7648,9 @@ class AnkiApp(tk.Tk):
         win.minsize(700, 450)
         win.grab_set()
 
-        def log_deck_editor(message: str, exc: BaseException | None = None) -> None:
+        def log_deck_settings(message: str, exc: BaseException | None = None) -> None:
             try:
-                with open("deck_editor_error.log", "a", encoding="utf-8") as log_file:
+                with open("deck_settings_error.log", "a", encoding="utf-8") as log_file:
                     log_file.write(f"{datetime.now().isoformat()} {message}\n")
                     if exc is not None:
                         log_file.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
@@ -7656,7 +7659,7 @@ class AnkiApp(tk.Tk):
                 pass
 
         def build_ui() -> None:
-            log_deck_editor("build_ui started")
+            log_deck_settings("build_ui started")
             try:
                 # Получаем текущие данные колоды
                 conn = get_connection()
@@ -7676,7 +7679,7 @@ class AnkiApp(tk.Tk):
                 except Exception as e:
                     # Fallback for legacy deck_timer / older DB schema (pre user_phase_intervals).
                     try:
-                        log_deck_editor("get_deck_timer_settings failed, using defaults", e)
+                        log_deck_settings("get_deck_timer_settings failed, using defaults", e)
                     except Exception:
                         pass
                     try:
@@ -7706,7 +7709,7 @@ class AnkiApp(tk.Tk):
                     phase_intervals = get_deck_phase_intervals(self.selected_deck_id)
                 except Exception as e:
                     try:
-                        log_deck_editor("get_deck_phase_intervals failed, using defaults", e)
+                        log_deck_settings("get_deck_phase_intervals failed, using defaults", e)
                     except Exception:
                         pass
                     phase_intervals = list(DEFAULT_PHASE_INTERVALS)
@@ -7856,87 +7859,104 @@ class AnkiApp(tk.Tk):
                     reset_deck_phase_intervals(self.selected_deck_id)
 
                 def save_changes():
-                    name = entry_name.get().strip()
-                    desc = entry_desc.get().strip()
-                    icon_path = icon_path_var.get().strip() or None
-                    tts_lang = tts_lang_var.get().strip() or "de"
-
-                    if not name:
-                        messagebox.showerror("Ошибка", "Название не может быть пустым.")
-                        return
-
                     try:
-                        timer_sec = int(timer_sec_var.get())
-                    except tk.TclError:
-                        messagebox.showerror("Ошибка", "Некорректное значение таймера.")
-                        return
+                        name = entry_name.get().strip()
+                        desc = entry_desc.get().strip()
+                        icon_path = icon_path_var.get().strip() or None
+                        tts_lang = tts_lang_var.get().strip() or "de"
 
-                    def parse_mode_timer(raw_value: str, label: str) -> int | None:
-                        value = raw_value.strip()
-                        if value == "":
-                            return None
+                        if not name:
+                            messagebox.showerror("Ошибка", "Название не может быть пустым.")
+                            return
+
                         try:
-                            parsed = int(value)
-                        except ValueError:
-                            messagebox.showerror("Ошибка", f"{label}: значение должно быть целым числом.")
-                            return None
-                        if parsed < 0:
-                            messagebox.showerror("Ошибка", f"{label}: значение должно быть >= 0.")
-                            return None
-                        return parsed
+                            timer_sec = int(timer_sec_var.get())
+                        except tk.TclError:
+                            messagebox.showerror("Ошибка", "Некорректное значение таймера.")
+                            return
 
-                    review_timer_seconds = parse_mode_timer(
-                        review_timer_var.get(), "Таймер повторения"
-                    )
-                    if review_timer_seconds is None and review_timer_var.get().strip():
-                        return
+                        def parse_mode_timer(raw_value: str, label: str) -> int | None:
+                            value = raw_value.strip()
+                            if value == "":
+                                return None
+                            try:
+                                parsed = int(value)
+                            except ValueError:
+                                messagebox.showerror("Ошибка", f"{label}: значение должно быть целым числом.")
+                                return None
+                            if parsed < 0:
+                                messagebox.showerror("Ошибка", f"{label}: значение должно быть >= 0.")
+                                return None
+                            return parsed
 
-                    playback_timer_seconds = parse_mode_timer(
-                        playback_timer_var.get(), "Таймер воспроизведения"
-                    )
-                    if playback_timer_seconds is None and playback_timer_var.get().strip():
-                        return
+                        review_timer_seconds = parse_mode_timer(
+                            review_timer_var.get(), "Таймер повторения"
+                        )
+                        if review_timer_seconds is None and review_timer_var.get().strip():
+                            return
 
-                    conn = get_connection()
-                    cur = conn.cursor()
-                    cur.execute(
-                        "UPDATE decks SET name = ?, description = ?, icon_path = ?, tts_lang = ? WHERE id = ?;",
-                        (name, desc or None, icon_path, tts_lang, self.selected_deck_id),
-                    )
-                    update_deck_timer_settings(
-                        self.selected_deck_id,
-                        timer_sec,
-                        timer_mode_var.get(),
-                        1 if inherit_var.get() else 0,
-                        review_timer_seconds,
-                        playback_timer_seconds,
-                        conn,
-                    )
-                    intervals = []
-                    for days_var, hours_var in phase_vars:
-                        seconds = max(0, int(days_var.get()) * 86400 + int(hours_var.get()) * 3600)
-                        intervals.append(seconds)
-                    save_deck_phase_intervals(self.selected_deck_id, intervals, conn)
-                    conn.commit()
-                    conn.close()
-                    self.refresh_decks()
-                    win.destroy()
+                        playback_timer_seconds = parse_mode_timer(
+                            playback_timer_var.get(), "Таймер воспроизведения"
+                        )
+                        if playback_timer_seconds is None and playback_timer_var.get().strip():
+                            return
+
+                        intervals = []
+                        for days_var, hours_var in phase_vars:
+                            try:
+                                days_val = int(days_var.get())
+                                hours_val = int(hours_var.get())
+                            except tk.TclError:
+                                messagebox.showerror("Ошибка", "Интервалы фаз должны быть числами.")
+                                return
+                            if days_val < 0 or hours_val < 0:
+                                messagebox.showerror("Ошибка", "Интервалы фаз должны быть >= 0.")
+                                return
+                            seconds = max(0, days_val * 86400 + hours_val * 3600)
+                            intervals.append(seconds)
+
+                        conn = get_connection()
+                        cur = conn.cursor()
+                        ensure_deck_settings_table(conn)
+                        ensure_deck_settings_row(self.selected_deck_id, conn)
+                        cur.execute(
+                            "UPDATE decks SET name = ?, description = ?, icon_path = ?, tts_lang = ? WHERE id = ?;",
+                            (name, desc or None, icon_path, tts_lang, self.selected_deck_id),
+                        )
+                        update_deck_timer_settings(
+                            self.selected_deck_id,
+                            timer_sec,
+                            timer_mode_var.get(),
+                            1 if inherit_var.get() else 0,
+                            review_timer_seconds,
+                            playback_timer_seconds,
+                            conn,
+                        )
+                        save_deck_phase_intervals(self.selected_deck_id, intervals, conn)
+                        conn.commit()
+                        conn.close()
+                        self.refresh_decks()
+                        messagebox.showinfo("Сохранено", "Настройки колоды сохранены")
+                        win.destroy()
+                    except Exception as exc:
+                        log_deck_settings("save_changes exception", exc)
+                        messagebox.showerror("Ошибка", traceback.format_exc())
 
                 btn_frame = ttk.Frame(main_frame)
                 btn_frame.pack(fill=tk.X, pady=(0, 4))
                 ttk.Button(
                     btn_frame, text="Сбросить настройки сроков", command=reset_phase_intervals
                 ).pack(side=tk.LEFT)
-                ttk.Button(btn_frame, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT, padx=(5, 0))
-                ttk.Button(btn_frame, text="Сохранить изменения", command=save_changes).pack(side=tk.RIGHT)
+                ttk.Button(btn_frame, text="Отмена", command=win.destroy).pack(side=tk.RIGHT, padx=(5, 0))
+                ttk.Button(btn_frame, text="Сохранить", command=save_changes).pack(side=tk.RIGHT)
             except Exception as exc:
-                log_deck_editor("build_ui exception", exc)
+                log_deck_settings("build_ui exception", exc)
                 messagebox.showerror(
                     "Ошибка",
-                    "Не удалось построить окно редактора колоды. См. deck_editor_error.log",
+                    traceback.format_exc(),
                 )
             finally:
-                log_deck_editor("build_ui finished")
+                log_deck_settings("build_ui finished")
 
         build_ui()
 
@@ -8047,266 +8067,279 @@ class AnkiApp(tk.Tk):
         win.geometry("950x760")
         win.grab_set()
 
-        colors = getattr(self, "palette", None) or {}
-        apply_dark_theme_to_window(win, colors)
-        background = colors.get("background", "#0B0D12")
-        text_color = colors.get("text", "#E5E7EB")
-
-        outer_frame = tk.Frame(win, bg=background)
-        outer_frame.pack(fill=tk.BOTH, expand=True)
-
-        deck_row = tk.Frame(outer_frame, bg=background)
-        deck_row.pack(fill=tk.X, padx=16, pady=(12, 0))
-        tk.Label(deck_row, text="Куда сохранить карточку:", bg=background, fg=text_color).pack(side=tk.LEFT)
-        decks = list_decks()
-        deck_map = {deck["name"]: deck["id"] for deck in decks}
-        default_name = next((d["name"] for d in decks if d["id"] == self.selected_deck_id), "")
-        deck_var = tk.StringVar(value=default_name)
-        deck_combo = ttk.Combobox(deck_row, values=list(deck_map.keys()), textvariable=deck_var, state="readonly")
-        deck_combo.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
-
-        card_bg, card_text, _ = get_card_surface_colors(self)
-        show_back_var = tk.BooleanVar(value=False)
-
-        switch_frame = tk.Frame(outer_frame, bg=background)
-        switch_frame.pack(fill=tk.X, padx=16, pady=(8, 0))
-        dots_frame = tk.Frame(switch_frame, bg=background)
-        dots_frame.pack(side=tk.LEFT)
-        toggle_button = ttk.Button(switch_frame, text="Показать обратную сторону")
-        toggle_button.pack(side=tk.RIGHT)
-
-        card_container = tk.Frame(outer_frame, bg=background)
-        card_container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
-
-        card_widget = CardWidget(card_container, palette=colors, editable=True, show_image_toolbar=False)
-        card_widget.pack(expand=True)
-
-        front_text = card_widget.front_text
-        back_text = card_widget.back_text
-        create_context_menu(front_text)
-        create_context_menu(back_text)
-
-        state = {
-            "front": {"image": None, "audio": [], "video": []},
-            "back": {"image": None, "audio": [], "video": []},
-        }
-
-        def current_side() -> str:
-            return "back" if show_back_var.get() else "front"
-
-        def current_text_widget() -> tk.Text:
-            return back_text if show_back_var.get() else front_text
-
-        def apply_format(tag: str, **cfg) -> None:
-            text_widget = current_text_widget()
-            if tag not in text_widget.tag_names():
-                text_widget.tag_configure(tag, **cfg)
+        def log_ui_error(exc: BaseException) -> None:
             try:
-                text_widget.tag_add(tag, "sel.first", "sel.last")
-            except tk.TclError:
+                with open("ui_error.log", "a", encoding="utf-8") as log_file:
+                    log_file.write(f"{datetime.now().isoformat()} manual card window\n")
+                    log_file.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                    log_file.write("\n")
+            except Exception:
                 pass
 
-        header_frame = tk.Frame(card_widget, bg=card_bg)
-        header_frame.place(x=10, y=10, width=780, height=28)
+        try:
+            colors = getattr(self, "palette", None) or {}
+            apply_dark_theme_to_window(win, colors)
+            background = colors.get("background", "#0B0D12")
+            text_color = colors.get("text", "#E5E7EB")
 
-        format_menu = tk.Menu(header_frame, tearoff=0)
-        format_menu.add_command(
-            label="Подчёркивание",
-            command=lambda: apply_format("underline", underline=1),
-        )
-        format_menu.add_command(
-            label="Красное подчёркивание",
-            command=lambda: apply_format("red_underline", underline=1, foreground="red"),
-        )
-        format_menu.add_command(
-            label="Маркер",
-            command=lambda: apply_format("marker_yellow", background="yellow"),
-        )
+            outer_frame = tk.Frame(win, bg=background)
+            outer_frame.pack(fill=tk.BOTH, expand=True)
 
-        format_button = ttk.Menubutton(header_frame, text="Форматирование")
-        format_button["menu"] = format_menu
-        format_button.pack(side=tk.LEFT)
+            deck_row = tk.Frame(outer_frame, bg=background)
+            deck_row.pack(fill=tk.X, padx=16, pady=(12, 0))
+            tk.Label(deck_row, text="Куда сохранить карточку:", bg=background, fg=text_color).pack(side=tk.LEFT)
+            decks = list_decks()
+            deck_map = {deck["name"]: deck["id"] for deck in decks}
+            default_name = next((d["name"] for d in decks if d["id"] == self.selected_deck_id), "")
+            deck_var = tk.StringVar(value=default_name)
+            deck_combo = ttk.Combobox(deck_row, values=list(deck_map.keys()), textvariable=deck_var, state="readonly")
+            deck_combo.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
 
-        save_button = ttk.Button(header_frame, text="Вписать")
-        save_button.pack(side=tk.RIGHT)
+            card_bg, card_text, _ = get_card_surface_colors(self)
+            show_back_var = tk.BooleanVar(value=False)
 
-        dots = []
+            switch_frame = tk.Frame(outer_frame, bg=background)
+            switch_frame.pack(fill=tk.X, padx=16, pady=(8, 0))
+            dots_frame = tk.Frame(switch_frame, bg=background)
+            dots_frame.pack(side=tk.LEFT)
+            toggle_button = ttk.Button(switch_frame, text="Показать обратную сторону")
+            toggle_button.pack(side=tk.RIGHT)
 
-        def update_dots():
-            active_color = colors.get("accent", "#4F46E5") if colors else "#4F46E5"
-            inactive_color = colors.get("muted", "#98A2B3") if colors else "#98A2B3"
-            for idx, dot in enumerate(dots):
-                is_active = (idx == (1 if show_back_var.get() else 0))
-                dot.config(text="●" if is_active else "○", fg=active_color if is_active else inactive_color)
+            card_container = tk.Frame(outer_frame, bg=background)
+            card_container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
 
-        def set_side(show_back: bool):
-            show_back_var.set(show_back)
-            img_path = state["back"]["image"] if show_back else state["front"]["image"]
-            card_widget.show_side(show_back, img_path)
-            update_media_action_labels()
-            toggle_button.config(
-                text="Показать лицевую сторону" if show_back else "Показать обратную сторону"
+            card_widget = CardWidget(card_container, palette=colors, editable=True, show_image_toolbar=False)
+            card_widget.pack(expand=True)
+
+            front_text = card_widget.front_text
+            back_text = card_widget.back_text
+            create_context_menu(front_text)
+            create_context_menu(back_text)
+
+            state = {
+                "front": {"image": None, "audio": [], "video": []},
+                "back": {"image": None, "audio": [], "video": []},
+            }
+
+            def current_side() -> str:
+                return "back" if show_back_var.get() else "front"
+
+            def current_text_widget() -> tk.Text:
+                return back_text if show_back_var.get() else front_text
+
+            def apply_format(tag: str, **cfg) -> None:
+                text_widget = current_text_widget()
+                if tag not in text_widget.tag_names():
+                    text_widget.tag_configure(tag, **cfg)
+                try:
+                    text_widget.tag_add(tag, "sel.first", "sel.last")
+                except tk.TclError:
+                    pass
+
+            header_frame = tk.Frame(card_widget, bg=card_bg)
+            header_frame.place(x=10, y=10, width=780, height=28)
+
+            format_menu = tk.Menu(header_frame, tearoff=0)
+            format_menu.add_command(
+                label="Подчёркивание",
+                command=lambda: apply_format("underline", underline=1),
             )
-            update_dots()
-            render_media_blocks()
-
-        for idx in range(2):
-            dot = tk.Label(dots_frame, text="○", font=("Segoe UI", 12), bg=dots_frame.cget("bg"))
-            dot.pack(side=tk.LEFT, padx=2)
-            dot.bind("<Button-1>", lambda _e, i=idx: set_side(i == 1))
-            dots.append(dot)
-
-        toggle_button.config(command=lambda: set_side(not show_back_var.get()))
-
-        def render_media_blocks():
-            for widget in card_widget.audio_inline_frame.winfo_children():
-                widget.destroy()
-            for widget in card_widget.video_inline_frame.winfo_children():
-                widget.destroy()
-            side = current_side()
-            media = state[side]
-            for _idx, path in enumerate(media["audio"], start=1):
-                ttk.Label(card_widget.audio_inline_frame, text="🎧 Аудио прикреплено").pack(anchor="w")
-            for _idx, path in enumerate(media["video"], start=1):
-                ttk.Label(card_widget.video_inline_frame, text="🎬 Видео прикреплено").pack(anchor="w")
-            if not media["audio"]:
-                ttk.Label(card_widget.audio_inline_frame, text="Аудио не прикреплено").pack(anchor="w", padx=5, pady=5)
-            if not media["video"]:
-                ttk.Label(card_widget.video_inline_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
-            card_widget.show_audio_frame(True)
-            card_widget.show_video_frame(True, height=90)
-
-        def select_image():
-            side = current_side()
-            filename = filedialog.askopenfilename(
-                title="Выбрать изображение",
-                filetypes=[
-                    ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
-                    ("Все файлы", "*.*"),
-                ],
+            format_menu.add_command(
+                label="Красное подчёркивание",
+                command=lambda: apply_format("red_underline", underline=1, foreground="red"),
             )
-            if not filename:
-                return
-            state[side]["image"] = filename
-            card_widget.show_side(show_back_var.get(), state[side]["image"])
-            render_media_blocks()
-
-        def add_audio():
-            side = current_side()
-            filename = filedialog.askopenfilename(
-                title="Добавить аудио",
-                filetypes=[
-                    ("Аудио", "*.mp3 *.wav *.ogg *.m4a"),
-                    ("Все файлы", "*.*"),
-                ],
+            format_menu.add_command(
+                label="Маркер",
+                command=lambda: apply_format("marker_yellow", background="yellow"),
             )
-            if not filename:
-                return
-            state[side]["audio"].append(filename)
-            render_media_blocks()
 
-        def add_video():
-            side = current_side()
-            filename = filedialog.askopenfilename(
-                title="Добавить видео",
-                filetypes=[
-                    ("Видео", "*.mp4 *.mov *.avi *.mkv *.webm"),
-                    ("Все файлы", "*.*"),
-                ],
-            )
-            if not filename:
-                return
-            state[side]["video"].append(filename)
-            render_media_blocks()
+            format_button = ttk.Menubutton(header_frame, text="Форматирование")
+            format_button["menu"] = format_menu
+            format_button.pack(side=tk.LEFT)
 
-        def generate_tts_audio():
-            side = current_side()
-            text_widget = back_text if side == "back" else front_text
-            text_value = text_widget.get("1.0", tk.END).strip()
-            if not text_value:
-                messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
-                return
-            lang = get_deck_tts_lang(deck_map.get(deck_var.get()), "de")
-            url = get_tts_url(text_value, lang)
-            if not url:
-                messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
-                return
-            ensure_media_dir()
-            filename = os.path.join(MEDIA_FOLDER, f"tts_{uuid4().hex}.mp3")
-            try:
-                request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(request, timeout=10) as response:
-                    data = response.read()
-                with open(filename, "wb") as fh:
-                    fh.write(data)
+            save_button = ttk.Button(header_frame, text="Вписать")
+            save_button.pack(side=tk.RIGHT)
+
+            dots = []
+
+            def update_dots():
+                active_color = colors.get("accent", "#4F46E5") if colors else "#4F46E5"
+                inactive_color = colors.get("muted", "#98A2B3") if colors else "#98A2B3"
+                for idx, dot in enumerate(dots):
+                    is_active = (idx == (1 if show_back_var.get() else 0))
+                    dot.config(text="●" if is_active else "○", fg=active_color if is_active else inactive_color)
+
+            def set_side(show_back: bool):
+                show_back_var.set(show_back)
+                img_path = state["back"]["image"] if show_back else state["front"]["image"]
+                card_widget.show_side(show_back, img_path)
+                update_media_action_labels()
+                toggle_button.config(
+                    text="Показать лицевую сторону" if show_back else "Показать обратную сторону"
+                )
+                update_dots()
+                render_media_blocks()
+
+            for idx in range(2):
+                dot = tk.Label(dots_frame, text="○", font=("Segoe UI", 12), bg=dots_frame.cget("bg"))
+                dot.pack(side=tk.LEFT, padx=2)
+                dot.bind("<Button-1>", lambda _e, i=idx: set_side(i == 1))
+                dots.append(dot)
+
+            toggle_button.config(command=lambda: set_side(not show_back_var.get()))
+
+            def render_media_blocks():
+                for widget in card_widget.audio_inline_frame.winfo_children():
+                    widget.destroy()
+                for widget in card_widget.video_inline_frame.winfo_children():
+                    widget.destroy()
+                side = current_side()
+                media = state[side]
+                for _idx, path in enumerate(media["audio"], start=1):
+                    ttk.Label(card_widget.audio_inline_frame, text="🎧 Аудио прикреплено").pack(anchor="w")
+                for _idx, path in enumerate(media["video"], start=1):
+                    ttk.Label(card_widget.video_inline_frame, text="🎬 Видео прикреплено").pack(anchor="w")
+                if not media["audio"]:
+                    ttk.Label(card_widget.audio_inline_frame, text="Аудио не прикреплено").pack(anchor="w", padx=5, pady=5)
+                if not media["video"]:
+                    ttk.Label(card_widget.video_inline_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
+                card_widget.show_audio_frame(True)
+                card_widget.show_video_frame(True, height=90)
+
+            def select_image():
+                side = current_side()
+                filename = filedialog.askopenfilename(
+                    title="Выбрать изображение",
+                    filetypes=[
+                        ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                        ("Все файлы", "*.*"),
+                    ],
+                )
+                if not filename:
+                    return
+                state[side]["image"] = filename
+                card_widget.show_side(show_back_var.get(), state[side]["image"])
+                render_media_blocks()
+
+            def add_audio():
+                side = current_side()
+                filename = filedialog.askopenfilename(
+                    title="Добавить аудио",
+                    filetypes=[
+                        ("Аудио", "*.mp3 *.wav *.ogg *.m4a"),
+                        ("Все файлы", "*.*"),
+                    ],
+                )
+                if not filename:
+                    return
                 state[side]["audio"].append(filename)
                 render_media_blocks()
-            except Exception as exc:
-                messagebox.showerror("Озвучка", f"Не удалось озвучить текст: {exc}")
 
-        media_actions_frame = tk.Frame(card_widget, bg=card_bg)
-        media_actions_frame.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
-        audio_button = ttk.Button(media_actions_frame, text="🎧", width=3, command=add_audio)
-        video_button = ttk.Button(media_actions_frame, text="🎬", width=3, command=add_video)
-        image_button = ttk.Button(media_actions_frame, text="🖼️", width=3, command=select_image)
-        tts_button = ttk.Button(media_actions_frame, text="🔊", width=3, command=generate_tts_audio)
-        image_button.pack(side=tk.LEFT, padx=3)
-        video_button.pack(side=tk.LEFT, padx=3)
-        audio_button.pack(side=tk.LEFT, padx=3)
-        tts_button.pack(side=tk.LEFT, padx=3)
-
-        def update_media_action_labels():
-            side = current_side()
-            suffix = "B" if side == "back" else "F"
-            image_button.config(text=f"🖼️ {suffix}")
-
-        def save_card():
-            front_value = front_text.get("1.0", tk.END).strip()
-            back_value = back_text.get("1.0", tk.END).strip()
-            if not front_value or not back_value:
-                messagebox.showerror("Ошибка", "Front и Back не могут быть пустыми.")
-                return
-            deck_id = deck_map.get(deck_var.get())
-            if not deck_id:
-                messagebox.showerror("Ошибка", "Выберите колоду для сохранения.")
-                return
-
-            front_image = state["front"]["image"]
-            back_image = state["back"]["image"]
-            stored_front = copy_image_asset_to_media(front_image, "front") if front_image else None
-            stored_back = copy_image_asset_to_media(back_image, "back") if back_image else None
-
-            try:
-                card_id = insert_card(
-                    deck_id,
-                    front_value,
-                    back_value,
-                    front_image_path=stored_front,
-                    back_image_path=stored_back,
-                    audio_path=None,
-                    level=1,
+            def add_video():
+                side = current_side()
+                filename = filedialog.askopenfilename(
+                    title="Добавить видео",
+                    filetypes=[
+                        ("Видео", "*.mp4 *.mov *.avi *.mkv *.webm"),
+                        ("Все файлы", "*.*"),
+                    ],
                 )
-                media_entries = []
-                for path in state["front"]["audio"]:
-                    media_entries.append((copy_audio_asset_to_media(path, "front_audio"), "audio", "front", None))
-                for path in state["back"]["audio"]:
-                    media_entries.append((copy_audio_asset_to_media(path, "back_audio"), "audio", "back", None))
-                for path in state["front"]["video"]:
-                    media_entries.append((copy_video_asset_to_media(path, "front_video"), "video", "front", None))
-                for path in state["back"]["video"]:
-                    media_entries.append((copy_video_asset_to_media(path, "back_video"), "video", "back", None))
-                if media_entries:
-                    attach_media_to_card(card_id, media_entries)
-            except sqlite3.OperationalError as e:
-                messagebox.showerror("БД", f"Не удалось сохранить карточку:\n{e}")
-                return
+                if not filename:
+                    return
+                state[side]["video"].append(filename)
+                render_media_blocks()
 
-            messagebox.showinfo("OK", "Карточка добавлена.")
-            win.destroy()
+            def generate_tts_audio():
+                side = current_side()
+                text_widget = back_text if side == "back" else front_text
+                text_value = text_widget.get("1.0", tk.END).strip()
+                if not text_value:
+                    messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
+                    return
+                lang = get_deck_tts_lang(deck_map.get(deck_var.get()), "de")
+                url = get_tts_url(text_value, lang)
+                if not url:
+                    messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
+                    return
+                ensure_media_dir()
+                filename = os.path.join(MEDIA_FOLDER, f"tts_{uuid4().hex}.mp3")
+                try:
+                    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        data = response.read()
+                    with open(filename, "wb") as fh:
+                        fh.write(data)
+                    state[side]["audio"].append(filename)
+                    render_media_blocks()
+                except Exception as exc:
+                    messagebox.showerror("Озвучка", f"Не удалось озвучить текст: {exc}")
 
-        save_button.config(command=save_card)
+            media_actions_frame = tk.Frame(card_widget, bg=card_bg)
+            media_actions_frame.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
+            audio_button = ttk.Button(media_actions_frame, text="🎧", width=3, command=add_audio)
+            video_button = ttk.Button(media_actions_frame, text="🎬", width=3, command=add_video)
+            image_button = ttk.Button(media_actions_frame, text="🖼️", width=3, command=select_image)
+            tts_button = ttk.Button(media_actions_frame, text="🔊", width=3, command=generate_tts_audio)
+            image_button.pack(side=tk.LEFT, padx=3)
+            video_button.pack(side=tk.LEFT, padx=3)
+            audio_button.pack(side=tk.LEFT, padx=3)
+            tts_button.pack(side=tk.LEFT, padx=3)
 
-        set_side(False)
+            def update_media_action_labels():
+                side = current_side()
+                suffix = "B" if side == "back" else "F"
+                image_button.config(text=f"🖼️ {suffix}")
+
+            def save_card():
+                front_value = front_text.get("1.0", tk.END).strip()
+                back_value = back_text.get("1.0", tk.END).strip()
+                if not front_value or not back_value:
+                    messagebox.showerror("Ошибка", "Front и Back не могут быть пустыми.")
+                    return
+                deck_id = deck_map.get(deck_var.get())
+                if not deck_id:
+                    messagebox.showerror("Ошибка", "Выберите колоду для сохранения.")
+                    return
+
+                front_image = state["front"]["image"]
+                back_image = state["back"]["image"]
+                stored_front = copy_image_asset_to_media(front_image, "front") if front_image else None
+                stored_back = copy_image_asset_to_media(back_image, "back") if back_image else None
+
+                try:
+                    card_id = insert_card(
+                        deck_id,
+                        front_value,
+                        back_value,
+                        front_image_path=stored_front,
+                        back_image_path=stored_back,
+                        audio_path=None,
+                        level=1,
+                    )
+                    media_entries = []
+                    for path in state["front"]["audio"]:
+                        media_entries.append((copy_audio_asset_to_media(path, "front_audio"), "audio", "front", None))
+                    for path in state["back"]["audio"]:
+                        media_entries.append((copy_audio_asset_to_media(path, "back_audio"), "audio", "back", None))
+                    for path in state["front"]["video"]:
+                        media_entries.append((copy_video_asset_to_media(path, "front_video"), "video", "front", None))
+                    for path in state["back"]["video"]:
+                        media_entries.append((copy_video_asset_to_media(path, "back_video"), "video", "back", None))
+                    if media_entries:
+                        attach_media_to_card(card_id, media_entries)
+                except sqlite3.OperationalError as e:
+                    messagebox.showerror("БД", f"Не удалось сохранить карточку:\n{e}")
+                    return
+
+                messagebox.showinfo("OK", "Карточка добавлена.")
+                win.destroy()
+
+            save_button.config(command=save_card)
+
+            set_side(False)
+        except Exception as exc:
+            log_ui_error(exc)
+            messagebox.showerror("Ошибка UI", traceback.format_exc())
 
     # --------- обзор карточек ---------
 
