@@ -17,6 +17,7 @@ class CardWidget(tk.Frame):
         editable: bool = False,
         width: int = 800,
         height: int = 520,
+        show_image_toolbar: bool = True,
     ) -> None:
         card_bg, card_text, _ = get_card_surface_colors(master)
         super().__init__(master, bg=card_bg, bd=0, relief="flat", width=width, height=height)
@@ -27,6 +28,7 @@ class CardWidget(tk.Frame):
         self.card_bg = card_bg
         self.card_text = card_text
         self.editable = editable
+        self.show_image_toolbar = show_image_toolbar
         self.show_back = False
 
         self.image_mode = "fit"
@@ -97,33 +99,36 @@ class CardWidget(tk.Frame):
         self.image_frame = tk.Frame(self.content_frame, bg=self.card_bg)
         self.image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        self.toolbar = ttk.Frame(self.image_frame, style="CardInner.TFrame")
-        self.toolbar.pack(fill=tk.X, pady=(0, 6))
+        if self.show_image_toolbar:
+            self.toolbar = ttk.Frame(self.image_frame, style="CardInner.TFrame")
+            self.toolbar.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Button(
-            self.toolbar,
-            text="Вписать",
-            style="Secondary.TButton",
-            command=lambda: self.set_image_mode("fit"),
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(
-            self.toolbar,
-            text="1:1",
-            style="Secondary.TButton",
-            command=lambda: self.set_image_mode("actual"),
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(
-            self.toolbar,
-            text="Zoom +",
-            style="Secondary.TButton",
-            command=lambda: self.zoom_image(1.12),
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(
-            self.toolbar,
-            text="Zoom -",
-            style="Secondary.TButton",
-            command=lambda: self.zoom_image(0.88),
-        ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                self.toolbar,
+                text="Вписать",
+                style="Secondary.TButton",
+                command=lambda: self.set_image_mode("fit"),
+            ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                self.toolbar,
+                text="1:1",
+                style="Secondary.TButton",
+                command=lambda: self.set_image_mode("actual"),
+            ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                self.toolbar,
+                text="Zoom +",
+                style="Secondary.TButton",
+                command=lambda: self.zoom_image(1.12),
+            ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                self.toolbar,
+                text="Zoom -",
+                style="Secondary.TButton",
+                command=lambda: self.zoom_image(0.88),
+            ).pack(side=tk.LEFT, padx=2)
+        else:
+            self.toolbar = None
 
         canvas_container = tk.Frame(self.image_frame, bg=self.card_bg)
         canvas_container.pack(fill=tk.BOTH, expand=True)
@@ -233,7 +238,7 @@ class CardWidget(tk.Frame):
                     10,
                     10,
                     anchor="nw",
-                    text="Нет изображения",
+                    text="Изображение не прикреплено",
                     fill="#666666",
                     tags=("card_preview",),
                 )
@@ -308,7 +313,7 @@ class CardWidget(tk.Frame):
                     10,
                     10,
                     anchor="nw",
-                    text="Нет изображения",
+                    text="Изображение не прикреплено",
                     fill="#666666",
                     tags=("card_preview",),
                 )
