@@ -6383,26 +6383,29 @@ class AnkiApp(tk.Tk):
         return btn
 
     def create_widgets(self):
+        menu_divider = tk.Frame(self, height=1, bg=self.palette["border"])
+        menu_divider.pack(fill=tk.X)
+
+        header_pad = (8, 8)
         header = ttk.Frame(self, style="Header.TFrame")
         header.pack(fill=tk.X, padx=16, pady=(12, 8))
         logo_wrap = ttk.Frame(header, width=48, height=48)
         logo_wrap.pack_propagate(False)
-        logo_wrap.pack(side=tk.LEFT, padx=(10, 8), pady=(6, 6))
+        logo_wrap.pack(side=tk.LEFT, padx=(10, 8), pady=header_pad)
         if self._logo_small is not None:
             logo_lbl = tk.Label(logo_wrap, image=self._logo_small, bd=0, highlightthickness=0)
             logo_lbl.pack(fill="both", expand=True)
         title_lbl = ttk.Label(header, text="X-FLASH", style="Title.TLabel")
-        title_lbl.pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(header, text="Цифровой слух · OCR · Wiktionary · AI", style="HeaderSub.TLabel").pack(side=tk.LEFT)
+        title_lbl.pack(side=tk.LEFT, padx=(0, 12), pady=header_pad)
 
         quick_actions = ttk.Frame(header, style="Header.TFrame")
-        quick_actions.pack(side=tk.RIGHT)
+        quick_actions.pack(side=tk.RIGHT, pady=header_pad)
         ttk.Button(quick_actions, text="Импорт .apkg", style="Secondary.TButton", command=self.open_apkg_import_window).pack(side=tk.LEFT, padx=6)
         ttk.Button(quick_actions, text="Импорт CSV", style="Secondary.TButton", command=self.open_csv_import_window).pack(side=tk.LEFT, padx=6)
         ttk.Button(quick_actions, text="Новая колода", style="Primary.TButton", command=self.add_deck_window).pack(side=tk.LEFT, padx=(10, 0))
 
         account_bar = ttk.Frame(header, style="Header.TFrame")
-        account_bar.pack(side=tk.RIGHT, padx=(0, 12))
+        account_bar.pack(side=tk.RIGHT, padx=(0, 12), pady=header_pad)
 
         balance_frame = ttk.Frame(account_bar, style="Header.TFrame")
         balance_frame.pack(side=tk.RIGHT, padx=(0, 8))
@@ -6475,13 +6478,23 @@ class AnkiApp(tk.Tk):
         self.overdue_canvas.pack(side=tk.LEFT, padx=8)
         self.overdue_badge_text_id = None
 
-        self.decks_tree = ttk.Treeview(frame_top, show="tree", selectmode="browse")
-        self.decks_tree.pack(fill=tk.BOTH, expand=True)
+        decks_tree_frame = ttk.Frame(frame_top, style="CardInner.TFrame")
+        decks_tree_frame.pack(fill=tk.BOTH, expand=True)
+        self.decks_tree = ttk.Treeview(decks_tree_frame, show="tree", selectmode="browse")
+        decks_tree_vbar = ttk.Scrollbar(decks_tree_frame, orient="vertical", command=self.decks_tree.yview)
+        self.decks_tree.configure(yscrollcommand=decks_tree_vbar.set)
+        self.decks_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        decks_tree_vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        decks_tree_frame.pack_propagate(False)
         # ttk.Treeview doesn't support classic Tk options like borderwidth/highlightthickness.
         try:
             self.decks_tree.configure(borderwidth=0, highlightthickness=0)
         except tk.TclError:
             pass
+        def _decks_mousewheel(event):
+            self.decks_tree.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.decks_tree.bind("<Enter>", lambda _e: self.decks_tree.bind_all("<MouseWheel>", _decks_mousewheel))
+        self.decks_tree.bind("<Leave>", lambda _e: self.decks_tree.unbind_all("<MouseWheel>"))
         self.decks_tree.bind("<<TreeviewSelect>>", self.on_deck_select)
         self.phase_badge_manager = PhaseOverdueBadges(self.decks_tree)
 
@@ -6536,7 +6549,8 @@ class AnkiApp(tk.Tk):
             text_frame,
             text="Название колоды",
             style="Section.TLabel",
-            wraplength=240
+            wraplength=240,
+            font=("Segoe UI", 13, "bold"),
         )
         self.deck_name_label.pack(anchor=tk.W, pady=(0, 10))
 
@@ -11200,6 +11214,7 @@ class RepeatWindow(tk.Toplevel):
         self.timer_job = None
         self.timer_flash_job = None
         self.timer_label = None
+        self._timer_fired = False
         
         self.title("Режим повторения")
         self.geometry("1000x700")
@@ -11626,6 +11641,7 @@ class RepeatWindow(tk.Toplevel):
 
     def reset_timer_for_card(self):
         self.stop_timer()
+        self._timer_fired = False
         review_seconds = get_effective_mode_timer(
             getattr(self.master, "selected_deck_id", None), "review"
         )
@@ -11659,6 +11675,9 @@ class RepeatWindow(tk.Toplevel):
         self.update_timer_label()
         if self.timer_left <= 0:
             self.handle_timer_notify()
+            if not self._timer_fired:
+                self._timer_fired = True
+                self.goto_next_card()
             return
         self.timer_job = self.after(1000, self.timer_tick)
 
@@ -11746,6 +11765,7 @@ class ReviewWindow(tk.Toplevel):
         self.timer_job = None
         self.timer_label = None
         self.timer_flash_job = None
+        self._timer_fired = False
 
         # Прогресс
         self.progress_canvas = None
@@ -12039,11 +12059,15 @@ class ReviewWindow(tk.Toplevel):
         self.update_timer_label()
         if self.timer_left <= 0:
             self.handle_timer_notify()
+            if not self._timer_fired:
+                self._timer_fired = True
+                self.goto_next_card()
             return
         self.timer_job = self.after(1000, self.timer_tick)
 
     def schedule_timers_for_card(self):
         self.cancel_timers()
+        self._timer_fired = False
         playback_seconds = get_effective_mode_timer(getattr(self.master, "selected_deck_id", None), "playback")
         self.timer_left = max(0, int(playback_seconds or 0))
         self.update_timer_label()
