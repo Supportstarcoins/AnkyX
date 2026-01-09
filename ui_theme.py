@@ -326,3 +326,12 @@ def style_card_surface_text(widget: tk.Text, palette: dict | None = None) -> Non
         highlightbackground=colors["card_border"],
         relief="flat",
     )
+
+
+def get_card_surface_colors(master: tk.Misc | None = None) -> tuple[str, str, str]:
+    colors = getattr(master, "palette", None) or {}
+    return (
+        colors.get("card_surface", "#FFFFFF"),
+        colors.get("card_text", "#111111"),
+        colors.get("card_border", "#E0E0E0"),
+    )

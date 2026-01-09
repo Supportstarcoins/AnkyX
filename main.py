@@ -113,11 +113,13 @@ from video_tools import (
 from audio_player_widget import AudioPlayerWidget
 from ui_theme import (
     apply_premium_dark_theme,
+    get_card_surface_colors,
     style_card,
     style_card_surface,
     style_card_surface_text,
     style_text_widget,
 )
+from card_widget import CardWidget
 
 def _fix_tk_default_fonts(root: tk.Tk, family: str = "Segoe UI", size: int = 11) -> None:
     """Fix invalid global font settings that can break tk.Menu on Windows.
@@ -3899,15 +3901,6 @@ def create_context_menu(widget):
 # ==========================
 # GUI
 # ==========================
-
-def get_card_surface_colors(master: tk.Misc | None = None) -> tuple[str, str, str]:
-    colors = getattr(master, "palette", None) or {}
-    return (
-        colors.get("card_surface", "#FFFFFF"),
-        colors.get("card_text", "#111111"),
-        colors.get("card_border", "#E0E0E0"),
-    )
-
 
 class ResizableImageLabel(tk.Label):
     """Label с изображением, которое можно масштабировать перетаскиванием за углы"""
@@ -7928,53 +7921,33 @@ class AnkiApp(tk.Tk):
         deck_combo = ttk.Combobox(deck_row, values=list(deck_map.keys()), textvariable=deck_var, state="readonly")
         deck_combo.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
 
-        show_back_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            win,
-            text="Показать обратную сторону",
-            variable=show_back_var,
-            command=lambda: toggle_side(),
-        ).pack(anchor="w", padx=10, pady=(8, 0))
-
         colors = getattr(self, "palette", None)
         card_bg, card_text, _ = get_card_surface_colors(self)
-        card_frame = tk.Frame(win, bg=card_bg, bd=0, relief="flat", width=820, height=460)
-        style_card_surface(card_frame, colors)
-        card_frame.pack(padx=10, pady=10, fill=tk.BOTH, expand=False)
-        card_frame.pack_propagate(False)
+        show_back_var = tk.BooleanVar(value=False)
 
-        content_frame = tk.Frame(card_frame, bg=card_bg)
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        switch_frame = ttk.Frame(win)
+        switch_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
+        dots_frame = tk.Frame(switch_frame, bg=colors.get("background", win.cget("bg")) if colors else win.cget("bg"))
+        dots_frame.pack(side=tk.LEFT)
+        toggle_button = ttk.Button(switch_frame, text="Показать обратную сторону")
+        toggle_button.pack(side=tk.RIGHT)
 
-        text_frame = tk.Frame(content_frame, bg=card_bg)
-        text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        front_text = tk.Text(text_frame, wrap=tk.WORD, height=10)
-        back_text = tk.Text(text_frame, wrap=tk.WORD, height=10)
-        style_card_surface_text(front_text, colors)
-        style_card_surface_text(back_text, colors)
-        front_text.pack(fill=tk.BOTH, expand=True)
-        back_text.pack_forget()
+        card_widget = CardWidget(win, palette=colors, editable=True)
+        card_widget.pack(padx=10, pady=10)
+
+        front_text = card_widget.front_text
+        back_text = card_widget.back_text
         create_context_menu(front_text)
         create_context_menu(back_text)
-        attach_simple_toolbar(text_frame, front_text)
-        attach_simple_toolbar(text_frame, back_text)
+        attach_simple_toolbar(card_widget.text_frame, front_text)
+        attach_simple_toolbar(card_widget.text_frame, back_text)
 
-        image_frame = tk.Frame(content_frame, bg=card_bg)
-        image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        front_image_label = ResizableImageLabel(image_frame, bg=card_bg, text="")
-        back_image_label = ResizableImageLabel(image_frame, bg=card_bg, text="")
-        style_card_surface(front_image_label, colors)
-        style_card_surface(back_image_label, colors)
-        front_image_label.pack(fill=tk.BOTH, expand=True)
-        back_image_label.pack_forget()
-
-        clip_frame = ttk.Frame(card_frame, style="CardInner.TFrame")
-        clip_frame.pack(fill=tk.X, padx=20, pady=(0, 6))
-        clip_label = ttk.Label(clip_frame, text="📎 Добавить изображение")
+        clip_frame = ttk.Frame(win)
+        clip_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
+        clip_label = ttk.Label(clip_frame, text="📎 Добавить изображение (front)")
         clip_label.pack(side=tk.LEFT)
-
-        media_frame = ttk.Frame(card_frame, style="CardInner.TFrame")
-        media_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
+        clip_button = ttk.Button(clip_frame, text="📎")
+        clip_button.pack(side=tk.RIGHT)
 
         state = {
             "front": {"image": None, "audio": [], "video": []},
@@ -7984,35 +7957,54 @@ class AnkiApp(tk.Tk):
         def current_side() -> str:
             return "back" if show_back_var.get() else "front"
 
-        def toggle_side():
-            side = current_side()
-            if side == "back":
-                front_text.pack_forget()
-                front_image_label.pack_forget()
-                back_text.pack(fill=tk.BOTH, expand=True)
-                back_image_label.pack(fill=tk.BOTH, expand=True)
-                clip_label.config(text="📎 Добавить изображение (back)")
-            else:
-                back_text.pack_forget()
-                back_image_label.pack_forget()
-                front_text.pack(fill=tk.BOTH, expand=True)
-                front_image_label.pack(fill=tk.BOTH, expand=True)
-                clip_label.config(text="📎 Добавить изображение (front)")
+        dots = []
+
+        def update_dots():
+            active_color = colors.get("accent", "#4F46E5") if colors else "#4F46E5"
+            inactive_color = colors.get("muted", "#98A2B3") if colors else "#98A2B3"
+            for idx, dot in enumerate(dots):
+                is_active = (idx == (1 if show_back_var.get() else 0))
+                dot.config(text="●" if is_active else "○", fg=active_color if is_active else inactive_color)
+
+        def set_side(show_back: bool):
+            show_back_var.set(show_back)
+            img_path = state["back"]["image"] if show_back else state["front"]["image"]
+            card_widget.show_side(show_back, img_path)
+            clip_label.config(text=f"📎 Добавить изображение ({'back' if show_back else 'front'})")
+            toggle_button.config(
+                text="Показать лицевую сторону" if show_back else "Показать обратную сторону"
+            )
+            update_dots()
             render_media_blocks()
 
+        for idx in range(2):
+            dot = tk.Label(dots_frame, text="○", font=("Segoe UI", 12), bg=dots_frame.cget("bg"))
+            dot.pack(side=tk.LEFT, padx=2)
+            dot.bind("<Button-1>", lambda _e, i=idx: set_side(i == 1))
+            dots.append(dot)
+
+        toggle_button.config(command=lambda: set_side(not show_back_var.get()))
+
         def render_media_blocks():
-            for widget in media_frame.winfo_children():
+            for widget in card_widget.audio_inline_frame.winfo_children():
+                widget.destroy()
+            for widget in card_widget.video_inline_frame.winfo_children():
                 widget.destroy()
             side = current_side()
             media = state[side]
-            if media["image"]:
-                ttk.Label(media_frame, text="🖼 Изображение прикреплено").pack(anchor="w")
             for _idx, path in enumerate(media["audio"], start=1):
-                ttk.Label(media_frame, text="🎧 Аудио прикреплено").pack(anchor="w")
+                ttk.Label(card_widget.audio_inline_frame, text="🎧 Аудио прикреплено").pack(anchor="w")
             for _idx, path in enumerate(media["video"], start=1):
-                ttk.Label(media_frame, text="🎬 Видео прикреплено").pack(anchor="w")
-            if not media["image"] and not media["audio"] and not media["video"]:
-                ttk.Label(media_frame, text="(Медиа нет)").pack(anchor="w")
+                ttk.Label(card_widget.video_inline_frame, text="🎬 Видео прикреплено").pack(anchor="w")
+            if media["audio"]:
+                card_widget.show_audio_frame(True)
+            else:
+                card_widget.show_audio_frame(False)
+            if media["video"]:
+                card_widget.show_video_frame(True, height=140)
+            else:
+                card_widget.show_video_frame(True, height=80)
+                ttk.Label(card_widget.video_inline_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
 
         def select_image():
             side = current_side()
@@ -8026,14 +8018,9 @@ class AnkiApp(tk.Tk):
             if not filename:
                 return
             state[side]["image"] = filename
-            if side == "front":
-                front_image_label.load_image(filename)
-            else:
-                back_image_label.load_image(filename)
+            card_widget.show_side(show_back_var.get(), state[side]["image"])
             render_media_blocks()
-
-        clip_button = ttk.Button(clip_frame, text="📎", command=select_image)
-        clip_button.pack(side=tk.RIGHT)
+        clip_button.config(command=select_image)
 
         def add_audio():
             side = current_side()
@@ -8142,7 +8129,7 @@ class AnkiApp(tk.Tk):
         btn_generate_frame.pack(fill=tk.X, padx=10, pady=10)
         ttk.Button(btn_generate_frame, text="Создать карточку", command=save_card).pack(side=tk.RIGHT)
 
-        render_media_blocks()
+        set_side(False)
 
     # --------- обзор карточек ---------
 
@@ -10813,14 +10800,7 @@ class RepeatWindow(tk.Toplevel):
         self.current_card = self.session.current_card()
         self.show_back = False
         self.current_photo = None
-        self._img_ref = None
-        self._image_path = None
-        self.image_mode = "fit"
-        self.zoom_factor = 1.0
-        self._last_fit_scale = 1.0
-        self.image_canvas = None
-        self.image_scroll_x = None
-        self.image_scroll_y = None
+        self.card_widget: CardWidget | None = None
         
         # Состояние переводов
         self.show_translations = TRANSLATION_SETTINGS.show_translations
@@ -10868,17 +10848,9 @@ class RepeatWindow(tk.Toplevel):
         self.timer_label.pack(anchor="center", pady=(3, 5))
 
         # Основной фрейм карточки
-        self.card_frame = tk.Frame(
-            frame_main,
-            bg=card_bg,
-            bd=0,
-            relief="flat",
-            width=800,
-            height=520
-        )
-        style_card_surface(self.card_frame, colors)
-        self.card_frame.pack(pady=10)
-        self.card_frame.pack_propagate(False)
+        self.card_widget = CardWidget(frame_main, palette=colors, editable=False)
+        self.card_widget.pack(pady=10)
+        self.card_frame = self.card_widget
 
         # Уровень карточки
         self.lbl_level = tk.Label(
@@ -10888,99 +10860,6 @@ class RepeatWindow(tk.Toplevel):
             fg=card_text,
             font=("Segoe UI", 10, "bold"))
         self.lbl_level.place(x=5, y=5)
-
-        # Контейнер для контента с прокруткой
-        content_container = tk.Frame(self.card_frame, bg=card_bg)
-        content_container.place(x=10, y=40, width=780, height=300)
-
-        canvas = tk.Canvas(content_container, bg=card_bg, highlightthickness=0, borderwidth=0)
-        scrollbar = ttk.Scrollbar(content_container, orient="vertical", command=canvas.yview)
-        self.scrollable_frame = tk.Frame(canvas, bg=card_bg)
-
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # Фреймы для контента
-        self.content_frame = tk.Frame(self.scrollable_frame, bg=card_bg)
-        self.content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        # Текст
-        self.text_frame = tk.Frame(self.content_frame, bg=card_bg)
-        self.text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-
-        self.lbl_text = tk.Label(
-            self.text_frame,
-            text="",
-            bg=card_bg,
-            fg=card_text,
-            wraplength=400,
-            justify="left",
-            font=("Segoe UI", 12)
-        )
-        self.lbl_text.pack(anchor="w")
-
-        # Изображение
-        self.image_frame = tk.Frame(self.content_frame, bg=card_bg)
-        self.image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        toolbar = ttk.Frame(self.image_frame, style="CardInner.TFrame")
-        toolbar.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Button(
-            toolbar,
-            text="Вписать",
-            style="Secondary.TButton",
-            command=lambda: self.set_image_mode("fit"),
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(
-            toolbar,
-            text="1:1",
-            style="Secondary.TButton",
-            command=lambda: self.set_image_mode("actual"),
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(
-            toolbar,
-            text="Zoom +",
-            style="Secondary.TButton",
-            command=lambda: self.zoom_image(1.12),
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(
-            toolbar,
-            text="Zoom -",
-            style="Secondary.TButton",
-            command=lambda: self.zoom_image(0.88),
-        ).pack(side=tk.LEFT, padx=2)
-
-        canvas_container = tk.Frame(self.image_frame, bg=card_bg)
-        canvas_container.pack(fill=tk.BOTH, expand=True)
-        canvas_container.grid_rowconfigure(0, weight=1)
-        canvas_container.grid_columnconfigure(0, weight=1)
-
-        self.image_canvas = tk.Canvas(
-            canvas_container,
-            bg=card_bg,
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        self.image_scroll_y = ttk.Scrollbar(canvas_container, orient="vertical", command=self.image_canvas.yview)
-        self.image_scroll_x = ttk.Scrollbar(canvas_container, orient="horizontal", command=self.image_canvas.xview)
-        self.image_canvas.configure(yscrollcommand=self.image_scroll_y.set, xscrollcommand=self.image_scroll_x.set)
-
-        self.image_canvas.grid(row=0, column=0, sticky="nsew")
-        self.image_scroll_y.grid(row=0, column=1, sticky="ns")
-        self.image_scroll_x.grid(row=1, column=0, sticky="ew")
-
-        self.image_canvas.bind(
-            "<Configure>",
-            lambda e: self._render_card_image()
-        )
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
         self.checkpoint_frame = tk.Frame(self.card_frame, bg=card_bg)
@@ -11001,13 +10880,8 @@ class RepeatWindow(tk.Toplevel):
             )
             cb.pack(side=tk.LEFT, padx=5)
 
-        # Встроенная аудио-панель внутри карточки (под контентом)
-        self.audio_inline_frame = ttk.Frame(self.card_frame, style="CardInner.TFrame")
-        self.audio_inline_frame.place_forget()
-
-        # Встроенный видеоблок (под аудио)
-        self.video_inline_frame = ttk.Frame(self.card_frame, style="CardInner.TFrame")
-        self.video_inline_frame.place_forget()
+        self.audio_inline_frame = self.card_widget.audio_inline_frame
+        self.video_inline_frame = self.card_widget.video_inline_frame
 
         # Нижний бар управления (всегда видим)
         self.controls_bar = ttk.Frame(self, style="Surface.TFrame")
@@ -11051,8 +10925,8 @@ class RepeatWindow(tk.Toplevel):
         display_audio_entries_on_frame(self.audio_inline_frame, entries)
         self.audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
         if entries:
-            if not self.audio_inline_frame.winfo_ismapped():
-                self.audio_inline_frame.place(x=10, y=350, width=780, height=90)
+            if self.card_widget is not None:
+                self.card_widget.show_audio_frame(True)
             if self.audio_widget is not None:
                 self.audio_widget.on_state_change = self._handle_media_state_update
                 self._apply_audio_state_from_selection()
@@ -11060,8 +10934,8 @@ class RepeatWindow(tk.Toplevel):
                 if selector is not None:
                     selector.bind("<<ComboboxSelected>>", lambda _e: self._apply_audio_state_from_selection())
         else:
-            if self.audio_inline_frame.winfo_ismapped():
-                self.audio_inline_frame.place_forget()
+            if self.card_widget is not None:
+                self.card_widget.show_audio_frame(False)
         self.update_video_player()
 
     def _apply_audio_state_from_selection(self):
@@ -11083,12 +10957,12 @@ class RepeatWindow(tk.Toplevel):
             widget.destroy()
         video_path = find_video_media_path(self.current_card)
         if not video_path:
-            if not self.video_inline_frame.winfo_ismapped():
-                self.video_inline_frame.place(x=10, y=440, width=780, height=80)
+            if self.card_widget is not None:
+                self.card_widget.show_video_frame(True, height=80)
             ttk.Label(self.video_inline_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
             return
-        if not self.video_inline_frame.winfo_ismapped():
-            self.video_inline_frame.place(x=10, y=440, width=780, height=140)
+        if self.card_widget is not None:
+            self.card_widget.show_video_frame(True, height=140)
         if is_vlc_available():
             try:
                 player = VlcPlayerWidget(
@@ -11154,87 +11028,6 @@ class RepeatWindow(tk.Toplevel):
                 state.get("volume", 70),
                 state.get("speed", 1),
             )
-
-    def set_image_mode(self, mode: str):
-        if mode not in ("fit", "actual", "zoom"):
-            return
-        if mode == "actual":
-            self.zoom_factor = 1.0
-        self.image_mode = mode
-        self._render_card_image()
-
-    def zoom_image(self, factor: float):
-        if not self._image_path:
-            return
-        if self.image_mode == "fit":
-            self.image_mode = "zoom"
-            self.zoom_factor = max(0.1, self._last_fit_scale)
-        elif self.image_mode == "actual":
-            self.image_mode = "zoom"
-            self.zoom_factor = 1.0
-        self.zoom_factor = max(0.1, min(6.0, self.zoom_factor * factor))
-        self._render_card_image()
-
-    def _render_card_image(self, image_path: str | None = None):
-        if image_path is not None:
-            self._image_path = image_path
-        path = self._image_path
-        if not path or not os.path.exists(path) or not PIL_AVAILABLE:
-            self._img_ref = None
-            if self.image_canvas is not None:
-                self.image_canvas.delete("all")
-                self.image_canvas.create_text(
-                    10, 10, anchor="nw", text="Нет изображения", fill="#666666"
-                )
-            return
-
-        try:
-            img = Image.open(path)
-            try:
-                img = ImageOps.exif_transpose(img)
-            except Exception:
-                pass
-            if self.image_canvas is None:
-                return
-            cont_w = max(1, self.image_canvas.winfo_width())
-            cont_h = max(1, self.image_canvas.winfo_height())
-            cont_w = max(1, cont_w - 10)
-            cont_h = max(1, cont_h - 10)
-            img_w, img_h = img.size
-            if img_w <= 0 or img_h <= 0:
-                raise ValueError("Invalid image size")
-            fit_scale = min(cont_w / img_w, cont_h / img_h)
-            self._last_fit_scale = fit_scale
-            if self.image_mode == "fit":
-                scale = fit_scale
-            elif self.image_mode == "actual":
-                scale = 1.0
-            else:
-                scale = max(0.1, self.zoom_factor)
-            new_size = (max(1, int(img_w * scale)), max(1, int(img_h * scale)))
-            resized = img.resize(new_size, Image.Resampling.LANCZOS)
-            self._img_ref = ImageTk.PhotoImage(resized)
-            self.image_canvas.delete("all")
-            self.image_canvas.create_image(0, 0, anchor="nw", image=self._img_ref)
-            self.image_canvas.config(scrollregion=(0, 0, new_size[0], new_size[1]))
-
-            if self.image_mode == "fit":
-                if self.image_scroll_x is not None:
-                    self.image_scroll_x.grid_remove()
-                if self.image_scroll_y is not None:
-                    self.image_scroll_y.grid_remove()
-            else:
-                if self.image_scroll_x is not None:
-                    self.image_scroll_x.grid()
-                if self.image_scroll_y is not None:
-                    self.image_scroll_y.grid()
-        except Exception:
-            self._img_ref = None
-            if self.image_canvas is not None:
-                self.image_canvas.delete("all")
-                self.image_canvas.create_text(
-                    10, 10, anchor="nw", text="Нет изображения", fill="#666666"
-                )
 
     def _show_audio_error(self, title: str, message: str):
         try:
@@ -11320,7 +11113,8 @@ class RepeatWindow(tk.Toplevel):
                 # Создаем фрейм для слова и перевода
                 colors = getattr(self.master, "palette", None)
                 card_bg, card_text, _ = get_card_surface_colors(self.master)
-                word_frame = tk.Frame(self.text_frame, bg=card_bg)
+                parent = self.card_widget.custom_text_frame if self.card_widget else self
+                word_frame = tk.Frame(parent, bg=card_bg)
 
                 # Слово
                 word_label = tk.Label(
@@ -11370,85 +11164,52 @@ class RepeatWindow(tk.Toplevel):
         phase = romans[min(max(lvl, 1), 10) - 1]
         self.lbl_level.config(text=f"Фаза {phase} | след. повтор: {c['next_review']}")
 
+        front_text = c["front"]
+        back_text = c["back"]
         if self.show_back:
-            # Показываем заднюю сторону
-            text = c["back"]
             img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
-            
-            # Очищаем текстовый фрейм и показываем текст в label
-            for widget in self.text_frame.winfo_children():
-                widget.destroy()
-
-            self.lbl_text = tk.Label(
-                self.text_frame,
-                text=text,
-                bg=card_bg,
-                fg=card_text,
-                wraplength=400,
-                justify="left",
-                font=("Segoe UI", 12)
-            )
-            self.lbl_text.pack(anchor="w")
-            
-            # Загружаем изображение
-            self._render_card_image(img_path)
-                
         else:
-            # Показываем лицевую сторону
-            text = c["front"]
             img_path = c["front_image_path"] or c["image_path"]
-            
-            # Очищаем текстовый фрейм
-            for widget in self.text_frame.winfo_children():
-                widget.destroy()
-                
-            if self.show_translations and c["leitner_level"] == 1:
-                # В режиме показа перевода и на фазе 1 добавляем переводы
-                words_with_translations = self.extract_words_with_translations(text)
-                
-                # Размещаем слова в текстовом фрейме
+
+        if self.card_widget is not None:
+            use_custom = (not self.show_back) and self.show_translations and c["leitner_level"] == 1
+            self.card_widget.use_custom_text(use_custom)
+            if use_custom:
+                self.card_widget.clear_custom_text()
+                words_with_translations = self.extract_words_with_translations(front_text)
                 row = 0
                 col = 0
                 max_cols = 3
-                
                 for item in words_with_translations:
                     if isinstance(item, tk.Frame):
-                        item.grid(row=row, column=col, sticky="w", padx=5, pady=2)
-                        col += 1
-                        if col >= max_cols:
-                            col = 0
-                            row += 1
+                        item.grid(
+                            row=row,
+                            column=col,
+                            sticky="w",
+                            padx=5,
+                            pady=2,
+                            in_=self.card_widget.custom_text_frame,
+                        )
                     else:
                         label = tk.Label(
-                            self.text_frame,
+                            self.card_widget.custom_text_frame,
                             text=item,
                             bg=card_bg,
                             fg=card_text,
-                            font=("Segoe UI", 12)
+                            font=("Segoe UI", 12),
                         )
                         label.grid(row=row, column=col, sticky="w", padx=5, pady=2)
-                        col += 1
-                        if col >= max_cols:
-                            col = 0
-                            row += 1
+                    col += 1
+                    if col >= max_cols:
+                        col = 0
+                        row += 1
             else:
-                # Просто отображаем текст в label
-                self.lbl_text = tk.Label(
-                    self.text_frame,
-                    text=text,
-                    bg=card_bg,
-                    fg=card_text,
-                    wraplength=400,
-                    justify="left",
-                    font=("Segoe UI", 12)
-                )
-                self.lbl_text.pack(anchor="w")
-            
-            # Загружаем изображение
-            self._render_card_image(img_path)
+                self.card_widget.set_text(front_text, back_text)
+            self.card_widget.show_side(self.show_back, img_path)
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
-        self.after(10, self._render_card_image)
+        if self.card_widget is not None:
+            self.after(10, self.card_widget.render_image)
         
         # Обновляем аудио-плеер
         self.update_audio_player()
@@ -11459,19 +11220,10 @@ class RepeatWindow(tk.Toplevel):
         self.update_timer_label()
         self.lbl_status.config(text="На сегодня всё")
         self.lbl_level.config(text="")
-        for widget in self.text_frame.winfo_children():
-            widget.destroy()
-        self.lbl_text = tk.Label(
-            self.text_frame,
-            text="На сегодня всё",
-            bg=get_card_surface_colors(self.master)[0],
-            fg=get_card_surface_colors(self.master)[1],
-            wraplength=400,
-            justify="center",
-            font=("Segoe UI", 12, "bold"),
-        )
-        self.lbl_text.pack(expand=True)
-        self._render_card_image(None)
+        if self.card_widget is not None:
+            self.card_widget.use_custom_text(False)
+            self.card_widget.set_text("На сегодня всё", "")
+            self.card_widget.show_side(False, None)
         for btn in [
             self.btn_prev,
             self.btn_next,
@@ -11600,6 +11352,7 @@ class ReviewWindow(tk.Toplevel):
         self.current_card = self.cards[self.current_index]
         self.show_back = False
         self.current_photo = None
+        self.card_widget: CardWidget | None = None
 
         # Таймеры
         self.auto_flip_id = None
@@ -11642,17 +11395,9 @@ class ReviewWindow(tk.Toplevel):
         self.timer_label.pack(anchor="center", pady=(3, 5))
 
         # Фрейм карточки
-        self.card_frame = tk.Frame(
-            frame_main,
-            bg=card_bg,
-            bd=0,
-            relief="flat",
-            width=700,
-            height=420
-        )
-        style_card_surface(self.card_frame, colors)
-        self.card_frame.pack(pady=10)
-        self.card_frame.pack_propagate(False)
+        self.card_widget = CardWidget(frame_main, palette=colors, editable=False)
+        self.card_widget.pack(pady=10)
+        self.card_frame = self.card_widget
 
         # Индикатор загрузки
         self.dot_canvas = tk.Canvas(self.card_frame, width=20, height=20,
@@ -11670,40 +11415,11 @@ class ReviewWindow(tk.Toplevel):
         )
         self.lbl_level.place(x=5, y=5)
 
-        # Контент
-        content_frame = tk.Frame(self.card_frame, bg=card_bg)
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=(25, 10))
-
-        self.lbl_text = tk.Label(
-            content_frame,
-            text="",
-            bg=card_bg,
-            fg=card_text,
-            wraplength=420,
-            justify="left",
-            font=("Segoe UI", 12)
-        )
-        self.lbl_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-
-        # Изображение с возможностью масштабирования
-        self.image_label = ResizableImageLabel(
-            content_frame,
-            bg=card_bg,
-            text=""
-        )
-        style_card_surface(self.image_label, colors)
-        self.image_label.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        content_frame.bind(
-            "<Configure>",
-            lambda e: self.image_label.set_container_size(e.width - 20, e.height)
-        )
-
-        self.video_frame = ttk.Frame(self.card_frame, style="CardInner.TFrame")
-        self.video_frame.pack(fill=tk.X, padx=30, pady=(0, 5))
+        self.video_inline_frame = self.card_widget.video_inline_frame
 
         # Прогресс-бар
-        progress_frame = tk.Frame(self.card_frame, bg=card_bg)
-        progress_frame.pack(side=tk.BOTTOM, pady=(0, 4))
+        progress_frame = tk.Frame(frame_main, bg=card_bg)
+        progress_frame.pack(pady=(0, 4))
 
         self.progress_canvas = tk.Canvas(
             progress_frame, width=260, height=14,
@@ -11726,12 +11442,11 @@ class ReviewWindow(tk.Toplevel):
         )
         self.btn_progress_plus.pack(side=tk.LEFT, padx=(4, 10))
 
-        self.audio_inline_frame = ttk.Frame(self.card_frame, style="CardInner.TFrame")
-        self.audio_inline_frame.pack_forget()
+        self.audio_inline_frame = self.card_widget.audio_inline_frame
 
         # Панель кнопок
-        self.bottom_frame = tk.Frame(self.card_frame, bg=card_bg)
-        self.bottom_frame.pack(side=tk.BOTTOM, pady=8)
+        self.bottom_frame = tk.Frame(frame_main, bg=card_bg)
+        self.bottom_frame.pack(pady=8)
 
         self.btn_audio_icon = ttk.Button(self.bottom_frame, text="🔊", width=3, command=self.play_word)
         self.btn_audio_icon.pack(side=tk.LEFT, padx=5)
@@ -11759,14 +11474,8 @@ class ReviewWindow(tk.Toplevel):
         entries = get_card_audio_entries(self.current_card, prefer_side="back" if self.show_back else "front")
         display_audio_entries_on_frame(self.audio_inline_frame, entries)
         if entries:
-            if not self.audio_inline_frame.winfo_ismapped():
-                self.audio_inline_frame.pack(
-                    side=tk.BOTTOM,
-                    fill=tk.X,
-                    padx=10,
-                    pady=(0, 5),
-                    before=self.bottom_frame,
-                )
+            if self.card_widget is not None:
+                self.card_widget.show_audio_frame(True)
             audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
             if audio_widget is not None:
                 audio_widget.on_state_change = self._handle_media_state_update
@@ -11775,8 +11484,8 @@ class ReviewWindow(tk.Toplevel):
                 if selector is not None:
                     selector.bind("<<ComboboxSelected>>", lambda _e: self._apply_audio_state_from_selection())
         else:
-            if self.audio_inline_frame.winfo_ismapped():
-                self.audio_inline_frame.pack_forget()
+            if self.card_widget is not None:
+                self.card_widget.show_audio_frame(False)
         self._update_video_player()
 
     def _apply_audio_state_from_selection(self):
@@ -11794,16 +11503,20 @@ class ReviewWindow(tk.Toplevel):
         audio_widget.apply_state(load_media_state(self.current_card["id"], media_key))
 
     def _update_video_player(self):
-        for widget in self.video_frame.winfo_children():
+        for widget in self.video_inline_frame.winfo_children():
             widget.destroy()
         video_path = find_video_media_path(self.current_card)
         if not video_path:
-            ttk.Label(self.video_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
+            if self.card_widget is not None:
+                self.card_widget.show_video_frame(True, height=80)
+            ttk.Label(self.video_inline_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
             return
+        if self.card_widget is not None:
+            self.card_widget.show_video_frame(True, height=140)
         if is_vlc_available():
             try:
                 player = VlcPlayerWidget(
-                    self.video_frame,
+                    self.video_inline_frame,
                     video_path,
                     width=420,
                     height=240,
@@ -11820,12 +11533,12 @@ class ReviewWindow(tk.Toplevel):
                 media_key = _build_media_key(media_id, video_path)
                 player.set_media_key(media_key)
                 player.apply_state(load_media_state(self.current_card["id"], media_key))
-                self.video_frame.vlc_player = player
+                self.video_inline_frame.vlc_player = player
                 return
             except Exception:
                 pass
         ttk.Button(
-            self.video_frame,
+            self.video_inline_frame,
             text="Открыть во внешнем плеере",
             command=lambda: open_in_external_player(video_path),
         ).pack(anchor="w", padx=5, pady=5)
@@ -11855,7 +11568,7 @@ class ReviewWindow(tk.Toplevel):
                 state.get("volume", 70),
                 state.get("speed", 1),
             )
-        video_player = getattr(self.video_frame, "vlc_player", None)
+        video_player = getattr(self.video_inline_frame, "vlc_player", None)
         if video_player and video_player.media_key:
             state = video_player.get_state()
             save_media_state(
@@ -12027,17 +11740,16 @@ class ReviewWindow(tk.Toplevel):
         phase = romans[min(max(lvl, 1), 10) - 1]
         self.lbl_level.config(text=f"Фаза {phase} | след. повтор: {c['next_review']}")
 
+        front_text = c["front"]
+        back_text = c["back"]
         if self.show_back:
-            text = c["back"]
             img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
         else:
-            text = c["front"]
             img_path = c["front_image_path"] or c["image_path"]
 
-        self.lbl_text.config(text=text)
-
-        # Загружаем изображение
-        self._render_card_image(img_path)
+        if self.card_widget is not None:
+            self.card_widget.set_text(front_text, back_text)
+            self.card_widget.show_side(self.show_back, img_path)
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
 
