@@ -7977,9 +7977,17 @@ class AnkiApp(tk.Tk):
         win.geometry("950x760")
         win.grab_set()
 
-        deck_row = ttk.Frame(win)
-        deck_row.pack(fill=tk.X, padx=10, pady=(10, 0))
-        ttk.Label(deck_row, text="Куда сохранить карточку:").pack(side=tk.LEFT)
+        colors = getattr(self, "palette", None) or {}
+        apply_dark_theme_to_window(win, colors)
+        background = colors.get("background", "#0B0D12")
+        text_color = colors.get("text", "#E5E7EB")
+
+        outer_frame = tk.Frame(win, bg=background)
+        outer_frame.pack(fill=tk.BOTH, expand=True)
+
+        deck_row = tk.Frame(outer_frame, bg=background)
+        deck_row.pack(fill=tk.X, padx=16, pady=(12, 0))
+        tk.Label(deck_row, text="Куда сохранить карточку:", bg=background, fg=text_color).pack(side=tk.LEFT)
         decks = list_decks()
         deck_map = {deck["name"]: deck["id"] for deck in decks}
         default_name = next((d["name"] for d in decks if d["id"] == self.selected_deck_id), "")
@@ -7987,33 +7995,26 @@ class AnkiApp(tk.Tk):
         deck_combo = ttk.Combobox(deck_row, values=list(deck_map.keys()), textvariable=deck_var, state="readonly")
         deck_combo.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
 
-        colors = getattr(self, "palette", None)
         card_bg, card_text, _ = get_card_surface_colors(self)
         show_back_var = tk.BooleanVar(value=False)
 
-        switch_frame = ttk.Frame(win)
-        switch_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
-        dots_frame = tk.Frame(switch_frame, bg=colors.get("background", win.cget("bg")) if colors else win.cget("bg"))
+        switch_frame = tk.Frame(outer_frame, bg=background)
+        switch_frame.pack(fill=tk.X, padx=16, pady=(8, 0))
+        dots_frame = tk.Frame(switch_frame, bg=background)
         dots_frame.pack(side=tk.LEFT)
         toggle_button = ttk.Button(switch_frame, text="Показать обратную сторону")
         toggle_button.pack(side=tk.RIGHT)
 
-        card_widget = CardWidget(win, palette=colors, editable=True)
-        card_widget.pack(padx=10, pady=10)
+        card_container = tk.Frame(outer_frame, bg=background)
+        card_container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        card_widget = CardWidget(card_container, palette=colors, editable=True, show_image_toolbar=False)
+        card_widget.pack(expand=True)
 
         front_text = card_widget.front_text
         back_text = card_widget.back_text
         create_context_menu(front_text)
         create_context_menu(back_text)
-        attach_simple_toolbar(card_widget.text_frame, front_text)
-        attach_simple_toolbar(card_widget.text_frame, back_text)
-
-        clip_frame = ttk.Frame(win)
-        clip_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
-        clip_label = ttk.Label(clip_frame, text="📎 Добавить изображение (front)")
-        clip_label.pack(side=tk.LEFT)
-        clip_button = ttk.Button(clip_frame, text="📎")
-        clip_button.pack(side=tk.RIGHT)
 
         state = {
             "front": {"image": None, "audio": [], "video": []},
@@ -8022,6 +8023,42 @@ class AnkiApp(tk.Tk):
 
         def current_side() -> str:
             return "back" if show_back_var.get() else "front"
+
+        def current_text_widget() -> tk.Text:
+            return back_text if show_back_var.get() else front_text
+
+        def apply_format(tag: str, **cfg) -> None:
+            text_widget = current_text_widget()
+            if tag not in text_widget.tag_names():
+                text_widget.tag_configure(tag, **cfg)
+            try:
+                text_widget.tag_add(tag, "sel.first", "sel.last")
+            except tk.TclError:
+                pass
+
+        header_frame = tk.Frame(card_widget, bg=card_bg)
+        header_frame.place(x=10, y=10, width=780, height=28)
+
+        format_menu = tk.Menu(header_frame, tearoff=0)
+        format_menu.add_command(
+            label="Подчёркивание",
+            command=lambda: apply_format("underline", underline=1),
+        )
+        format_menu.add_command(
+            label="Красное подчёркивание",
+            command=lambda: apply_format("red_underline", underline=1, foreground="red"),
+        )
+        format_menu.add_command(
+            label="Маркер",
+            command=lambda: apply_format("marker_yellow", background="yellow"),
+        )
+
+        format_button = ttk.Menubutton(header_frame, text="Форматирование")
+        format_button["menu"] = format_menu
+        format_button.pack(side=tk.LEFT)
+
+        save_button = ttk.Button(header_frame, text="Вписать")
+        save_button.pack(side=tk.RIGHT)
 
         dots = []
 
@@ -8036,7 +8073,7 @@ class AnkiApp(tk.Tk):
             show_back_var.set(show_back)
             img_path = state["back"]["image"] if show_back else state["front"]["image"]
             card_widget.show_side(show_back, img_path)
-            clip_label.config(text=f"📎 Добавить изображение ({'back' if show_back else 'front'})")
+            update_media_action_labels()
             toggle_button.config(
                 text="Показать лицевую сторону" if show_back else "Показать обратную сторону"
             )
@@ -8062,15 +8099,12 @@ class AnkiApp(tk.Tk):
                 ttk.Label(card_widget.audio_inline_frame, text="🎧 Аудио прикреплено").pack(anchor="w")
             for _idx, path in enumerate(media["video"], start=1):
                 ttk.Label(card_widget.video_inline_frame, text="🎬 Видео прикреплено").pack(anchor="w")
-            if media["audio"]:
-                card_widget.show_audio_frame(True)
-            else:
-                card_widget.show_audio_frame(False)
-            if media["video"]:
-                card_widget.show_video_frame(True, height=140)
-            else:
-                card_widget.show_video_frame(True, height=80)
+            if not media["audio"]:
+                ttk.Label(card_widget.audio_inline_frame, text="Аудио не прикреплено").pack(anchor="w", padx=5, pady=5)
+            if not media["video"]:
                 ttk.Label(card_widget.video_inline_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
+            card_widget.show_audio_frame(True)
+            card_widget.show_video_frame(True, height=90)
 
         def select_image():
             side = current_side()
@@ -8086,7 +8120,6 @@ class AnkiApp(tk.Tk):
             state[side]["image"] = filename
             card_widget.show_side(show_back_var.get(), state[side]["image"])
             render_media_blocks()
-        clip_button.config(command=select_image)
 
         def add_audio():
             side = current_side()
@@ -8141,11 +8174,21 @@ class AnkiApp(tk.Tk):
             except Exception as exc:
                 messagebox.showerror("Озвучка", f"Не удалось озвучить текст: {exc}")
 
-        actions_frame = ttk.Frame(win)
-        actions_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        ttk.Button(actions_frame, text="Добавить аудио", command=add_audio).pack(side=tk.LEFT, padx=5)
-        ttk.Button(actions_frame, text="Добавить видео", command=add_video).pack(side=tk.LEFT, padx=5)
-        ttk.Button(actions_frame, text="Озвучить (Google TTS)", command=generate_tts_audio).pack(side=tk.LEFT, padx=5)
+        media_actions_frame = tk.Frame(card_widget, bg=card_bg)
+        media_actions_frame.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
+        audio_button = ttk.Button(media_actions_frame, text="🎧", width=3, command=add_audio)
+        video_button = ttk.Button(media_actions_frame, text="🎬", width=3, command=add_video)
+        image_button = ttk.Button(media_actions_frame, text="🖼️", width=3, command=select_image)
+        tts_button = ttk.Button(media_actions_frame, text="🔊", width=3, command=generate_tts_audio)
+        image_button.pack(side=tk.LEFT, padx=3)
+        video_button.pack(side=tk.LEFT, padx=3)
+        audio_button.pack(side=tk.LEFT, padx=3)
+        tts_button.pack(side=tk.LEFT, padx=3)
+
+        def update_media_action_labels():
+            side = current_side()
+            suffix = "B" if side == "back" else "F"
+            image_button.config(text=f"🖼️ {suffix}")
 
         def save_card():
             front_value = front_text.get("1.0", tk.END).strip()
@@ -8191,9 +8234,7 @@ class AnkiApp(tk.Tk):
             messagebox.showinfo("OK", "Карточка добавлена.")
             win.destroy()
 
-        btn_generate_frame = ttk.Frame(win)
-        btn_generate_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Button(btn_generate_frame, text="Создать карточку", command=save_card).pack(side=tk.RIGHT)
+        save_button.config(command=save_card)
 
         set_side(False)
 
