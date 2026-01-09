@@ -94,10 +94,14 @@ from overdue_badges import (
     fetch_overdue_counts_by_phase,
 )
 from deck_timer import (
+    DEFAULT_PHASE_INTERVALS,
     ensure_deck_settings_row,
     ensure_deck_settings_table,
+    get_deck_phase_intervals,
     get_deck_timer_settings,
     get_effective_mode_timer,
+    reset_deck_phase_intervals,
+    save_deck_phase_intervals,
     update_deck_timer_settings,
 )
 from video_tools import (
@@ -765,6 +769,30 @@ def copy_image_asset_to_media(src: str, prefix: str = "img") -> str:
         dest_path = src
     return dest_path
 
+
+def copy_video_asset_to_media(src: str, prefix: str = "video") -> str:
+    ensure_media_dir()
+    ext = os.path.splitext(src)[1].lower() or ".mp4"
+    target_name = f"{prefix}_{uuid4().hex}{ext}"
+    dest_path = os.path.join(MEDIA_FOLDER, target_name)
+    try:
+        shutil.copy2(src, dest_path)
+    except Exception:
+        dest_path = src
+    return dest_path
+
+
+def copy_audio_asset_to_media(src: str, prefix: str = "audio") -> str:
+    ensure_media_dir()
+    ext = os.path.splitext(src)[1].lower() or ".mp3"
+    target_name = f"{prefix}_{uuid4().hex}{ext}"
+    dest_path = os.path.join(MEDIA_FOLDER, target_name)
+    try:
+        shutil.copy2(src, dest_path)
+    except Exception:
+        dest_path = src
+    return dest_path
+
 # ==========================
 # НАСТРОЙКИ ПЕРЕВОДА И СЛОВАРИ
 # ==========================
@@ -1255,9 +1283,11 @@ def update_user_profile(user_id: str, **fields) -> dict:
     return ensure_user_profile_row(user_id)
 
 
-def get_next_review_for_level(level: int) -> datetime:
+def get_next_review_for_level(level: int, deck_id: int | None = None) -> datetime:
     level = max(1, min(10, level))
-    return datetime.now() + LEITNER_SCHEDULE[level]
+    intervals = get_deck_phase_intervals(deck_id) if deck_id is not None else DEFAULT_PHASE_INTERVALS
+    seconds = intervals[level - 1] if level - 1 < len(intervals) else DEFAULT_PHASE_INTERVALS[-1]
+    return datetime.now() + timedelta(seconds=int(seconds))
 
 
 # ==========================
@@ -1584,6 +1614,24 @@ def ensure_media_table(conn: sqlite3.Connection):
     conn.commit()
 
 
+def ensure_media_state_table(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    if not _table_exists(conn, "media_state"):
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_state (
+                card_id INTEGER NOT NULL,
+                media_key TEXT NOT NULL,
+                pos_ms INTEGER DEFAULT 0,
+                volume REAL DEFAULT 70,
+                speed REAL DEFAULT 1.0,
+                PRIMARY KEY (card_id, media_key)
+            );
+            """
+        )
+        conn.commit()
+
+
 def _media_type_column(columns: set[str]) -> str:
     return "media_type" if "media_type" in columns else "type"
 
@@ -1720,6 +1768,54 @@ def get_media_for_card(card_id: int, note_id: int | None = None) -> list[dict]:
     rows = cur.fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def _build_media_key(media_id: int | None, path: str | None) -> str:
+    if media_id is not None:
+        return f"id:{media_id}"
+    if path:
+        return f"path:{path}"
+    return "unknown"
+
+
+def load_media_state(card_id: int, media_key: str) -> dict:
+    conn = get_connection()
+    ensure_media_state_table(conn)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT pos_ms, volume, speed
+        FROM media_state
+        WHERE card_id = ? AND media_key = ?;
+        """,
+        (card_id, media_key),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {}
+    return {
+        "pos_ms": row["pos_ms"],
+        "volume": row["volume"],
+        "speed": row["speed"],
+    }
+
+
+def save_media_state(card_id: int, media_key: str, pos_ms: int, volume: float, speed: float):
+    conn = get_connection()
+    ensure_media_state_table(conn)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO media_state (card_id, media_key, pos_ms, volume, speed)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(card_id, media_key)
+        DO UPDATE SET pos_ms = excluded.pos_ms, volume = excluded.volume, speed = excluded.speed;
+        """,
+        (card_id, media_key, int(pos_ms), float(volume), float(speed)),
+    )
+    conn.commit()
+    conn.close()
 
 
 SOUND_TAG_PATTERN = re.compile(r"\[sound:([^\]]+)\]")
@@ -2026,6 +2122,7 @@ def create_note_with_cards(
         (fields.get("image") or fields.get("front_image_path"), "image", "front", None),
         (fields.get("back_image_path"), "image", "back", None),
         (fields.get("audio_path"), "audio", audio_side, audio_source),
+        (fields.get("video_path"), "video", fields.get("video_side") or "front", None),
     ]
     attach_media_to_note(note_id, media_entries)
     return note_id, cards_created
@@ -2172,6 +2269,7 @@ def init_db():
     ensure_deck_settings_table(conn)
     ensure_stats_settings_table(conn)
     ensure_media_table(conn)
+    ensure_media_state_table(conn)
 
     run_migrations(conn)
     ensure_schema_for_import(conn)
@@ -2366,9 +2464,12 @@ def mark_card_for_overview(card_id: int):
 
 def update_card_leitner(card_id: int, new_level: int):
     new_level = max(1, min(10, new_level))
-    next_dt = get_next_review_for_level(new_level).isoformat()
     conn = get_connection()
     cur = conn.cursor()
+    cur.execute("SELECT deck_id FROM cards WHERE id = ?;", (card_id,))
+    row = cur.fetchone()
+    deck_id = row["deck_id"] if row else None
+    next_dt = get_next_review_for_level(new_level, deck_id).isoformat()
     cur.execute("""
         UPDATE cards
            SET leitner_level = ?, next_review = ?
@@ -2395,7 +2496,7 @@ def apply_srs_update(card_id: int, rating: int):
     card_data.setdefault("phase", card_data.get("leitner_level", 1))
     now_ts = int(time.time())
     result = schedule_review(card_data, rating, now_ts)
-    next_review_value = datetime.fromtimestamp(result["due"]).isoformat()
+    next_review_value = get_next_review_for_level(result["phase"], card_data.get("deck_id")).isoformat()
 
     conn = get_connection()
     cur = conn.cursor()
@@ -2969,7 +3070,7 @@ def insert_card(
             raise RuntimeError("Не выбрана колода...")
         deck_id = row["id"]
 
-    next_dt = get_next_review_for_level(level).isoformat()
+    next_dt = get_next_review_for_level(level, deck_id).isoformat()
 
     # ВАЖНО: Проверяем, есть ли аудио-тег в тексте карточки
     # Если audio_path передан, используем его
@@ -7489,7 +7590,7 @@ class AnkiApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Редактирование колоды")
-        win.geometry("420x460")
+        win.geometry("520x640")
         win.grab_set()
 
         # Получаем текущие данные колоды
@@ -7503,6 +7604,7 @@ class AnkiApp(tk.Tk):
         conn.close()
 
         timer_settings = get_deck_timer_settings(self.selected_deck_id)
+        phase_intervals = get_deck_phase_intervals(self.selected_deck_id)
 
         ttk.Label(win, text="Название колоды:").pack(anchor="w", padx=10, pady=(10, 0))
         entry_name = ttk.Entry(win)
@@ -7608,6 +7710,35 @@ class AnkiApp(tk.Tk):
             foreground="gray",
         ).grid(row=2, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="w")
 
+        phase_frame = ttk.LabelFrame(win, text="Интервалы повторений по фазам")
+        phase_frame.pack(fill=tk.BOTH, padx=10, pady=10, expand=False)
+        phase_frame.columnconfigure(1, weight=1)
+
+        phase_vars = []
+        for idx in range(10):
+            seconds = phase_intervals[idx] if idx < len(phase_intervals) else DEFAULT_PHASE_INTERVALS[idx]
+            days = int(seconds // 86400)
+            hours = int((seconds % 86400) // 3600)
+            days_var = tk.IntVar(value=days)
+            hours_var = tk.IntVar(value=hours)
+            phase_vars.append((days_var, hours_var))
+            ttk.Label(phase_frame, text=f"Фаза {idx + 1}:").grid(row=idx, column=0, padx=5, pady=3, sticky="w")
+            ttk.Label(phase_frame, text="дней").grid(row=idx, column=2, padx=2, sticky="w")
+            ttk.Label(phase_frame, text="часов").grid(row=idx, column=4, padx=2, sticky="w")
+            ttk.Spinbox(phase_frame, from_=0, to=999, textvariable=days_var, width=6).grid(
+                row=idx, column=1, padx=(5, 2), pady=3, sticky="w"
+            )
+            ttk.Spinbox(phase_frame, from_=0, to=23, textvariable=hours_var, width=6).grid(
+                row=idx, column=3, padx=(5, 2), pady=3, sticky="w"
+            )
+
+        def reset_phase_intervals():
+            for idx, (days_var, hours_var) in enumerate(phase_vars):
+                seconds = DEFAULT_PHASE_INTERVALS[idx]
+                days_var.set(int(seconds // 86400))
+                hours_var.set(int((seconds % 86400) // 3600))
+            reset_deck_phase_intervals(self.selected_deck_id)
+
         def save_changes():
             name = entry_name.get().strip()
             desc = entry_desc.get().strip()
@@ -7665,6 +7796,11 @@ class AnkiApp(tk.Tk):
                 playback_timer_seconds,
                 conn,
             )
+            intervals = []
+            for days_var, hours_var in phase_vars:
+                seconds = max(0, int(days_var.get()) * 86400 + int(hours_var.get()) * 3600)
+                intervals.append(seconds)
+            save_deck_phase_intervals(self.selected_deck_id, intervals, conn)
             conn.commit()
             conn.close()
             self.refresh_decks()
@@ -7672,7 +7808,8 @@ class AnkiApp(tk.Tk):
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Button(btn_frame, text="Сохранить", command=save_changes).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Сбросить настройки сроков", command=reset_phase_intervals).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Сохранить изменения", command=save_changes).pack(side=tk.RIGHT)
 
     def delete_selected_deck(self):
         if self.selected_deck_id is None:
@@ -7778,234 +7915,234 @@ class AnkiApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Новая карточка (ручной режим)")
-        win.geometry("700x800")
+        win.geometry("950x760")
         win.grab_set()
 
-        # Поле для ввода ключа OpenAI
-        api_key_frame = ttk.LabelFrame(win, text="OpenAI API ключ (для перевода)")
-        api_key_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
-        
-        ttk.Label(api_key_frame, text="Ключ OpenAI:").pack(anchor="w", padx=10, pady=(5, 0))
-        entry_api_key = ttk.Entry(api_key_frame, show="*")
-        entry_api_key.pack(fill=tk.X, padx=10, pady=(0, 5))
-        create_context_menu(entry_api_key)  # Добавляем контекстное меню
-        
-        if OPENAI_API_KEY:
-            entry_api_key.insert(0, OPENAI_API_KEY)
-        
-        def paste_api_key():
-            try:
-                text = win.clipboard_get()
-                entry_api_key.delete(0, tk.END)
-                entry_api_key.insert(0, text.strip())
-            except:
-                pass
-        
-        ttk.Button(api_key_frame, text="Вставить из буфера", command=paste_api_key).pack(anchor="e", padx=10, pady=(0, 5))
+        deck_row = ttk.Frame(win)
+        deck_row.pack(fill=tk.X, padx=10, pady=(10, 0))
+        ttk.Label(deck_row, text="Куда сохранить карточку:").pack(side=tk.LEFT)
+        decks = list_decks()
+        deck_map = {deck["name"]: deck["id"] for deck in decks}
+        default_name = next((d["name"] for d in decks if d["id"] == self.selected_deck_id), "")
+        deck_var = tk.StringVar(value=default_name)
+        deck_combo = ttk.Combobox(deck_row, values=list(deck_map.keys()), textvariable=deck_var, state="readonly")
+        deck_combo.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
 
-        # Переводчик в два поля
-        translator_frame = ttk.LabelFrame(win, text="Переводчик (немецкий ↔ русский)")
-        translator_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
-        
-        # Немецкое поле
-        german_frame = ttk.Frame(translator_frame)
-        german_frame.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Label(german_frame, text="Немецкий текст:").pack(side=tk.LEFT)
-        entry_german = ttk.Entry(german_frame)
-        entry_german.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
-        create_context_menu(entry_german)  # Добавляем контекстное меню
-        
-        # Русское поле
-        russian_frame = ttk.Frame(translator_frame)
-        russian_frame.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Label(russian_frame, text="Русский перевод:").pack(side=tk.LEFT)
-        entry_russian = ttk.Entry(russian_frame)
-        entry_russian.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
-        create_context_menu(entry_russian)  # Добавляем контекстное меню
-        
-        # Кнопки перевода
-        translate_btn_frame = ttk.Frame(translator_frame)
-        translate_btn_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
-        
-        def translate_to_russian():
-            german_text = entry_german.get().strip()
-            if not german_text:
-                return
-                
-            api_key = entry_api_key.get().strip()
-            if not api_key:
-                messagebox.showwarning("Нет ключа", "Введите ключ OpenAI для перевода")
-                return
-                
-            global OPENAI_API_KEY
-            OPENAI_API_KEY = api_key
-            
-            try:
-                translation = translate_sentence(german_text, use_openai=True)
-                entry_russian.delete(0, tk.END)
-                entry_russian.insert(0, translation)
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось перевести: {e}")
-        
-        def translate_to_german():
-            russian_text = entry_russian.get().strip()
-            if not russian_text:
-                return
-                
-            api_key = entry_api_key.get().strip()
-            if not api_key:
-                messagebox.showwarning("Нет ключа", "Введите ключ OpenAI для перевода")
-                return
-                
-            global OPENAI_API_KEY
-            OPENAI_API_KEY = api_key
-            
-            if len(russian_text.split()) > 1:
-                # Для предложений используем OpenAI
-                try:
-                    client = get_openai_client(OPENAI_API_KEY)
-                    response = client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {"role": "system", "content": "Ты переводчик с русского на немецкий. Отвечай только переводом предложения без пояснений."},
-                            {"role": "user", "content": f"Переведи с русского на немецкий предложение: {russian_text}"}
-                        ],
-                        max_tokens=100,
-                        temperature=0.1
-                    )
-                    translation = response.choices[0].message.content.strip()
-                    entry_german.delete(0, tk.END)
-                    entry_german.insert(0, translation)
-                except Exception as e:
-                    messagebox.showerror("Ошибка", f"Не удалось перевести: {e}")
+        show_back_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            win,
+            text="Показать обратную сторону",
+            variable=show_back_var,
+            command=lambda: toggle_side(),
+        ).pack(anchor="w", padx=10, pady=(8, 0))
+
+        colors = getattr(self, "palette", None)
+        card_bg, card_text, _ = get_card_surface_colors(self)
+        card_frame = tk.Frame(win, bg=card_bg, bd=0, relief="flat", width=820, height=460)
+        style_card_surface(card_frame, colors)
+        card_frame.pack(padx=10, pady=10, fill=tk.BOTH, expand=False)
+        card_frame.pack_propagate(False)
+
+        content_frame = tk.Frame(card_frame, bg=card_bg)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        text_frame = tk.Frame(content_frame, bg=card_bg)
+        text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        front_text = tk.Text(text_frame, wrap=tk.WORD, height=10)
+        back_text = tk.Text(text_frame, wrap=tk.WORD, height=10)
+        style_card_surface_text(front_text, colors)
+        style_card_surface_text(back_text, colors)
+        front_text.pack(fill=tk.BOTH, expand=True)
+        back_text.pack_forget()
+        create_context_menu(front_text)
+        create_context_menu(back_text)
+        attach_simple_toolbar(text_frame, front_text)
+        attach_simple_toolbar(text_frame, back_text)
+
+        image_frame = tk.Frame(content_frame, bg=card_bg)
+        image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        front_image_label = ResizableImageLabel(image_frame, bg=card_bg, text="")
+        back_image_label = ResizableImageLabel(image_frame, bg=card_bg, text="")
+        style_card_surface(front_image_label, colors)
+        style_card_surface(back_image_label, colors)
+        front_image_label.pack(fill=tk.BOTH, expand=True)
+        back_image_label.pack_forget()
+
+        clip_frame = ttk.Frame(card_frame, style="CardInner.TFrame")
+        clip_frame.pack(fill=tk.X, padx=20, pady=(0, 6))
+        clip_label = ttk.Label(clip_frame, text="📎 Добавить изображение")
+        clip_label.pack(side=tk.LEFT)
+
+        media_frame = ttk.Frame(card_frame, style="CardInner.TFrame")
+        media_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
+
+        state = {
+            "front": {"image": None, "audio": [], "video": []},
+            "back": {"image": None, "audio": [], "video": []},
+        }
+
+        def current_side() -> str:
+            return "back" if show_back_var.get() else "front"
+
+        def toggle_side():
+            side = current_side()
+            if side == "back":
+                front_text.pack_forget()
+                front_image_label.pack_forget()
+                back_text.pack(fill=tk.BOTH, expand=True)
+                back_image_label.pack(fill=tk.BOTH, expand=True)
+                clip_label.config(text="📎 Добавить изображение (back)")
             else:
-                # Для отдельных слов используем словарь
-                german_word = get_german_translation(russian_text, use_openai=True)
-                if german_word:
-                    entry_german.delete(0, tk.END)
-                    entry_german.insert(0, german_word)
-        
-        def generate_card():
-            german = entry_german.get().strip()
-            russian = entry_russian.get().strip()
-            
-            if not german or not russian:
-                messagebox.showwarning("Внимание", "Заполните оба поля перевода.")
+                back_text.pack_forget()
+                back_image_label.pack_forget()
+                front_text.pack(fill=tk.BOTH, expand=True)
+                front_image_label.pack(fill=tk.BOTH, expand=True)
+                clip_label.config(text="📎 Добавить изображение (front)")
+            render_media_blocks()
+
+        def render_media_blocks():
+            for widget in media_frame.winfo_children():
+                widget.destroy()
+            side = current_side()
+            media = state[side]
+            if media["image"]:
+                ttk.Label(media_frame, text="🖼 Изображение прикреплено").pack(anchor="w")
+            for _idx, path in enumerate(media["audio"], start=1):
+                ttk.Label(media_frame, text="🎧 Аудио прикреплено").pack(anchor="w")
+            for _idx, path in enumerate(media["video"], start=1):
+                ttk.Label(media_frame, text="🎬 Видео прикреплено").pack(anchor="w")
+            if not media["image"] and not media["audio"] and not media["video"]:
+                ttk.Label(media_frame, text="(Медиа нет)").pack(anchor="w")
+
+        def select_image():
+            side = current_side()
+            filename = filedialog.askopenfilename(
+                title="Выбрать изображение",
+                filetypes=[
+                    ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if not filename:
                 return
-                
-            # Создаем карточку с переводом
-            front = german  # Лицевая сторона - немецкий текст
-            # Задняя сторона - немецкий текст + перевод в скобках
-            back = f"{german}\n\n({russian})"
-            
-            # Вставляем карточку
+            state[side]["image"] = filename
+            if side == "front":
+                front_image_label.load_image(filename)
+            else:
+                back_image_label.load_image(filename)
+            render_media_blocks()
+
+        clip_button = ttk.Button(clip_frame, text="📎", command=select_image)
+        clip_button.pack(side=tk.RIGHT)
+
+        def add_audio():
+            side = current_side()
+            filename = filedialog.askopenfilename(
+                title="Добавить аудио",
+                filetypes=[
+                    ("Аудио", "*.mp3 *.wav *.ogg *.m4a"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if not filename:
+                return
+            state[side]["audio"].append(filename)
+            render_media_blocks()
+
+        def add_video():
+            side = current_side()
+            filename = filedialog.askopenfilename(
+                title="Добавить видео",
+                filetypes=[
+                    ("Видео", "*.mp4 *.mov *.avi *.mkv *.webm"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if not filename:
+                return
+            state[side]["video"].append(filename)
+            render_media_blocks()
+
+        def generate_tts_audio():
+            side = current_side()
+            text_widget = back_text if side == "back" else front_text
+            text_value = text_widget.get("1.0", tk.END).strip()
+            if not text_value:
+                messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
+                return
+            lang = get_deck_tts_lang(deck_map.get(deck_var.get()), "de")
+            url = get_tts_url(text_value, lang)
+            if not url:
+                messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
+                return
+            ensure_media_dir()
+            filename = os.path.join(MEDIA_FOLDER, f"tts_{uuid4().hex}.mp3")
             try:
-                insert_card(self.selected_deck_id, front, back,
-                            front_image_path=None,
-                            back_image_path=None,
-                            audio_path=None,
-                            level=1)
-                messagebox.showinfo("Успех", "Карточка сгенерирована и добавлена с переводом.")
-                win.destroy()
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось добавить карточку: {e}")
-        
-        ttk.Button(translate_btn_frame, text="DE → RU", command=translate_to_russian).pack(side=tk.LEFT, padx=2)
-        ttk.Button(translate_btn_frame, text="RU → DE", command=translate_to_german).pack(side=tk.LEFT, padx=2)
-        ttk.Button(translate_btn_frame, text="Создать карточку", 
-                  command=generate_card).pack(side=tk.RIGHT, padx=2)
+                request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    data = response.read()
+                with open(filename, "wb") as fh:
+                    fh.write(data)
+                state[side]["audio"].append(filename)
+                render_media_blocks()
+            except Exception as exc:
+                messagebox.showerror("Озвучка", f"Не удалось озвучить текст: {exc}")
 
-        ttk.Label(win, text="Front (лицевая сторона - немецкий текст):").pack(anchor="w", padx=10, pady=(10, 0))
-        txt_front = tk.Text(win, height=4)
-        txt_front.pack(fill=tk.BOTH, expand=False, padx=10)
-        create_context_menu(txt_front)  # Добавляем контекстное меню
-        
-        # Добавляем кнопки загрузки изображений для Front
-        img_front_frame = ttk.Frame(win)
-        img_front_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
-        ttk.Label(img_front_frame, text="Картинка (front):").pack(side=tk.LEFT)
-        
-        front_image_path_var = tk.StringVar()
-        lbl_img_front = ttk.Label(img_front_frame, text="не выбрана")
-        lbl_img_front.pack(side=tk.LEFT, padx=5)
-        
-        def select_img_front():
-            filetypes = [
-                ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp"),
-                ("Все файлы", "*.*"),
-            ]
-            filename = filedialog.askopenfilename(
-                title="Выбрать картинку для front",
-                filetypes=filetypes
-            )
-            if filename:
-                front_image_path_var.set(filename)
-                lbl_img_front.config(text=os.path.basename(filename))
-        
-        ttk.Button(img_front_frame, text="Загрузить картинку", command=select_img_front).pack(side=tk.RIGHT, padx=5)
-        
-        attach_simple_toolbar(win, txt_front)
+        actions_frame = ttk.Frame(win)
+        actions_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(actions_frame, text="Добавить аудио", command=add_audio).pack(side=tk.LEFT, padx=5)
+        ttk.Button(actions_frame, text="Добавить видео", command=add_video).pack(side=tk.LEFT, padx=5)
+        ttk.Button(actions_frame, text="Озвучить (Google TTS)", command=generate_tts_audio).pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(win, text="Back (задняя сторона - ответ с переводом):").pack(anchor="w", padx=10, pady=(10, 0))
-        txt_back = tk.Text(win, height=4)
-        txt_back.pack(fill=tk.BOTH, expand=False, padx=10)
-        create_context_menu(txt_back)  # Добавляем контекстное меню
-        
-        # Добавляем кнопки загрузки изображений для Back
-        img_back_frame = ttk.Frame(win)
-        img_back_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
-        ttk.Label(img_back_frame, text="Картинка (back):").pack(side=tk.LEFT)
-        
-        back_image_path_var = tk.StringVar()
-        lbl_img_back = ttk.Label(img_back_frame, text="не выбрана")
-        lbl_img_back.pack(side=tk.LEFT, padx=5)
-        
-        def select_img_back():
-            filetypes = [
-                ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp"),
-                ("Все файлы", "*.*"),
-            ]
-            filename = filedialog.askopenfilename(
-                title="Выбрать картинку для back",
-                filetypes=filetypes
-            )
-            if filename:
-                back_image_path_var.set(filename)
-                lbl_img_back.config(text=os.path.basename(filename))
-        
-        ttk.Button(img_back_frame, text="Загрузить картинку", command=select_img_back).pack(side=tk.RIGHT, padx=5)
-        
-        attach_simple_toolbar(win, txt_back)
-
-        audio_path_var = tk.StringVar()
-
-        # Кнопка сгенерировать карточку внизу окна
         def save_card():
-            front = txt_front.get("1.0", tk.END).strip()
-            back = txt_back.get("1.0", tk.END).strip()
-            if not front or not back:
+            front_value = front_text.get("1.0", tk.END).strip()
+            back_value = back_text.get("1.0", tk.END).strip()
+            if not front_value or not back_value:
                 messagebox.showerror("Ошибка", "Front и Back не могут быть пустыми.")
                 return
-            img_front = front_image_path_var.get().strip() or None
-            img_back = back_image_path_var.get().strip() or None
-            aud_path = audio_path_var.get().strip() or None
+            deck_id = deck_map.get(deck_var.get())
+            if not deck_id:
+                messagebox.showerror("Ошибка", "Выберите колоду для сохранения.")
+                return
+
+            front_image = state["front"]["image"]
+            back_image = state["back"]["image"]
+            stored_front = copy_image_asset_to_media(front_image, "front") if front_image else None
+            stored_back = copy_image_asset_to_media(back_image, "back") if back_image else None
+
             try:
-                insert_card(self.selected_deck_id, front, back,
-                            front_image_path=img_front,
-                            back_image_path=img_back,
-                            audio_path=aud_path,
-                            level=1)
+                card_id = insert_card(
+                    deck_id,
+                    front_value,
+                    back_value,
+                    front_image_path=stored_front,
+                    back_image_path=stored_back,
+                    audio_path=None,
+                    level=1,
+                )
+                media_entries = []
+                for path in state["front"]["audio"]:
+                    media_entries.append((copy_audio_asset_to_media(path, "front_audio"), "audio", "front", None))
+                for path in state["back"]["audio"]:
+                    media_entries.append((copy_audio_asset_to_media(path, "back_audio"), "audio", "back", None))
+                for path in state["front"]["video"]:
+                    media_entries.append((copy_video_asset_to_media(path, "front_video"), "video", "front", None))
+                for path in state["back"]["video"]:
+                    media_entries.append((copy_video_asset_to_media(path, "back_video"), "video", "back", None))
+                if media_entries:
+                    attach_media_to_card(card_id, media_entries)
             except sqlite3.OperationalError as e:
                 messagebox.showerror("БД", f"Не удалось сохранить карточку:\n{e}")
                 return
+
             messagebox.showinfo("OK", "Карточка добавлена.")
             win.destroy()
 
-        # Кнопка сгенерировать карточку внизу окна
         btn_generate_frame = ttk.Frame(win)
-        btn_generate_frame.pack(fill=tk.X, padx=10, pady=20)
-        ttk.Button(btn_generate_frame, text="Сгенерировать карточку", 
-                  command=save_card).pack(side=tk.RIGHT)
+        btn_generate_frame.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Button(btn_generate_frame, text="Создать карточку", command=save_card).pack(side=tk.RIGHT)
+
+        render_media_blocks()
 
     # --------- обзор карточек ---------
 
@@ -8754,14 +8891,20 @@ class AnkiApp(tk.Tk):
             def _task(progress_cb):
                 created = 0
                 done = 0
+                total_pages = max(len(state["chunks"]), 1)
+                try:
+                    page_index = int(page_var.get() or "1")
+                except ValueError:
+                    page_index = 1
+                progress_cb(done, total_steps, f"Страница {page_index}/{total_pages}")
                 for idx, card in enumerate(state["cards"], start=1):
                     progress_cb(done, total_steps, f"Подготовка карточки {idx}/{total_steps}")
                     image_path = ""
                     if add_images and idx <= image_limit:
-                        progress_cb(done, total_steps, f"AI-картинка {idx}/{total_steps}")
+                        progress_cb(done, total_steps, f"Генерация картинки {idx}/{image_steps or total_steps}")
                         image_path = self._create_ai_placeholder_image(card.get("front", "")) or ""
                         done += 1
-                        progress_cb(done, total_steps, f"AI-картинка готова {idx}/{total_steps}")
+                        progress_cb(done, total_steps, f"Генерация картинки {idx}/{image_steps or total_steps}")
 
                     note_fields = {
                         "word": card.get("front", ""),
@@ -8782,7 +8925,7 @@ class AnkiApp(tk.Tk):
                     )
                     created += cards_created
                     done += 1
-                    progress_cb(done, total_steps, f"Готово {idx}/{total_steps}")
+                    progress_cb(done, total_steps, "Сохранение карточек…")
                 return created
 
             def _on_success(created):
@@ -8946,6 +9089,8 @@ class AnkiApp(tk.Tk):
 
         front_image_var = tk.StringVar(value="")
         back_image_var = tk.StringVar(value="")
+        front_video_var = tk.StringVar(value="")
+        back_video_var = tk.StringVar(value="")
 
         frame_images = ttk.LabelFrame(frame_opts, text="Изображения карточки")
         frame_images.pack(fill=tk.X, padx=5, pady=(5, 0))
@@ -8993,6 +9138,50 @@ class AnkiApp(tk.Tk):
             text="Прикрепить изображение (обратная сторона)",
             command=select_back_image,
         ).grid(row=1, column=2, padx=5, pady=3, sticky="e")
+
+        ttk.Label(frame_images, text="Видео (лицевая):").grid(row=2, column=0, sticky="w", pady=3)
+        front_video_label = ttk.Label(frame_images, text="(нет)")
+        front_video_label.grid(row=2, column=1, sticky="w", padx=5)
+
+        def select_front_video():
+            filename = filedialog.askopenfilename(
+                title="Прикрепить видео (лицевая сторона)",
+                filetypes=[
+                    ("Видео", "*.mp4 *.mov *.avi *.mkv *.webm"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if filename:
+                front_video_var.set(filename)
+                front_video_label.config(text="🎬 Видео прикреплено")
+
+        ttk.Button(
+            frame_images,
+            text="Загрузить видео (лицевая сторона)",
+            command=select_front_video,
+        ).grid(row=2, column=2, padx=5, pady=3, sticky="e")
+
+        ttk.Label(frame_images, text="Видео (обратная):").grid(row=3, column=0, sticky="w", pady=3)
+        back_video_label = ttk.Label(frame_images, text="(нет)")
+        back_video_label.grid(row=3, column=1, sticky="w", padx=5)
+
+        def select_back_video():
+            filename = filedialog.askopenfilename(
+                title="Прикрепить видео (обратная сторона)",
+                filetypes=[
+                    ("Видео", "*.mp4 *.mov *.avi *.mkv *.webm"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if filename:
+                back_video_var.set(filename)
+                back_video_label.config(text="🎬 Видео прикреплено")
+
+        ttk.Button(
+            frame_images,
+            text="Загрузить видео (обратная сторона)",
+            command=select_back_video,
+        ).grid(row=3, column=2, padx=5, pady=3, sticky="e")
 
         frame_images.columnconfigure(1, weight=1)
 
@@ -9166,6 +9355,11 @@ class AnkiApp(tk.Tk):
                 else:
                     tk.Label(right, text="Нет изображения", bg=panel, fg=text_color).pack(anchor="w")
 
+                if front_video_var.get():
+                    tk.Label(left, text="🎬 Видео прикреплено", bg=panel, fg=text_color).pack(anchor="w", pady=(6, 0))
+                if back_video_var.get():
+                    tk.Label(right, text="🎬 Видео прикреплено", bg=panel, fg=text_color).pack(anchor="w", pady=(6, 0))
+
         def preview_cards():
             self.show_loading("Загрузка")
 
@@ -9200,6 +9394,8 @@ class AnkiApp(tk.Tk):
 
                     front_image_path = front_image_var.get()
                     back_image_path = back_image_var.get()
+                    front_video_path = front_video_var.get()
+                    back_video_path = back_video_var.get()
                     stored_front = (
                         copy_image_asset_to_media(front_image_path, "front")
                         if front_image_path
@@ -9208,6 +9404,16 @@ class AnkiApp(tk.Tk):
                     stored_back = (
                         copy_image_asset_to_media(back_image_path, "back")
                         if back_image_path
+                        else None
+                    )
+                    stored_front_video = (
+                        copy_video_asset_to_media(front_video_path, "front_video")
+                        if front_video_path
+                        else None
+                    )
+                    stored_back_video = (
+                        copy_video_asset_to_media(back_video_path, "back_video")
+                        if back_video_path
                         else None
                     )
 
@@ -9225,10 +9431,17 @@ class AnkiApp(tk.Tk):
                             "front": card.get("front", ""),
                             "back": card.get("back", ""),
                         }
-                        _, cards_created = create_note_with_cards(
+                        note_id, cards_created = create_note_with_cards(
                             self.selected_deck_id,
                             note_fields,
                             note_type_id=ensure_generated_note_type_id(),
+                        )
+                        attach_media_to_note(
+                            note_id,
+                            [
+                                (stored_front_video, "video", "front", None),
+                                (stored_back_video, "video", "back", None),
+                            ],
                         )
                         created += cards_created
 
@@ -10445,6 +10658,7 @@ class OverviewWindow(tk.Toplevel):
 
         video_path = find_video_media_path(card)
         if not video_path:
+            ttk.Label(video_frame, text="Видео не прикреплено").pack(side=tk.LEFT, padx=(0, 5))
             return
 
         ttk.Label(video_frame, text="Видео:").pack(side=tk.LEFT, padx=(0, 5))
@@ -10791,6 +11005,10 @@ class RepeatWindow(tk.Toplevel):
         self.audio_inline_frame = ttk.Frame(self.card_frame, style="CardInner.TFrame")
         self.audio_inline_frame.place_forget()
 
+        # Встроенный видеоблок (под аудио)
+        self.video_inline_frame = ttk.Frame(self.card_frame, style="CardInner.TFrame")
+        self.video_inline_frame.place_forget()
+
         # Нижний бар управления (всегда видим)
         self.controls_bar = ttk.Frame(self, style="Surface.TFrame")
         self.controls_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
@@ -10835,9 +11053,107 @@ class RepeatWindow(tk.Toplevel):
         if entries:
             if not self.audio_inline_frame.winfo_ismapped():
                 self.audio_inline_frame.place(x=10, y=350, width=780, height=90)
+            if self.audio_widget is not None:
+                self.audio_widget.on_state_change = self._handle_media_state_update
+                self._apply_audio_state_from_selection()
+                selector = getattr(self.audio_inline_frame, "audio_selector", None)
+                if selector is not None:
+                    selector.bind("<<ComboboxSelected>>", lambda _e: self._apply_audio_state_from_selection())
         else:
             if self.audio_inline_frame.winfo_ismapped():
                 self.audio_inline_frame.place_forget()
+        self.update_video_player()
+
+    def _apply_audio_state_from_selection(self):
+        audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
+        entry_map = getattr(self.audio_inline_frame, "audio_entry_map", {}) or {}
+        selection = getattr(self.audio_inline_frame, "audio_selector_var", None)
+        if not audio_widget or not selection:
+            return
+        selected_label = selection.get()
+        entry = entry_map.get(selected_label)
+        if not entry:
+            return
+        media_key = _build_media_key(entry.get("media_id"), entry.get("path"))
+        audio_widget.set_media_key(media_key)
+        audio_widget.apply_state(load_media_state(self.current_card["id"], media_key))
+
+    def update_video_player(self):
+        for widget in self.video_inline_frame.winfo_children():
+            widget.destroy()
+        video_path = find_video_media_path(self.current_card)
+        if not video_path:
+            if not self.video_inline_frame.winfo_ismapped():
+                self.video_inline_frame.place(x=10, y=440, width=780, height=80)
+            ttk.Label(self.video_inline_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
+            return
+        if not self.video_inline_frame.winfo_ismapped():
+            self.video_inline_frame.place(x=10, y=440, width=780, height=140)
+        if is_vlc_available():
+            try:
+                player = VlcPlayerWidget(
+                    self.video_inline_frame,
+                    video_path,
+                    width=420,
+                    height=200,
+                    on_state_change=self._handle_media_state_update,
+                )
+                player.pack(anchor="w")
+                media_entries = get_media_for_card(self.current_card.get("id"), self.current_card.get("note_id"))
+                media_id = None
+                for entry in media_entries:
+                    media_type = (entry.get("media_type") or entry.get("type") or "").lower()
+                    if media_type == "video" and entry.get("path") == video_path:
+                        media_id = entry.get("id")
+                        break
+                media_key = _build_media_key(media_id, video_path)
+                player.set_media_key(media_key)
+                player.apply_state(load_media_state(self.current_card["id"], media_key))
+                self.video_inline_frame.vlc_player = player
+                return
+            except Exception:
+                pass
+        ttk.Button(
+            self.video_inline_frame,
+            text="Открыть во внешнем плеере",
+            command=lambda: open_in_external_player(video_path),
+        ).pack(anchor="w", padx=5, pady=5)
+
+    def _handle_media_state_update(self, media_key: str | None, state: dict):
+        if not media_key:
+            return
+        try:
+            save_media_state(
+                self.current_card["id"],
+                media_key,
+                state.get("pos_ms", 0),
+                state.get("volume", 70),
+                state.get("speed", 1),
+            )
+        except Exception:
+            pass
+
+    def save_current_media_state(self):
+        audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
+        if audio_widget and audio_widget.media_key:
+            state = audio_widget.get_state()
+            save_media_state(
+                self.current_card["id"],
+                audio_widget.media_key,
+                state.get("pos_ms", 0),
+                state.get("volume", 70),
+                state.get("speed", 1),
+            )
+        video_player = getattr(self.video_inline_frame, "vlc_player", None)
+        if video_player and video_player.media_key:
+            state = video_player.get_state()
+            save_media_state(
+                self.current_card["id"],
+                video_player.media_key,
+                state.get("pos_ms", 0),
+                state.get("volume", 70),
+                state.get("speed", 1),
+            )
 
     def set_image_mode(self, mode: str):
         if mode not in ("fit", "actual", "zoom"):
@@ -11049,11 +11365,6 @@ class RepeatWindow(tk.Toplevel):
         )
 
         # Обновляем текст кнопок
-        current_level = c["leitner_level"]
-        self.btn_forget.config(text=f"Забыл (Фаза 1)")
-        next_level = min(10, current_level + 1)
-        self.btn_remember.config(text=f"Повторить (Фаза {next_level})")
-
         romans = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
         lvl = c["leitner_level"]
         phase = romans[min(max(lvl, 1), 10) - 1]
@@ -11247,6 +11558,7 @@ class RepeatWindow(tk.Toplevel):
         self.goto_next_card()
 
     def goto_next_card(self):
+        self.save_current_media_state()
         self.current_card = self.session.next_card()
         self.show_back = False
         if not self.current_card:
@@ -11260,6 +11572,7 @@ class RepeatWindow(tk.Toplevel):
         self.goto_next_card()
 
     def prev_card(self):
+        self.save_current_media_state()
         self.current_card = self.session.prev_card()
         self.show_back = False
         self.load_checkpoint_state()
@@ -11385,6 +11698,9 @@ class ReviewWindow(tk.Toplevel):
             lambda e: self.image_label.set_container_size(e.width - 20, e.height)
         )
 
+        self.video_frame = ttk.Frame(self.card_frame, style="CardInner.TFrame")
+        self.video_frame.pack(fill=tk.X, padx=30, pady=(0, 5))
+
         # Прогресс-бар
         progress_frame = tk.Frame(self.card_frame, bg=card_bg)
         progress_frame.pack(side=tk.BOTTOM, pady=(0, 4))
@@ -11433,14 +11749,8 @@ class ReviewWindow(tk.Toplevel):
         self.btn_show = ttk.Button(btn_frame, text="Показать ответ", command=self.toggle_front_back)
         self.btn_show.grid(row=0, column=0, padx=5)
 
-        self.btn_forget = ttk.Button(btn_frame, text="Забыл (Фаза 1)", command=self.mark_forgotten)
-        self.btn_forget.grid(row=0, column=1, padx=5)
-
-        self.btn_remember = ttk.Button(btn_frame, text="Повторить (Фаза +1)", command=self.mark_remembered)
-        self.btn_remember.grid(row=0, column=2, padx=5)
-
         self.btn_sound = ttk.Button(btn_frame, text="🔊 Слово", command=self.play_word)
-        self.btn_sound.grid(row=0, column=3, padx=5)
+        self.btn_sound.grid(row=0, column=1, padx=5)
 
         self.update_audio_player()
 
@@ -11457,9 +11767,104 @@ class ReviewWindow(tk.Toplevel):
                     pady=(0, 5),
                     before=self.bottom_frame,
                 )
+            audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
+            if audio_widget is not None:
+                audio_widget.on_state_change = self._handle_media_state_update
+                self._apply_audio_state_from_selection()
+                selector = getattr(self.audio_inline_frame, "audio_selector", None)
+                if selector is not None:
+                    selector.bind("<<ComboboxSelected>>", lambda _e: self._apply_audio_state_from_selection())
         else:
             if self.audio_inline_frame.winfo_ismapped():
                 self.audio_inline_frame.pack_forget()
+        self._update_video_player()
+
+    def _apply_audio_state_from_selection(self):
+        audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
+        entry_map = getattr(self.audio_inline_frame, "audio_entry_map", {}) or {}
+        selection = getattr(self.audio_inline_frame, "audio_selector_var", None)
+        if not audio_widget or not selection:
+            return
+        selected_label = selection.get()
+        entry = entry_map.get(selected_label)
+        if not entry:
+            return
+        media_key = _build_media_key(entry.get("media_id"), entry.get("path"))
+        audio_widget.set_media_key(media_key)
+        audio_widget.apply_state(load_media_state(self.current_card["id"], media_key))
+
+    def _update_video_player(self):
+        for widget in self.video_frame.winfo_children():
+            widget.destroy()
+        video_path = find_video_media_path(self.current_card)
+        if not video_path:
+            ttk.Label(self.video_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
+            return
+        if is_vlc_available():
+            try:
+                player = VlcPlayerWidget(
+                    self.video_frame,
+                    video_path,
+                    width=420,
+                    height=240,
+                    on_state_change=self._handle_media_state_update,
+                )
+                player.pack(anchor="w")
+                media_entries = get_media_for_card(self.current_card.get("id"), self.current_card.get("note_id"))
+                media_id = None
+                for entry in media_entries:
+                    media_type = (entry.get("media_type") or entry.get("type") or "").lower()
+                    if media_type == "video" and entry.get("path") == video_path:
+                        media_id = entry.get("id")
+                        break
+                media_key = _build_media_key(media_id, video_path)
+                player.set_media_key(media_key)
+                player.apply_state(load_media_state(self.current_card["id"], media_key))
+                self.video_frame.vlc_player = player
+                return
+            except Exception:
+                pass
+        ttk.Button(
+            self.video_frame,
+            text="Открыть во внешнем плеере",
+            command=lambda: open_in_external_player(video_path),
+        ).pack(anchor="w", padx=5, pady=5)
+
+    def _handle_media_state_update(self, media_key: str | None, state: dict):
+        if not media_key:
+            return
+        try:
+            save_media_state(
+                self.current_card["id"],
+                media_key,
+                state.get("pos_ms", 0),
+                state.get("volume", 70),
+                state.get("speed", 1),
+            )
+        except Exception:
+            pass
+
+    def save_current_media_state(self):
+        audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
+        if audio_widget and audio_widget.media_key:
+            state = audio_widget.get_state()
+            save_media_state(
+                self.current_card["id"],
+                audio_widget.media_key,
+                state.get("pos_ms", 0),
+                state.get("volume", 70),
+                state.get("speed", 1),
+            )
+        video_player = getattr(self.video_frame, "vlc_player", None)
+        if video_player and video_player.media_key:
+            state = video_player.get_state()
+            save_media_state(
+                self.current_card["id"],
+                video_player.media_key,
+                state.get("pos_ms", 0),
+                state.get("volume", 70),
+                state.get("speed", 1),
+            )
 
     def _show_audio_error(self, title: str, message: str):
         try:
@@ -11580,19 +11985,7 @@ class ReviewWindow(tk.Toplevel):
 
     def auto_mark_and_next(self):
         self.cancel_timers()
-        card_id = self.current_card["id"]
-        try:
-            apply_srs_update(card_id, 0)
-            update_statistics(self.master.selected_deck_id, remembered=False, forgotten=True, reviewed=True)
-
-            row = get_card_by_id(card_id)
-            if row:
-                self.current_card["leitner_level"] = row["leitner_level"]
-                self.current_card["next_review"] = row["next_review"]
-        except Exception:
-            pass
-
-        self.master.update_overdue_badge()
+        self.save_current_media_state()
         self.goto_next_card()
 
     def update_progress_view(self):
@@ -11701,6 +12094,7 @@ class ReviewWindow(tk.Toplevel):
 
     def goto_next_card(self):
         self.cancel_timers()
+        self.save_current_media_state()
         self.current_index += 1
         if self.current_index >= len(self.cards):
             messagebox.showinfo("Готово", "Карточки в этом режиме закончились.")
