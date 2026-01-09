@@ -7797,7 +7797,37 @@ class AnkiApp(tk.Tk):
                         pass
                     phase_intervals = list(DEFAULT_PHASE_INTERVALS)
 
-                main_frame = ttk.Frame(win, padding=12)
+                outer = ttk.Frame(win)
+                outer.pack(fill="both", expand=True)
+
+                btns = ttk.Frame(outer)
+                btns.pack(side="bottom", fill="x", padx=10, pady=10)
+
+                canvas = tk.Canvas(outer, highlightthickness=0, bd=0)
+                vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+                canvas.configure(yscrollcommand=vbar.set)
+
+                vbar.pack(side="right", fill="y")
+                canvas.pack(side="left", fill="both", expand=True)
+
+                content = ttk.Frame(canvas)
+                content_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+                def _on_content_configure(event=None):
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+
+                def _on_canvas_configure(event):
+                    canvas.itemconfigure(content_id, width=event.width)
+
+                def _on_mousewheel(e):
+                    canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+                content.bind("<Configure>", _on_content_configure)
+                canvas.bind("<Configure>", _on_canvas_configure)
+                canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+                canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+                main_frame = ttk.Frame(content, padding=12)
                 main_frame.pack(fill=tk.BOTH, expand=True)
 
                 ttk.Label(main_frame, text="Deck editor loaded OK").pack(anchor="w", pady=(0, 8))
@@ -7941,6 +7971,17 @@ class AnkiApp(tk.Tk):
                         hours_var.set(int((seconds % 86400) // 3600))
                     reset_deck_phase_intervals(self.selected_deck_id)
 
+                def log_deck_save_error(exc: BaseException) -> None:
+                    try:
+                        with open("deck_editor_save_error.log", "a", encoding="utf-8") as log_file:
+                            log_file.write(f"{datetime.now().isoformat()} save_changes failed\n")
+                            log_file.write(
+                                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                            )
+                            log_file.write("\n")
+                    except Exception:
+                        pass
+
                 def save_changes():
                     try:
                         name = entry_name.get().strip()
@@ -8002,37 +8043,60 @@ class AnkiApp(tk.Tk):
                         cur = conn.cursor()
                         ensure_deck_settings_table(conn)
                         ensure_deck_settings_row(self.selected_deck_id, conn)
-                        cur.execute(
-                            "UPDATE decks SET name = ?, description = ?, icon_path = ?, tts_lang = ? WHERE id = ?;",
-                            (name, desc or None, icon_path, tts_lang, self.selected_deck_id),
-                        )
-                        update_deck_timer_settings(
-                            self.selected_deck_id,
-                            timer_sec,
-                            timer_mode_var.get(),
-                            1 if inherit_var.get() else 0,
-                            review_timer_seconds,
-                            playback_timer_seconds,
-                            conn,
-                        )
-                        save_deck_phase_intervals(self.selected_deck_id, intervals, conn)
+                        cur.execute("PRAGMA table_info(decks);")
+                        deck_columns = {row["name"] for row in cur.fetchall()}
+                        updates = []
+                        params = []
+                        if "name" in deck_columns:
+                            updates.append("name = ?")
+                            params.append(name)
+                        if "description" in deck_columns:
+                            updates.append("description = ?")
+                            params.append(desc or None)
+                        if "icon_path" in deck_columns:
+                            updates.append("icon_path = ?")
+                            params.append(icon_path)
+                        if "tts_lang" in deck_columns:
+                            updates.append("tts_lang = ?")
+                            params.append(tts_lang)
+                        if updates:
+                            params.append(self.selected_deck_id)
+                            cur.execute(
+                                f"UPDATE decks SET {', '.join(updates)} WHERE id = ?;",
+                                params,
+                            )
+                        try:
+                            update_deck_timer_settings(
+                                self.selected_deck_id,
+                                timer_sec,
+                                timer_mode_var.get(),
+                                1 if inherit_var.get() else 0,
+                                review_timer_seconds,
+                                playback_timer_seconds,
+                                conn,
+                            )
+                        except Exception as exc:
+                            log_deck_settings("update_deck_timer_settings failed", exc)
+                        try:
+                            save_deck_phase_intervals(self.selected_deck_id, intervals, conn)
+                        except Exception as exc:
+                            log_deck_settings("save_deck_phase_intervals failed", exc)
                         conn.commit()
                         conn.close()
-                        self.refresh_decks()
+                        if hasattr(self, "refresh_decks"):
+                            self.refresh_decks()
                         messagebox.showinfo("Сохранено", "Настройки колоды сохранены")
-                        win.destroy()
                     except Exception as exc:
                         log_deck_settings("save_changes exception", exc)
+                        log_deck_save_error(exc)
                         messagebox.showerror("Ошибка", traceback.format_exc())
 
-                btn_frame = ttk.Frame(main_frame)
-                btn_frame.pack(fill=tk.X, pady=(0, 4))
                 ttk.Button(
-                    btn_frame, text="Сбросить настройки сроков", command=reset_phase_intervals
+                    btns, text="Сбросить настройки сроков", command=reset_phase_intervals
                 ).pack(side=tk.LEFT)
-                ttk.Button(btn_frame, text="Отмена", command=win.destroy).pack(side=tk.RIGHT, padx=(5, 0))
-                ttk.Button(btn_frame, text="Сохранить", style="Primary.TButton", command=save_changes).pack(
-                    side=tk.RIGHT
+                ttk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT, padx=6)
+                ttk.Button(btns, text="Сохранить", style="Primary.TButton", command=save_changes).pack(
+                    side=tk.RIGHT, padx=6
                 )
             except Exception as exc:
                 log_deck_settings("build_ui exception", exc)
