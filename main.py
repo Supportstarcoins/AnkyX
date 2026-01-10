@@ -8264,16 +8264,29 @@ class AnkiApp(tk.Tk):
 
             switch_frame = tk.Frame(outer_frame, bg=background)
             switch_frame.pack(fill=tk.X, padx=16, pady=(8, 0))
-            dots_frame = tk.Frame(switch_frame, bg=background)
-            dots_frame.pack(side=tk.LEFT)
-            toggle_button = ttk.Button(switch_frame, text="Показать обратную сторону")
-            toggle_button.pack(side=tk.RIGHT)
+            right_controls = tk.Frame(switch_frame, bg=background)
+            right_controls.pack(side=tk.RIGHT)
+            dots_frame = tk.Frame(right_controls, bg=background)
+            dots_frame.pack(side=tk.LEFT, padx=(0, 6))
+            toggle_button = ttk.Button(right_controls, text="Показать обратную сторону")
+            toggle_button.pack(side=tk.LEFT)
 
             card_container = tk.Frame(outer_frame, bg=background)
             card_container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
 
             card_widget = CardWidget(card_container, palette=colors, editable=True, show_image_toolbar=False)
             card_widget.pack(expand=True)
+            if card_widget.image_scroll_x is not None:
+                card_widget.image_scroll_x.grid_remove()
+            if card_widget.image_scroll_y is not None:
+                card_widget.image_scroll_y.grid_remove()
+            if card_widget.image_canvas is not None:
+                card_widget.image_canvas.configure(
+                    highlightthickness=1,
+                    highlightbackground=colors.get("border", "#E0E0E0"),
+                )
+            card_widget.audio_inline_frame.configure(style="CardSurface.TFrame")
+            card_widget.video_inline_frame.configure(style="CardSurface.TFrame")
 
             front_text = card_widget.front_text
             back_text = card_widget.back_text
@@ -8321,9 +8334,6 @@ class AnkiApp(tk.Tk):
             format_button["menu"] = format_menu
             format_button.pack(side=tk.LEFT)
 
-            save_button = ttk.Button(header_frame, text="Вписать")
-            save_button.pack(side=tk.RIGHT)
-
             dots = []
 
             def update_dots():
@@ -8337,7 +8347,6 @@ class AnkiApp(tk.Tk):
                 show_back_var.set(show_back)
                 img_path = state["back"]["image"] if show_back else state["front"]["image"]
                 card_widget.show_side(show_back, img_path)
-                update_media_action_labels()
                 toggle_button.config(
                     text="Показать лицевую сторону" if show_back else "Показать обратную сторону"
                 )
@@ -8359,16 +8368,66 @@ class AnkiApp(tk.Tk):
                     widget.destroy()
                 side = current_side()
                 media = state[side]
-                for _idx, path in enumerate(media["audio"], start=1):
-                    ttk.Label(card_widget.audio_inline_frame, text="🎧 Аудио прикреплено").pack(anchor="w")
-                for _idx, path in enumerate(media["video"], start=1):
-                    ttk.Label(card_widget.video_inline_frame, text="🎬 Видео прикреплено").pack(anchor="w")
-                if not media["audio"]:
-                    ttk.Label(card_widget.audio_inline_frame, text="Аудио не прикреплено").pack(anchor="w", padx=5, pady=5)
-                if not media["video"]:
-                    ttk.Label(card_widget.video_inline_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
+
+                def format_status(paths: list[str]) -> str:
+                    if not paths:
+                        return "не прикреплено"
+                    if len(paths) == 1:
+                        return os.path.basename(paths[0])
+                    return f"{len(paths)} файлов"
+
+                def format_image_status(path: str | None) -> str:
+                    return os.path.basename(path) if path else "не прикреплено"
+
+                def create_row(
+                    parent: tk.Frame,
+                    label: str,
+                    value: str,
+                    command,
+                    extra_button_label: str | None = None,
+                    extra_button_command=None,
+                ) -> None:
+                    row = tk.Frame(parent, bg=card_bg)
+                    row.pack(fill=tk.X, padx=10, pady=4)
+                    tk.Label(row, text=f"{label}:", bg=card_bg, fg=card_text).pack(side=tk.LEFT)
+                    tk.Label(row, text=value, bg=card_bg, fg=card_text).pack(side=tk.LEFT, padx=(6, 0))
+                    btn = ttk.Button(row, text="Прикрепить", command=command)
+                    btn.pack(side=tk.RIGHT)
+                    if extra_button_label and extra_button_command:
+                        ttk.Button(
+                            row,
+                            text=extra_button_label,
+                            command=extra_button_command,
+                        ).pack(side=tk.RIGHT, padx=(0, 6))
+
+                audio_status = format_status(media["audio"])
+                create_row(
+                    card_widget.audio_inline_frame,
+                    "Аудио",
+                    audio_status,
+                    add_audio,
+                    extra_button_label="Озвучить",
+                    extra_button_command=generate_tts_audio,
+                )
+
+                image_status = format_image_status(media["image"])
+                create_row(
+                    card_widget.video_inline_frame,
+                    "Изображение",
+                    image_status,
+                    select_image,
+                )
+
+                video_status = format_status(media["video"])
+                create_row(
+                    card_widget.video_inline_frame,
+                    "Видео",
+                    video_status,
+                    add_video,
+                )
+
                 card_widget.show_audio_frame(True)
-                card_widget.show_video_frame(True, height=90)
+                card_widget.show_video_frame(True, height=120)
 
             def select_image():
                 side = current_side()
@@ -8438,39 +8497,23 @@ class AnkiApp(tk.Tk):
                 except Exception as exc:
                     messagebox.showerror("Озвучка", f"Не удалось озвучить текст: {exc}")
 
-            media_actions_frame = tk.Frame(card_widget, bg=card_bg)
-            media_actions_frame.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
-            audio_button = ttk.Button(media_actions_frame, text="🎧", width=3, command=add_audio)
-            video_button = ttk.Button(media_actions_frame, text="🎬", width=3, command=add_video)
-            image_button = ttk.Button(media_actions_frame, text="🖼️", width=3, command=select_image)
-            tts_button = ttk.Button(media_actions_frame, text="🔊", width=3, command=generate_tts_audio)
-            image_button.pack(side=tk.LEFT, padx=3)
-            video_button.pack(side=tk.LEFT, padx=3)
-            audio_button.pack(side=tk.LEFT, padx=3)
-            tts_button.pack(side=tk.LEFT, padx=3)
-
-            def update_media_action_labels():
-                side = current_side()
-                suffix = "B" if side == "back" else "F"
-                image_button.config(text=f"🖼️ {suffix}")
-
             def save_card():
-                front_value = front_text.get("1.0", tk.END).strip()
-                back_value = back_text.get("1.0", tk.END).strip()
-                if not front_value or not back_value:
-                    messagebox.showerror("Ошибка", "Front и Back не могут быть пустыми.")
-                    return
-                deck_id = deck_map.get(deck_var.get())
-                if not deck_id:
-                    messagebox.showerror("Ошибка", "Выберите колоду для сохранения.")
-                    return
-
-                front_image = state["front"]["image"]
-                back_image = state["back"]["image"]
-                stored_front = copy_image_asset_to_media(front_image, "front") if front_image else None
-                stored_back = copy_image_asset_to_media(back_image, "back") if back_image else None
-
                 try:
+                    front_value = front_text.get("1.0", tk.END).strip()
+                    back_value = back_text.get("1.0", tk.END).strip()
+                    if not front_value and not back_value:
+                        messagebox.showwarning("Пустая карточка", "Введите текст для лицевой или обратной стороны.")
+                        return
+                    deck_id = deck_map.get(deck_var.get())
+                    if not deck_id:
+                        messagebox.showerror("Ошибка", "Выберите колоду для сохранения.")
+                        return
+
+                    front_image = state["front"]["image"]
+                    back_image = state["back"]["image"]
+                    stored_front = copy_image_asset_to_media(front_image, "front") if front_image else None
+                    stored_back = copy_image_asset_to_media(back_image, "back") if back_image else None
+
                     card_id = insert_card(
                         deck_id,
                         front_value,
@@ -8491,14 +8534,39 @@ class AnkiApp(tk.Tk):
                         media_entries.append((copy_video_asset_to_media(path, "back_video"), "video", "back", None))
                     if media_entries:
                         attach_media_to_card(card_id, media_entries)
-                except sqlite3.OperationalError as e:
-                    messagebox.showerror("БД", f"Не удалось сохранить карточку:\n{e}")
+                    mark_card_for_overview(card_id)
+                except Exception as exc:
+                    try:
+                        with open("add_card_save_error.log", "a", encoding="utf-8") as log_file:
+                            log_file.write(f"{datetime.now().isoformat()} manual card save\n")
+                            log_file.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                            log_file.write("\n")
+                    except Exception:
+                        pass
+                    messagebox.showerror("БД", f"Не удалось сохранить карточку:\n{exc}")
                     return
 
-                messagebox.showinfo("OK", "Карточка добавлена.")
+                messagebox.showinfo("Сохранено", "Карточка добавлена в ознакомление")
+                if hasattr(self, "refresh_decks"):
+                    self.refresh_decks()
+                if hasattr(self, "update_deck_preview"):
+                    self.update_deck_preview()
+                if hasattr(self, "update_overdue_badge"):
+                    self.update_overdue_badge()
                 win.destroy()
 
-            save_button.config(command=save_card)
+            footer_frame = tk.Frame(outer_frame, bg=background)
+            footer_frame.pack(fill=tk.X, padx=16, pady=(0, 16))
+            tk.Frame(footer_frame, bg=background).pack(side=tk.LEFT, expand=True, fill=tk.X)
+            ttk.Button(footer_frame, text="Отмена", style="Secondary.TButton", command=win.destroy).pack(
+                side=tk.RIGHT, padx=(6, 0)
+            )
+            ttk.Button(
+                footer_frame,
+                text="Сохранить карточку",
+                style="Primary.TButton",
+                command=save_card,
+            ).pack(side=tk.RIGHT)
 
             set_side(False)
         except Exception as exc:
