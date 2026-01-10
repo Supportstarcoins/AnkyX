@@ -63,6 +63,12 @@ except ImportError:
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import tkinter.font as tkfont
+import importlib.util
+
+_HAS_DND = importlib.util.find_spec("tkinterdnd2") is not None
+if _HAS_DND:
+    from tkinterdnd2 import DND_FILES
+
 from stats_config import (
     StatsSettings,
     ensure_stats_settings_table,
@@ -8297,7 +8303,42 @@ class AnkiApp(tk.Tk):
             outer_frame = tk.Frame(win, bg=background)
             outer_frame.pack(fill=tk.BOTH, expand=True)
 
-            top_bar = tk.Frame(outer_frame, bg=background)
+            bottom_actions = tk.Frame(outer_frame, bg=background)
+            bottom_actions.pack(side="bottom", fill="x", padx=16, pady=12)
+
+            canvas = tk.Canvas(outer_frame, bg=background, highlightthickness=0, bd=0)
+            sb = tk.Scrollbar(
+                outer_frame,
+                orient="vertical",
+                bg="#0b0f16",
+                troughcolor="#05070b",
+                activebackground="#121a26",
+                highlightthickness=0,
+                bd=0,
+                width=12,
+                command=canvas.yview,
+            )
+            canvas.configure(yscrollcommand=sb.set)
+
+            sb.pack(side="right", fill="y")
+            canvas.pack(side="left", fill="both", expand=True)
+
+            content = tk.Frame(canvas, bg=background)
+            content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+
+            content.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+            )
+            canvas.bind("<Configure>", lambda e: canvas.itemconfigure(content_window, width=e.width))
+
+            def _mw(e):
+                canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+            canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _mw))
+            canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+            top_bar = tk.Frame(content, bg=background)
             top_bar.pack(fill=tk.X, padx=16, pady=(12, 0))
             left_controls = tk.Frame(top_bar, bg=background)
             left_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -8317,7 +8358,7 @@ class AnkiApp(tk.Tk):
             toggle_button = ttk.Button(right_controls, text="Показать обратную сторону")
             toggle_button.pack(side=tk.LEFT)
 
-            format_bar = tk.Frame(outer_frame, bg=background)
+            format_bar = tk.Frame(content, bg=background)
             format_bar.pack(fill=tk.X, padx=16, pady=(10, 0))
             format_wrap = tk.Frame(format_bar, bg="white")
             format_wrap.pack(fill=tk.X)
@@ -8326,7 +8367,7 @@ class AnkiApp(tk.Tk):
 
             card_surface_bg, card_text, card_border = get_card_surface_colors(self)
 
-            content_row = tk.Frame(outer_frame, bg=background)
+            content_row = tk.Frame(content, bg=background)
             content_row.pack(fill=tk.BOTH, expand=True)
 
             card_container = tk.Frame(content_row, bg=background)
@@ -8341,13 +8382,13 @@ class AnkiApp(tk.Tk):
             )
             card_surface.pack(fill=tk.BOTH, expand=True)
 
-            text_frame = tk.Frame(card_surface, bg=card_surface_bg)
-            text_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(16, 8))
-            text_frame.columnconfigure(0, weight=1)
-            text_frame.rowconfigure(0, weight=1)
+            editor_wrap = tk.Frame(card_surface, bg=card_surface_bg)
+            editor_wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=(16, 8))
+            editor_wrap.columnconfigure(0, weight=1)
+            editor_wrap.rowconfigure(0, weight=1)
 
-            front_text = tk.Text(text_frame, height=10, wrap=tk.WORD)
-            back_text = tk.Text(text_frame, height=10, wrap=tk.WORD)
+            front_text = tk.Text(editor_wrap, height=10, wrap=tk.WORD)
+            back_text = tk.Text(editor_wrap, height=10, wrap=tk.WORD)
             style_card_surface_text(front_text, colors)
             style_card_surface_text(back_text, colors)
             front_text.grid(row=0, column=0, sticky="nsew")
@@ -8356,29 +8397,27 @@ class AnkiApp(tk.Tk):
             create_context_menu(front_text)
             create_context_menu(back_text)
 
-            media_slot = tk.Frame(
-                card_surface,
-                bg="white",
-                highlightbackground="#dddddd",
-                highlightthickness=1,
-            )
-            media_slot.pack(fill=tk.BOTH, expand=False, padx=12, pady=(0, 12))
+            media_canvas = tk.Canvas(card_surface, bg="white", highlightthickness=0, height=280)
+            media_canvas.pack(fill=tk.X, expand=False, padx=16, pady=(0, 8))
 
-            img_label = tk.Label(
-                media_slot,
-                text="Изображение/видео не прикреплено",
-                bg="white",
-            )
-            img_label.pack(fill=tk.BOTH, expand=True)
-
+            badges_row = tk.Frame(card_surface, bg=card_surface_bg)
+            badges_row.pack(fill=tk.X, padx=16, pady=(0, 16))
             audio_badge = tk.Label(
-                card_surface,
+                badges_row,
                 text="🔊 audio: не прикреплено",
                 bg=card_surface_bg,
                 fg=card_text,
                 anchor="w",
             )
-            audio_badge.pack(fill=tk.X, padx=16, pady=(0, 16))
+            audio_badge.pack(side=tk.LEFT)
+            video_badge = tk.Label(
+                badges_row,
+                text="🎬 video: не прикреплено",
+                bg=card_surface_bg,
+                fg=card_text,
+                anchor="w",
+            )
+            video_badge.pack(side=tk.LEFT, padx=(16, 0))
 
             right_panel = tk.Frame(content_row, bg=background, width=220)
             right_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=12, pady=12)
@@ -8403,18 +8442,19 @@ class AnkiApp(tk.Tk):
             log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
             log_box.configure(state=tk.DISABLED)
 
-            state = {
-                "front": {"image": None, "audio": [], "video": []},
-                "back": {"image": None, "audio": [], "video": []},
+            manual_media = {
+                "front": {"image": None, "video": None, "audio": None, "pos": None},
+                "back": {"image": None, "video": None, "audio": None, "pos": None},
             }
 
             self._front_img_photo = None
             self._back_img_photo = None
             self._active_img_photo = None
-            self._manual_img_photo = None
+            self._manual_media_photos = {"front": None, "back": None}
+            self.manual_side = "front"
 
             def current_side() -> str:
-                return "back" if show_back_var.get() else "front"
+                return self.manual_side
 
             def current_text_widget() -> tk.Text:
                 return back_text if show_back_var.get() else front_text
@@ -8457,6 +8497,7 @@ class AnkiApp(tk.Tk):
 
             def set_side(show_back: bool):
                 show_back_var.set(show_back)
+                self.manual_side = "back" if show_back else "front"
                 target_text = back_text if show_back else front_text
                 target_text.tkraise()
                 toggle_button.config(
@@ -8481,36 +8522,113 @@ class AnkiApp(tk.Tk):
                 log_box.see(tk.END)
                 log_box.configure(state=tk.DISABLED)
 
+            drag_state = {"item": None, "x": 0, "y": 0}
+
             def _reset_media_slot():
-                img_label.configure(image="", text="")
+                media_canvas.delete("all")
+                self._manual_media_photos["front"] = None
+                self._manual_media_photos["back"] = None
+
+            def _draw_drop_zone(canvas_width: int, canvas_height: int) -> tuple[float, float, float, float]:
+                pad = 16
+                x1, y1 = pad, pad
+                x2, y2 = max(pad + 10, canvas_width - pad), max(pad + 10, canvas_height - pad)
+                media_canvas.create_rectangle(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    dash=(6, 4),
+                    outline="#888",
+                    width=2,
+                )
+                media_canvas.create_text(
+                    (x1 + x2) / 2,
+                    (y1 + y2) / 2,
+                    text="Перетащите сюда изображение/видео/аудио\nили нажмите иконку ниже",
+                    fill="#666",
+                    justify="center",
+                    font=("Segoe UI", 10),
+                )
+                return x1, y1, x2, y2
+
+            def _store_media_position(side: str, item_id: int) -> None:
+                coords = media_canvas.coords(item_id)
+                if coords:
+                    manual_media[side]["pos"] = (coords[0], coords[1])
 
             def render_media_blocks():
                 side = current_side()
-                image_path = state[side]["image"]
-                video_path = state[side]["video"][-1] if state[side]["video"] else None
-                audio_path = state[side]["audio"][-1] if state[side]["audio"] else None
+                image_path = manual_media[side]["image"]
+                video_path = manual_media[side]["video"]
+                audio_path = manual_media[side]["audio"]
 
-                _reset_media_slot()
+                media_canvas.delete("all")
+                canvas_width = media_canvas.winfo_width() or 600
+                canvas_height = media_canvas.winfo_height() or 280
+                x1, y1, x2, y2 = _draw_drop_zone(canvas_width, canvas_height)
+                center = ((x1 + x2) / 2, (y1 + y2) / 2)
+
+                media_item_id = None
                 if image_path and os.path.exists(image_path):
-                    if PIL_AVAILABLE:
-                        try:
-                            img, _ = load_preview_image(image_path, (520, 320))
+                    try:
+                        if PIL_AVAILABLE:
+                            img, _ = load_preview_image(
+                                image_path,
+                                (max(1, int(x2 - x1 - 20)), max(1, int(y2 - y1 - 20))),
+                            )
                             photo = ImageTk.PhotoImage(img)
-                            if side == "front":
-                                self._front_img_photo = photo
-                            else:
-                                self._back_img_photo = photo
-                            self._active_img_photo = photo
-                            self._manual_img_photo = photo
-                            img_label.configure(image=photo, text="")
-                        except Exception:
-                            img_label.configure(text=f"🖼️ {os.path.basename(image_path)}", image="")
-                    else:
-                        img_label.configure(text=f"🖼️ {os.path.basename(image_path)}", image="")
+                        else:
+                            ext = os.path.splitext(image_path)[1].lower()
+                            if ext != ".png":
+                                raise ValueError("Unsupported image format without PIL")
+                            photo = tk.PhotoImage(file=image_path)
+                            max_w = max(1, int(x2 - x1 - 20))
+                            max_h = max(1, int(y2 - y1 - 20))
+                            if photo.width() > max_w or photo.height() > max_h:
+                                scale = max(photo.width() / max_w, photo.height() / max_h)
+                                subsample = int(scale) + 1
+                                photo = photo.subsample(subsample, subsample)
+                        self._manual_media_photos[side] = photo
+                        pos = manual_media[side]["pos"] or center
+                        manual_media[side]["pos"] = pos
+                        media_item_id = media_canvas.create_image(
+                            pos[0], pos[1], image=photo, tags=("media_item",)
+                        )
+                    except Exception:
+                        media_item_id = media_canvas.create_text(
+                            center[0],
+                            center[1],
+                            text=f"🖼️ {os.path.basename(image_path)}",
+                            fill="#444",
+                            font=("Segoe UI", 11),
+                            tags=("media_item",),
+                        )
+                        manual_media[side]["pos"] = center
                 elif video_path:
-                    img_label.configure(text=f"🎬 {os.path.basename(video_path)}", image="")
+                    pos = manual_media[side]["pos"] or center
+                    manual_media[side]["pos"] = pos
+                    media_item_id = media_canvas.create_text(
+                        pos[0],
+                        pos[1],
+                        text=f"🎬 {os.path.basename(video_path)}",
+                        fill="#444",
+                        font=("Segoe UI", 11),
+                        tags=("media_item",),
+                    )
+                elif audio_path:
+                    pos = manual_media[side]["pos"] or center
+                    manual_media[side]["pos"] = pos
+                    media_item_id = media_canvas.create_text(
+                        pos[0],
+                        pos[1],
+                        text=f"🎵 {os.path.basename(audio_path)}",
+                        fill="#444",
+                        font=("Segoe UI", 11),
+                        tags=("media_item",),
+                    )
                 else:
-                    img_label.configure(text="Изображение/видео не прикреплено", image="")
+                    manual_media[side]["pos"] = None
 
                 audio_badge.configure(
                     text=(
@@ -8519,9 +8637,87 @@ class AnkiApp(tk.Tk):
                         else "🔊 audio: не прикреплено"
                     )
                 )
+                video_badge.configure(
+                    text=(
+                        f"🎬 video: {os.path.basename(video_path)}"
+                        if video_path
+                        else "🎬 video: не прикреплено"
+                    )
+                )
+
+                if media_item_id:
+                    media_canvas.tag_raise(media_item_id)
+                    _store_media_position(side, media_item_id)
+
+            def attach_image(path: str) -> None:
+                side = current_side()
+                manual_media[side]["image"] = path
+                manual_media[side]["pos"] = None
+                add_change_log(f"Прикреплено изображение: {os.path.basename(path)}")
+                render_media_blocks()
+
+            def attach_audio(path: str) -> None:
+                side = current_side()
+                manual_media[side]["audio"] = path
+                manual_media[side]["pos"] = None
+                add_change_log(f"Прикреплено аудио: {os.path.basename(path)}")
+                render_media_blocks()
+
+            def attach_video(path: str) -> None:
+                side = current_side()
+                manual_media[side]["video"] = path
+                manual_media[side]["pos"] = None
+                add_change_log(f"Прикреплено видео: {os.path.basename(path)}")
+                render_media_blocks()
+
+            def _on_media_press(event) -> None:
+                item = media_canvas.find_withtag("current")
+                if not item:
+                    return
+                if "media_item" not in media_canvas.gettags(item[0]):
+                    return
+                drag_state["item"] = item[0]
+                drag_state["x"] = event.x
+                drag_state["y"] = event.y
+
+            def _on_media_drag(event) -> None:
+                item = drag_state["item"]
+                if not item:
+                    return
+                dx = event.x - drag_state["x"]
+                dy = event.y - drag_state["y"]
+                media_canvas.move(item, dx, dy)
+                drag_state["x"] = event.x
+                drag_state["y"] = event.y
+                _store_media_position(current_side(), item)
+
+            def _on_media_release(_event) -> None:
+                drag_state["item"] = None
+
+            media_canvas.tag_bind("media_item", "<ButtonPress-1>", _on_media_press)
+            media_canvas.tag_bind("media_item", "<B1-Motion>", _on_media_drag)
+            media_canvas.tag_bind("media_item", "<ButtonRelease-1>", _on_media_release)
+
+            def _handle_drop(event) -> None:
+                files = win.tk.splitlist(event.data)
+                if not files:
+                    return
+                path = files[0]
+                ext = os.path.splitext(path)[1].lower()
+                if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+                    attach_image(path)
+                elif ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
+                    attach_video(path)
+                elif ext in (".mp3", ".wav", ".ogg", ".m4a"):
+                    attach_audio(path)
+
+            if _HAS_DND and hasattr(media_canvas, "drop_target_register"):
+                media_canvas.drop_target_register(DND_FILES)
+                media_canvas.dnd_bind("<<Drop>>", _handle_drop)
+
+            media_canvas.bind("<Configure>", lambda _e: render_media_blocks())
 
             def select_image():
-                side = current_side()
                 filename = filedialog.askopenfilename(
                     title="Выбрать изображение",
                     filetypes=[
@@ -8531,12 +8727,9 @@ class AnkiApp(tk.Tk):
                 )
                 if not filename:
                     return
-                state[side]["image"] = filename
-                add_change_log(f"Прикреплено изображение: {os.path.basename(filename)}")
-                render_media_blocks()
+                attach_image(filename)
 
             def add_audio():
-                side = current_side()
                 filename = filedialog.askopenfilename(
                     title="Добавить аудио",
                     filetypes=[
@@ -8546,12 +8739,9 @@ class AnkiApp(tk.Tk):
                 )
                 if not filename:
                     return
-                state[side]["audio"].append(filename)
-                add_change_log(f"Прикреплено аудио: {os.path.basename(filename)}")
-                render_media_blocks()
+                attach_audio(filename)
 
             def add_video():
-                side = current_side()
                 filename = filedialog.askopenfilename(
                     title="Добавить видео",
                     filetypes=[
@@ -8561,9 +8751,7 @@ class AnkiApp(tk.Tk):
                 )
                 if not filename:
                     return
-                state[side]["video"].append(filename)
-                add_change_log(f"Прикреплено видео: {os.path.basename(filename)}")
-                render_media_blocks()
+                attach_video(filename)
 
             def generate_tts_audio():
                 side = current_side()
@@ -8585,7 +8773,8 @@ class AnkiApp(tk.Tk):
                         data = response.read()
                     with open(filename, "wb") as fh:
                         fh.write(data)
-                    state[side]["audio"].append(filename)
+                    manual_media[side]["audio"] = filename
+                    manual_media[side]["pos"] = None
                     add_change_log(f"Озвучка добавлена: {os.path.basename(filename)}")
                     render_media_blocks()
                 except Exception as exc:
@@ -8593,17 +8782,18 @@ class AnkiApp(tk.Tk):
 
             def clear_media():
                 side = current_side()
-                state[side]["image"] = None
-                state[side]["audio"] = []
-                state[side]["video"] = []
+                manual_media[side]["image"] = None
+                manual_media[side]["audio"] = None
+                manual_media[side]["video"] = None
+                manual_media[side]["pos"] = None
                 add_change_log("Удалены прикрепления для текущей стороны")
                 render_media_blocks()
 
             icon_active_bg = colors.get("surface", "#111827")
             icon_active_fg = colors.get("text", "#E5E7EB")
 
-            media_toolbar = tk.Frame(outer_frame, bg=background)
-            media_toolbar.pack(fill=tk.X, padx=16, pady=(0, 10))
+            media_toolbar = tk.Frame(bottom_actions, bg=background)
+            media_toolbar.pack(fill=tk.X)
 
             def add_icon_button(parent: tk.Frame, label: str, command) -> None:
                 tk.Button(
@@ -8635,8 +8825,8 @@ class AnkiApp(tk.Tk):
                         messagebox.showerror("Ошибка", "Выберите колоду для сохранения.")
                         return
 
-                    front_image = state["front"]["image"]
-                    back_image = state["back"]["image"]
+                    front_image = manual_media["front"]["image"]
+                    back_image = manual_media["back"]["image"]
                     stored_front = copy_image_asset_to_media(front_image, "front") if front_image else None
                     stored_back = copy_image_asset_to_media(back_image, "back") if back_image else None
 
@@ -8650,14 +8840,18 @@ class AnkiApp(tk.Tk):
                         level=1,
                     )
                     media_entries = []
-                    for path in state["front"]["audio"]:
-                        media_entries.append((copy_audio_asset_to_media(path, "front_audio"), "audio", "front", None))
-                    for path in state["back"]["audio"]:
-                        media_entries.append((copy_audio_asset_to_media(path, "back_audio"), "audio", "back", None))
-                    for path in state["front"]["video"]:
-                        media_entries.append((copy_video_asset_to_media(path, "front_video"), "video", "front", None))
-                    for path in state["back"]["video"]:
-                        media_entries.append((copy_video_asset_to_media(path, "back_video"), "video", "back", None))
+                    front_audio = manual_media["front"]["audio"]
+                    back_audio = manual_media["back"]["audio"]
+                    front_video = manual_media["front"]["video"]
+                    back_video = manual_media["back"]["video"]
+                    if front_audio:
+                        media_entries.append((copy_audio_asset_to_media(front_audio, "front_audio"), "audio", "front", None))
+                    if back_audio:
+                        media_entries.append((copy_audio_asset_to_media(back_audio, "back_audio"), "audio", "back", None))
+                    if front_video:
+                        media_entries.append((copy_video_asset_to_media(front_video, "front_video"), "video", "front", None))
+                    if back_video:
+                        media_entries.append((copy_video_asset_to_media(back_video, "back_video"), "video", "back", None))
                     if media_entries:
                         attach_media_to_card(card_id, media_entries)
                     add_card_to_intro(card_id, deck_id)
@@ -8672,7 +8866,7 @@ class AnkiApp(tk.Tk):
                     messagebox.showerror("БД", f"Не удалось сохранить карточку:\n{exc}")
                     return
 
-                messagebox.showinfo("Сохранено", "Карточка добавлена в ознакомление")
+                messagebox.showinfo("Сохранено", "Сохранено: добавлено в ознакомление")
                 add_change_log("Сохранена карточка")
                 if hasattr(self, "refresh_decks"):
                     self.refresh_decks()
