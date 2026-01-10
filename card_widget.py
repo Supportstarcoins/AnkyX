@@ -18,6 +18,7 @@ class CardWidget(tk.Frame):
         width: int = 800,
         height: int = 520,
         show_image_toolbar: bool = True,
+        image_layout: str = "side",
     ) -> None:
         card_bg, card_text, _ = get_card_surface_colors(master)
         super().__init__(master, bg=card_bg, bd=0, relief="flat", width=width, height=height)
@@ -30,6 +31,7 @@ class CardWidget(tk.Frame):
         self.editable = editable
         self.show_image_toolbar = show_image_toolbar
         self.show_back = False
+        self.image_layout = image_layout
 
         self.image_mode = "fit"
         self.zoom_factor = 1.0
@@ -63,7 +65,10 @@ class CardWidget(tk.Frame):
         self.content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         self.text_frame = tk.Frame(self.content_frame, bg=self.card_bg)
-        self.text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        if self.image_layout == "below":
+            self.text_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        else:
+            self.text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         self.custom_text_frame = tk.Frame(self.text_frame, bg=self.card_bg)
         self._use_custom_text = False
 
@@ -97,7 +102,10 @@ class CardWidget(tk.Frame):
         self.custom_text_frame.pack_forget()
 
         self.image_frame = tk.Frame(self.content_frame, bg=self.card_bg)
-        self.image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        if self.image_layout == "below":
+            self.image_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(10, 0))
+        else:
+            self.image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         if self.show_image_toolbar:
             self.toolbar = ttk.Frame(self.image_frame, style="CardInner.TFrame")

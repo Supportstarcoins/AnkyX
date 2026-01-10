@@ -844,6 +844,26 @@ def ensure_media_dir() -> str:
     return MEDIA_FOLDER
 
 
+def resolve_media_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    normalized = os.path.expanduser(path)
+    if os.path.isabs(normalized) and os.path.exists(normalized):
+        return normalized
+    if os.path.exists(normalized):
+        return normalized
+    if normalized.startswith(MEDIA_FOLDER + os.sep):
+        candidate = normalized
+    else:
+        candidate = os.path.join(MEDIA_FOLDER, normalized)
+    if os.path.exists(candidate):
+        return candidate
+    basename_candidate = os.path.join(MEDIA_FOLDER, os.path.basename(normalized))
+    if os.path.exists(basename_candidate):
+        return basename_candidate
+    return normalized
+
+
 def copy_image_to_media(src: str, target_id: int, move: bool = False) -> str:
     ensure_media_dir()
     ext = os.path.splitext(src)[1].lower() or ".png"
@@ -4034,8 +4054,9 @@ class ResizableImageLabel(tk.Label):
         
     def load_image(self, image_path):
         """Загрузить изображение"""
-        self.image_path = image_path
-        if image_path and os.path.exists(image_path) and PIL_AVAILABLE:
+        self.image_path = resolve_media_path(image_path) if image_path else None
+        resolved_path = self.image_path
+        if resolved_path and os.path.exists(resolved_path) and PIL_AVAILABLE:
             try:
                 cont_w, cont_h = self._container_size
                 if cont_w <= 1 or cont_h <= 1:
@@ -4044,26 +4065,41 @@ class ResizableImageLabel(tk.Label):
                 max_zoom = 3.0
                 max_preview = (int(cont_w * max_zoom), int(cont_h * max_zoom))
                 img, resized_for_pixels = load_preview_image(
-                    image_path,
+                    resolved_path,
                     max_preview,
                     max_pixels=MAX_PREVIEW_PIXELS,
                 )
-                if resized_for_pixels and self._warned_large_path != image_path:
+                if resized_for_pixels and self._warned_large_path != resolved_path:
                     messagebox.showinfo(
                         "Большое изображение",
                         "Изображение слишком большое, будет сжато для превью.",
                     )
-                    self._warned_large_path = image_path
+                    self._warned_large_path = resolved_path
                 self.original_image = img
                 self.scale_factor = 1.0
                 self.update_display()
                 return True
             except Exception as e:
-                log_image_error(image_path, e)
+                log_image_error(resolved_path, e)
                 try:
                     messagebox.showerror("Ошибка", "Не удалось загрузить изображение.")
                 except Exception:
                     pass
+                self.original_image = None
+                self.current_image = None
+                self.image = None
+                self.config(text="Нет изображения", image="")
+                return False
+        if resolved_path and os.path.exists(resolved_path) and not PIL_AVAILABLE:
+            try:
+                self.original_image = None
+                self.scale_factor = 1.0
+                self.current_image = tk.PhotoImage(file=resolved_path)
+                self.image = self.current_image
+                self.config(image=self.current_image, text="")
+                return True
+            except Exception as e:
+                log_image_error(resolved_path, e)
                 self.original_image = None
                 self.current_image = None
                 self.image = None
@@ -6481,7 +6517,17 @@ class AnkiApp(tk.Tk):
         decks_tree_frame = ttk.Frame(frame_top, style="CardInner.TFrame")
         decks_tree_frame.pack(fill=tk.BOTH, expand=True)
         self.decks_tree = ttk.Treeview(decks_tree_frame, show="tree", selectmode="browse")
-        decks_tree_vbar = ttk.Scrollbar(decks_tree_frame, orient="vertical", command=self.decks_tree.yview)
+        decks_tree_vbar = tk.Scrollbar(
+            decks_tree_frame,
+            orient="vertical",
+            command=self.decks_tree.yview,
+            bg="#0b0f16",
+            troughcolor="#05070b",
+            activebackground="#121a26",
+            highlightthickness=0,
+            bd=0,
+            width=12,
+        )
         self.decks_tree.configure(yscrollcommand=decks_tree_vbar.set)
         self.decks_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         decks_tree_vbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -8245,6 +8291,7 @@ class AnkiApp(tk.Tk):
             apply_dark_theme_to_window(win, colors)
             background = colors.get("background", "#0B0D12")
             text_color = colors.get("text", "#E5E7EB")
+            win.configure(bg=background)
 
             outer_frame = tk.Frame(win, bg=background)
             outer_frame.pack(fill=tk.BOTH, expand=True)
@@ -8272,10 +8319,16 @@ class AnkiApp(tk.Tk):
             toggle_button.pack(side=tk.LEFT)
 
             card_container = tk.Frame(outer_frame, bg=background)
-            card_container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+            card_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=16, pady=(16, 8))
 
-            card_widget = CardWidget(card_container, palette=colors, editable=True, show_image_toolbar=False)
-            card_widget.pack(expand=True)
+            card_widget = CardWidget(
+                card_container,
+                palette=colors,
+                editable=True,
+                show_image_toolbar=False,
+                image_layout="below",
+            )
+            card_widget.pack(fill=tk.BOTH, expand=True)
             if card_widget.image_scroll_x is not None:
                 card_widget.image_scroll_x.grid_remove()
             if card_widget.image_scroll_y is not None:
@@ -8556,7 +8609,7 @@ class AnkiApp(tk.Tk):
                 win.destroy()
 
             footer_frame = tk.Frame(outer_frame, bg=background)
-            footer_frame.pack(fill=tk.X, padx=16, pady=(0, 16))
+            footer_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 16))
             tk.Frame(footer_frame, bg=background).pack(side=tk.LEFT, expand=True, fill=tk.X)
             ttk.Button(footer_frame, text="Отмена", style="Secondary.TButton", command=win.destroy).pack(
                 side=tk.RIGHT, padx=(6, 0)
@@ -11050,7 +11103,7 @@ class OverviewWindow(tk.Toplevel):
         create_context_menu(self.front_text)  # Добавляем контекстное меню
         
         # Загружаем изображение лицевой стороны
-        front_img_path = c.get("front_image_path") or c.get("image_path")
+        front_img_path = resolve_media_path(c.get("front_image_path") or c.get("image_path"))
         if front_img_path:
             self.front_image_label.load_image(front_img_path)
         else:
@@ -11081,7 +11134,7 @@ class OverviewWindow(tk.Toplevel):
         create_context_menu(self.back_text)  # Добавляем контекстное меню
         
         # Загружаем изображение задней стороны
-        back_img_path = c.get("back_image_path") or c.get("image_path")
+        back_img_path = resolve_media_path(c.get("back_image_path") or c.get("image_path"))
         if back_img_path:
             self.back_image_label.load_image(back_img_path)
         else:
