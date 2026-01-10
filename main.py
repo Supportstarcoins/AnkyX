@@ -69,6 +69,32 @@ _HAS_DND = importlib.util.find_spec("tkinterdnd2") is not None
 if _HAS_DND:
     from tkinterdnd2 import DND_FILES
 
+
+def safe_enable_dnd(widget, on_drop_callback) -> bool:
+    try:
+        from tkinterdnd2 import DND_FILES
+    except Exception:
+        return False
+
+    try:
+        cmds = widget.tk.call("info", "commands")
+    except Exception:
+        return False
+
+    if isinstance(cmds, str):
+        available = "tkdnd::drop_target" in cmds.split()
+    else:
+        available = "tkdnd::drop_target" in cmds
+    if not available:
+        return False
+
+    try:
+        widget.drop_target_register(DND_FILES)
+        widget.dnd_bind("<<Drop>>", on_drop_callback)
+        return True
+    except Exception:
+        return False
+
 from stats_config import (
     StatsSettings,
     ensure_stats_settings_table,
@@ -8711,9 +8737,9 @@ class AnkiApp(tk.Tk):
                 elif ext in (".mp3", ".wav", ".ogg", ".m4a"):
                     attach_audio(path)
 
-            if _HAS_DND and hasattr(media_canvas, "drop_target_register"):
-                media_canvas.drop_target_register(DND_FILES)
-                media_canvas.dnd_bind("<<Drop>>", _handle_drop)
+            self._dnd_enabled = safe_enable_dnd(media_canvas, _handle_drop)
+            if not self._dnd_enabled:
+                add_change_log("DnD отключен (tkdnd недоступен)")
 
             media_canvas.bind("<Configure>", lambda _e: render_media_blocks())
 
