@@ -8987,6 +8987,25 @@ class AnkiApp(tk.Tk):
                 except tk.TclError:
                     pass
 
+            def _restore_manual_window() -> None:
+                win.after(0, lambda: (win.deiconify(), win.lift(), win.focus_force()))
+                win.after(10, lambda: win.grab_set())
+
+            def _open_media_dialog(*, title: str, filetypes: list[tuple[str, str]]):
+                try:
+                    if win.grab_current() == win:
+                        win.grab_release()
+                except Exception:
+                    pass
+                try:
+                    return filedialog.askopenfilename(
+                        title=title,
+                        filetypes=filetypes,
+                        parent=win,
+                    )
+                finally:
+                    _restore_manual_window()
+
             def _choose_color(title: str):
                 try:
                     win.grab_release()
@@ -8995,10 +9014,7 @@ class AnkiApp(tk.Tk):
                 try:
                     return colorchooser.askcolor(title=title, parent=win)
                 finally:
-                    try:
-                        win.grab_set()
-                    except tk.TclError:
-                        pass
+                    _restore_manual_window()
 
             def _ensure_hidden_token_tag(text_widget: tk.Text) -> str:
                 token_tag = "hidden_token"
@@ -9219,7 +9235,7 @@ class AnkiApp(tk.Tk):
                     text_widget.mark_set("insert", f"{insert_pos} + 3c")
 
             def attach_media() -> None:
-                filename = filedialog.askopenfilename(
+                filename = _open_media_dialog(
                     title="Прикрепить файл",
                     filetypes=[
                         ("Медиа", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.mp3 *.wav *.ogg *.m4a *.mp4 *.mov *.avi *.mkv *.webm"),
@@ -9512,7 +9528,7 @@ class AnkiApp(tk.Tk):
             media_canvas.bind("<Configure>", lambda _e: render_media_blocks())
 
             def select_image():
-                filename = filedialog.askopenfilename(
+                filename = _open_media_dialog(
                     title="Выбрать изображение",
                     filetypes=[
                         ("Изображения", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
@@ -9524,7 +9540,7 @@ class AnkiApp(tk.Tk):
                 attach_image(filename)
 
             def add_audio():
-                filename = filedialog.askopenfilename(
+                filename = _open_media_dialog(
                     title="Добавить аудио",
                     filetypes=[
                         ("Аудио", "*.mp3 *.wav *.ogg *.m4a"),
@@ -9536,7 +9552,7 @@ class AnkiApp(tk.Tk):
                 attach_audio(filename)
 
             def add_video():
-                filename = filedialog.askopenfilename(
+                filename = _open_media_dialog(
                     title="Добавить видео",
                     filetypes=[
                         ("Видео", "*.mp4 *.mov *.avi *.mkv *.webm"),
@@ -9552,12 +9568,12 @@ class AnkiApp(tk.Tk):
                 text_widget = back_text if side == "back" else front_text
                 text_value = text_widget.get("1.0", tk.END).strip()
                 if not text_value:
-                    messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
+                    messagebox.showinfo("Озвучка", "Нет текста для озвучивания.", parent=win)
                     return
                 lang = get_deck_tts_lang(deck_map.get(deck_var.get()), "de")
                 url = get_tts_url(text_value, lang)
                 if not url:
-                    messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
+                    messagebox.showinfo("Озвучка", "Нет текста для озвучивания.", parent=win)
                     return
                 try:
                     filename = os.path.join(get_tts_cache_dir(), f"tts_{int(time.time())}.mp3")
@@ -9573,7 +9589,7 @@ class AnkiApp(tk.Tk):
                     add_change_log(f"Озвучка добавлена: {os.path.basename(filename)}")
                     render_media_blocks()
                 except Exception as exc:
-                    messagebox.showerror("Озвучка", f"Не удалось озвучить: {exc}")
+                    messagebox.showerror("Озвучка", f"Не удалось озвучить: {exc}", parent=win)
 
             def clear_media():
                 side = current_side()
@@ -9658,11 +9674,15 @@ class AnkiApp(tk.Tk):
                     front_value = front_text.get("1.0", tk.END).strip()
                     back_value = back_text.get("1.0", tk.END).strip()
                     if not front_value and not back_value:
-                        messagebox.showwarning("Пустая карточка", "Введите текст для лицевой или обратной стороны.")
+                        messagebox.showwarning(
+                            "Пустая карточка",
+                            "Введите текст для лицевой или обратной стороны.",
+                            parent=win,
+                        )
                         return
                     deck_id = deck_map.get(deck_var.get())
                     if not deck_id:
-                        messagebox.showerror("Ошибка", "Выберите колоду для сохранения.")
+                        messagebox.showerror("Ошибка", "Выберите колоду для сохранения.", parent=win)
                         return
 
                     front_image = manual_media["front"]["image"]
@@ -9703,10 +9723,10 @@ class AnkiApp(tk.Tk):
                             log_file.write("\n")
                     except Exception:
                         pass
-                    messagebox.showerror("БД", f"Не удалось сохранить карточку:\n{exc}")
+                    messagebox.showerror("БД", f"Не удалось сохранить карточку:\n{exc}", parent=win)
                     return
 
-                messagebox.showinfo("Сохранено", "Сохранено: добавлено в ознакомление")
+                messagebox.showinfo("Сохранено", "Сохранено: добавлено в ознакомление", parent=win)
                 add_change_log("Сохранена карточка")
                 if hasattr(self, "refresh_decks"):
                     self.refresh_decks()
@@ -9746,7 +9766,7 @@ class AnkiApp(tk.Tk):
             set_side(False)
         except Exception as exc:
             log_ui_error(exc)
-            messagebox.showerror("Ошибка UI", traceback.format_exc())
+            messagebox.showerror("Ошибка UI", traceback.format_exc(), parent=win)
 
     # --------- обзор карточек ---------
 
@@ -13167,6 +13187,7 @@ class ReviewWindow(tk.Toplevel):
         # Прогресс
         self.progress_canvas = None
         self.progress_label = None
+        self.progress_var = None
 
         self.title("Режим воспроизведения (Лейтнер)")
         self.geometry("900x600")
@@ -13183,6 +13204,26 @@ class ReviewWindow(tk.Toplevel):
         colors = getattr(self.master, "palette", None)
         card_bg, card_text, _ = get_card_surface_colors(self.master)
 
+        style = ttk.Style(self)
+        style.configure(
+            "PlayGreen.Horizontal.TProgressbar",
+            troughcolor="white",
+            background="#2ecc71",
+        )
+        style.configure(
+            "Playback.Audio.TButton",
+            foreground="#111111",
+            background="white",
+            relief="flat",
+            bordercolor="#111111",
+        )
+        style.map(
+            "Playback.Audio.TButton",
+            foreground=[("active", "#111111"), ("!active", "#111111")],
+            background=[("active", "white"), ("!active", "white")],
+            bordercolor=[("active", "#111111"), ("!active", "#111111")],
+        )
+
         self.lbl_status = ttk.Label(frame_main, text="")
         self.lbl_status.pack(anchor="w")
 
@@ -13195,6 +13236,18 @@ class ReviewWindow(tk.Toplevel):
             font=("Segoe UI", 11, "bold")
         )
         self.timer_label.pack(anchor="center", pady=(3, 5))
+
+        controls_strip = ttk.Frame(frame_main)
+        controls_strip.pack(fill=tk.X, pady=(0, 6))
+
+        self.btn_show = ttk.Button(controls_strip, text="Показать ответ", command=self.toggle_front_back)
+        self.btn_show.pack(side=tk.LEFT, padx=5)
+
+        self.btn_sound = ttk.Button(controls_strip, text="🔊 Слово", command=self.play_word)
+        self.btn_sound.pack(side=tk.LEFT, padx=5)
+
+        self.actions_menu_button = self._build_actions_menu(controls_strip)
+        self.actions_menu_button.pack(side=tk.LEFT, padx=5)
 
         # Фрейм карточки
         cards_bg = tk.Frame(frame_main, bg=DARK_BG)
@@ -13229,58 +13282,67 @@ class ReviewWindow(tk.Toplevel):
 
         self.video_inline_frame = self.card_widget.video_inline_frame
 
-        # Прогресс-бар
-        progress_frame = tk.Frame(frame_main, bg=card_bg)
-        progress_frame.pack(pady=(0, 4))
+        # Прогресс-бар (внутри карточки, перед аудио)
+        progress_frame = tk.Frame(self.card_frame, bg="white")
+        progress_frame.place(x=10, y=320, width=780, height=26)
 
-        self.progress_canvas = tk.Canvas(
-            progress_frame, width=260, height=14,
-            bg=card_bg, highlightthickness=1, highlightbackground=colors["card_border"] if colors else "#cccccc"
-        )
-        self.progress_canvas.pack(side=tk.LEFT, padx=(10, 4))
-
-        self.progress_label = tk.Label(
+        self.btn_progress_minus = tk.Button(
             progress_frame,
-            text="0 / 100",
-            bg=card_bg,
-            fg=card_text,
-            font=("Segoe UI", 9),
+            text="-",
+            command=self.decrement_progress,
+            bg="white",
+            fg="black",
+            activebackground="white",
+            activeforeground="black",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#111111",
+            width=3,
         )
-        self.progress_label.pack(side=tk.LEFT, padx=4)
+        self.btn_progress_minus.pack(side=tk.LEFT, padx=(4, 6), pady=2)
 
-        self.btn_progress_plus = ttk.Button(
-            progress_frame, text="+", width=3,
-            command=self.increment_progress
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.progress_var,
+            maximum=100,
+            style="PlayGreen.Horizontal.TProgressbar",
         )
-        self.btn_progress_plus.pack(side=tk.LEFT, padx=(4, 10))
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=4)
+
+        self.btn_progress_plus = tk.Button(
+            progress_frame,
+            text="+",
+            command=self.increment_progress,
+            bg="white",
+            fg="black",
+            activebackground="white",
+            activeforeground="black",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#111111",
+            width=3,
+        )
+        self.btn_progress_plus.pack(side=tk.LEFT, padx=(6, 4), pady=2)
 
         self.audio_inline_frame = self.card_widget.audio_inline_frame
 
-        # Панель кнопок
-        self.bottom_frame = tk.Frame(frame_main, bg=card_bg)
-        self.bottom_frame.pack(pady=8)
+        # Нижняя панель управления (фиксированный футер)
+        footer = ttk.Frame(self, style="Surface.TFrame")
+        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
 
-        self.btn_audio_icon = ttk.Button(self.bottom_frame, text="🔊", width=3, command=self.play_word)
-        self.btn_audio_icon.pack(side=tk.LEFT, padx=5)
+        self.btn_prev = ttk.Button(footer, text="← Назад", command=self.goto_prev_card)
+        self.btn_prev.pack(side=tk.LEFT, padx=6)
 
-        self.btn_checkpoint = ttk.Button(
-            self.bottom_frame,
-            text="✅ Следующая карточка",
-            command=self.goto_next_card
+        self.btn_send_phase = ttk.Button(
+            footer,
+            text="Отправить в 1 фазу",
+            command=self.mark_forgotten,
         )
-        self.btn_checkpoint.pack(side=tk.LEFT, padx=5)
+        self.btn_send_phase.pack(side=tk.LEFT, padx=6)
 
-        btn_frame = ttk.Frame(frame_main)
-        btn_frame.pack(pady=10)
-
-        self.btn_show = ttk.Button(btn_frame, text="Показать ответ", command=self.toggle_front_back)
-        self.btn_show.grid(row=0, column=0, padx=5)
-
-        self.btn_sound = ttk.Button(btn_frame, text="🔊 Слово", command=self.play_word)
-        self.btn_sound.grid(row=0, column=1, padx=5)
-
-        self.actions_menu_button = self._build_actions_menu(btn_frame)
-        self.actions_menu_button.grid(row=0, column=2, padx=5)
+        self.btn_next = ttk.Button(footer, text="Далее →", command=self.goto_next_card)
+        self.btn_next.pack(side=tk.LEFT, padx=6)
 
         self.update_audio_player()
 
@@ -13294,6 +13356,7 @@ class ReviewWindow(tk.Toplevel):
             audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
             if audio_widget is not None:
                 audio_widget.on_state_change = self._handle_media_state_update
+                self._style_audio_buttons(audio_widget)
                 self._apply_audio_state_from_selection()
                 selector = getattr(self.audio_inline_frame, "audio_selector", None)
                 if selector is not None:
@@ -13302,6 +13365,18 @@ class ReviewWindow(tk.Toplevel):
             if self.card_widget is not None:
                 self.card_widget.show_audio_frame(False)
         self._update_video_player()
+
+    def _style_audio_buttons(self, audio_widget: AudioPlayerWidget) -> None:
+        try:
+            for btn in (
+                audio_widget.play_btn,
+                audio_widget.pause_btn,
+                audio_widget.stop_btn,
+                audio_widget.volume_btn,
+            ):
+                btn.configure(style="Playback.Audio.TButton")
+        except Exception:
+            pass
 
     def _apply_audio_state_from_selection(self):
         audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
@@ -13569,24 +13644,10 @@ class ReviewWindow(tk.Toplevel):
         self.goto_next_card()
 
     def update_progress_view(self):
-        if self.progress_canvas is None:
-            return
         p = int(self.current_card.get("progress") or 0)
         p = max(0, min(100, p))
-
-        self.progress_canvas.delete("all")
-
-        self.progress_canvas.create_rectangle(1, 1, 259, 13, outline="#cccccc", fill="white")
-
-        if p > 0:
-            width = int(258 * p / 100)
-            self.progress_canvas.create_rectangle(
-                1, 1, 1 + width, 13,
-                outline="", fill="#00aa00"
-            )
-
-        if self.progress_label is not None:
-            self.progress_label.config(text=f"{p} / 100")
+        if self.progress_var is not None:
+            self.progress_var.set(p)
 
     def update_view(self):
         total = len(self.cards)
@@ -13598,9 +13659,11 @@ class ReviewWindow(tk.Toplevel):
         )
 
         current_level = c["leitner_level"]
-        self.btn_forget.config(text=f"Забыл (Фаза 1)")
+        if getattr(self, "btn_forget", None) is not None:
+            self.btn_forget.config(text="Забыл (Фаза 1)")
         next_level = min(10, current_level + 1)
-        self.btn_remember.config(text=f"Повторить (Фаза {next_level})")
+        if getattr(self, "btn_remember", None) is not None:
+            self.btn_remember.config(text=f"Повторить (Фаза {next_level})")
 
         romans = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
         lvl = c["leitner_level"]
@@ -13618,7 +13681,8 @@ class ReviewWindow(tk.Toplevel):
             self.card_widget.set_text(front_text, back_text)
             self.card_widget.show_side(self.show_back, img_path)
 
-        self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
+        if getattr(self, "btn_show", None) is not None:
+            self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
 
         self.update_progress_view()
         self.update_timer_label()
@@ -13670,6 +13734,30 @@ class ReviewWindow(tk.Toplevel):
         self.current_card["progress"] = new_value
         update_card_progress(card_id, new_value)
         self.update_progress_view()
+
+    def decrement_progress(self):
+        card_id = self.current_card["id"]
+        current = int(self.current_card.get("progress") or 0)
+        if current <= 0:
+            return
+        new_value = max(0, current - 1)
+        self.current_card["progress"] = new_value
+        update_card_progress(card_id, new_value)
+        self.update_progress_view()
+
+    def goto_prev_card(self):
+        self.cancel_timers()
+        self.save_current_media_state()
+        if self.current_index <= 0:
+            self.current_index = 0
+            self.update_view()
+            self.schedule_timers_for_card()
+            return
+        self.current_index -= 1
+        self.current_card = self.cards[self.current_index]
+        self.show_back = False
+        self.update_view()
+        self.schedule_timers_for_card()
 
     def goto_next_card(self):
         self.cancel_timers()
