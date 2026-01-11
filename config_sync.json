@@ -1,0 +1,6 @@
+{
+  "api_base_url": "https://example.com/api",
+  "timeout_sec": 15,
+  "token": null,
+  "user_email": null
+}
