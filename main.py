@@ -4173,6 +4173,13 @@ def render_card_layout(parent, card_data: dict, editable: bool = False) -> dict:
     return layout
 
 
+_UNDERLINE_TOKEN_RE = re.compile(r"\[\[u:(double|wavy)\]\]|\[\[/u\]\]")
+
+
+def strip_custom_underline_tokens(text: str) -> str:
+    return _UNDERLINE_TOKEN_RE.sub("", text)
+
+
 def update_rendered_card(layout: dict, card_data: dict) -> None:
     text_widget = layout.get("text_widget")
     if text_widget is not None:
@@ -4180,7 +4187,7 @@ def update_rendered_card(layout: dict, card_data: dict) -> None:
         text_widget.delete("1.0", tk.END)
         content = card_data.get("text") or ""
         if content:
-            text_widget.insert("1.0", content)
+            text_widget.insert("1.0", strip_custom_underline_tokens(content))
         if not layout.get("editable", False):
             text_widget.configure(state=tk.DISABLED)
 
@@ -8980,6 +8987,46 @@ class AnkiApp(tk.Tk):
                 except tk.TclError:
                     pass
 
+            def _choose_color(title: str):
+                try:
+                    win.grab_release()
+                except tk.TclError:
+                    pass
+                try:
+                    return colorchooser.askcolor(title=title, parent=win)
+                finally:
+                    try:
+                        win.grab_set()
+                    except tk.TclError:
+                        pass
+
+            def _ensure_hidden_token_tag(text_widget: tk.Text) -> str:
+                token_tag = "hidden_token"
+                if token_tag not in text_widget.tag_names():
+                    try:
+                        text_widget.tag_configure(token_tag, elide=True)
+                    except tk.TclError:
+                        bg = text_widget.cget("bg")
+                        text_widget.tag_configure(token_tag, foreground=bg, background=bg)
+                return token_tag
+
+            def _insert_hidden_token(text_widget: tk.Text, index: str, token: str) -> None:
+                token_tag = _ensure_hidden_token_tag(text_widget)
+                text_widget.insert(index, token)
+                start = text_widget.index(index)
+                end = text_widget.index(f"{start} + {len(token)}c")
+                text_widget.tag_add(token_tag, start, end)
+
+            def _remove_underline_tokens(text_widget: tk.Text, start: str, end: str) -> None:
+                range_start = text_widget.index(f"{start} - 12c")
+                range_end = text_widget.index(f"{end} + 12c")
+                segment = text_widget.get(range_start, range_end)
+                matches = list(_UNDERLINE_TOKEN_RE.finditer(segment))
+                for match in reversed(matches):
+                    token_start = text_widget.index(f"{range_start} + {match.start()}c")
+                    token_end = text_widget.index(f"{range_start} + {match.end()}c")
+                    text_widget.delete(token_start, token_end)
+
             toolbar_bg = colors.get("surface", "#111827")
             toolbar_border = colors.get("card_border", "#1F2937")
             toolbar_fg = colors.get("text", "#E5E7EB")
@@ -9027,15 +9074,28 @@ class AnkiApp(tk.Tk):
                 except tk.TclError:
                     pass
 
+            def _clear_formatting() -> None:
+                text_widget = current_text_widget()
+                try:
+                    start = text_widget.index("sel.first")
+                    end = text_widget.index("sel.last")
+                except tk.TclError:
+                    start = text_widget.index("insert linestart")
+                    end = text_widget.index("insert lineend")
+                for tag in text_widget.tag_names():
+                    if tag != "sel":
+                        text_widget.tag_remove(tag, start, end)
+                _remove_underline_tokens(text_widget, start, end)
+
             def _apply_color() -> None:
-                chosen = colorchooser.askcolor(title="Цвет текста")
+                chosen = _choose_color("Цвет текста")
                 if not chosen or not chosen[1]:
                     return
                 color = chosen[1]
                 _toggle_tag(f"color_{color}", foreground=color)
 
             def _apply_marker() -> None:
-                chosen = colorchooser.askcolor(title="Цвет выделения")
+                chosen = _choose_color("Цвет выделения")
                 if not chosen or not chosen[1]:
                     return
                 color = chosen[1]
@@ -9058,6 +9118,48 @@ class AnkiApp(tk.Tk):
                         break
                     line = text_widget.index(f"{line} +1 line")
                     counter += 1
+
+            def _line_range(text_widget: tk.Text) -> tuple[str, str]:
+                try:
+                    start = text_widget.index("sel.first linestart")
+                    end = text_widget.index("sel.last linestart")
+                except tk.TclError:
+                    start = text_widget.index("insert linestart")
+                    end = start
+                return start, end
+
+            def _indent_lines() -> None:
+                text_widget = current_text_widget()
+                start, end = _line_range(text_widget)
+                line = start
+                while True:
+                    text_widget.insert(line, "\t")
+                    if line == end:
+                        break
+                    line = text_widget.index(f"{line} +1 line")
+
+            def _outdent_lines() -> None:
+                text_widget = current_text_widget()
+                start, end = _line_range(text_widget)
+                line = start
+                while True:
+                    if text_widget.get(line, f"{line} +1c") == "\t":
+                        text_widget.delete(line, f"{line} +1c")
+                    elif text_widget.get(line, f"{line} +4c") == "    ":
+                        text_widget.delete(line, f"{line} +4c")
+                    elif text_widget.get(line, f"{line} +2c") == "  ":
+                        text_widget.delete(line, f"{line} +2c")
+                    if line == end:
+                        break
+                    line = text_widget.index(f"{line} +1 line")
+
+            def _indent_key(_event):
+                _indent_lines()
+                return "break"
+
+            def _outdent_key(_event):
+                _outdent_lines()
+                return "break"
 
             def _apply_justify(align: str) -> None:
                 text_widget = current_text_widget()
@@ -9084,20 +9186,86 @@ class AnkiApp(tk.Tk):
                 text_widget = current_text_widget()
                 text_widget.insert("insert", url)
 
+            def _apply_underline_style(style: str) -> None:
+                text_widget = current_text_widget()
+                try:
+                    start = text_widget.index("sel.first")
+                    end = text_widget.index("sel.last")
+                except tk.TclError:
+                    return
+                if style == "double":
+                    tag_name = "underline_double"
+                    tag_cfg = {"underline": 1, "foreground": colors.get("accent", "#4F46E5")}
+                else:
+                    tag_name = "underline_wavy"
+                    tag_cfg = {"underline": 1, "foreground": colors.get("muted", "#98A2B3")}
+                if tag_name not in text_widget.tag_names():
+                    text_widget.tag_configure(tag_name, **tag_cfg)
+                text_widget.tag_add(tag_name, start, end)
+                _insert_hidden_token(text_widget, end, "[[/u]]")
+                _insert_hidden_token(text_widget, start, f"[[u:{style}]]")
+
+            def _insert_mathjax() -> None:
+                text_widget = current_text_widget()
+                try:
+                    start = text_widget.index("sel.first")
+                    end = text_widget.index("sel.last")
+                    content = text_widget.get(start, end)
+                    text_widget.delete(start, end)
+                    text_widget.insert(start, f"\\({content}\\)")
+                except tk.TclError:
+                    insert_pos = text_widget.index("insert")
+                    text_widget.insert(insert_pos, "\\(  \\)")
+                    text_widget.mark_set("insert", f"{insert_pos} + 3c")
+
+            def attach_media() -> None:
+                filename = filedialog.askopenfilename(
+                    title="Прикрепить файл",
+                    filetypes=[
+                        ("Медиа", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.mp3 *.wav *.ogg *.m4a *.mp4 *.mov *.avi *.mkv *.webm"),
+                        ("Все файлы", "*.*"),
+                    ],
+                )
+                if not filename:
+                    return
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+                    attach_image(filename)
+                elif ext in (".mp3", ".wav", ".ogg", ".m4a"):
+                    attach_audio(filename)
+                elif ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
+                    attach_video(filename)
+                else:
+                    set_status("Формат не поддерживается для прикрепления")
+
             _btn(toolbar, "B", lambda: _toggle_tag("bold", font=("Segoe UI", 10, "bold")))
             _btn(toolbar, "I", lambda: _toggle_tag("italic", font=("Segoe UI", 10, "italic")))
             _btn(toolbar, "U", lambda: _toggle_tag("underline", underline=1))
+            _btn(toolbar, "U²", lambda: _apply_underline_style("double"))
+            _btn(toolbar, "U~", lambda: _apply_underline_style("wavy"))
             _btn(toolbar, "x²", lambda: _apply_script("superscript", 6))
             _btn(toolbar, "x₂", lambda: _apply_script("subscript", -4))
             _btn(toolbar, "A", _apply_color)
             _btn(toolbar, "🖍", _apply_marker)
+            _btn(toolbar, "🧹", _clear_formatting)
             _btn(toolbar, "•", lambda: _apply_list("• "))
             _btn(toolbar, "1.", lambda: _apply_list("{counter}. "))
             _btn(toolbar, "L", lambda: _apply_justify("left"))
             _btn(toolbar, "C", lambda: _apply_justify("center"))
             _btn(toolbar, "R", lambda: _apply_justify("right"))
+            _btn(toolbar, "⇥", _indent_lines)
+            _btn(toolbar, "⇤", _outdent_lines)
             _btn(toolbar, "🔗", _insert_link)
+            _btn(toolbar, "📎", attach_media)
+            _btn(toolbar, "🎙", _fmt_not_ready)
+            _btn(toolbar, "Fx", _insert_mathjax)
+            _btn(toolbar, "</>", _fmt_not_ready)
             _btn(toolbar, "⨯", _fmt_not_ready)
+
+            front_text.bind("<Tab>", _indent_key)
+            front_text.bind("<Shift-Tab>", _outdent_key)
+            back_text.bind("<Tab>", _indent_key)
+            back_text.bind("<Shift-Tab>", _outdent_key)
 
             dots = []
 
