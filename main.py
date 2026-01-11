@@ -13189,7 +13189,7 @@ class ReviewWindow(tk.Toplevel):
         self.progress_label = None
         self.progress_var = None
         self.play_progress_value = tk.IntVar(value=0)
-        self.play_progress_label_var = tk.StringVar(value="Сложность: 0/100")
+        self.play_progress_label = None
         self.play_progress_card_id = None
 
         self.title("Режим воспроизведения (Лейтнер)")
@@ -13310,59 +13310,85 @@ class ReviewWindow(tk.Toplevel):
 
         self.video_inline_frame = self.card_widget.video_inline_frame
 
-        # Прогресс-бар (внутри карточки, перед аудио)
-        progress_frame = tk.Frame(self.card_frame, bg="white")
-        progress_frame.place(x=10, y=320, width=780, height=26)
+        # Прогресс-бар (внутри карточки, в самом низу)
+        progress_row = tk.Frame(
+            self.card_frame,
+            bg="white",
+            highlightbackground="#2ecc71",
+            highlightthickness=1,
+        )
+        progress_row.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(6, 10))
+
+        btn_minus = tk.Button(
+            progress_row,
+            text="−",
+            bg="white",
+            fg="black",
+            relief="solid",
+            bd=1,
+            width=3,
+            command=self._playback_dec_progress,
+        )
+        btn_plus = tk.Button(
+            progress_row,
+            text="+",
+            bg="white",
+            fg="black",
+            relief="solid",
+            bd=1,
+            width=3,
+            command=self._playback_inc_progress,
+        )
 
         self.progress_bar = ttk.Progressbar(
-            progress_frame,
+            progress_row,
             variable=self.play_progress_value,
             maximum=100,
             style="PlayGreen.Horizontal.TProgressbar",
+            length=320,
         )
-        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=4)
 
-        tk.Label(
-            progress_frame,
-            textvariable=self.play_progress_label_var,
+        self.play_progress_label = tk.Label(
+            progress_row,
+            text="Сложность: 0/100",
             bg="white",
             fg="black",
-            font=("Segoe UI", 9, "bold"),
-        ).pack(side=tk.LEFT, padx=(6, 6))
+        )
+
+        btn_minus.pack(side=tk.LEFT, padx=(0, 8))
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        btn_plus.pack(side=tk.LEFT, padx=(8, 12))
+        self.play_progress_label.pack(side=tk.LEFT)
 
         self.audio_inline_frame = self.card_widget.audio_inline_frame
 
-        # Нижняя панель управления (фиксированный футер)
-        footer = ttk.Frame(self, style="Surface.TFrame")
-        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
-
-        footer_left = ttk.Frame(footer, style="Surface.TFrame")
-        footer_left.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        footer_center = ttk.Frame(footer, style="Surface.TFrame")
-        footer_center.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        footer_right = ttk.Frame(footer, style="Surface.TFrame")
-        footer_right.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self.btn_prev = ttk.Button(footer_left, text="← Назад", command=self.goto_prev_card)
-        self.btn_prev.pack(side=tk.LEFT, padx=6)
-
-        self.btn_show = ttk.Button(footer_center, text="Показать ответ", command=self.toggle_front_back)
+        self.btn_show = ttk.Button(controls_strip, text="Показать ответ", command=self.toggle_front_back)
         self.btn_show.pack(side=tk.LEFT, padx=6)
 
-        self.btn_sound = ttk.Button(footer_center, text="🔊 Слово", command=self.play_word)
+        self.btn_sound = ttk.Button(controls_strip, text="🔊 Слово", command=self.play_word)
         self.btn_sound.pack(side=tk.LEFT, padx=6)
 
-        self.btn_send_phase = ttk.Button(
-            footer_center,
+        # Нижняя панель управления (фиксированный футер)
+        footer = tk.Frame(self, bg="#0B1220", height=56, highlightbackground="red", highlightthickness=2)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        footer.pack_propagate(False)
+
+        self.btn_prev = tk.Button(footer, text="← Назад", command=self.goto_prev_card)
+        self.btn_prev.pack(side=tk.LEFT, padx=12, pady=10)
+
+        self.btn_next = tk.Button(footer, text="Следующая →", command=self.goto_next_card)
+        self.btn_next.pack(side=tk.RIGHT, padx=12, pady=10)
+
+        self.btn_send_phase = tk.Button(
+            footer,
             text="Отправить в 1 фазу",
             command=self.mark_forgotten,
         )
-        self.btn_send_phase.pack(side=tk.LEFT, padx=6)
-
-        self.btn_next = ttk.Button(footer_right, text="Следующая →", command=self.goto_next_card)
-        self.btn_next.pack(side=tk.RIGHT, padx=6)
+        self.btn_send_phase.pack(side=tk.RIGHT, padx=12, pady=10)
 
         self.update_audio_player()
+        self.update_idletasks()
+        print("[PLAYBACK] footer+progress_row created and packed")
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
@@ -13664,16 +13690,35 @@ class ReviewWindow(tk.Toplevel):
     def update_progress_view(self):
         p = max(0, min(100, int(self.play_progress_value.get())))
         self.play_progress_value.set(p)
-        self.play_progress_label_var.set(f"Сложность: {p}/100")
+        if self.play_progress_label is not None:
+            self.play_progress_label.config(text=f"Сложность: {p}/100")
+
+    def _playback_reset_progress_for_card(self, card_id):
+        self.play_progress_card_id = card_id
+        self.play_progress_value.set(0)
+        if self.play_progress_label is not None:
+            self.play_progress_label.config(text="Сложность: 0/100")
+
+    def _playback_inc_progress(self):
+        v = int(self.play_progress_value.get())
+        v = min(100, v + 1)
+        self.play_progress_value.set(v)
+        if self.play_progress_label is not None:
+            self.play_progress_label.config(text=f"Сложность: {v}/100")
+
+    def _playback_dec_progress(self):
+        v = int(self.play_progress_value.get())
+        v = max(0, v - 1)
+        self.play_progress_value.set(v)
+        if self.play_progress_label is not None:
+            self.play_progress_label.config(text=f"Сложность: {v}/100")
 
     def update_view(self):
         total = len(self.cards)
         idx = self.current_index + 1
         c = self.current_card
         if self.play_progress_card_id != c.get("id"):
-            self.play_progress_card_id = c.get("id")
-            self.play_progress_value.set(0)
-            self.update_progress_view()
+            self._playback_reset_progress_for_card(c.get("id"))
 
         self.lbl_status.config(
             text=f"Карточка {idx}/{total} | ID {c['id']}"
@@ -13746,18 +13791,6 @@ class ReviewWindow(tk.Toplevel):
         messagebox.showinfo("Лейтнер", f"Отлично! Уровень карточки теперь: {self.current_card['leitner_level']}")
         self.goto_next_card()
 
-    def bump_play_progress(self):
-        card_id = self.current_card.get("id")
-        if card_id is None:
-            return
-        if self.play_progress_card_id == card_id:
-            new_value = min(100, int(self.play_progress_value.get()) + 1)
-        else:
-            self.play_progress_card_id = card_id
-            new_value = 1
-        self.play_progress_value.set(new_value)
-        self.update_progress_view()
-
     def goto_prev_card(self):
         self.cancel_timers()
         self.save_current_media_state()
@@ -13793,7 +13826,12 @@ class ReviewWindow(tk.Toplevel):
             messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
             return
         if not self.show_back:
-            self.bump_play_progress()
+            card_id = self.current_card.get("id")
+            if card_id != self.play_progress_card_id:
+                self._playback_reset_progress_for_card(card_id)
+                self._playback_inc_progress()
+            else:
+                self._playback_inc_progress()
         deck_id = self.current_card.get("deck_id") or getattr(self.master, "selected_deck_id", None)
         lang = get_deck_tts_lang(deck_id, "de")
         speak_google_tts(text, lang)
