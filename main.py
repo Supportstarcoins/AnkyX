@@ -13188,6 +13188,9 @@ class ReviewWindow(tk.Toplevel):
         self.progress_canvas = None
         self.progress_label = None
         self.progress_var = None
+        self.play_progress_value = tk.IntVar(value=0)
+        self.play_progress_label_var = tk.StringVar(value="Сложность: 0/100")
+        self.play_progress_card_id = None
 
         self.title("Режим воспроизведения (Лейтнер)")
         self.geometry("900x600")
@@ -13240,12 +13243,6 @@ class ReviewWindow(tk.Toplevel):
         controls_strip = ttk.Frame(frame_main)
         controls_strip.pack(fill=tk.X, pady=(0, 6))
 
-        self.btn_show = ttk.Button(controls_strip, text="Показать ответ", command=self.toggle_front_back)
-        self.btn_show.pack(side=tk.LEFT, padx=5)
-
-        self.btn_sound = ttk.Button(controls_strip, text="🔊 Слово", command=self.play_word)
-        self.btn_sound.pack(side=tk.LEFT, padx=5)
-
         self.actions_menu_button = self._build_actions_menu(controls_strip)
         self.actions_menu_button.pack(side=tk.LEFT, padx=5)
 
@@ -13260,9 +13257,40 @@ class ReviewWindow(tk.Toplevel):
             bd=0,
         )
         card_wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.card_widget = CardWidget(card_wrap, palette=colors, editable=False)
+        self.card_widget = CardWidget(card_wrap, palette=colors, editable=False, show_image_toolbar=False)
         self.card_widget.pack(fill=tk.BOTH, expand=True)
         self.card_frame = self.card_widget
+        self.card_widget.disable_scrollbars()
+
+        top_right_controls = tk.Frame(self.card_frame, bg=card_bg)
+        top_right_controls.place(relx=1.0, x=-10, y=10, anchor="ne")
+
+        tk.Button(
+            top_right_controls,
+            text="+",
+            command=lambda: self.card_widget.zoom_image(1.12),
+            bg="white",
+            fg="black",
+            activebackground="white",
+            activeforeground="black",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#111111",
+            width=3,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(
+            top_right_controls,
+            text="-",
+            command=lambda: self.card_widget.zoom_image(0.88),
+            bg="white",
+            fg="black",
+            activebackground="white",
+            activeforeground="black",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#111111",
+            width=3,
+        ).pack(side=tk.LEFT)
 
         # Индикатор загрузки
         self.dot_canvas = tk.Canvas(self.card_frame, width=20, height=20,
@@ -13286,44 +13314,21 @@ class ReviewWindow(tk.Toplevel):
         progress_frame = tk.Frame(self.card_frame, bg="white")
         progress_frame.place(x=10, y=320, width=780, height=26)
 
-        self.btn_progress_minus = tk.Button(
-            progress_frame,
-            text="-",
-            command=self.decrement_progress,
-            bg="white",
-            fg="black",
-            activebackground="white",
-            activeforeground="black",
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground="#111111",
-            width=3,
-        )
-        self.btn_progress_minus.pack(side=tk.LEFT, padx=(4, 6), pady=2)
-
-        self.progress_var = tk.DoubleVar(value=0)
         self.progress_bar = ttk.Progressbar(
             progress_frame,
-            variable=self.progress_var,
+            variable=self.play_progress_value,
             maximum=100,
             style="PlayGreen.Horizontal.TProgressbar",
         )
         self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=4)
 
-        self.btn_progress_plus = tk.Button(
+        tk.Label(
             progress_frame,
-            text="+",
-            command=self.increment_progress,
+            textvariable=self.play_progress_label_var,
             bg="white",
             fg="black",
-            activebackground="white",
-            activeforeground="black",
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground="#111111",
-            width=3,
-        )
-        self.btn_progress_plus.pack(side=tk.LEFT, padx=(6, 4), pady=2)
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(6, 6))
 
         self.audio_inline_frame = self.card_widget.audio_inline_frame
 
@@ -13331,18 +13336,31 @@ class ReviewWindow(tk.Toplevel):
         footer = ttk.Frame(self, style="Surface.TFrame")
         footer.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
 
-        self.btn_prev = ttk.Button(footer, text="← Назад", command=self.goto_prev_card)
+        footer_left = ttk.Frame(footer, style="Surface.TFrame")
+        footer_left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        footer_center = ttk.Frame(footer, style="Surface.TFrame")
+        footer_center.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        footer_right = ttk.Frame(footer, style="Surface.TFrame")
+        footer_right.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.btn_prev = ttk.Button(footer_left, text="← Назад", command=self.goto_prev_card)
         self.btn_prev.pack(side=tk.LEFT, padx=6)
 
+        self.btn_show = ttk.Button(footer_center, text="Показать ответ", command=self.toggle_front_back)
+        self.btn_show.pack(side=tk.LEFT, padx=6)
+
+        self.btn_sound = ttk.Button(footer_center, text="🔊 Слово", command=self.play_word)
+        self.btn_sound.pack(side=tk.LEFT, padx=6)
+
         self.btn_send_phase = ttk.Button(
-            footer,
+            footer_center,
             text="Отправить в 1 фазу",
             command=self.mark_forgotten,
         )
         self.btn_send_phase.pack(side=tk.LEFT, padx=6)
 
-        self.btn_next = ttk.Button(footer, text="Далее →", command=self.goto_next_card)
-        self.btn_next.pack(side=tk.LEFT, padx=6)
+        self.btn_next = ttk.Button(footer_right, text="Следующая →", command=self.goto_next_card)
+        self.btn_next.pack(side=tk.RIGHT, padx=6)
 
         self.update_audio_player()
 
@@ -13644,15 +13662,18 @@ class ReviewWindow(tk.Toplevel):
         self.goto_next_card()
 
     def update_progress_view(self):
-        p = int(self.current_card.get("progress") or 0)
-        p = max(0, min(100, p))
-        if self.progress_var is not None:
-            self.progress_var.set(p)
+        p = max(0, min(100, int(self.play_progress_value.get())))
+        self.play_progress_value.set(p)
+        self.play_progress_label_var.set(f"Сложность: {p}/100")
 
     def update_view(self):
         total = len(self.cards)
         idx = self.current_index + 1
         c = self.current_card
+        if self.play_progress_card_id != c.get("id"):
+            self.play_progress_card_id = c.get("id")
+            self.play_progress_value.set(0)
+            self.update_progress_view()
 
         self.lbl_status.config(
             text=f"Карточка {idx}/{total} | ID {c['id']}"
@@ -13725,24 +13746,16 @@ class ReviewWindow(tk.Toplevel):
         messagebox.showinfo("Лейтнер", f"Отлично! Уровень карточки теперь: {self.current_card['leitner_level']}")
         self.goto_next_card()
 
-    def increment_progress(self):
-        card_id = self.current_card["id"]
-        current = int(self.current_card.get("progress") or 0)
-        if current >= 100:
+    def bump_play_progress(self):
+        card_id = self.current_card.get("id")
+        if card_id is None:
             return
-        new_value = min(100, current + 1)
-        self.current_card["progress"] = new_value
-        update_card_progress(card_id, new_value)
-        self.update_progress_view()
-
-    def decrement_progress(self):
-        card_id = self.current_card["id"]
-        current = int(self.current_card.get("progress") or 0)
-        if current <= 0:
-            return
-        new_value = max(0, current - 1)
-        self.current_card["progress"] = new_value
-        update_card_progress(card_id, new_value)
+        if self.play_progress_card_id == card_id:
+            new_value = min(100, int(self.play_progress_value.get()) + 1)
+        else:
+            self.play_progress_card_id = card_id
+            new_value = 1
+        self.play_progress_value.set(new_value)
         self.update_progress_view()
 
     def goto_prev_card(self):
@@ -13774,11 +13787,13 @@ class ReviewWindow(tk.Toplevel):
 
     def play_word(self):
         selection = get_selected_text_from_widget(self.focus_get())
-        back_text = self.current_card.get("back") or ""
-        text = selection or back_text
+        front_text = self.current_card.get("front") or ""
+        text = selection or front_text
         if not text.strip():
             messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
             return
+        if not self.show_back:
+            self.bump_play_progress()
         deck_id = self.current_card.get("deck_id") or getattr(self.master, "selected_deck_id", None)
         lang = get_deck_tts_lang(deck_id, "de")
         speak_google_tts(text, lang)
