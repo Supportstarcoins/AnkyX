@@ -22,6 +22,12 @@ PALETTE = {
     "card_border": "#E0E0E0",
 }
 
+DARK_BG = "#0B1220"
+CARD_BORDER = "#D6DCE6"
+SCROLL_TROUGH = "#05070b"
+SCROLL_BG = "#0b0f16"
+SCROLL_ACTIVE = "#121a26"
+
 
 def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
     """Настроить тёмную тему. Использует ttkbootstrap при наличии."""
