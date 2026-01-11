@@ -39,6 +39,7 @@ class CardWidget(tk.Frame):
         self._image_path: str | None = None
         self._img_ref = None
         self._warned_large_path: str | None = None
+        self.scrollbars_enabled = True
 
         self._build_layout()
 
@@ -48,6 +49,8 @@ class CardWidget(tk.Frame):
 
         canvas = tk.Canvas(content_container, bg=self.card_bg, highlightthickness=0, borderwidth=0)
         scrollbar = ttk.Scrollbar(content_container, orient="vertical", command=canvas.yview)
+        self.content_canvas = canvas
+        self.content_scrollbar = scrollbar
         self.scrollable_frame = tk.Frame(canvas, bg=self.card_bg)
 
         self.scrollable_frame.bind(
@@ -298,7 +301,12 @@ class CardWidget(tk.Frame):
             self.image_canvas._preview_ref = self._img_ref
             self.image_canvas.config(scrollregion=(0, 0, new_size[0], new_size[1]))
 
-            if self.image_mode == "fit":
+            if not self.scrollbars_enabled:
+                if self.image_scroll_x is not None:
+                    self.image_scroll_x.grid_remove()
+                if self.image_scroll_y is not None:
+                    self.image_scroll_y.grid_remove()
+            elif self.image_mode == "fit":
                 if self.image_scroll_x is not None:
                     self.image_scroll_x.grid_remove()
                 if self.image_scroll_y is not None:
@@ -332,6 +340,17 @@ class CardWidget(tk.Frame):
         else:
             if self.audio_inline_frame.winfo_ismapped():
                 self.audio_inline_frame.place_forget()
+
+    def disable_scrollbars(self) -> None:
+        self.scrollbars_enabled = False
+        if getattr(self, "content_scrollbar", None) is not None:
+            self.content_scrollbar.pack_forget()
+        if getattr(self, "content_canvas", None) is not None:
+            self.content_canvas.configure(yscrollcommand=None)
+        if getattr(self, "image_scroll_x", None) is not None:
+            self.image_scroll_x.grid_remove()
+        if getattr(self, "image_scroll_y", None) is not None:
+            self.image_scroll_y.grid_remove()
 
     def show_video_frame(self, visible: bool, height: int = 80) -> None:
         if visible:
