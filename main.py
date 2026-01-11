@@ -13309,15 +13309,12 @@ class ReviewWindow(tk.Toplevel):
         self.lbl_level.place(x=5, y=5)
 
         self.video_inline_frame = self.card_widget.video_inline_frame
+        self.audio_inline_frame = self.card_widget.audio_inline_frame
 
-        # Прогресс-бар (внутри карточки, в самом низу)
-        progress_row = tk.Frame(
-            self.card_frame,
-            bg="white",
-            highlightbackground="#2ecc71",
-            highlightthickness=1,
-        )
-        progress_row.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(6, 10))
+        # Прогресс-бар (внутри карточки, перед аудио)
+        progress_parent = self.audio_inline_frame.master
+        progress_row = tk.Frame(progress_parent, bg="white")
+        progress_row.pack(fill=tk.X, padx=10, pady=(0, 6), before=self.audio_inline_frame)
 
         btn_minus = tk.Button(
             progress_row,
@@ -13360,35 +13357,31 @@ class ReviewWindow(tk.Toplevel):
         btn_plus.pack(side=tk.LEFT, padx=(8, 12))
         self.play_progress_label.pack(side=tk.LEFT)
 
-        self.audio_inline_frame = self.card_widget.audio_inline_frame
-
-        self.btn_show = ttk.Button(controls_strip, text="Показать ответ", command=self.toggle_front_back)
-        self.btn_show.pack(side=tk.LEFT, padx=6)
-
-        self.btn_sound = ttk.Button(controls_strip, text="🔊 Слово", command=self.play_word)
-        self.btn_sound.pack(side=tk.LEFT, padx=6)
-
         # Нижняя панель управления (фиксированный футер)
-        footer = tk.Frame(self, bg="#0B1220", height=56, highlightbackground="red", highlightthickness=2)
-        footer.pack(side=tk.BOTTOM, fill=tk.X)
-        footer.pack_propagate(False)
+        footer = tk.Frame(frame_main, bg=card_bg)
+        footer.pack(side="bottom", fill="x", pady=(8, 0))
 
-        self.btn_prev = tk.Button(footer, text="← Назад", command=self.goto_prev_card)
-        self.btn_prev.pack(side=tk.LEFT, padx=12, pady=10)
+        self.btn_prev = ttk.Button(footer, text="← Назад", command=self.goto_prev_card)
+        self.btn_prev.pack(side="left", padx=10, pady=8)
 
-        self.btn_next = tk.Button(footer, text="Следующая →", command=self.goto_next_card)
-        self.btn_next.pack(side=tk.RIGHT, padx=12, pady=10)
+        self.btn_next = ttk.Button(footer, text="Следующая →", command=self.goto_next_card)
+        self.btn_next.pack(side="right", padx=10, pady=8)
 
-        self.btn_send_phase = tk.Button(
+        self.btn_send_phase = ttk.Button(
             footer,
             text="Отправить в 1 фазу",
             command=self.mark_forgotten,
         )
-        self.btn_send_phase.pack(side=tk.RIGHT, padx=12, pady=10)
+        self.btn_send_phase.pack(side="right", padx=10, pady=8)
+
+        self.btn_show = ttk.Button(footer, text="Показать ответ", command=self.toggle_front_back)
+        self.btn_show.pack(side="left", padx=10, pady=8)
+
+        self.btn_sound = ttk.Button(footer, text="🔊 Слово", command=self.play_word)
+        self.btn_sound.pack(side="left", padx=10, pady=8)
 
         self.update_audio_player()
         self.update_idletasks()
-        print("[PLAYBACK] footer+progress_row created and packed")
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
