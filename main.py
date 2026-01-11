@@ -24,6 +24,13 @@ from pathlib import Path
 from uuid import uuid4
 csv.field_size_limit(10 * 1024 * 1024)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SYNC_CONFIG_PATH = os.path.join(BASE_DIR, "config_sync.json")
+SYNC_CONFIG_DEFAULT = {
+    "api_base_url": "https://example.com/api",
+    "timeout_sec": 15,
+    "token": None,
+    "user_email": None,
+}
 import gzip
 import pickle
 from datetime import date, datetime, timedelta
@@ -106,6 +113,7 @@ from db_connect import DB_WRITE_LOCK, commit_with_retry, open_db
 from db_path import get_db_path
 from credits import CreditsService
 from referral import ReferralService
+from sync_client import SyncClient
 from payments import PACKAGES, build_payment_url, verify_payment
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
@@ -568,6 +576,26 @@ def ocr_image(pil_img: Image.Image, lang: str, config: str) -> str:
 
 
 auto_configure_tesseract()
+
+def load_sync_config() -> dict:
+    config = SYNC_CONFIG_DEFAULT.copy()
+    if not os.path.exists(SYNC_CONFIG_PATH):
+        return config
+    try:
+        with open(SYNC_CONFIG_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            config.update({key: data.get(key) for key in SYNC_CONFIG_DEFAULT})
+    except Exception:
+        return config
+    return config
+
+
+def save_sync_config(config: dict) -> None:
+    payload = SYNC_CONFIG_DEFAULT.copy()
+    payload.update({key: config.get(key) for key in SYNC_CONFIG_DEFAULT})
+    with open(SYNC_CONFIG_PATH, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 # ==========================
 # Необязательные библиотеки
@@ -4295,6 +4323,13 @@ class AnkiApp(tk.Tk):
         self.user_id = get_local_user_id()
         self.user_account = ensure_user_account(self.user_id)
         self.user_profile = ensure_user_profile_row(self.user_id)
+        self.sync_config = load_sync_config()
+        self.sync_token = self.sync_config.get("token")
+        self.sync_user_email = self.sync_config.get("user_email")
+        self.sync_client = SyncClient(
+            self.sync_config.get("api_base_url") or SYNC_CONFIG_DEFAULT["api_base_url"],
+            self.sync_config.get("timeout_sec") or SYNC_CONFIG_DEFAULT["timeout_sec"],
+        )
         self.credits_service = CreditsService()
         self.referral_service = ReferralService(credits_service=self.credits_service)
         self.balance_var = tk.StringVar(value="—")
@@ -7238,6 +7273,9 @@ class AnkiApp(tk.Tk):
         ttk.Button(user_row, text="Копировать", style="Secondary.TButton", command=self.copy_user_id).pack(
             side=tk.LEFT, padx=6
         )
+        ttk.Button(user_row, text="Синхронизация", style="Secondary.TButton", command=self.open_sync_flow).pack(
+            side=tk.LEFT, padx=6
+        )
         status_row = ttk.Frame(account_card, style="CardInner.TFrame")
         status_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(status_row, text="Статус:", style="Muted.TLabel").pack(side=tk.LEFT)
@@ -7457,6 +7495,269 @@ class AnkiApp(tk.Tk):
         self.refresh_ledger_table()
         self.refresh_referral_info()
         self.refresh_activation_progress_ui()
+
+    def _save_sync_config(self) -> None:
+        self.sync_config["token"] = self.sync_token
+        self.sync_config["user_email"] = self.sync_user_email
+        save_sync_config(self.sync_config)
+
+    def _set_sync_token(self, token: str | None, email: str | None = None) -> None:
+        self.sync_token = token
+        if email is not None:
+            self.sync_user_email = email
+        self._save_sync_config()
+
+    def _clear_sync_token(self) -> None:
+        self._set_sync_token(None, self.sync_user_email)
+
+    def open_sync_flow(self) -> None:
+        if self.sync_token:
+            self.open_sync_deck_window()
+        else:
+            self.open_sync_login_window()
+
+    def open_sync_login_window(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("Синхронизация с сайтом")
+        win.transient(self)
+        win.resizable(False, False)
+
+        container = ttk.Frame(win, padding=16)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            container,
+            text="Для синхронизации коллекции создайте учетную запись",
+            style="HeaderSub.TLabel",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            container,
+            text="При регистрации на сайте можно указать реферальный код для бонуса 300 кредитов.",
+            style="Muted.TLabel",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 12))
+
+        form = ttk.Frame(container)
+        form.pack(fill=tk.X)
+        ttk.Label(form, text="Email").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(form, text="Пароль").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        email_var = tk.StringVar(value=self.sync_user_email or "")
+        password_var = tk.StringVar(value="")
+        email_entry = ttk.Entry(form, textvariable=email_var, width=36)
+        email_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        password_entry = ttk.Entry(form, textvariable=password_var, show="*", width=36)
+        password_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        form.columnconfigure(1, weight=1)
+
+        status_var = tk.StringVar(value="")
+        status_label = ttk.Label(container, textvariable=status_var, style="Muted.TLabel")
+        status_label.pack(anchor="w", pady=(8, 0))
+        progress = ttk.Progressbar(container, mode="indeterminate")
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=tk.X, pady=(10, 0))
+        sync_button = ttk.Button(buttons, text="Синхронизировать", style="Primary.TButton")
+        sync_button.pack(side=tk.LEFT, padx=(0, 6))
+        cancel_button = ttk.Button(buttons, text="Отмена", style="Secondary.TButton", command=win.destroy)
+        cancel_button.pack(side=tk.LEFT)
+        retry_button = ttk.Button(buttons, text="Повторить", style="Secondary.TButton")
+
+        def set_inputs_enabled(enabled: bool) -> None:
+            state = "normal" if enabled else "disabled"
+            email_entry.config(state=state)
+            password_entry.config(state=state)
+            sync_button.config(state=state)
+
+        def start_progress() -> None:
+            progress.pack(fill=tk.X, pady=(6, 0))
+            progress.start(10)
+
+        def stop_progress() -> None:
+            progress.stop()
+            progress.pack_forget()
+
+        def reset_for_retry() -> None:
+            status_var.set("")
+            retry_button.pack_forget()
+            set_inputs_enabled(True)
+            email_entry.focus_set()
+
+        def handle_success(token: str) -> None:
+            stop_progress()
+            status_var.set("Синхронизирован")
+            self._set_sync_token(token, email_var.get().strip())
+            win.after(400, lambda: (win.destroy(), self.open_sync_deck_window()))
+
+        def handle_error(message: str) -> None:
+            stop_progress()
+            status_var.set(message)
+            set_inputs_enabled(False)
+            retry_button.pack(side=tk.LEFT, padx=(6, 0))
+
+        def do_login() -> None:
+            email = email_var.get().strip()
+            password = password_var.get()
+            if not email or not password:
+                status_var.set("Введите email и пароль.")
+                return
+            set_inputs_enabled(False)
+            cancel_button.config(state="disabled")
+            retry_button.pack_forget()
+            status_var.set("Синхронизация...")
+            start_progress()
+
+            def worker():
+                try:
+                    token = self.sync_client.login(email, password)
+                    if not token:
+                        raise ValueError("Не синхронизирован")
+                    win.after(0, lambda: handle_success(token))
+                except Exception:
+                    win.after(0, lambda: handle_error("Не синхронизирован"))
+                finally:
+                    win.after(0, lambda: cancel_button.config(state="normal"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        sync_button.config(command=do_login)
+        retry_button.config(command=reset_for_retry)
+        email_entry.focus_set()
+
+    def _build_deck_payload(self, deck_id: int) -> dict:
+        decks = list_decks()
+        deck = next((item for item in decks if item["id"] == deck_id), None)
+        cards = get_cards_in_deck(deck_id)
+        max_cards = 200
+        cards_payload = []
+        for card in cards[:max_cards]:
+            cards_payload.append(
+                {
+                    "id": card["id"],
+                    "front": card["front"],
+                    "back": card["back"],
+                    "media": {
+                        "front_image_path": card["front_image_path"],
+                        "back_image_path": card["back_image_path"],
+                        "image_path": card["image_path"],
+                        "audio_path": card["audio_path"],
+                    },
+                }
+            )
+        # TODO: добавить постраничную отправку, если карточек больше лимита.
+        return {
+            "deck_id": deck_id,
+            "deck_name": deck["name"] if deck else "",
+            "deck_description": deck["description"] if deck else "",
+            "cards": cards_payload,
+        }
+
+    def open_sync_deck_window(self) -> None:
+        if not self.sync_token:
+            self.open_sync_login_window()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Синхронизация колоды")
+        win.transient(self)
+        win.resizable(False, False)
+
+        container = ttk.Frame(win, padding=16)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        decks = list_decks()
+        deck_names = [deck["name"] for deck in decks]
+        deck_lookup = {deck["name"]: deck["id"] for deck in decks}
+
+        ttk.Label(container, text="Выберите колоду", style="HeaderSub.TLabel").pack(anchor="w")
+        deck_var = tk.StringVar(value=deck_names[0] if deck_names else "")
+        deck_combo = ttk.Combobox(container, values=deck_names, textvariable=deck_var, state="readonly", width=32)
+        deck_combo.pack(fill=tk.X, pady=(6, 8))
+
+        status_var = tk.StringVar(value="")
+        status_label = ttk.Label(container, textvariable=status_var, style="Muted.TLabel")
+        status_label.pack(anchor="w")
+        progress = ttk.Progressbar(container, mode="indeterminate")
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=tk.X, pady=(10, 0))
+        sync_button = ttk.Button(buttons, text="Синхронизировать колоду", style="Primary.TButton")
+        sync_button.pack(side=tk.LEFT)
+        retry_button = ttk.Button(buttons, text="Повторить", style="Secondary.TButton")
+
+        def set_inputs_enabled(enabled: bool) -> None:
+            state = "normal" if enabled else "disabled"
+            deck_combo.config(state="readonly" if enabled else "disabled")
+            sync_button.config(state=state)
+
+        def start_progress() -> None:
+            progress.pack(fill=tk.X, pady=(6, 0))
+            progress.start(10)
+
+        def stop_progress() -> None:
+            progress.stop()
+            progress.pack_forget()
+
+        def reset_for_retry() -> None:
+            status_var.set("")
+            retry_button.pack_forget()
+            set_inputs_enabled(True)
+
+        def handle_error() -> None:
+            stop_progress()
+            status_var.set("Статус: не синхронизирован")
+            set_inputs_enabled(False)
+            retry_button.pack(side=tk.LEFT, padx=(6, 0))
+
+        def handle_success() -> None:
+            stop_progress()
+            status_var.set("Статус: синхронизирован")
+            set_inputs_enabled(True)
+
+        def handle_unauthorized() -> None:
+            stop_progress()
+            status_var.set("Статус: не синхронизирован")
+            self._clear_sync_token()
+            messagebox.showwarning("Синхронизация", "Сессия истекла. Войдите снова.")
+            win.destroy()
+            self.open_sync_login_window()
+
+        def do_sync() -> None:
+            deck_name = deck_var.get()
+            deck_id = deck_lookup.get(deck_name)
+            if not deck_id:
+                status_var.set("Выберите колоду.")
+                return
+            retry_button.pack_forget()
+            set_inputs_enabled(False)
+            status_var.set("Синхронизация...")
+            start_progress()
+
+            def worker():
+                token = self.sync_token
+                try:
+                    payload = self._build_deck_payload(deck_id)
+                    result = self.sync_client.push_deck(token, payload)
+                    unauthorized = not result and not (token and token.startswith("mock-token"))
+                    if result:
+                        win.after(0, handle_success)
+                    elif unauthorized:
+                        win.after(0, handle_unauthorized)
+                    else:
+                        win.after(0, handle_error)
+                except Exception:
+                    win.after(0, handle_error)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        sync_button.config(command=do_sync)
+        retry_button.config(command=reset_for_retry)
+
+        if not deck_names:
+            status_var.set("Нет колод для синхронизации.")
+            set_inputs_enabled(False)
 
     def copy_ref_link(self):
         link = self.ref_summary_vars.get("link").get() if self.ref_summary_vars else ""
