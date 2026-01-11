@@ -257,6 +257,11 @@ if get_card_surface_colors is None:
     def get_card_surface_colors(*_a, **_k):
         # (bg, card_bg, text)
         return ('#0f1115', '#ffffff', '#111111')
+DARK_BG = getattr(_ui_theme, "DARK_BG", "#0B1220")
+CARD_BORDER = getattr(_ui_theme, "CARD_BORDER", "#D6DCE6")
+SCROLL_TROUGH = getattr(_ui_theme, "SCROLL_TROUGH", "#05070b")
+SCROLL_BG = getattr(_ui_theme, "SCROLL_BG", "#0b0f16")
+SCROLL_ACTIVE = getattr(_ui_theme, "SCROLL_ACTIVE", "#121a26")
 from card_widget import CardWidget
 from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
 
@@ -3820,6 +3825,20 @@ TTS_CACHE_TTL = 120
 _TTS_CACHE: dict[str, dict[str, object]] = {}
 
 
+def ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def get_tts_cache_dir() -> str:
+    base = globals().get("app_data_dir")
+    if isinstance(base, str) and base.strip():
+        cache_dir = os.path.join(base, "tts_cache")
+    else:
+        cache_dir = os.path.join(os.getcwd(), "tts_cache")
+    return ensure_dir(cache_dir)
+
+
 def get_tts_url(text: str, lang: str) -> str:
     clean = text.strip()
     if not clean:
@@ -3912,7 +3931,7 @@ def speak_google_tts(text: str, lang: str = "de") -> None:
     if not url:
         messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
         return
-    temp_path = os.path.join(tempfile.gettempdir(), f"xflash_tts_{cache_key}.mp3")
+    temp_path = os.path.join(get_tts_cache_dir(), f"tts_{cache_key}.mp3")
     try:
         request = urllib.request.Request(
             url,
@@ -3922,6 +3941,8 @@ def speak_google_tts(text: str, lang: str = "de") -> None:
             data = response.read()
         with open(temp_path, "wb") as fh:
             fh.write(data)
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1024:
+            raise RuntimeError("TTS файл не создан")
         _TTS_CACHE[cache_key] = {"path": temp_path, "ts": time.time()}
         play_audio_file(temp_path)
     except Exception as exc:
@@ -8921,6 +8942,16 @@ class AnkiApp(tk.Tk):
             log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
             log_box.configure(state=tk.DISABLED)
 
+            def set_status(msg: str) -> None:
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                log_box.configure(state=tk.NORMAL)
+                log_box.insert(tk.END, f"[{timestamp}] {msg}\n")
+                log_box.see(tk.END)
+                log_box.configure(state=tk.DISABLED)
+
+            def _fmt_not_ready() -> None:
+                set_status("Функция в разработке")
+
             manual_media = {
                 "front": {"image": None, "video": None, "audio": None, "pos": None},
                 "back": {"image": None, "video": None, "audio": None, "pos": None},
@@ -9064,6 +9095,7 @@ class AnkiApp(tk.Tk):
             _btn(toolbar, "C", lambda: _apply_justify("center"))
             _btn(toolbar, "R", lambda: _apply_justify("right"))
             _btn(toolbar, "🔗", _insert_link)
+            _btn(toolbar, "⨯", _fmt_not_ready)
 
             dots = []
 
@@ -9095,11 +9127,7 @@ class AnkiApp(tk.Tk):
             toggle_button.config(command=lambda: set_side(not show_back_var.get()))
 
             def add_change_log(msg: str) -> None:
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                log_box.configure(state=tk.NORMAL)
-                log_box.insert(tk.END, f"[{timestamp}] {msg}\n")
-                log_box.see(tk.END)
-                log_box.configure(state=tk.DISABLED)
+                set_status(msg)
 
             drag_state = {"item": None, "x": 0, "y": 0}
 
@@ -9131,6 +9159,37 @@ class AnkiApp(tk.Tk):
                 )
                 return x1, y1, x2, y2
 
+            def _render_media_in_dropzone(
+                canvas: tk.Canvas,
+                img_path: str,
+                rect_coords: tuple[float, float, float, float],
+                pad: int = 2,
+            ) -> tuple[tk.PhotoImage | None, int | None]:
+                x1, y1, x2, y2 = rect_coords
+                max_w = max(1, int(x2 - x1 - 2 * pad))
+                max_h = max(1, int(y2 - y1 - 2 * pad))
+                if PIL_AVAILABLE:
+                    img, _ = load_preview_image(img_path, (max_w, max_h))
+                    photo = ImageTk.PhotoImage(img)
+                else:
+                    ext = os.path.splitext(img_path)[1].lower()
+                    if ext != ".png":
+                        raise ValueError("Unsupported image format without PIL")
+                    photo = tk.PhotoImage(file=img_path)
+                    if photo.width() > max_w or photo.height() > max_h:
+                        scale = max(photo.width() / max_w, photo.height() / max_h)
+                        subsample = int(scale) + 1
+                        photo = photo.subsample(subsample, subsample)
+                center = ((x1 + x2) / 2, (y1 + y2) / 2)
+                item_id = canvas.create_image(
+                    center[0],
+                    center[1],
+                    image=photo,
+                    anchor="center",
+                    tags=("media_item_fixed",),
+                )
+                return photo, item_id
+
             def _store_media_position(side: str, item_id: int) -> None:
                 coords = media_canvas.coords(item_id)
                 if coords:
@@ -9145,35 +9204,18 @@ class AnkiApp(tk.Tk):
                 media_canvas.delete("all")
                 canvas_width = media_canvas.winfo_width() or 600
                 canvas_height = media_canvas.winfo_height() or 280
-                x1, y1, x2, y2 = _draw_drop_zone(canvas_width, canvas_height)
+                rect_coords = _draw_drop_zone(canvas_width, canvas_height)
+                x1, y1, x2, y2 = rect_coords
                 center = ((x1 + x2) / 2, (y1 + y2) / 2)
 
                 media_item_id = None
                 if image_path and os.path.exists(image_path):
                     try:
-                        if PIL_AVAILABLE:
-                            img, _ = load_preview_image(
-                                image_path,
-                                (max(1, int(x2 - x1 - 20)), max(1, int(y2 - y1 - 20))),
-                            )
-                            photo = ImageTk.PhotoImage(img)
-                        else:
-                            ext = os.path.splitext(image_path)[1].lower()
-                            if ext != ".png":
-                                raise ValueError("Unsupported image format without PIL")
-                            photo = tk.PhotoImage(file=image_path)
-                            max_w = max(1, int(x2 - x1 - 20))
-                            max_h = max(1, int(y2 - y1 - 20))
-                            if photo.width() > max_w or photo.height() > max_h:
-                                scale = max(photo.width() / max_w, photo.height() / max_h)
-                                subsample = int(scale) + 1
-                                photo = photo.subsample(subsample, subsample)
-                        self._manual_media_photos[side] = photo
-                        pos = manual_media[side]["pos"] or center
-                        manual_media[side]["pos"] = pos
-                        media_item_id = media_canvas.create_image(
-                            pos[0], pos[1], image=photo, tags=("media_item",)
+                        photo, media_item_id = _render_media_in_dropzone(
+                            media_canvas, image_path, rect_coords
                         )
+                        self._manual_media_photos[side] = photo
+                        manual_media[side]["pos"] = None
                     except Exception:
                         media_item_id = media_canvas.create_text(
                             center[0],
@@ -11843,29 +11885,49 @@ class OverviewWindow(tk.Toplevel):
         )
         
         # Контейнер для двух карточек
-        cards_container = ttk.Frame(main_frame)
+        cards_bg = tk.Frame(main_frame, bg=DARK_BG)
+        cards_bg.pack(fill=tk.BOTH, expand=True)
+        cards_container = ttk.Frame(cards_bg)
         cards_container.pack(fill=tk.BOTH, expand=True)
-        
+
+        left_wrap = tk.Frame(
+            cards_container,
+            bg=DARK_BG,
+            highlightbackground=CARD_BORDER,
+            highlightthickness=1,
+            bd=0,
+        )
+        left_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        right_wrap = tk.Frame(
+            cards_container,
+            bg=DARK_BG,
+            highlightbackground=CARD_BORDER,
+            highlightthickness=1,
+            bd=0,
+        )
+        right_wrap.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
         # Левая карточка - лицевая сторона
         self.left_frame = ttk.LabelFrame(
-            cards_container,
+            left_wrap,
             text="ЛИЦЕВАЯ СТОРОНА",
             width=650,
             height=500,
             style="CardSurface.TLabelframe",
         )
-        self.left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        self.left_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.left_frame.pack_propagate(False)
         
         # Правая карточка - задняя сторона  
         self.right_frame = ttk.LabelFrame(
-            cards_container,
+            right_wrap,
             text="ЗАДНЯЯ СТОРОНА",
             width=650,
             height=500,
             style="CardSurface.TLabelframe",
         )
-        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+        self.right_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.right_frame.pack_propagate(False)
         
         # Панель кнопок навигации
@@ -12349,8 +12411,18 @@ class RepeatWindow(tk.Toplevel):
         self.timer_label.pack(anchor="center", pady=(3, 5))
 
         # Основной фрейм карточки
-        self.card_widget = CardWidget(frame_main, palette=colors, editable=False)
-        self.card_widget.pack(pady=10)
+        cards_bg = tk.Frame(frame_main, bg=DARK_BG)
+        cards_bg.pack(fill=tk.BOTH, expand=True, pady=10)
+        card_wrap = tk.Frame(
+            cards_bg,
+            bg=DARK_BG,
+            highlightbackground=CARD_BORDER,
+            highlightthickness=1,
+            bd=0,
+        )
+        card_wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.card_widget = CardWidget(card_wrap, palette=colors, editable=False)
+        self.card_widget.pack(fill=tk.BOTH, expand=True)
         self.card_frame = self.card_widget
 
         # Уровень карточки
@@ -12951,8 +13023,18 @@ class ReviewWindow(tk.Toplevel):
         self.timer_label.pack(anchor="center", pady=(3, 5))
 
         # Фрейм карточки
-        self.card_widget = CardWidget(frame_main, palette=colors, editable=False)
-        self.card_widget.pack(pady=10)
+        cards_bg = tk.Frame(frame_main, bg=DARK_BG)
+        cards_bg.pack(fill=tk.BOTH, expand=True, pady=10)
+        card_wrap = tk.Frame(
+            cards_bg,
+            bg=DARK_BG,
+            highlightbackground=CARD_BORDER,
+            highlightthickness=1,
+            bd=0,
+        )
+        card_wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.card_widget = CardWidget(card_wrap, palette=colors, editable=False)
+        self.card_widget.pack(fill=tk.BOTH, expand=True)
         self.card_frame = self.card_widget
 
         # Индикатор загрузки
