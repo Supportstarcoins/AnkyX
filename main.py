@@ -3931,7 +3931,7 @@ def speak_google_tts(text: str, lang: str = "de") -> None:
     if not url:
         messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
         return
-    temp_path = os.path.join(get_tts_cache_dir(), f"tts_{cache_key}.mp3")
+    temp_path = os.path.join(get_tts_cache_dir(), f"tts_{int(time.time())}.mp3")
     try:
         request = urllib.request.Request(
             url,
@@ -3942,11 +3942,11 @@ def speak_google_tts(text: str, lang: str = "de") -> None:
         with open(temp_path, "wb") as fh:
             fh.write(data)
         if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1024:
-            raise RuntimeError("TTS файл не создан")
+            raise RuntimeError("TTS файл не создан или пустой")
         _TTS_CACHE[cache_key] = {"path": temp_path, "ts": time.time()}
         play_audio_file(temp_path)
     except Exception as exc:
-        messagebox.showerror("Озвучка", f"Не удалось озвучить текст: {exc}")
+        messagebox.showerror("Озвучка", f"Не удалось озвучить: {exc}")
 
 
 def speak_text(text: str):
@@ -8961,6 +8961,8 @@ class AnkiApp(tk.Tk):
             self._back_img_photo = None
             self._active_img_photo = None
             self._manual_media_photos = {"front": None, "back": None}
+            self._manual_img_photo_front = None
+            self._manual_img_photo_back = None
             self.manual_side = "front"
 
             def current_side() -> str:
@@ -9135,6 +9137,8 @@ class AnkiApp(tk.Tk):
                 media_canvas.delete("all")
                 self._manual_media_photos["front"] = None
                 self._manual_media_photos["back"] = None
+                self._manual_img_photo_front = None
+                self._manual_img_photo_back = None
 
             def _draw_drop_zone(canvas_width: int, canvas_height: int) -> tuple[float, float, float, float]:
                 pad = 16
@@ -9161,8 +9165,8 @@ class AnkiApp(tk.Tk):
 
             def _render_media_in_dropzone(
                 canvas: tk.Canvas,
-                img_path: str,
                 rect_coords: tuple[float, float, float, float],
+                img_path: str,
                 pad: int = 2,
             ) -> tuple[tk.PhotoImage | None, int | None]:
                 x1, y1, x2, y2 = rect_coords
@@ -9180,7 +9184,7 @@ class AnkiApp(tk.Tk):
                         scale = max(photo.width() / max_w, photo.height() / max_h)
                         subsample = int(scale) + 1
                         photo = photo.subsample(subsample, subsample)
-                center = ((x1 + x2) / 2, (y1 + y2) / 2)
+                center = (x1 + pad + max_w // 2, y1 + pad + max_h // 2)
                 item_id = canvas.create_image(
                     center[0],
                     center[1],
@@ -9212,9 +9216,10 @@ class AnkiApp(tk.Tk):
                 if image_path and os.path.exists(image_path):
                     try:
                         photo, media_item_id = _render_media_in_dropzone(
-                            media_canvas, image_path, rect_coords
+                            media_canvas, rect_coords, image_path
                         )
                         self._manual_media_photos[side] = photo
+                        setattr(self, f"_manual_img_photo_{side}", photo)
                         manual_media[side]["pos"] = None
                     except Exception:
                         media_item_id = media_canvas.create_text(
@@ -9386,20 +9391,21 @@ class AnkiApp(tk.Tk):
                 if not url:
                     messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
                     return
-                ensure_media_dir()
-                filename = os.path.join(MEDIA_FOLDER, f"tts_{uuid4().hex}.mp3")
                 try:
+                    filename = os.path.join(get_tts_cache_dir(), f"tts_{int(time.time())}.mp3")
                     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                     with urllib.request.urlopen(request, timeout=10) as response:
                         data = response.read()
                     with open(filename, "wb") as fh:
                         fh.write(data)
+                    if not os.path.exists(filename) or os.path.getsize(filename) < 1024:
+                        raise RuntimeError("TTS файл не создан или пустой")
                     manual_media[side]["audio"] = filename
                     manual_media[side]["pos"] = None
                     add_change_log(f"Озвучка добавлена: {os.path.basename(filename)}")
                     render_media_blocks()
                 except Exception as exc:
-                    messagebox.showerror("Озвучка", f"Не удалось озвучить текст: {exc}")
+                    messagebox.showerror("Озвучка", f"Не удалось озвучить: {exc}")
 
             def clear_media():
                 side = current_side()
