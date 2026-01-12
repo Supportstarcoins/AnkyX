@@ -12613,8 +12613,11 @@ class RepeatWindow(tk.Toplevel):
             highlightbackground=CARD_BORDER,
             highlightthickness=1,
             bd=0,
+            width=700,
+            height=420,
         )
-        card_wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        card_wrap.pack(padx=10, pady=10)
+        card_wrap.pack_propagate(False)
         self.card_widget = CardWidget(card_wrap, palette=colors, editable=False)
         self.card_widget.pack(fill=tk.BOTH, expand=True)
         self.card_frame = self.card_widget
@@ -12630,7 +12633,7 @@ class RepeatWindow(tk.Toplevel):
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
         self.checkpoint_frame = tk.Frame(self.card_frame, bg=card_bg)
-        self.checkpoint_frame.place(x=250, y=470, width=300, height=40)
+        self.checkpoint_frame.place(x=250, y=370, width=300, height=40)
         
         # Создаем 6 чекбоксов в ряд
         self.checkpoint_vars = []
@@ -13173,7 +13176,6 @@ class ReviewWindow(tk.Toplevel):
         self.current_card = self.cards[self.current_index]
         self.show_back = False
         self.current_photo = None
-        self.card_widget: CardWidget | None = None
 
         # Таймеры
         self.auto_flip_id = None
@@ -13182,15 +13184,10 @@ class ReviewWindow(tk.Toplevel):
         self.timer_job = None
         self.timer_label = None
         self.timer_flash_job = None
-        self._timer_fired = False
 
         # Прогресс
         self.progress_canvas = None
         self.progress_label = None
-        self.progress_var = None
-        self.play_progress_value = tk.IntVar(value=0)
-        self.play_progress_label = None
-        self.play_progress_card_id = None
 
         self.title("Режим воспроизведения (Лейтнер)")
         self.geometry("900x600")
@@ -13207,26 +13204,6 @@ class ReviewWindow(tk.Toplevel):
         colors = getattr(self.master, "palette", None)
         card_bg, card_text, _ = get_card_surface_colors(self.master)
 
-        style = ttk.Style(self)
-        style.configure(
-            "PlayGreen.Horizontal.TProgressbar",
-            troughcolor="white",
-            background="#2ecc71",
-        )
-        style.configure(
-            "Playback.Audio.TButton",
-            foreground="#111111",
-            background="white",
-            relief="flat",
-            bordercolor="#111111",
-        )
-        style.map(
-            "Playback.Audio.TButton",
-            foreground=[("active", "#111111"), ("!active", "#111111")],
-            background=[("active", "white"), ("!active", "white")],
-            bordercolor=[("active", "#111111"), ("!active", "#111111")],
-        )
-
         self.lbl_status = ttk.Label(frame_main, text="")
         self.lbl_status.pack(anchor="w")
 
@@ -13240,57 +13217,18 @@ class ReviewWindow(tk.Toplevel):
         )
         self.timer_label.pack(anchor="center", pady=(3, 5))
 
-        controls_strip = ttk.Frame(frame_main)
-        controls_strip.pack(fill=tk.X, pady=(0, 6))
-
-        self.actions_menu_button = self._build_actions_menu(controls_strip)
-        self.actions_menu_button.pack(side=tk.LEFT, padx=5)
-
         # Фрейм карточки
-        cards_bg = tk.Frame(frame_main, bg=DARK_BG)
-        cards_bg.pack(fill=tk.BOTH, expand=True, pady=10)
-        card_wrap = tk.Frame(
-            cards_bg,
-            bg=DARK_BG,
-            highlightbackground=CARD_BORDER,
-            highlightthickness=1,
+        self.card_frame = tk.Frame(
+            frame_main,
+            bg=card_bg,
             bd=0,
+            relief="flat",
+            width=700,
+            height=420
         )
-        card_wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.card_widget = CardWidget(card_wrap, palette=colors, editable=False, show_image_toolbar=False)
-        self.card_widget.pack(fill=tk.BOTH, expand=True)
-        self.card_frame = self.card_widget
-        self.card_widget.disable_scrollbars()
-
-        top_right_controls = tk.Frame(self.card_frame, bg=card_bg)
-        top_right_controls.place(relx=1.0, x=-10, y=10, anchor="ne")
-
-        tk.Button(
-            top_right_controls,
-            text="+",
-            command=lambda: self.card_widget.zoom_image(1.12),
-            bg="white",
-            fg="black",
-            activebackground="white",
-            activeforeground="black",
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground="#111111",
-            width=3,
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(
-            top_right_controls,
-            text="-",
-            command=lambda: self.card_widget.zoom_image(0.88),
-            bg="white",
-            fg="black",
-            activebackground="white",
-            activeforeground="black",
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground="#111111",
-            width=3,
-        ).pack(side=tk.LEFT)
+        style_card_surface(self.card_frame, colors)
+        self.card_frame.pack(pady=10)
+        self.card_frame.pack_propagate(False)
 
         # Индикатор загрузки
         self.dot_canvas = tk.Canvas(self.card_frame, width=20, height=20,
@@ -13308,251 +13246,93 @@ class ReviewWindow(tk.Toplevel):
         )
         self.lbl_level.place(x=5, y=5)
 
-        self.video_inline_frame = self.card_widget.video_inline_frame
-        self.audio_inline_frame = self.card_widget.audio_inline_frame
+        # Контент
+        content_frame = tk.Frame(self.card_frame, bg=card_bg)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=(25, 10))
 
-        # Прогресс-бар (внутри карточки, перед аудио)
-        progress_parent = self.audio_inline_frame.master
-        progress_row = tk.Frame(progress_parent, bg="white")
-        progress_row.pack(fill=tk.X, padx=10, pady=(0, 6), before=self.audio_inline_frame)
-
-        btn_minus = tk.Button(
-            progress_row,
-            text="−",
-            bg="white",
-            fg="black",
-            relief="solid",
-            bd=1,
-            width=3,
-            command=self._playback_dec_progress,
+        self.lbl_text = tk.Label(
+            content_frame,
+            text="",
+            bg=card_bg,
+            fg=card_text,
+            wraplength=420,
+            justify="left",
+            font=("Segoe UI", 12)
         )
-        btn_plus = tk.Button(
-            progress_row,
-            text="+",
-            bg="white",
-            fg="black",
-            relief="solid",
-            bd=1,
-            width=3,
-            command=self._playback_inc_progress,
-        )
+        self.lbl_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
-        self.progress_bar = ttk.Progressbar(
-            progress_row,
-            variable=self.play_progress_value,
-            maximum=100,
-            style="PlayGreen.Horizontal.TProgressbar",
-            length=320,
+        # Изображение с возможностью масштабирования
+        self.image_label = ResizableImageLabel(
+            content_frame,
+            bg=card_bg,
+            text=""
+        )
+        style_card_surface(self.image_label, colors)
+        self.image_label.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        content_frame.bind(
+            "<Configure>",
+            lambda e: self.image_label.set_container_size(e.width - 20, e.height)
         )
 
-        self.play_progress_label = tk.Label(
-            progress_row,
-            text="Сложность: 0/100",
-            bg="white",
-            fg="black",
+        # Прогресс-бар
+        progress_frame = tk.Frame(self.card_frame, bg=card_bg)
+        progress_frame.pack(side=tk.BOTTOM, pady=(0, 4))
+
+        self.progress_canvas = tk.Canvas(
+            progress_frame, width=260, height=14,
+            bg=card_bg, highlightthickness=1, highlightbackground=colors["card_border"] if colors else "#cccccc"
         )
+        self.progress_canvas.pack(side=tk.LEFT, padx=(10, 4))
 
-        btn_minus.pack(side=tk.LEFT, padx=(0, 8))
-        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        btn_plus.pack(side=tk.LEFT, padx=(8, 12))
-        self.play_progress_label.pack(side=tk.LEFT)
-
-        # Нижняя панель управления (фиксированный футер)
-        footer = tk.Frame(frame_main, bg=card_bg)
-        footer.pack(side="bottom", fill="x", pady=(8, 0))
-
-        self.btn_prev = ttk.Button(footer, text="← Назад", command=self.goto_prev_card)
-        self.btn_prev.pack(side="left", padx=10, pady=8)
-
-        self.btn_next = ttk.Button(footer, text="Следующая →", command=self.goto_next_card)
-        self.btn_next.pack(side="right", padx=10, pady=8)
-
-        self.btn_send_phase = ttk.Button(
-            footer,
-            text="Отправить в 1 фазу",
-            command=self.mark_forgotten,
+        self.progress_label = tk.Label(
+            progress_frame,
+            text="0 / 100",
+            bg=card_bg,
+            fg=card_text,
+            font=("Segoe UI", 9),
         )
-        self.btn_send_phase.pack(side="right", padx=10, pady=8)
+        self.progress_label.pack(side=tk.LEFT, padx=4)
 
-        self.btn_show = ttk.Button(footer, text="Показать ответ", command=self.toggle_front_back)
-        self.btn_show.pack(side="left", padx=10, pady=8)
+        self.btn_progress_plus = ttk.Button(
+            progress_frame, text="+", width=3,
+            command=self.increment_progress
+        )
+        self.btn_progress_plus.pack(side=tk.LEFT, padx=(4, 10))
 
-        self.btn_sound = ttk.Button(footer, text="🔊 Слово", command=self.play_word)
-        self.btn_sound.pack(side="left", padx=10, pady=8)
+        self.audio_widget = AudioPlayerWidget(self.card_frame, on_error_callback=self._show_audio_error)
+        self.audio_widget.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
 
+        # Панель кнопок
+        bottom_frame = tk.Frame(self.card_frame, bg=card_bg)
+        bottom_frame.pack(side=tk.BOTTOM, pady=8)
+
+        self.btn_audio_icon = ttk.Button(bottom_frame, text="🔊", width=3, command=self.play_word)
+        self.btn_audio_icon.pack(side=tk.LEFT, padx=5)
+
+        btn_frame = ttk.Frame(frame_main)
+        btn_frame.pack(pady=10)
+
+        self.btn_show = ttk.Button(btn_frame, text="Показать ответ", command=self.toggle_front_back)
+        self.btn_show.grid(row=0, column=0, padx=5)
+
+        self.btn_prev = ttk.Button(btn_frame, text="← Назад", command=self.goto_prev_card)
+        self.btn_prev.grid(row=0, column=1, padx=5)
+
+        self.btn_next = ttk.Button(btn_frame, text="Следующая →", command=self.goto_next_card)
+        self.btn_next.grid(row=0, column=2, padx=5)
+
+
+        self.btn_sound = ttk.Button(btn_frame, text="🔊 Слово", command=self.play_word)
+        self.btn_sound.grid(row=0, column=3, padx=5)
+
+        # Добавить аудио-плеер
+        self.card_frame.audio_widget = self.audio_widget
         self.update_audio_player()
-        self.update_idletasks()
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
         entries = get_card_audio_entries(self.current_card, prefer_side="back" if self.show_back else "front")
-        display_audio_entries_on_frame(self.audio_inline_frame, entries)
-        if entries:
-            if self.card_widget is not None:
-                self.card_widget.show_audio_frame(True)
-            audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
-            if audio_widget is not None:
-                audio_widget.on_state_change = self._handle_media_state_update
-                self._style_audio_buttons(audio_widget)
-                self._apply_audio_state_from_selection()
-                selector = getattr(self.audio_inline_frame, "audio_selector", None)
-                if selector is not None:
-                    selector.bind("<<ComboboxSelected>>", lambda _e: self._apply_audio_state_from_selection())
-        else:
-            if self.card_widget is not None:
-                self.card_widget.show_audio_frame(False)
-        self._update_video_player()
-
-    def _style_audio_buttons(self, audio_widget: AudioPlayerWidget) -> None:
-        try:
-            for btn in (
-                audio_widget.play_btn,
-                audio_widget.pause_btn,
-                audio_widget.stop_btn,
-                audio_widget.volume_btn,
-            ):
-                btn.configure(style="Playback.Audio.TButton")
-        except Exception:
-            pass
-
-    def _apply_audio_state_from_selection(self):
-        audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
-        entry_map = getattr(self.audio_inline_frame, "audio_entry_map", {}) or {}
-        selection = getattr(self.audio_inline_frame, "audio_selector_var", None)
-        if not audio_widget or not selection:
-            return
-        selected_label = selection.get()
-        entry = entry_map.get(selected_label)
-        if not entry:
-            return
-        media_key = _build_media_key(entry.get("media_id"), entry.get("path"))
-        audio_widget.set_media_key(media_key)
-        audio_widget.apply_state(load_media_state(self.current_card["id"], media_key))
-
-    def _update_video_player(self):
-        for widget in self.video_inline_frame.winfo_children():
-            widget.destroy()
-        video_path = find_video_media_path(self.current_card)
-        if not video_path:
-            if self.card_widget is not None:
-                self.card_widget.show_video_frame(True, height=80)
-            ttk.Label(self.video_inline_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
-            return
-        if self.card_widget is not None:
-            self.card_widget.show_video_frame(True, height=140)
-        if is_vlc_available():
-            try:
-                player = VlcPlayerWidget(
-                    self.video_inline_frame,
-                    video_path,
-                    width=420,
-                    height=240,
-                    on_state_change=self._handle_media_state_update,
-                )
-                player.pack(anchor="w")
-                media_entries = get_media_for_card(self.current_card.get("id"), self.current_card.get("note_id"))
-                media_id = None
-                for entry in media_entries:
-                    media_type = (entry.get("media_type") or entry.get("type") or "").lower()
-                    if media_type == "video" and entry.get("path") == video_path:
-                        media_id = entry.get("id")
-                        break
-                media_key = _build_media_key(media_id, video_path)
-                player.set_media_key(media_key)
-                player.apply_state(load_media_state(self.current_card["id"], media_key))
-                self.video_inline_frame.vlc_player = player
-                return
-            except Exception:
-                pass
-        ttk.Button(
-            self.video_inline_frame,
-            text="Открыть во внешнем плеере",
-            command=lambda: open_in_external_player(video_path),
-        ).pack(anchor="w", padx=5, pady=5)
-
-    def _build_actions_menu(self, parent) -> ttk.Menubutton:
-        menu_button, menu = create_action_menubutton(parent, getattr(self.master, "palette", None))
-
-        def _placeholder(action: str) -> None:
-            messagebox.showinfo(action, "Будет реализовано")
-
-        def _card_info() -> None:
-            if not self.current_card:
-                return
-            messagebox.showinfo(
-                "Сведения о карточке",
-                f"ID: {self.current_card.get('id')}\nКолода: {self.current_card.get('deck_id')}",
-            )
-
-        def _reset_card() -> None:
-            if not self.current_card:
-                return
-            update_card_progress(self.current_card["id"], 0)
-            update_card_leitner(self.current_card["id"], 1)
-            self.update_view()
-
-        def _delete_card() -> None:
-            if not self.current_card:
-                return
-            card_id = self.current_card["id"]
-            delete_card(card_id)
-            self.cards = [c for c in self.cards if c["id"] != card_id]
-            self.current_index = min(self.current_index, max(0, len(self.cards) - 1))
-            if not self.cards:
-                messagebox.showinfo("Готово", "Карточки закончились.")
-                self.destroy()
-                return
-            self.current_card = self.cards[self.current_index]
-            self.update_view()
-
-        menu.add_command(
-            label="Отметить карточку",
-            command=lambda: mark_card_for_overview(self.current_card["id"]) if self.current_card else None,
-        )
-        menu.add_command(label="Отложить карточку", command=lambda: _placeholder("Отложить карточку"))
-        menu.add_command(label="Сбросить карточку", command=_reset_card)
-        menu.add_command(label="Задать срок", command=lambda: _placeholder("Задать срок"))
-        menu.add_command(label="Исключить карточку", command=lambda: _placeholder("Исключить карточку"))
-        menu.add_command(label="Сведения о карточке", command=_card_info)
-        menu.add_command(label="Удалить карточку", command=_delete_card)
-
-        return menu_button
-
-    def _handle_media_state_update(self, media_key: str | None, state: dict):
-        if not media_key:
-            return
-        try:
-            save_media_state(
-                self.current_card["id"],
-                media_key,
-                state.get("pos_ms", 0),
-                state.get("volume", 70),
-                state.get("speed", 1),
-            )
-        except Exception:
-            pass
-
-    def save_current_media_state(self):
-        audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
-        if audio_widget and audio_widget.media_key:
-            state = audio_widget.get_state()
-            save_media_state(
-                self.current_card["id"],
-                audio_widget.media_key,
-                state.get("pos_ms", 0),
-                state.get("volume", 70),
-                state.get("speed", 1),
-            )
-        video_player = getattr(self.video_inline_frame, "vlc_player", None)
-        if video_player and video_player.media_key:
-            state = video_player.get_state()
-            save_media_state(
-                self.current_card["id"],
-                video_player.media_key,
-                state.get("pos_ms", 0),
-                state.get("volume", 70),
-                state.get("speed", 1),
-            )
+        display_audio_entries_on_frame(self.card_frame, entries)
 
     def _show_audio_error(self, title: str, message: str):
         try:
@@ -13629,15 +13409,11 @@ class ReviewWindow(tk.Toplevel):
         self.update_timer_label()
         if self.timer_left <= 0:
             self.handle_timer_notify()
-            if not self._timer_fired:
-                self._timer_fired = True
-                self.goto_next_card()
             return
         self.timer_job = self.after(1000, self.timer_tick)
 
     def schedule_timers_for_card(self):
         self.cancel_timers()
-        self._timer_fired = False
         playback_seconds = get_effective_mode_timer(getattr(self.master, "selected_deck_id", None), "playback")
         self.timer_left = max(0, int(playback_seconds or 0))
         self.update_timer_label()
@@ -13677,71 +13453,73 @@ class ReviewWindow(tk.Toplevel):
 
     def auto_mark_and_next(self):
         self.cancel_timers()
-        self.save_current_media_state()
+        card_id = self.current_card["id"]
+        try:
+            apply_srs_update(card_id, 0)
+            update_statistics(self.master.selected_deck_id, remembered=False, forgotten=True, reviewed=True)
+
+            row = get_card_by_id(card_id)
+            if row:
+                self.current_card["leitner_level"] = row["leitner_level"]
+                self.current_card["next_review"] = row["next_review"]
+        except Exception:
+            pass
+
+        self.master.update_overdue_badge()
         self.goto_next_card()
 
     def update_progress_view(self):
-        p = max(0, min(100, int(self.play_progress_value.get())))
-        self.play_progress_value.set(p)
-        if self.play_progress_label is not None:
-            self.play_progress_label.config(text=f"Сложность: {p}/100")
+        if self.progress_canvas is None:
+            return
+        p = int(self.current_card.get("progress") or 0)
+        p = max(0, min(100, p))
 
-    def _playback_reset_progress_for_card(self, card_id):
-        self.play_progress_card_id = card_id
-        self.play_progress_value.set(0)
-        if self.play_progress_label is not None:
-            self.play_progress_label.config(text="Сложность: 0/100")
+        self.progress_canvas.delete("all")
 
-    def _playback_inc_progress(self):
-        v = int(self.play_progress_value.get())
-        v = min(100, v + 1)
-        self.play_progress_value.set(v)
-        if self.play_progress_label is not None:
-            self.play_progress_label.config(text=f"Сложность: {v}/100")
+        self.progress_canvas.create_rectangle(1, 1, 259, 13, outline="#cccccc", fill="white")
 
-    def _playback_dec_progress(self):
-        v = int(self.play_progress_value.get())
-        v = max(0, v - 1)
-        self.play_progress_value.set(v)
-        if self.play_progress_label is not None:
-            self.play_progress_label.config(text=f"Сложность: {v}/100")
+        if p > 0:
+            width = int(258 * p / 100)
+            self.progress_canvas.create_rectangle(
+                1, 1, 1 + width, 13,
+                outline="", fill="#00aa00"
+            )
+
+        if self.progress_label is not None:
+            self.progress_label.config(text=f"{p} / 100")
 
     def update_view(self):
         total = len(self.cards)
         idx = self.current_index + 1
         c = self.current_card
-        if self.play_progress_card_id != c.get("id"):
-            self._playback_reset_progress_for_card(c.get("id"))
 
         self.lbl_status.config(
             text=f"Карточка {idx}/{total} | ID {c['id']}"
         )
 
-        current_level = c["leitner_level"]
-        if getattr(self, "btn_forget", None) is not None:
-            self.btn_forget.config(text="Забыл (Фаза 1)")
-        next_level = min(10, current_level + 1)
-        if getattr(self, "btn_remember", None) is not None:
-            self.btn_remember.config(text=f"Повторить (Фаза {next_level})")
+        # Навигация по карточкам (вместо "Забыл/Повторить")
+        self.btn_prev.config(state=(tk.DISABLED if self.current_index <= 0 else tk.NORMAL))
+        self.btn_next.config(state=(tk.DISABLED if self.current_index >= len(self.cards) - 1 else tk.NORMAL))
+
 
         romans = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
         lvl = c["leitner_level"]
         phase = romans[min(max(lvl, 1), 10) - 1]
         self.lbl_level.config(text=f"Фаза {phase} | след. повтор: {c['next_review']}")
 
-        front_text = c["front"]
-        back_text = c["back"]
         if self.show_back:
+            text = c["back"]
             img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
         else:
+            text = c["front"]
             img_path = c["front_image_path"] or c["image_path"]
 
-        if self.card_widget is not None:
-            self.card_widget.set_text(front_text, back_text)
-            self.card_widget.show_side(self.show_back, img_path)
+        self.lbl_text.config(text=text)
 
-        if getattr(self, "btn_show", None) is not None:
-            self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
+        # Загружаем изображение
+        self._render_card_image(img_path)
+
+        self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
 
         self.update_progress_view()
         self.update_timer_label()
@@ -13784,13 +13562,29 @@ class ReviewWindow(tk.Toplevel):
         messagebox.showinfo("Лейтнер", f"Отлично! Уровень карточки теперь: {self.current_card['leitner_level']}")
         self.goto_next_card()
 
+    def increment_progress(self):
+        card_id = self.current_card["id"]
+        current = int(self.current_card.get("progress") or 0)
+        if current >= 100:
+            return
+        new_value = min(100, current + 1)
+        self.current_card["progress"] = new_value
+        update_card_progress(card_id, new_value)
+        self.update_progress_view()
+
     def goto_prev_card(self):
-        self.cancel_timers()
-        self.save_current_media_state()
+        """Перейти к предыдущей карточке (режим воспроизведения)."""
+        try:
+            self.cancel_timers()
+        except Exception:
+            pass
         if self.current_index <= 0:
-            self.current_index = 0
-            self.update_view()
-            self.schedule_timers_for_card()
+            # Уже на первой карточке
+            try:
+                self.update_view()
+                self.schedule_timers_for_card()
+            except Exception:
+                pass
             return
         self.current_index -= 1
         self.current_card = self.cards[self.current_index]
@@ -13800,7 +13594,6 @@ class ReviewWindow(tk.Toplevel):
 
     def goto_next_card(self):
         self.cancel_timers()
-        self.save_current_media_state()
         self.current_index += 1
         if self.current_index >= len(self.cards):
             messagebox.showinfo("Готово", "Карточки в этом режиме закончились.")
@@ -13812,22 +13605,25 @@ class ReviewWindow(tk.Toplevel):
         self.schedule_timers_for_card()
 
     def play_word(self):
-        selection = get_selected_text_from_widget(self.focus_get())
-        front_text = self.current_card.get("front") or ""
-        text = selection or front_text
-        if not text.strip():
-            messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
+        target_side = "back" if self.show_back else "front"
+        audio_path = get_card_audio_path(self.current_card, prefer_side=target_side)
+        if getattr(self, "audio_widget", None) and self.audio_widget.is_loaded():
+            self.audio_widget.play()
             return
-        if not self.show_back:
-            card_id = self.current_card.get("id")
-            if card_id != self.play_progress_card_id:
-                self._playback_reset_progress_for_card(card_id)
-                self._playback_inc_progress()
-            else:
-                self._playback_inc_progress()
-        deck_id = self.current_card.get("deck_id") or getattr(self.master, "selected_deck_id", None)
-        lang = get_deck_tts_lang(deck_id, "de")
-        speak_google_tts(text, lang)
+        if audio_path and os.path.exists(audio_path) and WINSOUND_AVAILABLE:
+            try:
+                winsound.PlaySound(audio_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                return
+            except Exception:
+                pass
+
+        back = self.current_card["back"]
+        first_line = back.splitlines()[0] if back else ""
+        word = first_line.split()[0] if first_line else ""
+        if not word:
+            messagebox.showinfo("Озвучка", "Не удалось выделить слово для озвучки.")
+            return
+        speak_text(word)
 
 
 class AudioEditorWindow:
