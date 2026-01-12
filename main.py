@@ -4509,6 +4509,11 @@ class AnkiApp(tk.Tk):
         self.main_notebook: ttk.Notebook | None = None
         self.dashboard_tab: ttk.Frame | None = None
         self.personal_tab = None
+        self.functions_tab: ttk.Frame | None = None
+        self.settings_tab: ttk.Frame | None = None
+        self.generation_tab: ttk.Frame | None = None
+        self.modes_tab: ttk.Frame | None = None
+        self.stats_tab: ttk.Frame | None = None
         self.ledger_tree: ttk.Treeview | None = None
         self.ref_summary_vars: dict[str, tk.StringVar] = {}
         self.activation_progress_vars: dict[str, tk.DoubleVar] = {}
@@ -4524,8 +4529,15 @@ class AnkiApp(tk.Tk):
         self.credit_icon_image = None
         self.credit_icon_small = None
         self.credit_icon_large = None
+        self.credit_icon_list = None
         self.generation_menu = None
         self.generation_menu_indexes: dict[str, int] = {}
+        self.generation_action_buttons: list[tk.Button] = []
+        self.premium_action_labels: list[tk.Label] = []
+        self.appbar_tab_buttons: dict[str, tk.Button] = {}
+        self.appbar_tab_indicators: dict[str, tk.Frame] = {}
+        self.section_tabs: dict[str, ttk.Frame] = {}
+        self.settings_panel_container: tk.Frame | None = None
         self.mode_actions: dict[str, callable] = {}
         self.user_id_var = tk.StringVar(value=self.user_id)
         self.account_status_var = tk.StringVar(value="")
@@ -4542,7 +4554,6 @@ class AnkiApp(tk.Tk):
             "playback": self.start_playback_mode,
         }
 
-        self.create_menu()
         self.create_widgets()
         self.refresh_decks()
         self.refresh_balance_display()
@@ -4645,90 +4656,6 @@ class AnkiApp(tk.Tk):
     def run_task(self, title: str, mode: str, task_fn, on_success, on_error, total=None):
         self.task_runner.run_task(title, mode, task_fn, on_success, on_error, total)
 
-    # --------- меню ---------
-
-    def create_menu(self):
-        menubar = tk.Menu(self)
-
-        file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Импорт Anki (.apkg)", command=self.open_apkg_import_window)
-        file_menu.add_separator()
-        file_menu.add_command(label="Новая колода", command=self.add_deck_window)
-        file_menu.add_command(label="Редактировать колоду", command=self.edit_deck_window)
-        file_menu.add_command(label="Удалить выбранную колоду", command=self.delete_selected_deck)
-        menubar.add_cascade(label="Файл", menu=file_menu)
-
-        settings_menu = tk.Menu(menubar, tearoff=0)
-        settings_menu.add_command(label="OpenAI API ключ", command=self.open_settings_window)
-        settings_menu.add_command(label="Аудиоустройство (цифровой слух)",
-                                  command=self.open_audio_device_window)
-        settings_menu.add_command(label="Настройки перевода",
-                                  command=self.open_translation_settings_window)
-        settings_menu.add_command(label="Управление словарями",
-                                  command=self.open_dictionary_manager_window)
-        menubar.add_cascade(label="Настройки", menu=settings_menu)
-
-        gen_menu = tk.Menu(menubar, tearoff=0)
-        self.generation_menu = gen_menu
-        gen_menu.add_command(label="Генерация из текста…", command=self.open_generate_from_text_window)
-        self.generation_menu_indexes["text"] = gen_menu.index("end")
-        gen_menu.add_command(
-            label="Генерация по конспекту AI + картинки…",
-            command=self.open_generate_from_notes_window,
-        )
-        gen_menu.add_command(
-            label="Режим генерация из текста AI 👑",
-            command=self.open_generate_from_text_ai_window,
-        )
-        self.generation_menu_indexes["text_ai"] = gen_menu.index("end")
-        gen_menu.add_command(
-            label="Генерация из изображения (OCR) 👑 (1⚡/стр)",
-            command=self.open_generate_from_image_window,
-        )
-        self.generation_menu_indexes["ocr"] = gen_menu.index("end")
-        gen_menu.add_command(label="Генерация через цифровой слух…",
-                             command=self.open_generate_from_speech_window)
-        gen_menu.add_command(label="Генерация из видео (цифровой слух)…",
-                             command=self.open_generate_from_video_window)
-        gen_menu.add_command(label="Видео → клипы → карточки",
-                             command=self.open_video_clip_window)
-        gen_menu.add_command(
-            label="Импорт картинок по ID (CSV) 👑 (5⚡/операция)",
-            command=self.open_image_id_import_window,
-        )
-        self.generation_menu_indexes["image_id_import"] = gen_menu.index("end")
-        gen_menu.add_command(label="Импорт CSV колоды", command=self.open_csv_import_window)
-        gen_menu.add_command(
-            label="Картинки по CSV (Wikimedia) 👑 (5⚡ за 10 импортов)",
-            command=self.open_wikimedia_csv_window,
-        )
-        self.generation_menu_indexes["wikimedia"] = gen_menu.index("end")
-        menubar.add_cascade(label="Режим генерации", menu=gen_menu)
-        self.refresh_generation_menu_state()
-
-        modes_menu = tk.Menu(menubar, tearoff=0)
-        modes_menu.add_command(
-            label="Режим повторения (по дате)",
-            command=self.mode_actions.get("repeat", self.start_repeat_mode)
-        )
-        modes_menu.add_command(
-            label="Режим воспроизведения (по прогрессу)",
-            command=self.mode_actions.get("playback", self.start_playback_mode)
-        )
-        modes_menu.add_command(label="Режим обзора / редактирования",
-                               command=self.show_cards_window)
-        modes_menu.add_command(label="Режим ознакомления",
-                               command=self.start_overview_mode)
-        menubar.add_cascade(label="Режимы", menu=modes_menu)
-
-        # Добавляем меню статистики
-        stats_menu = tk.Menu(menubar, tearoff=0)
-        stats_menu.add_command(label="Показать статистику", command=self.show_statistics_window)
-        stats_menu.add_command(label="Статистика словаря", command=self.show_dictionary_stats_window)
-        menubar.add_cascade(label="Статистика", menu=stats_menu)
-
-        self.config(menu=menubar)
-    
     def open_generate_from_video_window(self):
         """Открыть окно генерации из видео"""
         if self.selected_deck_id is None:
@@ -6658,55 +6585,123 @@ class AnkiApp(tk.Tk):
         return btn
 
     def create_widgets(self):
-        menu_divider = tk.Frame(self, height=1, bg=self.palette["border"])
-        menu_divider.pack(fill=tk.X)
+        palette = self.palette
+        appbar = tk.Frame(self, bg=palette["background"], height=56)
+        appbar.pack(side="top", fill="x")
+        appbar.pack_propagate(False)
 
-        header_pad = (8, 8)
-        header = ttk.Frame(self, style="Header.TFrame")
-        header.pack(fill=tk.X, padx=16, pady=(12, 8))
-        logo_wrap = ttk.Frame(header, width=48, height=48)
+        left_block = tk.Frame(appbar, bg=palette["background"])
+        left_block.pack(side=tk.LEFT, padx=16)
+        logo_wrap = tk.Frame(left_block, width=36, height=36, bg=palette["background"])
         logo_wrap.pack_propagate(False)
-        logo_wrap.pack(side=tk.LEFT, padx=(10, 8), pady=header_pad)
+        logo_wrap.pack(side=tk.LEFT, padx=(0, 10))
         if self._logo_small is not None:
-            logo_lbl = tk.Label(logo_wrap, image=self._logo_small, bd=0, highlightthickness=0)
+            logo_lbl = tk.Label(logo_wrap, image=self._logo_small, bd=0, highlightthickness=0, bg=palette["background"])
             logo_lbl.pack(fill="both", expand=True)
-        title_lbl = ttk.Label(header, text="X-FLASH", style="Title.TLabel")
-        title_lbl.pack(side=tk.LEFT, padx=(0, 12), pady=header_pad)
+        tk.Label(
+            left_block,
+            text="X-FLASH",
+            bg=palette["background"],
+            fg=palette["text"],
+            font=("Segoe UI", 14, "bold"),
+        ).pack(side=tk.LEFT)
 
-        quick_actions = ttk.Frame(header, style="Header.TFrame")
-        quick_actions.pack(side=tk.RIGHT, pady=header_pad)
-        ttk.Button(quick_actions, text="Импорт .apkg", style="Secondary.TButton", command=self.open_apkg_import_window).pack(side=tk.LEFT, padx=6)
-        ttk.Button(quick_actions, text="Импорт CSV", style="Secondary.TButton", command=self.open_csv_import_window).pack(side=tk.LEFT, padx=6)
-        ttk.Button(quick_actions, text="Новая колода", style="Primary.TButton", command=self.add_deck_window).pack(side=tk.LEFT, padx=(10, 0))
+        tabs_frame = tk.Frame(appbar, bg=palette["background"])
+        tabs_frame.pack(side=tk.TOP, expand=True)
 
-        account_bar = ttk.Frame(header, style="Header.TFrame")
-        account_bar.pack(side=tk.RIGHT, padx=(0, 12), pady=header_pad)
+        right_block = tk.Frame(appbar, bg=palette["background"])
+        right_block.pack(side=tk.RIGHT, padx=16)
 
-        balance_frame = ttk.Frame(account_bar, style="Header.TFrame")
-        balance_frame.pack(side=tk.RIGHT, padx=(0, 8))
-        balance_icon = self._load_credit_icon(size=32)
+        balance_frame = tk.Frame(right_block, bg=palette["background"])
+        balance_frame.pack(side=tk.RIGHT, padx=(8, 0))
+        balance_icon = self._load_credit_icon(size=20)
         if balance_icon:
             self.credit_icon_small = balance_icon
             self.credit_icon_image = balance_icon
-            ttk.Label(balance_frame, image=balance_icon, style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+            tk.Label(balance_frame, image=balance_icon, bg=palette["background"]).pack(side=tk.LEFT, padx=(0, 6))
         else:
-            ttk.Label(balance_frame, text="ⓘ", style="HeaderSub.TLabel").pack(side=tk.LEFT, padx=(0, 4))
-        lbl_balance = ttk.Label(
+            tk.Label(balance_frame, text="ⓘ", bg=palette["background"], fg=palette["muted"]).pack(side=tk.LEFT, padx=(0, 4))
+        lbl_balance = tk.Label(
             balance_frame,
             textvariable=self.balance_var,
-            style="HeaderSub.TLabel",
-            font=("Segoe UI", 16, "bold"),
+            bg=palette["background"],
+            fg=palette["text"],
+            font=("Segoe UI", 13, "bold"),
         )
         lbl_balance.pack(side=tk.LEFT)
         self.balance_labels.append(self.balance_var)
         self.balance_widgets.append(lbl_balance)
 
-        ttk.Button(
-            account_bar,
-            text="Личный кабинет",
-            style="Ghost.TButton",
-            command=self.open_personal_tab,
-        ).pack(side=tk.RIGHT)
+        def _mk_appbar_button(text, command, accent=False):
+            base_bg = palette["background"]
+            hover_bg = palette["panel2"]
+            fg = palette["text"]
+            btn = tk.Button(
+                right_block,
+                text=text,
+                command=command,
+                bg=base_bg,
+                fg=fg,
+                activebackground=hover_bg,
+                activeforeground=fg,
+                relief="flat",
+                bd=0,
+                padx=12,
+                pady=6,
+                font=("Segoe UI", 11, "bold" if accent else "normal"),
+                cursor="hand2",
+            )
+
+            def _enter(_e):
+                btn.configure(bg=hover_bg)
+
+            def _leave(_e):
+                btn.configure(bg=base_bg)
+
+            btn.bind("<Enter>", _enter)
+            btn.bind("<Leave>", _leave)
+            return btn
+
+        _mk_appbar_button("Личный кабинет", self.open_personal_tab).pack(side=tk.RIGHT, padx=(8, 0))
+        _mk_appbar_button("Новая колода", self.add_deck_window, accent=True).pack(side=tk.RIGHT, padx=(8, 0))
+        _mk_appbar_button("Импорт CSV", self.open_csv_import_window).pack(side=tk.RIGHT, padx=(8, 0))
+        _mk_appbar_button("Импорт .apkg", self.open_apkg_import_window).pack(side=tk.RIGHT, padx=(8, 0))
+
+        def _mk_tab_button(tab_name):
+            tab_wrap = tk.Frame(tabs_frame, bg=palette["background"])
+            tab_wrap.pack(side=tk.LEFT, padx=4)
+            btn = tk.Button(
+                tab_wrap,
+                text=tab_name,
+                bg=palette["background"],
+                fg=palette["text"],
+                activebackground=palette["panel2"],
+                activeforeground=palette["text"],
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=4,
+                font=("Segoe UI", 11),
+                cursor="hand2",
+                command=lambda: self.show_section(tab_name),
+            )
+            btn.pack()
+            indicator = tk.Frame(tab_wrap, height=2, bg=palette["background"])
+            indicator.pack(fill=tk.X, pady=(2, 0))
+            self.appbar_tab_buttons[tab_name] = btn
+            self.appbar_tab_indicators[tab_name] = indicator
+
+        for tab_name in (
+            "Главная",
+            "Функции",
+            "Настройки",
+            "Режим генерации",
+            "Режимы",
+            "Статистика",
+        ):
+            _mk_tab_button(tab_name)
+
+        tk.Frame(self, height=1, bg=palette["border"]).pack(fill=tk.X)
 
         shell = ttk.Frame(self, style="Surface.TFrame")
         shell.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
@@ -6720,10 +6715,39 @@ class AnkiApp(tk.Tk):
 
         self.personal_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
         self.main_notebook.add(self.personal_tab, text="Личный кабинет")
+        self.functions_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
+        self.main_notebook.add(self.functions_tab, text="Функции")
+        self.settings_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
+        self.main_notebook.add(self.settings_tab, text="Настройки")
+        self.generation_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
+        self.main_notebook.add(self.generation_tab, text="Режим генерации")
+        self.modes_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
+        self.main_notebook.add(self.modes_tab, text="Режимы")
+        self.stats_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
+        self.main_notebook.add(self.stats_tab, text="Статистика")
         self.main_notebook.bind("<<NotebookTabChanged>>", self._on_main_tab_changed)
         self.main_notebook.select(self.dashboard_tab)
 
+        self.section_tabs = {
+            "Главная": self.dashboard_tab,
+            "Функции": self.functions_tab,
+            "Настройки": self.settings_tab,
+            "Режим генерации": self.generation_tab,
+            "Режимы": self.modes_tab,
+            "Статистика": self.stats_tab,
+        }
+
+        self.generation_action_buttons = []
+        self.premium_action_labels = []
+
         self.build_personal_tab(self.personal_tab)
+        self.build_functions_tab(self.functions_tab)
+        self.build_settings_tab(self.settings_tab)
+        self.build_generation_tab(self.generation_tab)
+        self.build_modes_tab(self.modes_tab)
+        self.build_stats_tab(self.stats_tab)
+        self.refresh_generation_menu_state()
+        self._set_active_appbar_tab("Главная")
 
         main_container = ttk.PanedWindow(dashboard_tab, orient=tk.HORIZONTAL)
         main_container.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -6877,6 +6901,514 @@ class AnkiApp(tk.Tk):
             btn = self._mk_wrapped_tk_button(action_frame, text, command, style_name, wraplength=180)
             btn.grid(row=row, column=col, columnspan=span, padx=6, pady=6, sticky="nsew")
 
+    def _extract_price_text(self, label: str) -> str:
+        if "⚡" in label:
+            match = re.search(r"\(([^)]*⚡[^)]*)\)", label)
+            if match:
+                return match.group(1)
+            match = re.search(r"(\d+\s*⚡[^\s)]*)", label)
+            if match:
+                return match.group(1)
+        return "0"
+
+    def _get_generation_items(self) -> list[dict]:
+        return [
+            {"label": "Генерация из текста…", "command": self.open_generate_from_text_window},
+            {"label": "Генерация по конспекту AI + картинки…", "command": self.open_generate_from_notes_window},
+            {"label": "Режим генерация из текста AI 👑", "command": self.open_generate_from_text_ai_window, "premium": True},
+            {"label": "Генерация из изображения (OCR) 👑 (1⚡/стр)", "command": self.open_generate_from_image_window, "premium": True},
+            {"label": "Генерация через цифровой слух…", "command": self.open_generate_from_speech_window},
+            {"label": "Генерация из видео (цифровой слух)…", "command": self.open_generate_from_video_window},
+            {"label": "Видео → клипы → карточки", "command": self.open_video_clip_window},
+            {"label": "Импорт картинок по ID (CSV) 👑 (5⚡/операция)", "command": self.open_image_id_import_window, "premium": True},
+            {"label": "Импорт CSV колоды", "command": self.open_csv_import_window},
+            {"label": "Картинки по CSV (Wikimedia) 👑 (5⚡ за 10 импортов)", "command": self.open_wikimedia_csv_window, "premium": True},
+        ]
+
+    def _get_modes_items(self) -> list[dict]:
+        return [
+            {
+                "label": "Режим повторения (по дате)",
+                "command": self.mode_actions.get("repeat", self.start_repeat_mode),
+            },
+            {
+                "label": "Режим воспроизведения (по прогрессу)",
+                "command": self.mode_actions.get("playback", self.start_playback_mode),
+            },
+            {"label": "Режим обзора / редактирования", "command": self.show_cards_window},
+            {"label": "Режим ознакомления", "command": self.start_overview_mode},
+        ]
+
+    def _get_stats_items(self) -> list[dict]:
+        return [
+            {"label": "Показать статистику", "command": self.show_statistics_window},
+            {"label": "Статистика словаря", "command": self.show_dictionary_stats_window},
+        ]
+
+    def _get_function_items(self) -> list[dict]:
+        items = [
+            {"label": "Импорт Anki (.apkg)", "command": self.open_apkg_import_window},
+            {"label": "Новая колода", "command": self.add_deck_window},
+            {"label": "Редактировать колоду", "command": self.edit_deck_window},
+            {"label": "Удалить выбранную колоду", "command": self.delete_selected_deck},
+        ]
+        items.extend(self._get_generation_items())
+        items.extend(self._get_modes_items())
+        items.extend(self._get_stats_items())
+        return items
+
+    def _build_action_list(self, parent: tk.Frame, items: list[dict], title: str | None = None) -> None:
+        palette = self.palette
+        container = tk.Frame(parent, bg=palette["background"])
+        container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        if title:
+            tk.Label(
+                container,
+                text=title,
+                bg=palette["background"],
+                fg=palette["text"],
+                font=("Segoe UI", 16, "bold"),
+            ).pack(anchor="w", pady=(0, 12))
+
+        body = tk.Frame(container, bg=palette["background"])
+        body.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(body, bg=palette["background"], highlightthickness=0)
+        scrollbar = tk.Scrollbar(
+            body,
+            orient="vertical",
+            command=canvas.yview,
+            bg="#0b0f16",
+            troughcolor="#05070b",
+            activebackground="#121a26",
+            highlightthickness=0,
+            bd=0,
+            width=12,
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        list_frame = tk.Frame(canvas, bg=palette["background"])
+        canvas.create_window((0, 0), window=list_frame, anchor="nw")
+
+        def _on_frame_configure(_event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        list_frame.bind("<Configure>", _on_frame_configure)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        if self.credit_icon_list is None:
+            self.credit_icon_list = self._load_credit_icon(size=16)
+
+        for item in items:
+            row = tk.Frame(
+                list_frame,
+                bg=palette["panel"],
+                highlightthickness=1,
+                highlightbackground=palette["border"],
+            )
+            row.pack(fill=tk.X, pady=6)
+
+            btn = tk.Button(
+                row,
+                text=item["label"],
+                command=item["command"],
+                bg=palette["panel"],
+                fg=palette["text"],
+                activebackground=palette["panel2"],
+                activeforeground=palette["text"],
+                relief="flat",
+                bd=0,
+                padx=12,
+                pady=10,
+                anchor="w",
+                font=("Segoe UI", 12),
+                cursor="hand2",
+            )
+            btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            price_frame = tk.Frame(row, bg=palette["panel"])
+            price_frame.pack(side=tk.RIGHT, padx=12)
+            if self.credit_icon_list:
+                tk.Label(price_frame, image=self.credit_icon_list, bg=palette["panel"]).pack(side=tk.LEFT, padx=(0, 6))
+            price_text = item.get("price") or self._extract_price_text(item["label"])
+            price_label = tk.Label(
+                price_frame,
+                text=price_text,
+                bg=palette["panel"],
+                fg=palette["muted"],
+                font=("Segoe UI", 11, "bold"),
+            )
+            price_label.pack(side=tk.LEFT)
+
+            if item.get("premium"):
+                self.generation_action_buttons.append(btn)
+                self.premium_action_labels.append(price_label)
+
+    def build_functions_tab(self, parent: ttk.Frame) -> None:
+        self._build_action_list(parent, self._get_function_items(), title="Функции")
+
+    def build_generation_tab(self, parent: ttk.Frame) -> None:
+        self._build_action_list(parent, self._get_generation_items(), title="Режим генерации")
+
+    def build_modes_tab(self, parent: ttk.Frame) -> None:
+        self._build_action_list(parent, self._get_modes_items(), title="Режимы")
+
+    def build_stats_tab(self, parent: ttk.Frame) -> None:
+        self._build_action_list(parent, self._get_stats_items(), title="Статистика")
+
+    def build_settings_tab(self, parent: ttk.Frame) -> None:
+        palette = self.palette
+        container = tk.Frame(parent, bg=palette["background"])
+        container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        sidebar = tk.Frame(container, bg=palette["panel"], width=240)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
+
+        body = tk.Frame(container, bg=palette["panel"])
+        body.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        self.settings_panel_container = body
+
+        listbox = tk.Listbox(
+            sidebar,
+            bg=palette["panel"],
+            fg=palette["text"],
+            highlightthickness=0,
+            selectbackground=palette["panel2"],
+            selectforeground=palette["text"],
+            relief="flat",
+        )
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        scrollbar = tk.Scrollbar(
+            sidebar,
+            orient="vertical",
+            command=listbox.yview,
+            bg="#0b0f16",
+            troughcolor="#05070b",
+            activebackground="#121a26",
+            highlightthickness=0,
+            bd=0,
+            width=12,
+        )
+        listbox.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        categories = [
+            "OpenAI API ключ",
+            "Аудиоустройство (цифровой слух)",
+            "Настройки перевода",
+            "Управление словарями",
+        ]
+        for item in categories:
+            listbox.insert(tk.END, item)
+
+        def _on_select(_event=None):
+            selection = listbox.curselection()
+            if not selection:
+                return
+            value = listbox.get(selection[0])
+            self._show_settings_panel(value)
+
+        listbox.bind("<<ListboxSelect>>", _on_select)
+        listbox.selection_set(0)
+        _on_select()
+
+    def _clear_frame(self, frame: tk.Widget) -> None:
+        for child in frame.winfo_children():
+            child.destroy()
+
+    def _show_settings_panel(self, name: str) -> None:
+        if not self.settings_panel_container:
+            return
+        container = self.settings_panel_container
+        self._clear_frame(container)
+        if name == "OpenAI API ключ":
+            self._build_openai_settings_panel(container)
+        elif name == "Аудиоустройство (цифровой слух)":
+            self._build_audio_device_panel(container)
+        elif name == "Настройки перевода":
+            self._build_translation_settings_panel(container)
+        elif name == "Управление словарями":
+            self._build_dictionary_manager_panel(container)
+
+    def _build_openai_settings_panel(self, parent: tk.Frame) -> None:
+        palette = self.palette
+        tk.Label(
+            parent,
+            text="API ключ OpenAI (формат sk-... / sk-proj-...; хранится только в памяти):",
+            bg=palette["panel"],
+            fg=palette["text"],
+            anchor="w",
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        entry_key = ttk.Entry(parent, show="*")
+        entry_key.pack(fill=tk.X, padx=12, pady=6)
+        create_context_menu(entry_key)
+
+        if OPENAI_API_KEY:
+            entry_key.insert(0, OPENAI_API_KEY)
+
+        def paste_from_clipboard():
+            try:
+                text = parent.clipboard_get()
+            except tk.TclError:
+                text = ""
+            entry_key.delete(0, tk.END)
+            entry_key.insert(0, text.strip())
+
+        ttk.Button(parent, text="Вставить из буфера обмена", command=paste_from_clipboard).pack(anchor="e", padx=12)
+
+        def save_key():
+            global OPENAI_API_KEY
+            key = entry_key.get().strip()
+            OPENAI_API_KEY = key or None
+            messagebox.showinfo("Сохранено", "Ключ сохранён в памяти приложения.")
+
+        ttk.Button(parent, text="Сохранить", command=save_key).pack(anchor="e", padx=12, pady=12)
+
+    def _build_translation_settings_panel(self, parent: tk.Frame) -> None:
+        palette = self.palette
+        wrap = tk.Frame(parent, bg=palette["panel"])
+        wrap.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        use_dict_var = tk.BooleanVar(value=TRANSLATION_SETTINGS.use_embedded_dict)
+        ttk.Checkbutton(
+            wrap,
+            text="Использовать встроенный словарь",
+            variable=use_dict_var,
+        ).pack(anchor="w", pady=(0, 8))
+
+        use_openai_var = tk.BooleanVar(value=TRANSLATION_SETTINGS.use_openai)
+        ttk.Checkbutton(
+            wrap,
+            text="Использовать OpenAI для перевода (если есть ключ)",
+            variable=use_openai_var,
+        ).pack(anchor="w", pady=8)
+
+        show_trans_var = tk.BooleanVar(value=TRANSLATION_SETTINGS.show_translations)
+        ttk.Checkbutton(
+            wrap,
+            text="Показывать переводы над словами в режиме повторения (лицевая сторона)",
+            variable=show_trans_var,
+        ).pack(anchor="w", pady=8)
+
+        show_back_var = tk.BooleanVar(value=TRANSLATION_SETTINGS.show_back_translation)
+        ttk.Checkbutton(
+            wrap,
+            text="Всегда показывать русский перевод на задней стороне карточки",
+            variable=show_back_var,
+        ).pack(anchor="w", pady=8)
+
+        ttk.Label(wrap, text="Приоритет перевода:").pack(anchor="w", pady=(8, 4))
+        priority_var = tk.StringVar(value="dictionary")
+        ttk.Radiobutton(
+            wrap,
+            text="Сначала словарь, потом OpenAI",
+            variable=priority_var,
+            value="dictionary",
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            wrap,
+            text="Сначала OpenAI, потом словарь",
+            variable=priority_var,
+            value="openai",
+        ).pack(anchor="w")
+
+        def save_settings():
+            TRANSLATION_SETTINGS.use_embedded_dict = use_dict_var.get()
+            TRANSLATION_SETTINGS.use_openai = use_openai_var.get()
+            TRANSLATION_SETTINGS.show_translations = show_trans_var.get()
+            TRANSLATION_SETTINGS.show_back_translation = show_back_var.get()
+            TRANSLATION_SETTINGS.save()
+            messagebox.showinfo("Сохранено", "Настройки перевода сохранены.")
+
+        ttk.Button(wrap, text="Сохранить", command=save_settings).pack(anchor="e", pady=12)
+
+    def _build_audio_device_panel(self, parent: tk.Frame) -> None:
+        palette = self.palette
+        wrap = tk.Frame(parent, bg=palette["panel"])
+        wrap.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        if not SR_AVAILABLE:
+            ttk.Label(
+                wrap,
+                text=(
+                    "Чтобы выбрать микрофон, установите SpeechRecognition и PyAudio:\n"
+                    "pip install SpeechRecognition pyaudio"
+                ),
+            ).pack(anchor="w")
+            return
+
+        try:
+            devices = sr.Microphone.list_microphone_names()
+        except Exception as e:
+            ttk.Label(wrap, text=f"Не удалось получить список устройств:\n{e}").pack(anchor="w")
+            return
+
+        ttk.Label(
+            wrap,
+            text=(
+                "Выбери устройство записи, которое будет слушать звук\n"
+                "в режиме «Генерация через цифрового слуха».\n\n"
+                "Для VB-Audio Cable обычно это CABLE Output."
+            ),
+        ).pack(anchor="w", pady=(0, 8))
+
+        listbox = tk.Listbox(wrap, height=10)
+        listbox.pack(fill=tk.BOTH, expand=True)
+
+        selected_initial = 0
+        for i, name in enumerate(devices):
+            listbox.insert(tk.END, f"{i}: {name}")
+            if self.microphone_index is not None and i == self.microphone_index:
+                selected_initial = i
+
+        if devices:
+            listbox.selection_set(selected_initial)
+            listbox.see(selected_initial)
+
+        def save_device():
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showwarning("Не выбрано", "Выберите устройство.")
+                return
+            idx = selection[0]
+            self.microphone_index = idx
+            messagebox.showinfo("Сохранено", f"Выбрано устройство: {devices[idx]}")
+
+        ttk.Button(wrap, text="Сохранить", command=save_device).pack(anchor="e", pady=12)
+
+    def _build_dictionary_manager_panel(self, parent: tk.Frame) -> None:
+        palette = self.palette
+        wrap = tk.Frame(parent, bg=palette["panel"])
+        wrap.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        stats_frame = ttk.LabelFrame(wrap, text="Статистика словаря")
+        stats_frame.pack(fill=tk.X, padx=6, pady=6)
+
+        stats = DICTIONARY_MANAGER.get_statistics()
+        stats_text = f"""
+        Всего слов в словаре: {stats['total_words']:,}
+        Загруженные файлы: {len(stats['loaded_files'])}
+        Используемая память: {stats['memory_size_mb']:.2f} МБ
+
+        Формат: немецкое слово -> русский перевод
+        """
+        ttk.Label(stats_frame, text=stats_text, justify=tk.LEFT).pack(padx=10, pady=10)
+
+        if stats["loaded_files"]:
+            files_frame = ttk.LabelFrame(wrap, text="Загруженные файлы словарей")
+            files_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+            listbox = tk.Listbox(files_frame)
+            listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            for file in stats["loaded_files"]:
+                listbox.insert(tk.END, file)
+
+        mgmt_frame = ttk.LabelFrame(wrap, text="Управление словарями")
+        mgmt_frame.pack(fill=tk.X, padx=6, pady=6)
+        btn_frame = ttk.Frame(mgmt_frame)
+        btn_frame.pack(padx=10, pady=10)
+
+        def refresh_panel():
+            self._show_settings_panel("Управление словарями")
+
+        def load_dictionary():
+            filetypes = [
+                ("CSV файлы", "*.csv"),
+                ("JSON файлы", "*.json"),
+                ("Сжатые файлы", "*.gz *.json.gz"),
+                ("Все файлы", "*.*"),
+            ]
+            filename = filedialog.askopenfilename(
+                title="Выберите файл словаря",
+                filetypes=filetypes,
+            )
+            if filename:
+                try:
+                    if filename.endswith(".csv"):
+                        count = DICTIONARY_MANAGER.load_from_csv(filename)
+                        messagebox.showinfo("Успех", f"Загружено {count} слов из {filename}")
+                    elif filename.endswith(".json"):
+                        count = DICTIONARY_MANAGER.load_from_json(filename)
+                        messagebox.showinfo("Успех", f"Загружено {count} слов из {filename}")
+                    elif filename.endswith((".gz", ".json.gz")):
+                        count = DICTIONARY_MANAGER.load_from_compressed(filename)
+                        messagebox.showinfo("Успех", f"Загружено {count} слов из {filename}")
+
+                    if filename not in TRANSLATION_SETTINGS.dictionary_paths:
+                        TRANSLATION_SETTINGS.dictionary_paths.append(filename)
+                        TRANSLATION_SETTINGS.save()
+                    refresh_panel()
+                except Exception as e:
+                    messagebox.showerror("Ошибка", f"Не удалось загрузить словарь:\n{e}")
+
+        def export_dictionary():
+            filename = filedialog.asksaveasfilename(
+                title="Экспорт словаря",
+                defaultextension=".csv",
+                filetypes=[("CSV файлы", "*.csv"), ("Все файлы", "*.*")],
+            )
+            if filename:
+                try:
+                    DICTIONARY_MANAGER.export_to_csv(filename)
+                    messagebox.showinfo("Успех", f"Словарь экспортирован в {filename}")
+                except Exception as e:
+                    messagebox.showerror("Ошибка", f"Не удалось экспортировать словарь:\n{e}")
+
+        def save_compressed():
+            filename = filedialog.asksaveasfilename(
+                title="Сохранить сжатый словарь",
+                defaultextension=".json.gz",
+                filetypes=[("Сжатые JSON файлы", "*.json.gz"), ("Все файлы", "*.*")],
+            )
+            if filename:
+                try:
+                    DICTIONARY_MANAGER.save_compressed_dictionary(filename)
+                    messagebox.showinfo("Успех", f"Словарь сохранен в {filename}")
+                except Exception as e:
+                    messagebox.showerror("Ошибка", f"Не удалось сохранить словарь:\n{e}")
+
+        def search_word():
+            search_win = tk.Toplevel(parent)
+            search_win.title("Поиск слова")
+            search_win.geometry("400x300")
+            search_win.grab_set()
+
+            ttk.Label(search_win, text="Введите слово для поиска:").pack(padx=10, pady=(10, 0))
+
+            entry = ttk.Entry(search_win)
+            entry.pack(fill=tk.X, padx=10, pady=5)
+
+            results_text = tk.Text(search_win, height=10)
+            results_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+            def perform_search():
+                word = entry.get().strip()
+                if word:
+                    results = DICTIONARY_MANAGER.search_words(word, limit=20)
+                    results_text.delete(1.0, tk.END)
+                    if results:
+                        for german, russian in results:
+                            results_text.insert(tk.END, f"{german} -> {russian}\n")
+                    else:
+                        results_text.insert(tk.END, "Совпадений не найдено")
+
+            ttk.Button(search_win, text="Поиск", command=perform_search).pack(pady=10)
+
+        ttk.Button(btn_frame, text="Загрузить словарь", command=load_dictionary).grid(row=0, column=0, padx=5, pady=5)
+        ttk.Button(btn_frame, text="Экспорт в CSV", command=export_dictionary).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(btn_frame, text="Сохранить сжатый", command=save_compressed).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(btn_frame, text="Поиск слова", command=search_word).grid(row=1, column=0, padx=5, pady=5, columnspan=3)
+
     def _load_credit_icon(self, size: int = 18):
         search_paths = [Path("iconcoin1.png"), Path("icon credits.jpeg")]
         for path in search_paths:
@@ -6893,6 +7425,23 @@ class AnkiApp(tk.Tk):
                 continue
         return None
 
+    def show_section(self, section_name: str) -> None:
+        if not self.main_notebook:
+            return
+        tab = self.section_tabs.get(section_name)
+        if not tab:
+            return
+        self.main_notebook.select(tab)
+        self._set_active_appbar_tab(section_name)
+
+    def _set_active_appbar_tab(self, active_name: str | None) -> None:
+        palette = self.palette
+        for name, indicator in self.appbar_tab_indicators.items():
+            if name == active_name:
+                indicator.configure(bg=palette["accent"])
+            else:
+                indicator.configure(bg=palette["background"])
+
     def open_personal_tab(self):
         if self.main_notebook and self.personal_tab:
             self.main_notebook.select(self.personal_tab)
@@ -6907,6 +7456,12 @@ class AnkiApp(tk.Tk):
             current = notebook.nametowidget(notebook.select())
         except Exception:
             return
+        for name, tab in self.section_tabs.items():
+            if current is tab:
+                self._set_active_appbar_tab(name)
+                break
+        if current is self.personal_tab:
+            self._set_active_appbar_tab(None)
         if current is self.personal_tab:
             self.refresh_balance_display()
             self.refresh_ledger_table()
@@ -6930,17 +7485,17 @@ class AnkiApp(tk.Tk):
         self.refresh_generation_menu_state()
 
     def refresh_generation_menu_state(self):
-        if not self.generation_menu:
-            return
         state = tk.NORMAL if self.is_premium_active() else tk.DISABLED
-        for key in ("ocr", "image_id_import", "wikimedia", "text_ai"):
-            idx = self.generation_menu_indexes.get(key)
-            if idx is None:
-                continue
+        for btn in self.generation_action_buttons:
             try:
-                self.generation_menu.entryconfig(idx, state=state)
-            except Exception:
-                pass
+                btn.configure(state=state)
+            except tk.TclError:
+                continue
+        for lbl in self.premium_action_labels:
+            try:
+                lbl.configure(fg=self.palette["muted"] if state == tk.DISABLED else self.palette["text"])
+            except tk.TclError:
+                continue
 
     def _record_payment(
         self,
