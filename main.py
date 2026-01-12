@@ -4526,6 +4526,9 @@ class AnkiApp(tk.Tk):
         self.credit_icon_large = None
         self.generation_menu = None
         self.generation_menu_indexes: dict[str, int] = {}
+        self.generation_drawer = None
+        self.generation_drawer_buttons: dict[str, tk.Widget] = {}
+        self.hamburger_button = None
         self.mode_actions: dict[str, callable] = {}
         self.user_id_var = tk.StringVar(value=self.user_id)
         self.account_status_var = tk.StringVar(value="")
@@ -4670,10 +4673,10 @@ class AnkiApp(tk.Tk):
 
         gen_menu = tk.Menu(menubar, tearoff=0)
         self.generation_menu = gen_menu
-        gen_menu.add_command(label="Генерация из текста…", command=self.open_generate_from_text_window)
+        gen_menu.add_command(label="Генерация из текста...", command=self.open_generate_from_text_window)
         self.generation_menu_indexes["text"] = gen_menu.index("end")
         gen_menu.add_command(
-            label="Генерация по конспекту AI + картинки…",
+            label="Генерация по конспекту AI + картинки...",
             command=self.open_generate_from_notes_window,
         )
         gen_menu.add_command(
@@ -4686,9 +4689,9 @@ class AnkiApp(tk.Tk):
             command=self.open_generate_from_image_window,
         )
         self.generation_menu_indexes["ocr"] = gen_menu.index("end")
-        gen_menu.add_command(label="Генерация через цифровой слух…",
+        gen_menu.add_command(label="Генерация через цифровой слух...",
                              command=self.open_generate_from_speech_window)
-        gen_menu.add_command(label="Генерация из видео (цифровой слух)…",
+        gen_menu.add_command(label="Генерация из видео (цифровой слух)...",
                              command=self.open_generate_from_video_window)
         gen_menu.add_command(label="Видео → клипы → карточки",
                              command=self.open_video_clip_window)
@@ -4699,11 +4702,10 @@ class AnkiApp(tk.Tk):
         self.generation_menu_indexes["image_id_import"] = gen_menu.index("end")
         gen_menu.add_command(label="Импорт CSV колоды", command=self.open_csv_import_window)
         gen_menu.add_command(
-            label="Картинки по CSV (Wikimedia) 👑 (5⚡ за 10 импортов)",
+            label="Импорт CSV колоды (wikimedia) 👑 (5⚡ за 10 импортов)",
             command=self.open_wikimedia_csv_window,
         )
         self.generation_menu_indexes["wikimedia"] = gen_menu.index("end")
-        menubar.add_cascade(label="Режим генерации", menu=gen_menu)
         self.refresh_generation_menu_state()
 
         modes_menu = tk.Menu(menubar, tearoff=0)
@@ -4728,6 +4730,194 @@ class AnkiApp(tk.Tk):
         menubar.add_cascade(label="Статистика", menu=stats_menu)
 
         self.config(menu=menubar)
+
+    def _is_widget_in_generation_drawer(self, widget: tk.Widget | None) -> bool:
+        if not self.generation_drawer or widget is None:
+            return False
+        current = widget
+        while current is not None:
+            if current == self.generation_drawer:
+                return True
+            current = current.master
+        return False
+
+    def _maybe_close_generation_drawer(self, event) -> None:
+        if not self.generation_drawer or not self.generation_drawer.winfo_exists():
+            return
+        if self.hamburger_button is not None and event.widget == self.hamburger_button:
+            return
+        if self._is_widget_in_generation_drawer(event.widget):
+            return
+        self._close_generation_drawer()
+
+    def _run_generation_drawer_action(
+        self,
+        action,
+        feature_key: str | None = None,
+        require_premium: bool = False,
+    ) -> None:
+        if require_premium:
+            if not self.guard_premium_and_spend(feature_key or "premium_access", 0, require_premium=True):
+                self._close_generation_drawer()
+                return
+        self._close_generation_drawer()
+        action()
+
+    def _create_drawer_button(self, parent: tk.Widget, label: str, command) -> tk.Button:
+        palette = getattr(self, "palette", {}) or {}
+        bg = palette.get("panel", "#111827")
+        hover = palette.get("panel2", "#1F2937")
+        fg = palette.get("text", "#E5E7EB")
+        btn = tk.Button(
+            parent,
+            text=label,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground=hover,
+            activeforeground=fg,
+            relief="flat",
+            bd=0,
+            padx=16,
+            pady=8,
+            anchor="w",
+            justify=tk.LEFT,
+            font=("Segoe UI", 11),
+            cursor="hand2",
+        )
+
+        def _enter(_e):
+            btn.configure(bg=hover)
+
+        def _leave(_e):
+            btn.configure(bg=bg)
+
+        btn.bind("<Enter>", _enter)
+        btn.bind("<Leave>", _leave)
+        return btn
+
+    def _build_generation_drawer(self) -> None:
+        palette = getattr(self, "palette", {}) or {}
+        bg = palette.get("panel", "#111827")
+        border = palette.get("border", "#1F2937")
+
+        drawer = tk.Toplevel(self)
+        drawer.overrideredirect(True)
+        drawer.transient(self)
+        drawer.configure(bg=bg)
+        try:
+            drawer.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        container = tk.Frame(drawer, bg=bg, highlightthickness=1, highlightbackground=border)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(container, bg=bg, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        inner = tk.Frame(canvas, bg=bg)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync_width(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def _sync_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        canvas.bind("<Configure>", _sync_width)
+        inner.bind("<Configure>", _sync_scrollregion)
+
+        self.generation_drawer = drawer
+        self.generation_drawer_buttons = {}
+
+        entries = [
+            ("Генерация из текста...", lambda: self._run_generation_drawer_action(self.open_generate_from_text_window)),
+            ("Генерация по конспекту AI + картинки...", lambda: self._run_generation_drawer_action(self.open_generate_from_notes_window)),
+            (
+                "Режим генерация из текста AI 👑",
+                lambda: self._run_generation_drawer_action(
+                    self.open_generate_from_text_ai_window,
+                    feature_key="text_ai",
+                    require_premium=True,
+                ),
+            ),
+            (
+                "Генерация из изображения (OCR) 👑 (1⚡/стр)",
+                lambda: self._run_generation_drawer_action(
+                    self.open_generate_from_image_window,
+                    feature_key="ocr_image",
+                    require_premium=True,
+                ),
+            ),
+            ("Генерация через цифровой слух...", lambda: self._run_generation_drawer_action(self.open_generate_from_speech_window)),
+            ("Генерация из видео (цифровой слух)...", lambda: self._run_generation_drawer_action(self.open_generate_from_video_window)),
+            ("Видео → клипы → карточки", lambda: self._run_generation_drawer_action(self.open_video_clip_window)),
+            (
+                "Импорт картинок по ID (CSV) 👑 (5⚡/операция)",
+                lambda: self._run_generation_drawer_action(
+                    self.open_image_id_import_window,
+                    feature_key="image_id_import",
+                    require_premium=True,
+                ),
+            ),
+            ("Импорт CSV колоды", lambda: self._run_generation_drawer_action(self.open_csv_import_window)),
+            (
+                "Импорт CSV колоды (wikimedia) 👑 (5⚡ за 10 импортов)",
+                lambda: self._run_generation_drawer_action(
+                    self.open_wikimedia_csv_window,
+                    feature_key="wikimedia",
+                    require_premium=True,
+                ),
+            ),
+        ]
+
+        for label, command in entries:
+            btn = self._create_drawer_button(inner, label, command)
+            btn.pack(fill=tk.X, padx=8, pady=2)
+
+        # PATCH: youtube hamburger menu added
+
+    def _position_generation_drawer(self) -> None:
+        if not self.generation_drawer or not self.generation_drawer.winfo_exists():
+            return
+        self.generation_drawer.update_idletasks()
+        width = 300
+        if self.hamburger_button is not None:
+            x = self.hamburger_button.winfo_rootx()
+            y = self.hamburger_button.winfo_rooty() + self.hamburger_button.winfo_height() + 6
+        else:
+            x = self.winfo_rootx() + 10
+            y = self.winfo_rooty() + 10
+        max_height = max(240, self.winfo_height() - (y - self.winfo_rooty()) - 16)
+        req_height = self.generation_drawer.winfo_reqheight()
+        height = min(req_height, max_height)
+        self.generation_drawer.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _open_generation_drawer(self) -> None:
+        if not self.generation_drawer or not self.generation_drawer.winfo_exists():
+            self._build_generation_drawer()
+        self._position_generation_drawer()
+        try:
+            self.generation_drawer.deiconify()
+            self.generation_drawer.lift()
+            self.generation_drawer.focus_force()
+        except Exception:
+            pass
+
+    def _close_generation_drawer(self) -> None:
+        if self.generation_drawer and self.generation_drawer.winfo_exists():
+            self.generation_drawer.destroy()
+        self.generation_drawer = None
+
+    def toggle_generation_drawer(self) -> None:
+        if self.generation_drawer and self.generation_drawer.winfo_exists():
+            self._close_generation_drawer()
+            return
+        self._open_generation_drawer()
     
     def open_generate_from_video_window(self):
         """Открыть окно генерации из видео"""
@@ -6664,6 +6854,41 @@ class AnkiApp(tk.Tk):
         header_pad = (8, 8)
         header = ttk.Frame(self, style="Header.TFrame")
         header.pack(fill=tk.X, padx=16, pady=(12, 8))
+        menu_bg = self.palette.get("panel", "#111827")
+        menu_hover = self.palette.get("panel2", "#1F2937")
+        menu_fg = self.palette.get("text", "#E5E7EB")
+        menu_border = self.palette.get("border", "#1F2937")
+        hamburger_btn = tk.Button(
+            header,
+            text="☰",
+            command=self.toggle_generation_drawer,
+            bg=menu_bg,
+            fg=menu_fg,
+            activebackground=menu_hover,
+            activeforeground=menu_fg,
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=6,
+            width=2,
+            height=1,
+            highlightthickness=1,
+            highlightbackground=menu_border,
+            highlightcolor=menu_border,
+            cursor="hand2",
+            font=("Segoe UI", 12, "bold"),
+        )
+        hamburger_btn.pack(side=tk.LEFT, padx=(6, 4), pady=header_pad)
+        self.hamburger_button = hamburger_btn
+
+        def _menu_enter(_e):
+            hamburger_btn.configure(bg=menu_hover)
+
+        def _menu_leave(_e):
+            hamburger_btn.configure(bg=menu_bg)
+
+        hamburger_btn.bind("<Enter>", _menu_enter)
+        hamburger_btn.bind("<Leave>", _menu_leave)
         logo_wrap = ttk.Frame(header, width=48, height=48)
         logo_wrap.pack_propagate(False)
         logo_wrap.pack(side=tk.LEFT, padx=(10, 8), pady=header_pad)
@@ -6707,6 +6932,8 @@ class AnkiApp(tk.Tk):
             style="Ghost.TButton",
             command=self.open_personal_tab,
         ).pack(side=tk.RIGHT)
+
+        self.bind("<Button-1>", self._maybe_close_generation_drawer, add="+")
 
         shell = ttk.Frame(self, style="Surface.TFrame")
         shell.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
