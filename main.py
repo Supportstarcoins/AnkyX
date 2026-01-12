@@ -4528,6 +4528,7 @@ class AnkiApp(tk.Tk):
         self.generation_menu_indexes: dict[str, int] = {}
         self.generation_drawer = None
         self.generation_drawer_buttons: dict[str, tk.Widget] = {}
+        self.generation_drawer_coin_icon = None
         self.hamburger_button = None
         self.mode_actions: dict[str, callable] = {}
         self.user_id_var = tk.StringVar(value=self.user_id)
@@ -4800,6 +4801,9 @@ class AnkiApp(tk.Tk):
         palette = getattr(self, "palette", {}) or {}
         bg = palette.get("panel", "#111827")
         border = palette.get("border", "#1F2937")
+        fg = palette.get("text", "#E5E7EB")
+        muted = palette.get("muted", "#9CA3AF")
+        hover = palette.get("panel2", "#1F2937")
 
         drawer = tk.Toplevel(self)
         drawer.overrideredirect(True)
@@ -4834,67 +4838,143 @@ class AnkiApp(tk.Tk):
         self.generation_drawer = drawer
         self.generation_drawer_buttons = {}
 
+        if self.generation_drawer_coin_icon is None:
+            self.generation_drawer_coin_icon = self._load_credit_icon(size=14)
+
+        def _on_mousewheel(event):
+            if event.delta:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            elif event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+            return "break"
+
+        for target in (canvas, inner):
+            target.bind("<MouseWheel>", _on_mousewheel)
+            target.bind("<Button-4>", _on_mousewheel)
+            target.bind("<Button-5>", _on_mousewheel)
+
+        def _create_drawer_row(
+            title: str,
+            command,
+            *,
+            price: str | None = None,
+            premium: bool = False,
+            feature_key: str | None = None,
+        ) -> None:
+            display_title = title
+            if premium and "👑" not in display_title:
+                display_title = f"{display_title} 👑"
+
+            row = tk.Frame(inner, bg=bg, padx=12, pady=6)
+            row.pack(fill=tk.X, padx=6, pady=2)
+
+            left = tk.Label(
+                row,
+                text=display_title,
+                bg=bg,
+                fg=fg,
+                anchor="w",
+                justify=tk.LEFT,
+                font=("Segoe UI", 11),
+                wraplength=420,
+            )
+            left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            right = None
+            widgets = [row, left]
+            if price:
+                right = tk.Frame(row, bg=bg)
+                right.pack(side=tk.RIGHT, padx=(8, 0))
+                if self.generation_drawer_coin_icon:
+                    icon = tk.Label(right, image=self.generation_drawer_coin_icon, bg=bg)
+                    icon.pack(side=tk.LEFT, padx=(0, 6))
+                    widgets.append(icon)
+                cost = tk.Label(right, text=price, bg=bg, fg=muted, font=("Segoe UI", 10))
+                cost.pack(side=tk.LEFT)
+                widgets.extend([right, cost])
+
+            def _run_action(_event=None):
+                self._run_generation_drawer_action(
+                    command,
+                    feature_key=feature_key,
+                    require_premium=premium,
+                )
+
+            def _set_bg(color: str):
+                row.configure(bg=color)
+                left.configure(bg=color)
+                if right is not None:
+                    right.configure(bg=color)
+                for widget in widgets:
+                    if isinstance(widget, tk.Label):
+                        widget.configure(bg=color)
+
+            def _enter(_event):
+                _set_bg(hover)
+
+            def _leave(_event):
+                _set_bg(bg)
+
+            for widget in widgets:
+                widget.bind("<Enter>", _enter)
+                widget.bind("<Leave>", _leave)
+                widget.bind("<Button-1>", _run_action)
+            row.configure(cursor="hand2")
+
         entries = [
-            ("Генерация из текста...", lambda: self._run_generation_drawer_action(self.open_generate_from_text_window)),
-            ("Генерация по конспекту AI + картинки...", lambda: self._run_generation_drawer_action(self.open_generate_from_notes_window)),
-            (
-                "Режим генерация из текста AI 👑",
-                lambda: self._run_generation_drawer_action(
-                    self.open_generate_from_text_ai_window,
-                    feature_key="text_ai",
-                    require_premium=True,
-                ),
-            ),
-            (
-                "Генерация из изображения (OCR) 👑 (1⚡/стр)",
-                lambda: self._run_generation_drawer_action(
-                    self.open_generate_from_image_window,
-                    feature_key="ocr_image",
-                    require_premium=True,
-                ),
-            ),
-            ("Генерация через цифровой слух...", lambda: self._run_generation_drawer_action(self.open_generate_from_speech_window)),
-            ("Генерация из видео (цифровой слух)...", lambda: self._run_generation_drawer_action(self.open_generate_from_video_window)),
-            ("Видео → клипы → карточки", lambda: self._run_generation_drawer_action(self.open_video_clip_window)),
-            (
-                "Импорт картинок по ID (CSV) 👑 (5⚡/операция)",
-                lambda: self._run_generation_drawer_action(
-                    self.open_image_id_import_window,
-                    feature_key="image_id_import",
-                    require_premium=True,
-                ),
-            ),
-            ("Импорт CSV колоды", lambda: self._run_generation_drawer_action(self.open_csv_import_window)),
-            (
-                "Импорт CSV колоды (wikimedia) 👑 (5⚡ за 10 импортов)",
-                lambda: self._run_generation_drawer_action(
-                    self.open_wikimedia_csv_window,
-                    feature_key="wikimedia",
-                    require_premium=True,
-                ),
-            ),
+            ("Генерация из текста...", self.open_generate_from_text_window, None, False, None),
+            ("Генерация по конспекту AI + картинки...", self.open_generate_from_notes_window, None, False, None),
+            ("Режим генерация из текста AI", self.open_generate_from_text_ai_window, None, True, "text_ai"),
+            ("Генерация из изображения (OCR)", self.open_generate_from_image_window, "1/стр", True, "ocr_image"),
+            ("Генерация через цифровой слух...", self.open_generate_from_speech_window, None, False, None),
+            ("Генерация из видео (цифровой слух)...", self.open_generate_from_video_window, None, False, None),
+            ("Видео → клипы → карточки", self.open_video_clip_window, None, False, None),
+            ("Импорт картинок по ID (CSV)", self.open_image_id_import_window, "5/операция", True, "image_id_import"),
+            ("Импорт CSV колоды", self.open_csv_import_window, None, False, None),
+            ("Картинки по CSV (Wikimedia)", self.open_wikimedia_csv_window, "5 за 10 импортов", True, "wikimedia"),
         ]
 
-        for label, command in entries:
-            btn = self._create_drawer_button(inner, label, command)
-            btn.pack(fill=tk.X, padx=8, pady=2)
+        for title, action, price, premium, feature_key in entries:
+            _create_drawer_row(
+                title,
+                action,
+                price=price,
+                premium=premium,
+                feature_key=feature_key,
+            )
 
-        # PATCH: youtube hamburger menu added
+        # PATCH: fixed hamburger menu full list + scroll + iconcoin cost
 
     def _position_generation_drawer(self) -> None:
         if not self.generation_drawer or not self.generation_drawer.winfo_exists():
             return
         self.generation_drawer.update_idletasks()
-        width = 300
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        width = 520
         if self.hamburger_button is not None:
             x = self.hamburger_button.winfo_rootx()
-            y = self.hamburger_button.winfo_rooty() + self.hamburger_button.winfo_height() + 6
+            button_y = self.hamburger_button.winfo_rooty()
+            y = button_y + self.hamburger_button.winfo_height() + 6
         else:
             x = self.winfo_rootx() + 10
             y = self.winfo_rooty() + 10
-        max_height = max(240, self.winfo_height() - (y - self.winfo_rooty()) - 16)
+            button_y = y
+        max_height = min(int(screen_h * 0.75), screen_h - 40)
         req_height = self.generation_drawer.winfo_reqheight()
-        height = min(req_height, max_height)
+        height = max(200, min(req_height, max_height))
+        if x + width > screen_w - 10:
+            x = max(10, screen_w - width - 10)
+        if x < 10:
+            x = 10
+        if y + height > screen_h - 10:
+            alt_y = button_y - height - 6
+            if alt_y >= 10:
+                y = alt_y
+            else:
+                y = max(10, screen_h - height - 10)
         self.generation_drawer.geometry(f"{width}x{height}+{x}+{y}")
 
     def _open_generation_drawer(self) -> None:
