@@ -1,0 +1,7 @@
+{
+  "id": "hello_addon",
+  "name": "Hello Addon",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "__init__:setup"
+}

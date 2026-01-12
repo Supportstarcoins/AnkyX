@@ -1,4 +1,5 @@
 import os, tempfile
+import sys
 os.environ.setdefault("DISABLE_MODEL_SOURCE_CHECK", "True")
 import io
 safe = tempfile.gettempdir()
@@ -71,6 +72,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, colorchooser, simpledialog
 import tkinter.font as tkfont
 import importlib.util
+from addons_manager import AddonManager, UIAdapter, MWContext, CollectionAdapter, gui_hooks, set_mw
 
 _HAS_DND = importlib.util.find_spec("tkinterdnd2") is not None
 if _HAS_DND:
@@ -4531,6 +4533,10 @@ class AnkiApp(tk.Tk):
         self.generation_drawer_coin_icon = None
         self.hamburger_button = None
         self.mode_actions: dict[str, callable] = {}
+        self.menubar: tk.Menu | None = None
+        self.ui_adapter: UIAdapter | None = None
+        self.addon_manager: AddonManager | None = None
+        self.mw_context: MWContext | None = None
         self.user_id_var = tk.StringVar(value=self.user_id)
         self.account_status_var = tk.StringVar(value="")
         self.premium_timer_var = tk.StringVar(value="00:00:00")
@@ -4547,13 +4553,16 @@ class AnkiApp(tk.Tk):
         }
 
         self.create_menu()
+        self._setup_addon_system()
         self.create_widgets()
+        self._load_addons()
         self.refresh_decks()
         self.refresh_balance_display()
         self.start_premium_timer()
 
         self.after(500, self.warn_if_no_tesseract)
         self.after(50, self.poll_bg_queues)
+        self.after(0, self._run_app_startup_hooks)
 
     # --------- предупреждение ---------
 
@@ -4651,6 +4660,38 @@ class AnkiApp(tk.Tk):
 
     # --------- меню ---------
 
+    def _setup_addon_system(self) -> None:
+        self.ui_adapter = UIAdapter(self, self.menubar)
+        self.addon_manager = AddonManager(BASE_DIR, ui=self.ui_adapter)
+        safe_mode_flag = any(
+            flag in sys.argv for flag in ("--safe-mode", "--safe_mode", "--no-addons")
+        )
+        if safe_mode_flag:
+            self.addon_manager.safe_mode = True
+        self.ui_adapter.set_addon_manager(self.addon_manager)
+        self.mw_context = MWContext(self, self.ui_adapter, self.addon_manager)
+        self.mw_context.col = CollectionAdapter(
+            db_path=get_db_path(),
+            list_decks=list_decks,
+            get_cards_in_deck=get_cards_in_deck,
+        )
+        self.mw_context.state = {
+            "current_deck_id": None,
+            "current_card_id": None,
+        }
+        set_mw(self.mw_context)
+        self.ui_adapter.add_menu_item("Настройки", "Аддоны...", self.addon_manager.open_manager_window)
+
+    def _load_addons(self) -> None:
+        if self.addon_manager and not self.addon_manager.safe_mode:
+            self.addon_manager.load_addons()
+
+    def _run_app_startup_hooks(self) -> None:
+        try:
+            gui_hooks.app_did_startup()
+        except Exception:
+            pass
+
     def create_menu(self):
         menubar = tk.Menu(self)
 
@@ -4731,6 +4772,7 @@ class AnkiApp(tk.Tk):
         menubar.add_cascade(label="Статистика", menu=stats_menu)
 
         self.config(menu=menubar)
+        self.menubar = menubar
 
     def _is_widget_in_generation_drawer(self, widget: tk.Widget | None) -> bool:
         if not self.generation_drawer or widget is None:
@@ -5153,6 +5195,7 @@ class AnkiApp(tk.Tk):
                     ),
                 )
                 self.refresh_decks()
+                gui_hooks.import_did_finish(summary)
             elif kind == "error":
                 if processing_task["task"]:
                     self.unregister_bg_handler(processing_task["task"].queue)
@@ -5884,6 +5927,7 @@ class AnkiApp(tk.Tk):
                         f"Ошибки: {summary['errors']}"
                     ),
                 )
+                gui_hooks.import_did_finish(summary)
                 self.unregister_bg_handler(processing_task["task"].queue)
                 processing_task["task"] = None
             elif kind == "error":
@@ -6129,6 +6173,12 @@ class AnkiApp(tk.Tk):
             return
         deck_id = self.selected_deck_id
         phase_filter = self.selected_phase
+        if self.mw_context is not None:
+            self.mw_context.state["current_deck_id"] = deck_id
+        gui_hooks.deck_will_open(deck_id)
+        if self.mw_context is not None:
+            self.mw_context.state["current_deck_id"] = deck_id
+        gui_hooks.deck_will_open(deck_id)
 
         def task(progress_cb):
             cards = get_overview_cards(deck_id)
@@ -6256,6 +6306,7 @@ class AnkiApp(tk.Tk):
             )
             if filename:
                 try:
+                    gui_hooks.export_will_start(filename)
                     DICTIONARY_MANAGER.export_to_csv(filename)
                     messagebox.showinfo("Успех", f"Словарь экспортирован в {filename}")
                 except Exception as e:
@@ -8485,6 +8536,10 @@ class AnkiApp(tk.Tk):
         deck_id, phase = self.deck_items.get(item_id, (None, None))
         self.selected_deck_id = deck_id
         self.selected_phase = phase
+        if self.mw_context is not None:
+            self.mw_context.state["current_deck_id"] = deck_id
+        if deck_id is not None:
+            gui_hooks.deck_will_open(deck_id)
         self.load_templates_for_selected_deck()
         self.update_overdue_badge()
         self.update_deck_preview()
@@ -10527,6 +10582,7 @@ class AnkiApp(tk.Tk):
                     state["fallback_window"].lift()
                 editor_status_var.set("Редактор: открыт (упрощенный)")
                 state["editor_open"] = True
+                gui_hooks.editor_did_open(state["fallback_window"])
                 return True
 
             quill_files = [
@@ -10547,6 +10603,7 @@ class AnkiApp(tk.Tk):
                     pass
                 editor_status_var.set("Редактор: открыт")
                 state["editor_open"] = True
+                gui_hooks.editor_did_open(state["editor_window"])
                 return True
 
             try:
@@ -10567,6 +10624,7 @@ class AnkiApp(tk.Tk):
                     state["fallback_window"].lift()
                 editor_status_var.set("Редактор: открыт (упрощенный)")
                 state["editor_open"] = True
+                gui_hooks.editor_did_open(state["fallback_window"])
                 return True
 
             editor_path = os.path.abspath(os.path.join(BASE_DIR, "editor_quill.html"))
@@ -10610,6 +10668,7 @@ class AnkiApp(tk.Tk):
 
             editor_status_var.set("Редактор: открыт")
             state["editor_open"] = True
+            gui_hooks.editor_did_open(state["editor_window"])
 
             if not state["webview_started"] and not state["webview_starting"]:
                 state["webview_starting"] = True
@@ -12571,6 +12630,10 @@ class OverviewWindow(tk.Toplevel):
         idx = self.current_index + 1
         c = self.current_card
 
+        if getattr(self.master, "mw_context", None) is not None:
+            self.master.mw_context.state["current_card_id"] = c.get("id")
+        gui_hooks.card_will_show(c)
+
         # Обновляем статус
         self.lbl_status.config(text=f"Карточка {idx}/{total} | ID {c['id']} | Уровень: {c['leitner_level']} | Прогресс: {c['progress']}%")
         
@@ -13281,6 +13344,10 @@ class RepeatWindow(tk.Toplevel):
             self.show_end_state()
             return
 
+        if getattr(self.master, "mw_context", None) is not None:
+            self.master.mw_context.state["current_card_id"] = c.get("id")
+        gui_hooks.card_will_show(c)
+
         self.lbl_status.config(
             text=f"Карточка {idx}/{total} | ID {c['id']}"
         )
@@ -13433,11 +13500,15 @@ class RepeatWindow(tk.Toplevel):
     def mark_forgotten(self):
         self.session.mark_wrong()
         self.master.update_overdue_badge()
+        if self.current_card:
+            gui_hooks.card_did_answer(self.current_card, 0)
         self.goto_next_card()
 
     def mark_remembered(self):
         self.session.mark_correct()
         self.master.update_overdue_badge()
+        if self.current_card:
+            gui_hooks.card_did_answer(self.current_card, 2)
         self.goto_next_card()
 
     def goto_next_card(self):
@@ -13773,6 +13844,8 @@ class ReviewWindow(tk.Toplevel):
             pass
 
         self.master.update_overdue_badge()
+        if self.current_card:
+            gui_hooks.card_did_answer(self.current_card, 0)
         self.goto_next_card()
 
     def update_progress_view(self):
@@ -13803,6 +13876,10 @@ class ReviewWindow(tk.Toplevel):
         self.lbl_status.config(
             text=f"Карточка {idx}/{total} | ID {c['id']}"
         )
+
+        if getattr(self.master, "mw_context", None) is not None:
+            self.master.mw_context.state["current_card_id"] = c.get("id")
+        gui_hooks.card_will_show(c)
 
         # Навигация по карточкам (вместо "Забыл/Повторить")
         self.btn_prev.config(state=(tk.DISABLED if self.current_index <= 0 else tk.NORMAL))
