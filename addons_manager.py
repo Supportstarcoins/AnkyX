@@ -1,20 +1,23 @@
 import json
 import logging
 import os
+import shutil
 import sys
 import traceback
 import importlib
 import importlib.util
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 
-LOG_FILENAME = "_logs.txt"
+LOG_FILENAME = "addons.log"
 SETTINGS_FILENAME = "_manager.json"
+BACKUP_DIRNAME = "_backup"
 
 
 mw = None
@@ -95,6 +98,9 @@ class AddonInfo:
     enabled: bool
     last_error: str | None = None
     last_error_time: str | None = None
+    needs_restart: bool = False
+    invalid: bool = False
+    manifest: dict[str, Any] | None = None
 
 
 class UIAdapter:
@@ -234,6 +240,7 @@ class MWContext:
 
 
 class AddonManager:
+    # PATCH: addons manager install/update/remove + oldschool folder support
     def __init__(self, base_dir: str, ui: UIAdapter | None = None):
         self.base_dir = Path(base_dir)
         self.addons_dir = self.base_dir / "addons21"
@@ -245,6 +252,7 @@ class AddonManager:
         self.addon_modules: dict[str, list[str]] = {}
         self.loading_addon_id: str | None = None
         self.safe_mode = False
+        self._restart_required = False
         self._init_logger()
         self._load_settings()
         gui_hooks.set_addon_manager(self)
@@ -292,17 +300,27 @@ class AddonManager:
 
     def _read_meta(self, addon_dir: Path) -> dict[str, Any]:
         meta_path = addon_dir / "meta.json"
+        base = {
+            "enabled": True,
+            "last_error": None,
+            "last_error_time": None,
+            "installed_at": None,
+            "updated_at": None,
+            "needs_restart": False,
+        }
         if not meta_path.exists():
-            meta = {"enabled": True, "last_error": None, "last_error_time": None}
             try:
-                meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+                meta_path.write_text(json.dumps(base, indent=2, ensure_ascii=False), encoding="utf-8")
             except Exception:
                 pass
-            return meta
+            return dict(base)
         try:
-            return json.loads(meta_path.read_text(encoding="utf-8"))
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
-            return {"enabled": True, "last_error": None, "last_error_time": None}
+            data = {}
+        merged = dict(base)
+        merged.update(data)
+        return merged
 
     def _write_meta(self, addon_dir: Path, meta: dict[str, Any]) -> None:
         meta_path = addon_dir / "meta.json"
@@ -310,6 +328,88 @@ class AddonManager:
             meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
+
+    def validate_manifest(self, manifest_dict: dict[str, Any]) -> tuple[bool, list[str]]:
+        errors: list[str] = []
+        if not isinstance(manifest_dict, dict):
+            return False, ["manifest.json должен быть объектом"]
+        if "id" in manifest_dict and not isinstance(manifest_dict.get("id"), str):
+            errors.append("Поле id должно быть строкой")
+        if "name" in manifest_dict and not isinstance(manifest_dict.get("name"), str):
+            errors.append("Поле name должно быть строкой")
+        if "version" in manifest_dict and not isinstance(manifest_dict.get("version"), str):
+            errors.append("Поле version должно быть строкой")
+        if "api_version" in manifest_dict:
+            try:
+                int(manifest_dict.get("api_version"))
+            except Exception:
+                errors.append("Поле api_version должно быть числом")
+        if "entry" in manifest_dict and not isinstance(manifest_dict.get("entry"), str):
+            errors.append("Поле entry должно быть строкой")
+        return len(errors) == 0, errors
+
+    def read_manifest_from_zip(self, zip_path: str) -> dict[str, Any] | None:
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                manifest_name = self._find_manifest_in_zip(zf)
+                if not manifest_name:
+                    return None
+                with zf.open(manifest_name) as handle:
+                    return json.loads(handle.read().decode("utf-8"))
+        except Exception:
+            logging.exception("Failed to read manifest from %s", zip_path)
+            return None
+
+    def _find_manifest_in_zip(self, zf: zipfile.ZipFile) -> str | None:
+        candidates = [name for name in zf.namelist() if name.endswith("manifest.json")]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item.count("/"), len(item)))
+        return candidates[0]
+
+    def _locate_manifest_dir(self, base: Path) -> tuple[Path | None, dict[str, Any] | None]:
+        manifest = self._read_manifest(base)
+        if manifest:
+            return base, manifest
+        for entry in base.iterdir():
+            if entry.is_dir():
+                manifest = self._read_manifest(entry)
+                if manifest:
+                    return entry, manifest
+        return None, None
+
+    def _get_install_preview_from_zip(self, zip_path: str) -> dict[str, Any]:
+        preview: dict[str, Any] = {"files": [], "size": 0, "manifest": None}
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                preview["size"] = sum(item.file_size for item in zf.infolist())
+                preview["files"] = [item.filename for item in zf.infolist() if not item.is_dir()]
+                manifest = self.read_manifest_from_zip(zip_path)
+                preview["manifest"] = manifest
+        except Exception:
+            logging.exception("Failed to preview zip %s", zip_path)
+        return preview
+
+    def _get_install_preview_from_folder(self, folder_path: str) -> dict[str, Any]:
+        base = Path(folder_path)
+        files: list[str] = []
+        total_size = 0
+        if base.exists():
+            for root, _, filenames in os.walk(base):
+                for filename in filenames:
+                    full = Path(root) / filename
+                    try:
+                        total_size += full.stat().st_size
+                    except Exception:
+                        pass
+                    rel = str(full.relative_to(base))
+                    files.append(rel)
+        manifest = self._read_manifest(base)
+        if manifest is None:
+            located_root, located_manifest = self._locate_manifest_dir(base)
+            if located_root:
+                manifest = located_manifest
+        return {"files": files, "size": total_size, "manifest": manifest}
 
     def discover_addons(self) -> dict[str, AddonInfo]:
         self.addons = {}
@@ -320,6 +420,23 @@ class AddonManager:
                 continue
             manifest = self._read_manifest(entry)
             if not manifest:
+                meta = self._read_meta(entry)
+                addon_id = entry.name
+                info = AddonInfo(
+                    addon_id=addon_id,
+                    name="Invalid addon",
+                    version="-",
+                    api_version=0,
+                    entry="",
+                    path=entry,
+                    enabled=bool(meta.get("enabled", False)),
+                    last_error=meta.get("last_error"),
+                    last_error_time=meta.get("last_error_time"),
+                    needs_restart=bool(meta.get("needs_restart", False)),
+                    invalid=True,
+                    manifest=None,
+                )
+                self.addons[addon_id] = info
                 continue
             meta = self._read_meta(entry)
             addon_id = str(manifest.get("id") or entry.name)
@@ -333,6 +450,9 @@ class AddonManager:
                 enabled=bool(meta.get("enabled", True)),
                 last_error=meta.get("last_error"),
                 last_error_time=meta.get("last_error_time"),
+                needs_restart=bool(meta.get("needs_restart", False)),
+                invalid=False,
+                manifest=manifest,
             )
             self.addons[addon_id] = info
         return self.addons
@@ -350,7 +470,145 @@ class AddonManager:
         info.enabled = enabled
         meta = self._read_meta(info.path)
         meta["enabled"] = enabled
+        meta["needs_restart"] = True
+        meta["updated_at"] = datetime_now()
         self._write_meta(info.path, meta)
+        self._restart_required = True
+
+    def install_from_zip(self, zip_path: str) -> tuple[bool, str]:
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                manifest_name = self._find_manifest_in_zip(zf)
+                manifest = self.read_manifest_from_zip(zip_path)
+                root_dir = ""
+                if manifest_name:
+                    root_dir = str(Path(manifest_name).parent)
+                with tempfile_directory() as temp_dir:
+                    zf.extractall(temp_dir)
+                    source_root = Path(temp_dir)
+                    if root_dir and root_dir != ".":
+                        source_root = Path(temp_dir) / root_dir
+                    if not source_root.exists():
+                        source_root = Path(temp_dir)
+                    if manifest is None:
+                        located_root, located_manifest = self._locate_manifest_dir(source_root)
+                        if located_root:
+                            source_root = located_root
+                            manifest = located_manifest
+                    addon_id = str(manifest.get("id")) if manifest else source_root.name
+                    if (self.addons_dir / addon_id).exists():
+                        return self.update_addon(addon_id, source_root)
+                    return self._install_from_source(addon_id, source_root, manifest)
+        except Exception as exc:
+            logging.exception("Failed to install addon from zip")
+            return False, str(exc)
+
+    def install_from_folder(self, folder_path: str) -> tuple[bool, str]:
+        source_root = Path(folder_path)
+        if not source_root.exists():
+            return False, "Папка не найдена"
+        manifest = self._read_manifest(source_root)
+        if manifest is None:
+            located_root, located_manifest = self._locate_manifest_dir(source_root)
+            if located_root:
+                source_root = located_root
+                manifest = located_manifest
+        addon_id = str(manifest.get("id")) if manifest else source_root.name
+        if (self.addons_dir / addon_id).exists():
+            return self.update_addon(addon_id, source_root)
+        return self._install_from_source(addon_id, source_root, manifest)
+
+    def _install_from_source(
+        self,
+        addon_id: str,
+        source_root: Path,
+        manifest: dict[str, Any] | None,
+    ) -> tuple[bool, str]:
+        dest = self.addons_dir / addon_id
+        if dest.exists():
+            return False, "Аддон уже установлен"
+        try:
+            shutil.copytree(source_root, dest)
+            meta = self._read_meta(dest)
+            meta["enabled"] = True
+            meta["installed_at"] = datetime_now()
+            meta["updated_at"] = datetime_now()
+            meta["needs_restart"] = True
+            self._write_meta(dest, meta)
+            self._restart_required = True
+            return True, "Installed"
+        except Exception as exc:
+            logging.exception("Failed to install addon")
+            return False, str(exc)
+
+    def update_addon(self, addon_id: str, source: Path) -> tuple[bool, str]:
+        addon_dir = self.addons_dir / addon_id
+        if not addon_dir.exists():
+            return self._install_from_source(addon_id, source, self._read_manifest(source))
+        old_meta = self._read_meta(addon_dir)
+        preserved_config = None
+        preserved_user_data = None
+        config_path = addon_dir / "config.json"
+        if config_path.exists():
+            try:
+                preserved_config = config_path.read_text(encoding="utf-8")
+            except Exception:
+                preserved_config = None
+        user_data_path = addon_dir / "user-data"
+        if user_data_path.exists() and user_data_path.is_dir():
+            preserved_user_data = user_data_path
+        backup_path = self.backup_addon(addon_id)
+        backup_user_data = Path(backup_path) / "user-data" if preserved_user_data else None
+        try:
+            shutil.rmtree(addon_dir)
+        except Exception:
+            pass
+        try:
+            shutil.copytree(source, addon_dir)
+            if preserved_config is not None:
+                new_config_path = addon_dir / "config.json"
+                if new_config_path.exists():
+                    (addon_dir / "config.user.json").write_text(preserved_config, encoding="utf-8")
+                else:
+                    new_config_path.write_text(preserved_config, encoding="utf-8")
+            if backup_user_data is not None and backup_user_data.exists() and not (addon_dir / "user-data").exists():
+                shutil.copytree(backup_user_data, addon_dir / "user-data")
+            meta = self._read_meta(addon_dir)
+            meta["enabled"] = bool(old_meta.get("enabled", True))
+            meta["installed_at"] = old_meta.get("installed_at") or datetime_now()
+            meta["updated_at"] = datetime_now()
+            meta["last_error"] = None
+            meta["last_error_time"] = None
+            meta["needs_restart"] = True
+            self._write_meta(addon_dir, meta)
+            self._restart_required = True
+            return True, f"Updated (backup: {backup_path})"
+        except Exception as exc:
+            logging.exception("Failed to update addon")
+            return False, str(exc)
+
+    def remove_addon(self, addon_id: str, move_to_backup: bool = True) -> tuple[bool, str]:
+        addon_dir = self.addons_dir / addon_id
+        if not addon_dir.exists():
+            return False, "Аддон не найден"
+        try:
+            backup_path = None
+            if move_to_backup:
+                backup_path = self.backup_addon(addon_id)
+            shutil.rmtree(addon_dir)
+            self._restart_required = True
+            return True, f"Removed{f' (backup: {backup_path})' if backup_path else ''}"
+        except Exception as exc:
+            logging.exception("Failed to remove addon")
+            return False, str(exc)
+
+    def backup_addon(self, addon_id: str) -> str:
+        addon_dir = self.addons_dir / addon_id
+        backup_root = self.addons_dir / BACKUP_DIRNAME
+        backup_root.mkdir(exist_ok=True)
+        backup_path = backup_root / f"{addon_id}_{datetime_now().replace(':', '-')}"
+        shutil.copytree(addon_dir, backup_path)
+        return str(backup_path)
 
     def _resolve_entry(self, addon: AddonInfo) -> tuple[str, str]:
         entry = addon.entry
@@ -395,6 +653,8 @@ class AddonManager:
         if not addon:
             return
         if not addon.enabled:
+            return
+        if addon.invalid:
             return
         if addon.api_version != 1:
             self.handle_addon_error(addon_id, RuntimeError("Unsupported api_version"), context="api_version")
@@ -443,8 +703,19 @@ class AddonManager:
             meta["last_error"] = msg
             meta["last_error_time"] = datetime_now()
             meta["enabled"] = False
+            meta["needs_restart"] = True
             self._write_meta(addon.path, meta)
             addon.enabled = False
+            addon.needs_restart = True
+            self._restart_required = True
+
+    def restart_required(self) -> bool:
+        if self._restart_required:
+            return True
+        for addon in self.addons.values():
+            if addon.needs_restart:
+                return True
+        return False
 
     def open_manager_window(self) -> None:
         if not self.ui:
@@ -456,8 +727,10 @@ class AddonManagerWindow(tk.Toplevel):
     def __init__(self, parent: tk.Tk, manager: AddonManager):
         super().__init__(parent)
         self.manager = manager
+        self.search_var = tk.StringVar()
+        self.dnd_available = False
         self.title("Менеджер аддонов")
-        self.geometry("720x420")
+        self.geometry("980x560")
         self._build_ui()
         self.refresh_list()
 
@@ -465,30 +738,73 @@ class AddonManagerWindow(tk.Toplevel):
         main = ttk.Frame(self)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        columns = ("name", "id", "version", "enabled")
-        self.tree = ttk.Treeview(main, columns=columns, show="headings", selectmode="browse")
-        self.tree.heading("name", text="Название")
+        header = ttk.Frame(main)
+        header.pack(fill=tk.X)
+        ttk.Label(
+            header,
+            text="Можно установить вручную: распакуйте аддон в addons21/ и нажмите Reload",
+        ).pack(side=tk.LEFT)
+
+        top = ttk.Frame(main)
+        top.pack(fill=tk.X, pady=(8, 8))
+
+        ttk.Label(top, text="Search:").pack(side=tk.LEFT)
+        search_entry = ttk.Entry(top, textvariable=self.search_var)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8))
+        search_entry.bind("<KeyRelease>", lambda _event: self.refresh_list())
+
+        ttk.Button(top, text="Install from ZIP...", command=self.install_zip).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Install from Folder...", command=self.install_folder).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Open addons21 Folder", command=self.open_addons_folder).pack(side=tk.LEFT, padx=4)
+
+        self.dnd_label = ttk.Label(main, text="Drag & Drop .zip сюда")
+        self.dnd_label.pack(fill=tk.X)
+        self._setup_drag_and_drop()
+
+        content = ttk.Panedwindow(main, orient=tk.HORIZONTAL)
+        content.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        table_frame = ttk.Frame(content)
+        content.add(table_frame, weight=3)
+
+        columns = ("name", "id", "version", "enabled", "status")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        self.tree.heading("name", text="Name")
         self.tree.heading("id", text="ID")
-        self.tree.heading("version", text="Версия")
-        self.tree.heading("enabled", text="Включен")
-        self.tree.column("name", width=240)
-        self.tree.column("id", width=160)
-        self.tree.column("version", width=80)
+        self.tree.heading("version", text="Version")
+        self.tree.heading("enabled", text="Enabled")
+        self.tree.heading("status", text="Status")
+        self.tree.column("name", width=220)
+        self.tree.column("id", width=170)
+        self.tree.column("version", width=90)
         self.tree.column("enabled", width=80)
+        self.tree.column("status", width=130)
         self.tree.pack(fill=tk.BOTH, expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda _event: self.update_preview())
+        self.tree.bind("<Double-1>", lambda _event: self.toggle_selected())
+
+        preview_frame = ttk.Frame(content)
+        content.add(preview_frame, weight=2)
+
+        ttk.Label(preview_frame, text="Details").pack(anchor="w")
+        self.preview_text = tk.Text(preview_frame, height=10, wrap="word")
+        self.preview_text.pack(fill=tk.BOTH, expand=True)
+        self.preview_text.configure(state="disabled")
 
         controls = ttk.Frame(main)
         controls.pack(fill=tk.X, pady=(10, 0))
 
         ttk.Button(controls, text="Enable/Disable", command=self.toggle_selected).pack(side=tk.LEFT, padx=4)
-        ttk.Button(controls, text="Open Folder", command=self.open_folder).pack(side=tk.LEFT, padx=4)
+        ttk.Button(controls, text="Remove", command=self.remove_selected).pack(side=tk.LEFT, padx=4)
         ttk.Button(controls, text="Open Config", command=self.open_config).pack(side=tk.LEFT, padx=4)
         ttk.Button(controls, text="View Error/Log", command=self.view_error).pack(side=tk.LEFT, padx=4)
         ttk.Button(controls, text="Reload", command=self.reload_addons).pack(side=tk.RIGHT, padx=4)
+        self.restart_button = ttk.Button(controls, text="Restart Now", command=self.restart_now)
+        self.restart_button.pack(side=tk.RIGHT, padx=4)
 
         self.safe_mode_var = tk.BooleanVar(value=self.manager.safe_mode)
         safe_frame = ttk.Frame(main)
-        safe_frame.pack(fill=tk.X, pady=(10, 0))
+        safe_frame.pack(fill=tk.X, pady=(8, 0))
         ttk.Checkbutton(
             safe_frame,
             text="Safe Mode (не загружать аддоны)",
@@ -496,22 +812,97 @@ class AddonManagerWindow(tk.Toplevel):
             command=self.toggle_safe_mode,
         ).pack(side=tk.LEFT)
 
+    def _setup_drag_and_drop(self) -> None:
+        try:
+            if hasattr(self, "drop_target_register"):
+                self.drop_target_register("DND_Files")
+                self.dnd_available = True
+        except Exception:
+            self.dnd_available = False
+        if self.dnd_available:
+            self.dnd_label.configure(text="Drag & Drop .zip сюда")
+            if hasattr(self.dnd_label, "dnd_bind"):
+                self.dnd_label.dnd_bind("<<Drop>>", self._on_drop)  # type: ignore[attr-defined]
+            else:
+                self.dnd_available = False
+        if not self.dnd_available:
+            self.dnd_label.configure(text="Drag & Drop не доступен (установите через кнопки Install)")
+
+    def _on_drop(self, event) -> None:
+        if not event.data:
+            return
+        paths = self.tk.splitlist(event.data)
+        for path in paths:
+            if str(path).lower().endswith(".zip"):
+                self._install_with_preview_zip(path)
+                break
+
     def refresh_list(self) -> None:
         self.tree.delete(*self.tree.get_children())
         addons = self.manager.discover_addons()
+        query = self.search_var.get().strip().lower()
         for addon_id, info in addons.items():
+            if query and query not in info.name.lower() and query not in addon_id.lower():
+                continue
+            status = self._status_for(info)
             self.tree.insert(
                 "",
                 tk.END,
                 iid=addon_id,
-                values=(info.name, info.addon_id, info.version, "Да" if info.enabled else "Нет"),
+                values=(info.name, info.addon_id, info.version, "Yes" if info.enabled else "No", status),
             )
+        self.update_preview()
+        self._update_restart_button()
+
+    def _status_for(self, info: AddonInfo) -> str:
+        if info.invalid:
+            return "Invalid"
+        if info.last_error:
+            return "Error"
+        if info.needs_restart:
+            return "Needs restart"
+        return "OK"
 
     def _selected_addon_id(self) -> str | None:
         selection = self.tree.selection()
         if not selection:
             return None
         return selection[0]
+
+    def update_preview(self) -> None:
+        addon_id = self._selected_addon_id()
+        info = self.manager.addons.get(addon_id) if addon_id else None
+        details = []
+        if info is None:
+            details.append("Выберите аддон для просмотра деталей.")
+        else:
+            details.append(f"Name: {info.name}")
+            details.append(f"ID: {info.addon_id}")
+            details.append(f"Version: {info.version}")
+            details.append(f"API version: {info.api_version}")
+            details.append(f"Enabled: {'Yes' if info.enabled else 'No'}")
+            details.append(f"Path: {info.path}")
+            if info.manifest:
+                author = info.manifest.get("author")
+                description = info.manifest.get("description")
+                permissions = info.manifest.get("permissions")
+                homepage = info.manifest.get("homepage")
+                if author:
+                    details.append(f"Author: {author}")
+                if homepage:
+                    details.append(f"Homepage: {homepage}")
+                if permissions:
+                    details.append(f"Permissions: {', '.join(permissions)}")
+                if description:
+                    details.append("Description:")
+                    details.append(str(description))
+            if info.last_error:
+                details.append("Last error:")
+                details.append(info.last_error)
+        self.preview_text.configure(state="normal")
+        self.preview_text.delete("1.0", tk.END)
+        self.preview_text.insert("1.0", "\n".join(details))
+        self.preview_text.configure(state="disabled")
 
     def toggle_selected(self) -> None:
         addon_id = self._selected_addon_id()
@@ -520,15 +911,15 @@ class AddonManagerWindow(tk.Toplevel):
         info = self.manager.addons.get(addon_id)
         if not info:
             return
+        if info.invalid:
+            messagebox.showwarning("Аддоны", "Невозможно включить аддон без manifest.json")
+            return
         self.manager.set_addon_enabled(addon_id, not info.enabled)
+        self.manager.reload_addons()
         self.refresh_list()
 
-    def open_folder(self) -> None:
-        addon_id = self._selected_addon_id()
-        if not addon_id:
-            return
-        if self.manager.ui:
-            self.manager.ui.open_addon_folder(addon_id)
+    def open_addons_folder(self) -> None:
+        open_path(str(self.manager.addons_dir))
 
     def open_config(self) -> None:
         addon_id = self._selected_addon_id()
@@ -545,8 +936,31 @@ class AddonManagerWindow(tk.Toplevel):
         if not info:
             return
         last_error = info.last_error or "Нет ошибок"
+        log_tail = self._read_log_tail()
+
+        def _build(win, frame):
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+            text = tk.Text(frame, wrap="word")
+            text.grid(row=0, column=0, sticky="nsew")
+            text.insert("1.0", f"Last error:\n{last_error}\n\nLog tail:\n{log_tail}")
+            text.configure(state="disabled")
+
+        self.manager.ui.open_window("Addon Error/Log", _build) if self.manager.ui else messagebox.showinfo(
+            "Ошибки аддона",
+            f"{last_error}\n\nLog:\n{log_tail}",
+        )
+
+    def _read_log_tail(self, lines: int = 120) -> str:
         log_path = self.manager.log_path
-        messagebox.showinfo("Ошибки аддона", f"{last_error}\n\nЛог: {log_path}")
+        if not log_path.exists():
+            return "Log not found"
+        try:
+            content = log_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return "Log not available"
+        tail = content[-lines:]
+        return "\n".join(tail)
 
     def reload_addons(self) -> None:
         self.manager.reload_addons()
@@ -557,6 +971,161 @@ class AddonManagerWindow(tk.Toplevel):
         self.manager._save_settings()
         if self.manager.safe_mode:
             messagebox.showinfo("Safe Mode", "Safe Mode включен. Перезапустите приложение.")
+
+    def install_zip(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Install from ZIP",
+            filetypes=[("ZIP", "*.zip")],
+        )
+        if not path:
+            return
+        self._install_with_preview_zip(path)
+
+    def install_folder(self) -> None:
+        path = filedialog.askdirectory(title="Install from Folder")
+        if not path:
+            return
+        self._install_with_preview_folder(path)
+
+    def _install_with_preview_zip(self, path: str) -> None:
+        preview = self.manager._get_install_preview_from_zip(path)
+        self._show_install_preview(
+            source_label=path,
+            preview=preview,
+            on_install=lambda: self._perform_install_zip(path),
+        )
+
+    def _install_with_preview_folder(self, path: str) -> None:
+        preview = self.manager._get_install_preview_from_folder(path)
+        self._show_install_preview(
+            source_label=path,
+            preview=preview,
+            on_install=lambda: self._perform_install_folder(path),
+        )
+
+    def _show_install_preview(self, source_label: str, preview: dict[str, Any], on_install) -> None:
+        manifest = preview.get("manifest")
+        files = preview.get("files") or []
+        size = preview.get("size") or 0
+        valid = False
+        errors: list[str] = []
+        if manifest:
+            valid, errors = self.manager.validate_manifest(manifest)
+
+        detail_lines = [f"Source: {source_label}"]
+        if manifest:
+            detail_lines.append(f"Name: {manifest.get('name', 'Unknown')}")
+            detail_lines.append(f"ID: {manifest.get('id', 'Unknown')}")
+            detail_lines.append(f"Version: {manifest.get('version', '-')}")
+            detail_lines.append(f"Author: {manifest.get('author', '-')}")
+            detail_lines.append(f"API version: {manifest.get('api_version', '-')}")
+            if manifest.get("description"):
+                detail_lines.append("Description:")
+                detail_lines.append(str(manifest.get("description")))
+            if manifest.get("permissions"):
+                detail_lines.append(f"Permissions: {', '.join(manifest.get('permissions'))}")
+        else:
+            detail_lines.append("Manifest not found: addon будет помечен как Invalid")
+        if errors:
+            detail_lines.append("Manifest warnings:")
+            detail_lines.extend(errors)
+        detail_lines.append(f"Files: {len(files)}")
+        detail_lines.append(f"Approx size: {format_size(size)}")
+        if files:
+            detail_lines.append("Files preview:")
+            detail_lines.extend(files[:120])
+            if len(files) > 120:
+                detail_lines.append("...")
+        detail_lines.append("\n⚠️ Аддоны — это Python-код. Устанавливайте только из доверенных источников.")
+
+        def _build(win, frame):
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+            text = tk.Text(frame, wrap="word")
+            text.grid(row=0, column=0, sticky="nsew")
+            text.insert("1.0", "\n".join(detail_lines))
+            text.configure(state="disabled")
+
+            buttons = ttk.Frame(frame)
+            buttons.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+            def _confirm():
+                win.destroy()
+                on_install()
+
+            ttk.Button(buttons, text="Install anyway", command=_confirm).pack(side=tk.RIGHT, padx=4)
+            ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side=tk.RIGHT)
+
+        if self.manager.ui:
+            self.manager.ui.open_window("Install Preview", _build)
+        else:
+            if messagebox.askyesno("Install Preview", "\n".join(detail_lines)):
+                on_install()
+
+    def _perform_install_zip(self, path: str) -> None:
+        manifest = self.manager.read_manifest_from_zip(path)
+        addon_id = str(manifest.get("id")) if manifest else Path(path).stem
+        if (self.manager.addons_dir / addon_id).exists():
+            if not messagebox.askyesno("Update addon", f"Аддон {addon_id} уже установлен. Обновить?"):
+                return
+        ok, msg = self.manager.install_from_zip(path)
+        if not ok:
+            messagebox.showerror("Install", msg)
+        else:
+            messagebox.showinfo("Install", "Готово")
+        self.manager.reload_addons()
+        self.refresh_list()
+
+    def _perform_install_folder(self, path: str) -> None:
+        manifest = self.manager._read_manifest(Path(path))
+        if manifest is None:
+            located_root, located_manifest = self.manager._locate_manifest_dir(Path(path))
+            if located_root:
+                manifest = located_manifest
+        addon_id = str(manifest.get("id")) if manifest else Path(path).name
+        if (self.manager.addons_dir / addon_id).exists():
+            if not messagebox.askyesno("Update addon", f"Аддон {addon_id} уже установлен. Обновить?"):
+                return
+        ok, msg = self.manager.install_from_folder(path)
+        if not ok:
+            messagebox.showerror("Install", msg)
+        else:
+            messagebox.showinfo("Install", "Готово")
+        self.manager.reload_addons()
+        self.refresh_list()
+
+    def remove_selected(self) -> None:
+        addon_id = self._selected_addon_id()
+        if not addon_id:
+            return
+        choice = messagebox.askyesnocancel(
+            "Удаление аддона",
+            "Удалить аддон?\n\nYes = Переместить в backup\nNo = Удалить навсегда",
+        )
+        if choice is None:
+            return
+        move_to_backup = bool(choice)
+        ok, msg = self.manager.remove_addon(addon_id, move_to_backup=move_to_backup)
+        if not ok:
+            messagebox.showerror("Remove", msg)
+        else:
+            messagebox.showinfo("Remove", "Готово")
+        self.manager.reload_addons()
+        self.refresh_list()
+
+    def restart_now(self) -> None:
+        if not messagebox.askyesno("Restart", "Перезапустить приложение сейчас?"):
+            return
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as exc:
+            messagebox.showerror("Restart", f"Не удалось перезапустить: {exc}")
+
+    def _update_restart_button(self) -> None:
+        if self.manager.restart_required():
+            self.restart_button.pack(side=tk.RIGHT, padx=4)
+        else:
+            self.restart_button.pack_forget()
 
 
 def open_path(path: str) -> None:
@@ -581,3 +1150,33 @@ def datetime_now() -> str:
     import datetime
 
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def format_size(size: int) -> str:
+    if size <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    unit = 0
+    while value >= 1024 and unit < len(units) - 1:
+        value /= 1024
+        unit += 1
+    return f"{value:.1f} {units[unit]}"
+
+
+def tempfile_directory():
+    import tempfile
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _tempdir():
+        path = tempfile.mkdtemp(prefix="ankyx_addon_")
+        try:
+            yield path
+        finally:
+            try:
+                shutil.rmtree(path)
+            except Exception:
+                pass
+
+    return _tempdir()
