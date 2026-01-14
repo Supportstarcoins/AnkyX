@@ -264,6 +264,8 @@ CARD_BORDER = getattr(_ui_theme, "CARD_BORDER", "#D6DCE6")
 SCROLL_TROUGH = getattr(_ui_theme, "SCROLL_TROUGH", "#05070b")
 SCROLL_BG = getattr(_ui_theme, "SCROLL_BG", "#0b0f16")
 SCROLL_ACTIVE = getattr(_ui_theme, "SCROLL_ACTIVE", "#121a26")
+CARD_VIEW_WIDTH = 700
+CARD_VIEW_HEIGHT = 420
 from card_widget import CardWidget
 from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
 
@@ -2257,6 +2259,32 @@ def find_video_media_path(card: dict) -> str | None:
     return None
 
 
+def find_video_media_path_for_side(card: dict, side: str) -> str | None:
+    media_entries = get_media_for_card(card.get("id"), card.get("note_id"))
+    side_key = (side or "back").lower()
+    for entry in media_entries:
+        media_type = (entry.get("media_type") or entry.get("type") or "").lower()
+        if media_type != "video":
+            continue
+        entry_side = (entry.get("side") or "back").lower()
+        if entry_side != side_key:
+            continue
+        path = resolve_media_path(entry.get("path"))
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def get_side_media(side_data: dict) -> tuple[str, str] | None:
+    image_path = resolve_media_path(side_data.get("image_path"))
+    if image_path and os.path.exists(image_path):
+        return ("image", image_path)
+    video_path = resolve_media_path(side_data.get("video_path"))
+    if video_path and os.path.exists(video_path):
+        return ("video", video_path)
+    return None
+
+
 def create_note(
     deck_id: int,
     fields: dict,
@@ -4242,12 +4270,14 @@ class CardRenderer:
         height: int = 420,
         show_image_toolbar: bool = False,
         image_layout: str = "side",
+        show_media_placeholder: bool = True,
         on_media_state_change=None,
         enable_state_restore: bool = False,
     ) -> None:
         self.palette = palette or getattr(parent, "palette", None) or {}
         self.on_media_state_change = on_media_state_change
         self.enable_state_restore = enable_state_restore
+        self.show_media_placeholder = show_media_placeholder
         if card_widget is not None:
             self.card_widget = card_widget
         else:
@@ -4265,6 +4295,9 @@ class CardRenderer:
         self.video_frame = self.card_widget.video_inline_frame
         self._current_video_path: str | None = None
         self._current_audio_key: str | None = None
+        self._current_show_back = False
+        self._current_side_media: tuple[str, str] | None = None
+        self.video_player = None
 
     def _resolve_image_path(self, card: dict, show_back: bool, image_override: str | None = None) -> str | None:
         if image_override is not None:
@@ -4274,6 +4307,34 @@ class CardRenderer:
         else:
             path = card.get("front_image_path") or card.get("image_path")
         return resolve_media_path(path)
+
+    def _resolve_video_path(
+        self,
+        card: dict,
+        show_back: bool,
+        video_override: str | None = None,
+    ) -> str | None:
+        if video_override is not None:
+            return resolve_media_path(video_override)
+        if show_back:
+            video_path = card.get("back_video_path") or card.get("video_path")
+        else:
+            video_path = card.get("front_video_path") or card.get("video_path")
+        if not video_path and (card.get("id") is not None or card.get("note_id") is not None):
+            video_path = find_video_media_path_for_side(card, "back" if show_back else "front")
+        return resolve_media_path(video_path)
+
+    def _select_side_media(
+        self,
+        card: dict,
+        *,
+        show_back: bool,
+        image_override: str | None = None,
+        video_override: str | None = None,
+    ) -> tuple[str, str] | None:
+        image_path = self._resolve_image_path(card, show_back, image_override=image_override)
+        video_path = self._resolve_video_path(card, show_back, video_override=video_override)
+        return get_side_media({"image_path": image_path, "video_path": video_path})
 
     def _apply_custom_text(self, items: list, *, card_bg: str, card_text: str) -> None:
         self.card_widget.use_custom_text(True)
@@ -4311,6 +4372,7 @@ class CardRenderer:
         *,
         show_back: bool = False,
         image_override: str | None = None,
+        video_override: str | None = None,
         custom_items: list | None = None,
     ) -> None:
         colors = getattr(self.card_widget, "palette", None) or {}
@@ -4322,7 +4384,16 @@ class CardRenderer:
         else:
             self.card_widget.use_custom_text(False)
             self.card_widget.set_text(front_text, back_text)
-        image_path = self._resolve_image_path(card, show_back, image_override=image_override)
+        self._current_show_back = show_back
+        side_media = self._select_side_media(
+            card,
+            show_back=show_back,
+            image_override=image_override,
+            video_override=video_override,
+        )
+        self._current_side_media = side_media
+        image_path = side_media[1] if side_media and side_media[0] == "image" else None
+        self._current_video_path = side_media[1] if side_media and side_media[0] == "video" else None
         self.card_widget.show_side(show_back, image_path)
         if custom_items is None:
             try:
@@ -4385,12 +4456,30 @@ class CardRenderer:
     def _render_video(self, card: dict) -> None:
         for widget in self.video_frame.winfo_children():
             widget.destroy()
-        video_path = card.get("video_path") or find_video_media_path(card)
-        if not video_path:
+        side_media = self._current_side_media or self._select_side_media(card, show_back=self._current_show_back)
+        if not side_media or side_media[0] != "video":
             if self.card_widget is not None:
-                self.card_widget.show_video_frame(True, height=80)
-            ttk.Label(self.video_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
+                self.card_widget.show_video_frame(False)
             self._current_video_path = None
+            self.video_player = None
+            if not side_media and self.show_media_placeholder:
+                if self.card_widget is not None:
+                    self.card_widget.show_video_frame(True, height=80)
+                ttk.Label(self.video_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
+            return
+
+        video_path = side_media[1]
+        if not os.path.exists(video_path):
+            print(f"[Video] Файл видео не найден: {video_path}")
+            if self.card_widget is not None:
+                if self.show_media_placeholder:
+                    self.card_widget.show_video_frame(True, height=80)
+                else:
+                    self.card_widget.show_video_frame(False)
+            self._current_video_path = None
+            self.video_player = None
+            if self.show_media_placeholder:
+                ttk.Label(self.video_frame, text="Видео не найдено").pack(anchor="w", padx=5, pady=5)
             return
 
         if self.card_widget is not None:
@@ -4406,6 +4495,7 @@ class CardRenderer:
                     on_state_change=self.on_media_state_change,
                 )
                 if not player.ensure_embedded():
+                    print("[VLC] Не удалось встроить видео в контейнер.")
                     player.frame.destroy()
                 else:
                     player.pack(anchor="w")
@@ -4421,16 +4511,19 @@ class CardRenderer:
                         player.set_media_key(media_key)
                         player.apply_state(load_media_state(card["id"], media_key))
                     self.video_frame.vlc_player = player
+                    self.video_player = player
                     self._current_video_path = video_path
                     return
             except Exception as exc:
                 print(f"[VLC] Ошибка embed видео: {exc}")
 
+        print(f"[Video] Не удалось встроить видео: {video_path}")
         ttk.Button(
             self.video_frame,
             text="Открыть видео внешним плеером",
             command=lambda: open_in_external_player(video_path),
         ).pack(anchor="w", padx=5, pady=5)
+        self.video_player = None
         self._current_video_path = video_path
 
     def render(
@@ -4440,9 +4533,16 @@ class CardRenderer:
         show_back: bool = False,
         prefer_audio_side: str | None = None,
         image_override: str | None = None,
+        video_override: str | None = None,
         custom_items: list | None = None,
     ) -> None:
-        self.update_text(card, show_back=show_back, image_override=image_override, custom_items=custom_items)
+        self.update_text(
+            card,
+            show_back=show_back,
+            image_override=image_override,
+            video_override=video_override,
+            custom_items=custom_items,
+        )
         self.update_media(card, prefer_audio_side=prefer_audio_side)
 
     def get_audio_widget(self):
@@ -10572,8 +10672,10 @@ class AnkiApp(tk.Tk):
                 card_data = {
                     "front": front_text.get("1.0", tk.END).strip(),
                     "back": back_text.get("1.0", tk.END).strip(),
-                    "image_path": media.get("image"),
-                    "video_path": media.get("video"),
+                    "front_image_path": manual_media.get("front", {}).get("image"),
+                    "back_image_path": manual_media.get("back", {}).get("image"),
+                    "front_video_path": manual_media.get("front", {}).get("video"),
+                    "back_video_path": manual_media.get("back", {}).get("video"),
                     "audio_path": media.get("audio"),
                 }
                 if full_refresh:
@@ -10581,13 +10683,11 @@ class AnkiApp(tk.Tk):
                         card_data,
                         show_back=(side == "back"),
                         prefer_audio_side=side,
-                        image_override=media.get("image"),
                     )
                 else:
                     renderer.update_text(
                         card_data,
                         show_back=(side == "back"),
-                        image_override=media.get("image"),
                     )
 
             def open_preview() -> None:
@@ -10616,14 +10716,35 @@ class AnkiApp(tk.Tk):
                     side=tk.LEFT, padx=4
                 )
 
-                renderer = CardRenderer(
+                card_wrap = tk.Frame(
                     container,
+                    bg=DARK_BG,
+                    highlightbackground=CARD_BORDER,
+                    highlightthickness=1,
+                    bd=0,
+                    width=CARD_VIEW_WIDTH,
+                    height=CARD_VIEW_HEIGHT,
+                )
+                card_wrap.pack(padx=10, pady=10)
+                card_wrap.pack_propagate(False)
+                preview_card = CardWidget(
+                    card_wrap,
                     palette=colors,
                     editable=False,
-                    width=700,
-                    height=420,
+                    width=CARD_VIEW_WIDTH,
+                    height=CARD_VIEW_HEIGHT,
                     show_image_toolbar=False,
                     image_layout="side",
+                )
+                preview_card.pack(fill=tk.BOTH, expand=True)
+                renderer = CardRenderer(
+                    preview_card,
+                    palette=colors,
+                    card_widget=preview_card,
+                    editable=False,
+                    show_image_toolbar=False,
+                    image_layout="side",
+                    show_media_placeholder=False,
                 )
                 preview_state["window"] = preview_win
                 preview_state["renderer"] = renderer
@@ -13645,12 +13766,18 @@ class RepeatWindow(tk.Toplevel):
             highlightbackground=CARD_BORDER,
             highlightthickness=1,
             bd=0,
-            width=700,
-            height=420,
+            width=CARD_VIEW_WIDTH,
+            height=CARD_VIEW_HEIGHT,
         )
         card_wrap.pack(padx=10, pady=10)
         card_wrap.pack_propagate(False)
-        self.card_widget = CardWidget(card_wrap, palette=colors, editable=False)
+        self.card_widget = CardWidget(
+            card_wrap,
+            palette=colors,
+            editable=False,
+            width=CARD_VIEW_WIDTH,
+            height=CARD_VIEW_HEIGHT,
+        )
         self.card_widget.pack(fill=tk.BOTH, expand=True)
         self.card_frame = self.card_widget
         self.card_renderer = CardRenderer(
@@ -14239,8 +14366,8 @@ class ReviewWindow(tk.Toplevel):
             bg=card_bg,
             bd=0,
             relief="flat",
-            width=700,
-            height=420
+            width=CARD_VIEW_WIDTH,
+            height=CARD_VIEW_HEIGHT
         )
         style_card_surface(self.card_frame, colors)
         self.card_frame.pack(pady=10)
@@ -14268,8 +14395,8 @@ class ReviewWindow(tk.Toplevel):
             content_container,
             palette=colors,
             editable=False,
-            width=700,
-            height=420,
+            width=CARD_VIEW_WIDTH,
+            height=CARD_VIEW_HEIGHT,
             show_image_toolbar=False,
             image_layout="side",
         )
@@ -14964,3 +15091,4 @@ if __name__ == "__main__":
     app = AnkiApp()
     app.mainloop()
 # PATCH: tabs moved + dark scrollbar + video embed fixed + upload video in generator + unified card renderer
+# PATCH: unify card renderer sizes + white video background + image-over-video rule

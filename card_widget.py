@@ -41,12 +41,16 @@ class CardWidget(tk.Frame):
         self._warned_large_path: str | None = None
         self.scrollbars_enabled = True
         self._last_video_height = 80
+        self.media_width = 260
+        self.media_bg = "white"
 
         self._build_layout()
 
     def _build_layout(self) -> None:
         content_container = tk.Frame(self, bg=self.card_bg)
-        content_container.place(x=10, y=40, width=780, height=300)
+        self.content_container = content_container
+        self._update_content_geometry()
+        self.bind("<Configure>", lambda _e: self._update_content_geometry())
 
         canvas = tk.Canvas(content_container, bg=self.card_bg, highlightthickness=0, borderwidth=0)
         scrollbar = ttk.Scrollbar(content_container, orient="vertical", command=canvas.yview)
@@ -66,13 +70,24 @@ class CardWidget(tk.Frame):
         scrollbar.pack(side="right", fill="y")
 
         self.content_frame = tk.Frame(self.scrollable_frame, bg=self.card_bg)
-        self.content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.content_frame.grid(row=0, column=0, sticky="nsew")
+        self.scrollable_frame.grid_rowconfigure(0, weight=1)
+        self.scrollable_frame.grid_columnconfigure(0, weight=1)
+
+        if self.image_layout == "below":
+            self.content_frame.grid_columnconfigure(0, weight=1)
+            self.content_frame.grid_rowconfigure(0, weight=1)
+            self.content_frame.grid_rowconfigure(1, weight=1)
+        else:
+            self.content_frame.grid_columnconfigure(0, weight=0, minsize=self.media_width)
+            self.content_frame.grid_columnconfigure(1, weight=1)
+            self.content_frame.grid_rowconfigure(0, weight=1)
 
         self.text_frame = tk.Frame(self.content_frame, bg=self.card_bg)
         if self.image_layout == "below":
-            self.text_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+            self.text_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
         else:
-            self.text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+            self.text_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
         self.custom_text_frame = tk.Frame(self.text_frame, bg=self.card_bg)
         self._use_custom_text = False
 
@@ -105,11 +120,12 @@ class CardWidget(tk.Frame):
         self.back_text.pack_forget()
         self.custom_text_frame.pack_forget()
 
-        self.image_frame = tk.Frame(self.content_frame, bg=self.card_bg)
+        self.image_frame = tk.Frame(self.content_frame, bg=self.card_bg, width=self.media_width)
         if self.image_layout == "below":
-            self.image_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(10, 0))
+            self.image_frame.grid(row=1, column=0, sticky="nsew")
         else:
-            self.image_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+            self.image_frame.grid(row=0, column=0, sticky="nsew")
+            self.image_frame.grid_propagate(False)
 
         if self.show_image_toolbar:
             self.toolbar = ttk.Frame(self.image_frame, style="CardInner.TFrame")
@@ -142,14 +158,14 @@ class CardWidget(tk.Frame):
         else:
             self.toolbar = None
 
-        canvas_container = tk.Frame(self.image_frame, bg=self.card_bg)
+        canvas_container = tk.Frame(self.image_frame, bg=self.media_bg)
         canvas_container.pack(fill=tk.BOTH, expand=True)
         canvas_container.grid_rowconfigure(0, weight=1)
         canvas_container.grid_columnconfigure(0, weight=1)
 
         self.image_canvas = tk.Canvas(
             canvas_container,
-            bg=self.card_bg,
+            bg=self.media_bg,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -246,14 +262,6 @@ class CardWidget(tk.Frame):
             self._img_ref = None
             if self.image_canvas is not None:
                 self.image_canvas.delete("card_preview")
-                self.image_canvas.create_text(
-                    10,
-                    10,
-                    anchor="nw",
-                    text="Изображение не прикреплено",
-                    fill="#666666",
-                    tags=("card_preview",),
-                )
             return
 
         try:
@@ -326,14 +334,7 @@ class CardWidget(tk.Frame):
             self._img_ref = None
             if self.image_canvas is not None:
                 self.image_canvas.delete("card_preview")
-                self.image_canvas.create_text(
-                    10,
-                    10,
-                    anchor="nw",
-                    text="Изображение не прикреплено",
-                    fill="#666666",
-                    tags=("card_preview",),
-                )
+                self.image_canvas.configure(bg=self.media_bg)
 
     def show_audio_frame(self, visible: bool) -> None:
         if visible:
@@ -377,3 +378,18 @@ class CardWidget(tk.Frame):
         video_y = max(10, current_height - video_height - 10)
         audio_y = max(10, video_y - audio_height - 10)
         return audio_y, video_y
+
+    def _update_content_geometry(self) -> None:
+        try:
+            width = int(self.cget("width") or 700)
+        except Exception:
+            width = 700
+        try:
+            height = int(self.cget("height") or 420)
+        except Exception:
+            height = 420
+        width = max(width, self.winfo_width() or width)
+        height = max(height, self.winfo_height() or height)
+        content_width = max(1, width - 20)
+        content_height = max(1, height - 120)
+        self.content_container.place(x=10, y=40, width=content_width, height=content_height)
