@@ -933,6 +933,127 @@ def resolve_media_path(path: str | None) -> str | None:
     return normalized
 
 
+def render_image(label, container_widget, image_path, zoom, key):
+    if not image_path:
+        label.config(image="", text="Нет изображения")
+        label.image = None
+        return False
+    resolved_path = resolve_media_path(image_path) if image_path else None
+    if resolved_path and not os.path.isabs(resolved_path):
+        resolved_path = os.path.abspath(os.path.join(MEDIA_FOLDER, resolved_path))
+    exists = bool(resolved_path and os.path.exists(resolved_path))
+    try:
+        cont_w = int(container_widget.winfo_width())
+        cont_h = int(container_widget.winfo_height())
+    except Exception:
+        cont_w = 0
+        cont_h = 0
+    print(
+        "[render_image] container:",
+        cont_w,
+        cont_h,
+        "zoom:",
+        zoom,
+        "path:",
+        resolved_path,
+        "exists:",
+        exists,
+    )
+    if cont_w < 80 or cont_h < 80:
+        prev_job = getattr(label, "_min_size_job", None)
+        if prev_job:
+            try:
+                label.after_cancel(prev_job)
+            except Exception:
+                pass
+        label._min_size_job = label.after(80, lambda: render_image(label, container_widget, image_path, zoom, key))
+        return False
+    if not exists:
+        label.config(image="", text="Нет изображения")
+        label.image = None
+        return False
+    if not hasattr(label, "_orig_pil_by_key"):
+        label._orig_pil_by_key = {}
+    if not hasattr(label, "_tkimg_by_key"):
+        label._tkimg_by_key = {}
+    if not hasattr(label, "_orig_path_by_key"):
+        label._orig_path_by_key = {}
+    path_changed = label._orig_path_by_key.get(key) != resolved_path
+    orig = label._orig_pil_by_key.get(key)
+    if orig is None or path_changed:
+        if PIL_AVAILABLE:
+            try:
+                img, resized_for_pixels = load_preview_image(
+                    resolved_path,
+                    None,
+                    max_pixels=MAX_PREVIEW_PIXELS,
+                )
+                if resized_for_pixels and getattr(label, "_warned_large_path", None) != resolved_path:
+                    try:
+                        messagebox.showinfo(
+                            "Большое изображение",
+                            "Изображение слишком большое, будет сжато для превью.",
+                        )
+                    except Exception:
+                        pass
+                    label._warned_large_path = resolved_path
+                label._orig_pil_by_key[key] = img
+                label._orig_path_by_key[key] = resolved_path
+                orig = img
+            except Exception as exc:
+                log_image_error(resolved_path, exc)
+                label.config(image="", text="Нет изображения")
+                label.image = None
+                return False
+        else:
+            try:
+                tk_img = tk.PhotoImage(file=resolved_path)
+                label._tkimg_by_key[key] = tk_img
+                label.config(image=tk_img, text="")
+                label.image = tk_img
+                return True
+            except Exception as exc:
+                log_image_error(resolved_path, exc)
+                label.config(image="", text="Нет изображения")
+                label.image = None
+                return False
+    if not PIL_AVAILABLE:
+        label.config(image="", text="Нет изображения")
+        label.image = None
+        return False
+    if orig is None:
+        label.config(image="", text="Нет изображения")
+        label.image = None
+        return False
+    try:
+        label.original_image = orig
+        cont_w = max(1, cont_w - 6)
+        cont_h = max(1, cont_h - 6)
+        img_w, img_h = orig.size
+        if img_w <= 0 or img_h <= 0:
+            return False
+        base_ratio = min(cont_w / img_w, cont_h / img_h) if cont_w and cont_h else 1.0
+        zoom_factor = float(zoom) if zoom is not None else 1.0
+        desired_ratio = max(0.05, base_ratio * zoom_factor)
+        max_scale = getattr(label, "max_scale_factor", 3.0)
+        clamped_ratio = max(0.05, min(desired_ratio, base_ratio * max_scale))
+        width = max(1, int(img_w * clamped_ratio))
+        height = max(1, int(img_h * clamped_ratio))
+        pil_copy = orig.copy()
+        resized_image = pil_copy.resize((width, height), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(resized_image)
+        label._tkimg_by_key[key] = photo
+        label.current_image = photo
+        label.config(image=photo, text="")
+        label.image = photo
+        return True
+    except Exception as exc:
+        log_image_error(resolved_path, exc)
+        label.config(image="", text="Нет изображения")
+        label.image = None
+        return False
+
+
 def copy_image_to_media(src: str, target_id: int, move: bool = False) -> str:
     ensure_media_dir()
     ext = os.path.splitext(src)[1].lower() or ".png"
@@ -4587,8 +4708,13 @@ class CardRenderer:
             self.custom_text_frame.grid_remove()
 
         if image_path:
-            self.image_label.load_image(image_path)
-            self.image_label.set_zoom_factor(self.image_zoom)
+            render_key = (card.get("id") or card.get("note_id") or "card", "back" if show_back else "front")
+            self.image_label.load_image(
+                image_path,
+                key=render_key,
+                zoom=self.image_zoom,
+                container_widget=self.image_container,
+            )
         else:
             self.image_label.config(image="", text="Нет изображения")
 
@@ -4773,6 +4899,14 @@ class ResizableImageLabel(tk.Label):
         self.drag_data = {"x": 0, "y": 0, "item": None}
         self._container_size: tuple[int, int] = (0, 0)
         self._warned_large_path: str | None = None
+        self._configure_job = None
+        self._min_size_job = None
+        self._orig_pil_by_key: dict = {}
+        self._tkimg_by_key: dict = {}
+        self._orig_path_by_key: dict = {}
+        self._render_key = None
+        self._render_zoom = None
+        self._render_container = None
         self.max_scale_factor = 3.0
         self.configure(anchor="center")
         
@@ -4787,98 +4921,50 @@ class ResizableImageLabel(tk.Label):
         self.bind("<Configure>", self._handle_configure)
 
     def _handle_configure(self, event):
-        self.set_container_size(event.width, event.height)
+        self._container_size = (max(1, int(event.width)), max(1, int(event.height)))
+        if self._configure_job:
+            try:
+                self.after_cancel(self._configure_job)
+            except Exception:
+                pass
+        self._configure_job = self.after(80, self._render_from_state)
+
+    def _render_from_state(self):
+        if not self.image_path:
+            return
+        container = self._render_container or self.master
+        key = self._render_key or self.image_path
+        zoom = self._render_zoom if self._render_zoom is not None else self.scale_factor
+        render_image(self, container, self.image_path, zoom, key)
 
     def set_container_size(self, width: int, height: int):
         """Установить размеры контейнера для подгонки изображения под доступную область."""
         self._container_size = (max(1, int(width)), max(1, int(height)))
         self.update_display()
         
-    def load_image(self, image_path):
+    def load_image(self, image_path, *, key=None, zoom=None, container_widget=None):
         """Загрузить изображение"""
         self.image_path = resolve_media_path(image_path) if image_path else None
-        resolved_path = self.image_path
-        if resolved_path and os.path.exists(resolved_path) and PIL_AVAILABLE:
-            try:
-                cont_w, cont_h = self._container_size
-                if cont_w <= 1 or cont_h <= 1:
-                    cont_w = max(1, self.winfo_width() or self.winfo_reqwidth() or 800)
-                    cont_h = max(1, self.winfo_height() or self.winfo_reqheight() or 600)
-                max_zoom = 3.0
-                max_preview = (int(cont_w * max_zoom), int(cont_h * max_zoom))
-                img, resized_for_pixels = load_preview_image(
-                    resolved_path,
-                    max_preview,
-                    max_pixels=MAX_PREVIEW_PIXELS,
-                )
-                if resized_for_pixels and self._warned_large_path != resolved_path:
-                    messagebox.showinfo(
-                        "Большое изображение",
-                        "Изображение слишком большое, будет сжато для превью.",
-                    )
-                    self._warned_large_path = resolved_path
-                self.original_image = img
-                self.scale_factor = 1.0
-                self.update_display()
-                return True
-            except Exception as e:
-                log_image_error(resolved_path, e)
-                try:
-                    messagebox.showerror("Ошибка", "Не удалось загрузить изображение.")
-                except Exception:
-                    pass
-                self.original_image = None
-                self.current_image = None
-                self.image = None
-                self.config(text="Нет изображения", image="")
-                return False
-        if resolved_path and os.path.exists(resolved_path) and not PIL_AVAILABLE:
-            try:
-                self.original_image = None
-                self.scale_factor = 1.0
-                self.current_image = tk.PhotoImage(file=resolved_path)
-                self.image = self.current_image
-                self.config(image=self.current_image, text="")
-                return True
-            except Exception as e:
-                log_image_error(resolved_path, e)
-                self.original_image = None
-                self.current_image = None
-                self.image = None
-                self.config(text="Нет изображения", image="")
-                return False
-        else:
+        self._render_key = key
+        if zoom is not None:
+            self.scale_factor = max(0.1, min(self.max_scale_factor, float(zoom)))
+        self._render_zoom = self.scale_factor
+        self._render_container = container_widget or self.master
+        if not self.image_path:
             self.original_image = None
             self.current_image = None
             self.image = None
             self.config(text="Нет изображения", image="")
             return False
+        return bool(render_image(self, self._render_container, self.image_path, self.scale_factor, self._render_key or self.image_path))
     
     def update_display(self):
         """Обновить отображение изображения"""
-        if self.original_image:
-            cont_w, cont_h = self._container_size
-            if cont_w <= 1 or cont_h <= 1:
-                cont_w = max(1, self.winfo_width() or self.winfo_reqwidth())
-                cont_h = max(1, self.winfo_height() or self.winfo_reqheight())
-            cont_w = max(1, cont_w - 6)
-            cont_h = max(1, cont_h - 6)
-
-            img_w, img_h = self.original_image.size
-            if img_w == 0 or img_h == 0:
-                return
-            base_ratio = min(cont_w / img_w, cont_h / img_h) if cont_w and cont_h else 1.0
-            desired_ratio = max(0.05, base_ratio * self.scale_factor)
-            clamped_ratio = max(0.05, min(desired_ratio, base_ratio * self.max_scale_factor))
-            width = max(1, int(img_w * clamped_ratio))
-            height = max(1, int(img_h * clamped_ratio))
-            
-            # Масштабируем изображение
-            resized_image = self.original_image.resize((width, height), Image.Resampling.LANCZOS)
-            self.config(image="", text="")
-            self.current_image = ImageTk.PhotoImage(resized_image)
-            self.image = self.current_image
-            self.config(image=self.current_image, text="")
+        if self.image_path:
+            container = self._render_container or self.master
+            key = self._render_key or self.image_path
+            zoom = self._render_zoom if self._render_zoom is not None else self.scale_factor
+            render_image(self, container, self.image_path, zoom, key)
     
     def start_drag(self, event):
         """Начать перетаскивание для масштабирования"""
@@ -4909,6 +4995,7 @@ class ResizableImageLabel(tk.Label):
             
             # Применяем масштаб
             self.scale_factor = max(0.1, min(3.0, self.scale_factor + delta * 0.5))
+            self._render_zoom = self.scale_factor
             
             # Обновляем изображение
             self.update_display()
@@ -4923,6 +5010,7 @@ class ResizableImageLabel(tk.Label):
     
     def set_zoom_factor(self, zoom_factor: float) -> None:
         self.scale_factor = max(0.1, min(self.max_scale_factor, float(zoom_factor)))
+        self._render_zoom = self.scale_factor
         self.update_display()
 
     def on_mousewheel(self, event):
@@ -4933,6 +5021,7 @@ class ResizableImageLabel(tk.Label):
                 self.scale_factor = max(0.1, self.scale_factor * 0.9)
             elif event.num == 4 or event.delta > 0:  # Вверх или к пользователю
                 self.scale_factor = min(3.0, self.scale_factor * 1.1)
+            self._render_zoom = self.scale_factor
             
             # Обновляем изображение
             self.update_display()
@@ -10863,6 +10952,7 @@ class AnkiApp(tk.Tk):
                     return
                 side = preview_state.get("side") or "front"
                 media = manual_media.get(side, {})
+                image_override = manual_media.get(side, {}).get("image")
                 card_data = {
                     "front": front_text.get("1.0", tk.END).strip(),
                     "back": back_text.get("1.0", tk.END).strip(),
@@ -10880,11 +10970,13 @@ class AnkiApp(tk.Tk):
                         show_back=(side == "back"),
                         prefer_audio_side=side,
                         header_text=header_text,
+                        image_override=image_override,
                     )
                 else:
                     renderer.update_text(
                         card_data,
                         show_back=(side == "back"),
+                        image_override=image_override,
                     )
 
             def open_preview() -> None:
@@ -12531,19 +12623,18 @@ class AnkiApp(tk.Tk):
         media_state = {"image_path": None, "video_path": None}
 
         def update_preview_image(path: str | None):
-            if not path or not os.path.exists(path) or not PIL_AVAILABLE:
+            if not path:
                 preview_label.config(image="", text="Нет превью")
                 win._preview_img_ref = None
                 return
-            try:
-                img = Image.open(path)
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail((520, 320), Image.Resampling.LANCZOS)
-                win._preview_img_ref = ImageTk.PhotoImage(img)
-                preview_label.config(image=win._preview_img_ref, text="")
-            except Exception:
+            preview_key = ("ai_preview", "image")
+            rendered = render_image(preview_label, preview_label, path, 1.0, preview_key)
+            if not rendered:
                 preview_label.config(image="", text="Не удалось загрузить превью")
                 win._preview_img_ref = None
+                return
+            win._preview_img_ref = getattr(preview_label, "image", None)
+            preview_label.image = win._preview_img_ref
 
         def set_preview_text(text: str):
             preview_label.config(image="", text=text)
@@ -15246,3 +15337,4 @@ if __name__ == "__main__":
     app.mainloop()
 # PATCH: tabs moved + dark scrollbar + video embed fixed + upload video in generator + unified card renderer
 # PATCH: unify card renderer sizes + white video background + image-over-video rule
+# PATCH: fix random image shrink (configure debounce + min size + orig cache) + fix preview image render (PhotoImage refs + shared renderer)
