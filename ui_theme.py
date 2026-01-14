@@ -228,6 +228,21 @@ def apply_premium_dark_theme(root: tk.Tk) -> tuple[ttk.Style, dict]:
 
     style.configure("Horizontal.TScrollbar", gripcount=0, background=PALETTE["panel"], troughcolor=PALETTE["border"])
     style.configure("Vertical.TScrollbar", gripcount=0, background=PALETTE["panel"], troughcolor=PALETTE["border"])
+    style.configure(
+        "Dark.Vertical.TScrollbar",
+        gripcount=0,
+        background=SCROLL_BG,
+        troughcolor=SCROLL_TROUGH,
+        bordercolor=SCROLL_TROUGH,
+        lightcolor=SCROLL_BG,
+        darkcolor=SCROLL_BG,
+        arrowcolor=PALETTE["text"],
+    )
+    style.map(
+        "Dark.Vertical.TScrollbar",
+        background=[("active", SCROLL_ACTIVE), ("pressed", SCROLL_ACTIVE)],
+        troughcolor=[("active", SCROLL_TROUGH)],
+    )
 
     style.configure(
         "TLabelframe",
