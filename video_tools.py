@@ -173,8 +173,8 @@ class VlcPlayerWidget:
         self._volume = 70.0
         self._rate = 1.0
 
-        self.frame = ttk.Frame(parent)
-        self.canvas = tk.Canvas(self.frame, width=width, height=height, bg="black", highlightthickness=0)
+        self.frame = tk.Frame(parent, bg="white")
+        self.canvas = tk.Canvas(self.frame, width=width, height=height, bg="white", highlightthickness=0)
         self.canvas.pack(side=tk.TOP, padx=6, pady=6)
 
         control_row = ttk.Frame(self.frame)
