@@ -40,6 +40,7 @@ class CardWidget(tk.Frame):
         self._img_ref = None
         self._warned_large_path: str | None = None
         self.scrollbars_enabled = True
+        self._last_video_height = 80
 
         self._build_layout()
 
@@ -336,7 +337,8 @@ class CardWidget(tk.Frame):
 
     def show_audio_frame(self, visible: bool) -> None:
         if visible:
-            self.audio_inline_frame.place(x=10, y=350, width=780, height=90)
+            audio_y, _video_y = self._calculate_media_positions(self._last_video_height, audio_height=90)
+            self.audio_inline_frame.place(x=10, y=audio_y, width=780, height=90)
         else:
             if self.audio_inline_frame.winfo_ismapped():
                 self.audio_inline_frame.place_forget()
@@ -354,7 +356,24 @@ class CardWidget(tk.Frame):
 
     def show_video_frame(self, visible: bool, height: int = 80) -> None:
         if visible:
-            self.video_inline_frame.place(x=10, y=440, width=780, height=height)
+            self._last_video_height = height
+            _audio_y, video_y = self._calculate_media_positions(height, audio_height=90)
+            self.video_inline_frame.place(x=10, y=video_y, width=780, height=height)
         else:
             if self.video_inline_frame.winfo_ismapped():
                 self.video_inline_frame.place_forget()
+
+    def _calculate_media_positions(self, video_height: int, audio_height: int = 90) -> tuple[int, int]:
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        current_height = self.winfo_height()
+        if not current_height:
+            try:
+                current_height = int(self.cget("height") or 520)
+            except Exception:
+                current_height = 520
+        video_y = max(10, current_height - video_height - 10)
+        audio_y = max(10, video_y - audio_height - 10)
+        return audio_y, video_y

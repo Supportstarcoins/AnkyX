@@ -236,13 +236,44 @@ class VlcPlayerWidget:
         self.player = self.instance.media_player_new()
 
     def _apply_handle(self) -> None:
+        try:
+            self.canvas.update_idletasks()
+        except Exception:
+            pass
         handle = self.canvas.winfo_id()
-        if sys.platform.startswith("linux"):
-            self.player.set_xwindow(handle)
-        elif sys.platform == "darwin":
-            self.player.set_nsobject(handle)
-        else:
-            self.player.set_hwnd(handle)
+        if not handle:
+            print("[VLC] Не удалось получить window handle для видео.")
+            return
+        try:
+            if sys.platform.startswith("linux"):
+                self.player.set_xwindow(handle)
+            elif sys.platform == "darwin":
+                self.player.set_nsobject(handle)
+            else:
+                self.player.set_hwnd(handle)
+        except Exception as exc:
+            print(f"[VLC] Ошибка embed видео: {exc}")
+
+    def ensure_embedded(self) -> bool:
+        try:
+            self.canvas.update_idletasks()
+        except Exception:
+            pass
+        handle = self.canvas.winfo_id()
+        if not handle:
+            print("[VLC] Не удалось получить window handle для видео.")
+            return False
+        try:
+            if sys.platform.startswith("linux"):
+                self.player.set_xwindow(handle)
+            elif sys.platform == "darwin":
+                self.player.set_nsobject(handle)
+            else:
+                self.player.set_hwnd(handle)
+            return True
+        except Exception as exc:
+            print(f"[VLC] Ошибка embed видео: {exc}")
+            return False
 
     def play(self) -> None:
         if not os.path.exists(self.video_path):
