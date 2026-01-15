@@ -2361,27 +2361,35 @@ def remove_media_entry(media_id: int):
 
 
 def display_audio_entries_on_frame(audio_frame, entries: list[dict]):
-    audio_widget = getattr(audio_frame, "audio_widget", None)
-    if audio_widget is None:
-        audio_widget = AudioPlayerWidget(audio_frame)
-        audio_frame.audio_widget = audio_widget
-        audio_widget.pack(fill=tk.X)
+    if not audio_frame or not audio_frame.winfo_exists():
+        return
+    for child in audio_frame.winfo_children():
+        try:
+            child.destroy()
+        except Exception:
+            pass
+    audio_frame.audio_widget = None
+    audio_frame.audio_selector = None
+    audio_frame.audio_selector_frame = None
+    audio_frame.audio_selector_var = None
+    audio_frame.audio_entry_map = {}
+    audio_widget = AudioPlayerWidget(audio_frame)
+    audio_frame.audio_widget = audio_widget
+    audio_widget.pack(fill=tk.X)
 
-    selector_frame = getattr(audio_frame, "audio_selector_frame", None)
-    if selector_frame is None:
-        audio_bg = audio_frame.cget("bg") if hasattr(audio_frame, "cget") else "white"
-        selector_frame = tk.Frame(audio_frame, bg=audio_bg)
-        selector_frame.pack(fill=tk.X, pady=(0, 2))
-        tk.Label(selector_frame, text="Аудиофайлы:", bg=audio_bg).pack(side=tk.LEFT, padx=(0, 5))
-        audio_frame.audio_selector_var = tk.StringVar()
-        combo = ttk.Combobox(
-            selector_frame,
-            textvariable=audio_frame.audio_selector_var,
-            state="readonly",
-        )
-        combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        audio_frame.audio_selector = combo
-        audio_frame.audio_selector_frame = selector_frame
+    audio_bg = audio_frame.cget("bg") if hasattr(audio_frame, "cget") else "white"
+    selector_frame = tk.Frame(audio_frame, bg=audio_bg)
+    selector_frame.pack(fill=tk.X, pady=(0, 2))
+    tk.Label(selector_frame, text="Аудиофайлы:", bg=audio_bg).pack(side=tk.LEFT, padx=(0, 5))
+    audio_frame.audio_selector_var = tk.StringVar()
+    combo = ttk.Combobox(
+        selector_frame,
+        textvariable=audio_frame.audio_selector_var,
+        state="readonly",
+    )
+    combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    audio_frame.audio_selector = combo
+    audio_frame.audio_selector_frame = selector_frame
 
     combo: ttk.Combobox = getattr(audio_frame, "audio_selector", None)
     if not entries:
@@ -4461,11 +4469,13 @@ class CardRenderer:
         self._current_side_media: tuple[str, str] | None = None
         self.video_player = None
         self._use_custom_text = False
+        self._custom_text_widgets: list[tk.Widget] = []
 
         card_bg, card_text, _ = get_card_surface_colors(parent)
         self.card_bg = card_bg
         self.card_text = card_text
         self.container = tk.Frame(parent, bg=card_bg, width=width, height=height)
+        self.root_frame = self.container
         self.container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
         self.container.pack_propagate(False)
         self.container.grid_rowconfigure(1, weight=1)
@@ -4611,6 +4621,70 @@ class CardRenderer:
         self._bind_mousewheel(self.content_canvas)
         self._bind_mousewheel(self.content_inner)
 
+    def is_alive(self) -> bool:
+        return self.root_frame is not None and self.root_frame.winfo_exists()
+
+    def _extract_custom_text_item(self, item, *, card_bg: str, card_text: str) -> dict:
+        if isinstance(item, (tk.Label, tk.Message)):
+            font = item.cget("font") if hasattr(item, "cget") else ("Segoe UI", 12)
+            fg = item.cget("fg") if hasattr(item, "cget") else card_text
+            bg = item.cget("bg") if hasattr(item, "cget") else card_bg
+            wraplength = item.cget("wraplength") if hasattr(item, "cget") else 0
+            anchor = item.cget("anchor") if hasattr(item, "cget") else "w"
+            justify = item.cget("justify") if hasattr(item, "cget") else "left"
+            text = item.cget("text") if hasattr(item, "cget") else str(item)
+            return {
+                "type": "text",
+                "text": text,
+                "font": font,
+                "fg": fg,
+                "bg": bg,
+                "wraplength": wraplength,
+                "anchor": anchor,
+                "justify": justify,
+                "widget": "message" if isinstance(item, tk.Message) else "label",
+            }
+        if isinstance(item, tk.Frame):
+            bg = item.cget("bg") if hasattr(item, "cget") else card_bg
+            children = []
+            for child in item.winfo_children():
+                if isinstance(child, (tk.Label, tk.Message)):
+                    font = child.cget("font") if hasattr(child, "cget") else ("Segoe UI", 12)
+                    fg = child.cget("fg") if hasattr(child, "cget") else card_text
+                    cbg = child.cget("bg") if hasattr(child, "cget") else card_bg
+                    wraplength = child.cget("wraplength") if hasattr(child, "cget") else 0
+                    anchor = child.cget("anchor") if hasattr(child, "cget") else "w"
+                    justify = child.cget("justify") if hasattr(child, "cget") else "left"
+                    text = child.cget("text") if hasattr(child, "cget") else ""
+                    children.append(
+                        {
+                            "text": text,
+                            "font": font,
+                            "fg": fg,
+                            "bg": cbg,
+                            "wraplength": wraplength,
+                            "anchor": anchor,
+                            "justify": justify,
+                            "widget": "message" if isinstance(child, tk.Message) else "label",
+                        }
+                    )
+            return {
+                "type": "frame",
+                "bg": bg,
+                "children": children,
+            }
+        return {
+            "type": "text",
+            "text": str(item),
+            "font": ("Segoe UI", 12),
+            "fg": card_text,
+            "bg": card_bg,
+            "wraplength": 0,
+            "anchor": "w",
+            "justify": "left",
+            "widget": "label",
+        }
+
     def _bind_mousewheel(self, target: tk.Widget) -> None:
         def _on_mousewheel(event):
             if event.num == 4:
@@ -4679,31 +4753,84 @@ class CardRenderer:
         return get_side_media({"image_path": image_path, "video_path": video_path})
 
     def _apply_custom_text(self, items: list, *, card_bg: str, card_text: str) -> None:
+        # PATCH: fix TclError bad window path by recreating widgets (no reuse) + winfo_exists guards
         self._use_custom_text = True
+        for widget in self._custom_text_widgets:
+            if widget.winfo_exists():
+                widget.destroy()
+        self._custom_text_widgets.clear()
         for widget in self.custom_text_frame.winfo_children():
-            widget.destroy()
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+        extracted_items: list[dict] = []
+        for item in items:
+            if isinstance(item, dict):
+                extracted_items.append(item)
+            else:
+                extracted_items.append(self._extract_custom_text_item(item, card_bg=card_bg, card_text=card_text))
         row = 0
         col = 0
         max_cols = 3
-        for item in items:
-            if isinstance(item, tk.Frame):
-                item.grid(
-                    row=row,
-                    column=col,
-                    sticky="w",
-                    padx=5,
-                    pady=2,
-                    in_=self.custom_text_frame,
-                )
+        for item in extracted_items:
+            item_type = item.get("type")
+            if item_type == "frame":
+                frame = tk.Frame(self.custom_text_frame, bg=item.get("bg") or card_bg)
+                for child in item.get("children", []):
+                    widget_type = child.get("widget")
+                    if widget_type == "message":
+                        child_widget = tk.Message(
+                            frame,
+                            text=child.get("text", ""),
+                            bg=child.get("bg") or card_bg,
+                            fg=child.get("fg") or card_text,
+                            font=child.get("font") or ("Segoe UI", 12),
+                            wraplength=child.get("wraplength") or 0,
+                            anchor=child.get("anchor") or "w",
+                            justify=child.get("justify") or "left",
+                        )
+                    else:
+                        child_widget = tk.Label(
+                            frame,
+                            text=child.get("text", ""),
+                            bg=child.get("bg") or card_bg,
+                            fg=child.get("fg") or card_text,
+                            font=child.get("font") or ("Segoe UI", 12),
+                            wraplength=child.get("wraplength") or 0,
+                            anchor=child.get("anchor") or "w",
+                            justify=child.get("justify") or "left",
+                        )
+                    child_widget.pack(side=tk.LEFT, padx=(0, 5))
+                    self._custom_text_widgets.append(child_widget)
+                frame.grid(row=row, column=col, sticky="w", padx=5, pady=2)
+                self._custom_text_widgets.append(frame)
             else:
-                label = tk.Label(
-                    self.custom_text_frame,
-                    text=item,
-                    bg="white",
-                    fg=card_text,
-                    font=("Segoe UI", 12),
-                )
+                widget_type = item.get("widget")
+                if widget_type == "message":
+                    label = tk.Message(
+                        self.custom_text_frame,
+                        text=item.get("text", ""),
+                        bg=item.get("bg") or card_bg,
+                        fg=item.get("fg") or card_text,
+                        font=item.get("font") or ("Segoe UI", 12),
+                        wraplength=item.get("wraplength") or 0,
+                        anchor=item.get("anchor") or "w",
+                        justify=item.get("justify") or "left",
+                    )
+                else:
+                    label = tk.Label(
+                        self.custom_text_frame,
+                        text=item.get("text", ""),
+                        bg=item.get("bg") or card_bg,
+                        fg=item.get("fg") or card_text,
+                        font=item.get("font") or ("Segoe UI", 12),
+                        wraplength=item.get("wraplength") or 0,
+                        anchor=item.get("anchor") or "w",
+                        justify=item.get("justify") or "left",
+                    )
                 label.grid(row=row, column=col, sticky="w", padx=5, pady=2)
+                self._custom_text_widgets.append(label)
             col += 1
             if col >= max_cols:
                 col = 0
@@ -4789,6 +4916,8 @@ class CardRenderer:
         return []
 
     def update_media(self, card: dict, *, prefer_audio_side: str | None = None) -> None:
+        if not self.audio_frame or not self.audio_frame.winfo_exists():
+            return
         prefer_side = prefer_audio_side or "back"
         entries = self._get_audio_entries(card, prefer_side)
         if entries:
@@ -4815,7 +4944,10 @@ class CardRenderer:
                 _apply_audio_selection()
         else:
             for widget in self.audio_frame.winfo_children():
-                widget.destroy()
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass
             ttk.Label(self.audio_frame, text="Аудио не прикреплено").pack(anchor="center")
 
         self._render_video(card)
@@ -14388,51 +14520,81 @@ class RepeatWindow(tk.Toplevel):
         """Извлечь слова из текста и добавить переводы из словаря."""
         # Удаляем перевод в скобках если он есть
         text = re.sub(r'\([^)]*\)', '', text).strip()
-        
+
+        card_bg, card_text, _ = get_card_surface_colors(self.master)
         words = re.findall(r'\b\w+\b', text, re.UNICODE)
         result = []
 
         for word in words:
             if len(word) < 2:  # Пропускаем очень короткие слова
-                result.append(word)
+                result.append(
+                    {
+                        "type": "text",
+                        "text": word,
+                        "font": ("Segoe UI", 12),
+                        "fg": card_text,
+                        "bg": card_bg,
+                        "wraplength": 0,
+                        "anchor": "w",
+                        "justify": "left",
+                        "widget": "label",
+                    }
+                )
                 continue
 
             translation = get_translation(word, use_openai=False) if self.show_translations else ""
             if translation:
-                # Создаем фрейм для слова и перевода
                 colors = getattr(self.master, "palette", None)
-                card_bg, card_text, _ = get_card_surface_colors(self.master)
-                parent = self.card_renderer.custom_text_frame if self.card_renderer else self
-                word_frame = tk.Frame(parent, bg=card_bg)
-
-                # Слово
-                word_label = tk.Label(
-                    word_frame,
-                    text=word,
-                    bg=card_bg,
-                    fg=card_text,
-                    font=("Segoe UI", 12)
+                result.append(
+                    {
+                        "type": "frame",
+                        "bg": card_bg,
+                        "children": [
+                            {
+                                "text": word,
+                                "font": ("Segoe UI", 12),
+                                "fg": card_text,
+                                "bg": card_bg,
+                                "wraplength": 0,
+                                "anchor": "w",
+                                "justify": "left",
+                                "widget": "label",
+                            },
+                            {
+                                "text": f"({translation})",
+                                "font": ("Segoe UI", 10, "italic"),
+                                "fg": colors["accent"] if colors else "blue",
+                                "bg": card_bg,
+                                "wraplength": 0,
+                                "anchor": "w",
+                                "justify": "left",
+                                "widget": "label",
+                            },
+                        ],
+                    }
                 )
-                word_label.pack(side=tk.LEFT, padx=(0, 5))
-
-                # Перевод
-                if self.show_translations:
-                    trans_label = tk.Label(
-                        word_frame,
-                        text=f"({translation})",
-                        bg=card_bg,
-                        fg=colors["accent"] if colors else "blue",
-                        font=("Segoe UI", 10, "italic")
-                    )
-                    trans_label.pack(side=tk.LEFT)
-
-                result.append(word_frame)
             else:
-                result.append(word)
+                result.append(
+                    {
+                        "type": "text",
+                        "text": word,
+                        "font": ("Segoe UI", 12),
+                        "fg": card_text,
+                        "bg": card_bg,
+                        "wraplength": 0,
+                        "anchor": "w",
+                        "justify": "left",
+                        "widget": "label",
+                    }
+                )
         
         return result
 
     def update_view(self):
+        if not self.winfo_exists():
+            return
+        if not self.card_renderer or not self.card_renderer.is_alive():
+            return
         total = len(self.session.cards)
         idx = self.session.index + 1
         c = self.current_card
@@ -14594,6 +14756,10 @@ class RepeatWindow(tk.Toplevel):
         self.reset_timer_for_card()
 
     def next_card(self):
+        if not self.winfo_exists():
+            return
+        if not self.card_renderer or not self.card_renderer.is_alive():
+            return
         self.goto_next_card()
 
     def prev_card(self):
