@@ -177,7 +177,7 @@ class VlcPlayerWidget:
         self.canvas = tk.Canvas(self.frame, width=width, height=height, bg="white", highlightthickness=0)
         self.canvas.pack(side=tk.TOP, padx=6, pady=6)
 
-        control_row = ttk.Frame(self.frame)
+        control_row = tk.Frame(self.frame, bg="white")
         control_row.pack(fill=tk.X, pady=2)
         self.play_btn = ttk.Button(control_row, text="▶ Play", command=self.play)
         self.play_btn.pack(side=tk.LEFT, padx=2)
@@ -200,7 +200,7 @@ class VlcPlayerWidget:
         self.rate_combo.pack(side=tk.LEFT)
         self.rate_combo.bind("<<ComboboxSelected>>", lambda _e: self.set_rate(float(self.rate_var.get())))
 
-        self.volume_panel = ttk.Frame(self.frame)
+        self.volume_panel = tk.Frame(self.frame, bg="white")
         self.volume_panel.pack(fill=tk.X, pady=2)
         self.volume_panel.pack_forget()
         ttk.Label(self.volume_panel, text="Громкость").pack(side=tk.LEFT, padx=(0, 5))
@@ -215,7 +215,7 @@ class VlcPlayerWidget:
         )
         self.volume_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        seek_frame = ttk.Frame(self.frame)
+        seek_frame = tk.Frame(self.frame, bg="white")
         seek_frame.pack(fill=tk.X, pady=2)
         self.time_label = ttk.Label(seek_frame, text="00:00 / 00:00")
         self.time_label.pack(side=tk.LEFT, padx=(0, 5))
@@ -240,7 +240,7 @@ class VlcPlayerWidget:
             self.canvas.update_idletasks()
         except Exception:
             pass
-        handle = self.canvas.winfo_id()
+        handle = int(self.canvas.winfo_id() or 0)
         if not handle:
             print("[VLC] Не удалось получить window handle для видео.")
             return
@@ -259,7 +259,7 @@ class VlcPlayerWidget:
             self.canvas.update_idletasks()
         except Exception:
             pass
-        handle = self.canvas.winfo_id()
+        handle = int(self.canvas.winfo_id() or 0)
         if not handle:
             print("[VLC] Не удалось получить window handle для видео.")
             return False
