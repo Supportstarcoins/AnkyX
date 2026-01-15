@@ -814,6 +814,9 @@ MIC_DEVICE_INDEX = None
 DEFAULT_FRONT_TEMPLATE = "{sentence_with_gap}"
 DEFAULT_BACK_TEMPLATE = "{word} [{ipa}] ({gender}; pl. {plural})\n\n{sentence}\n\n{translation}"
 MEDIA_FOLDER = "media"
+# PATCH: unified fixed media slot 512x384 + shared image renderer for preview/repeat/playback (no container autosize)
+MEDIA_SLOT_W = 512
+MEDIA_SLOT_H = 384
 MEDIA_IMPORT_SUBDIR = "anki_import"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 
@@ -4504,13 +4507,17 @@ class CardRenderer:
         self.show_media_placeholder = show_media_placeholder
         self.card_widget = card_widget
         self.image_zoom = 1.0
-        self.media_width = 260
+        self.media_width = MEDIA_SLOT_W
         self._current_video_path: str | None = None
         self._current_audio_key: str | None = None
         self._current_show_back = False
         self._current_side_media: tuple[str, str] | None = None
         self._current_image_override: str | None = None
+        self._current_image_path: str | None = None
+        self._current_image_key = None
         self._tk_img_cache: dict = {}
+        self._orig_pil_cache: dict = {}
+        self._orig_path_cache: dict = {}
         self.video_player = None
         self._use_custom_text = False
         self._custom_text_widgets: list[tk.Widget] = []
@@ -4578,17 +4585,18 @@ class CardRenderer:
         self.media_col = tk.Frame(self.content_row, bg="white", width=self.media_width)
         self.media_col.grid(row=0, column=0, sticky="nw", padx=(0, 12))
         self.media_col.grid_propagate(False)
+        self.media_col.pack_propagate(False)
 
-        self.image_container = tk.Frame(self.media_col, bg="white")
-        self.image_container.pack(fill=tk.BOTH, expand=True)
-        self.image_label = ResizableImageLabel(
-            self.image_container,
+        self.image_container = tk.Frame(
+            self.media_col,
             bg="white",
-            relief="flat",
-            bd=0,
-            enable_mousewheel=False,
+            width=MEDIA_SLOT_W,
+            height=MEDIA_SLOT_H,
         )
-        self.image_label.pack(fill=tk.BOTH, expand=True)
+        self.image_container.pack_propagate(False)
+        self.image_container.grid_propagate(False)
+        self.image_container.pack(anchor="nw")
+        self.media_slot = self.image_container
 
         self.zoom_frame = tk.Frame(self.media_col, bg="white")
         self.zoom_frame.pack(anchor="w", pady=(6, 0))
@@ -4758,6 +4766,58 @@ class CardRenderer:
             self.front_text.configure(wraplength=width)
         if isinstance(self.back_text, tk.Label):
             self.back_text.configure(wraplength=width)
+
+    def render_image_to_slot(self, slot_parent, image_path, cache_key, zoom=1.0):
+        if not slot_parent or not slot_parent.winfo_exists():
+            return False
+        if not hasattr(self, "_tk_img_cache"):
+            self._tk_img_cache = {}
+        if not hasattr(self, "_orig_pil_cache"):
+            self._orig_pil_cache = {}
+        if not hasattr(self, "_orig_path_cache"):
+            self._orig_path_cache = {}
+        for widget in slot_parent.winfo_children():
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+        abs_path = resolve_media_path(image_path) if image_path else ""
+        abs_path = os.path.abspath(abs_path) if abs_path else ""
+        if not abs_path or not os.path.exists(abs_path):
+            return False
+        if not PIL_AVAILABLE:
+            return False
+        path_changed = self._orig_path_cache.get(cache_key) != abs_path
+        orig = self._orig_pil_cache.get(cache_key)
+        if orig is None or path_changed:
+            try:
+                img = Image.open(abs_path)
+                img = img.convert("RGBA")
+            except Exception:
+                return False
+            self._orig_pil_cache[cache_key] = img
+            self._orig_path_cache[cache_key] = abs_path
+            orig = img
+        img_w, img_h = orig.size
+        if img_w <= 0 or img_h <= 0:
+            return False
+        scale = min(MEDIA_SLOT_W / img_w, MEDIA_SLOT_H / img_h) * float(zoom)
+        new_w = max(1, int(img_w * scale))
+        new_h = max(1, int(img_h * scale))
+        try:
+            resample = Image.Resampling.LANCZOS
+        except Exception:
+            resample = getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", 1))
+        try:
+            resized = orig.copy().resize((new_w, new_h), resample)
+            photo = ImageTk.PhotoImage(resized)
+        except Exception:
+            return False
+        self._tk_img_cache[cache_key] = photo
+        lbl = tk.Label(slot_parent, image=photo, bg="white")
+        lbl.image = photo
+        lbl.place(relx=0.5, rely=0.5, anchor="center")
+        return True
 
     def render_image_hard(self, parent_frame, image_path, cache_key):
         return render_image_hard_shared(self, parent_frame, image_path, cache_key)
@@ -4932,8 +4992,12 @@ class CardRenderer:
             self.custom_text_frame.grid_remove()
 
         if not image_path:
-            if self.image_label is not None and self.image_label.winfo_exists():
-                self.image_label.config(image="", text="Нет изображения")
+            if self.media_slot is not None and self.media_slot.winfo_exists():
+                for widget in self.media_slot.winfo_children():
+                    try:
+                        widget.destroy()
+                    except Exception:
+                        pass
 
     def _get_audio_entries(self, card: dict, prefer_side: str | None) -> list[dict]:
         if "audio_entries" in card:
@@ -4968,23 +5032,18 @@ class CardRenderer:
         picked_path = self._current_image_override if self._current_image_override is not None else get_side_image_path(card, side_for_image)
         print("[IMG] mode=", mode, "side=", side_for_image, "picked=", picked_path)
 
-        media_container = self.image_container
+        media_container = self.media_slot
         if not media_container or not media_container.winfo_exists():
             print("[IMG] media_container missing or destroyed in mode:", mode)
         else:
             try:
-                media_container.configure(bg="white")
+                media_container.configure(bg="white", width=MEDIA_SLOT_W, height=MEDIA_SLOT_H)
             except Exception:
                 pass
-            for widget in media_container.winfo_children():
-                try:
-                    widget.destroy()
-                except Exception:
-                    pass
-            image_parent = tk.Frame(media_container, bg="white")
-            image_parent.pack(fill="both", expand=True, anchor="nw")
-            render_key = (card.get("id") or card.get("note_id") or "card", side_for_image)
-            self.render_image_hard(image_parent, picked_path, render_key)
+            render_key = (mode, card.get("id") or card.get("note_id") or "card", side_for_image, "image")
+            self._current_image_path = picked_path
+            self._current_image_key = render_key
+            self.render_image_to_slot(media_container, picked_path, render_key, zoom=self.image_zoom)
 
         prefer_side = prefer_audio_side or "back"
         entries = self._get_audio_entries(card, prefer_side)
@@ -5111,8 +5170,11 @@ class CardRenderer:
         self.header_label.config(text=text)
 
     def adjust_image_zoom(self, factor: float) -> None:
-        self.image_zoom = max(0.1, min(3.0, self.image_zoom * float(factor)))
-        self.image_label.set_zoom_factor(self.image_zoom)
+        self.image_zoom = max(0.5, min(2.5, self.image_zoom * float(factor)))
+        if self.media_slot is not None and self.media_slot.winfo_exists():
+            image_path = self._current_image_path
+            cache_key = self._current_image_key or ("zoom", image_path or "empty")
+            self.render_image_to_slot(self.media_slot, image_path, cache_key, zoom=self.image_zoom)
 
 def create_action_menubutton(parent, palette: dict | None = None) -> tuple[ttk.Menubutton, tk.Menu]:
     palette = palette or {}
@@ -13720,6 +13782,7 @@ class OverviewWindow(tk.Toplevel):
         self.master = master
         self.cards = [dict(c) for c in cards]
         self._tk_img_cache = {}
+        self._orig_pil_cache = {}
         
         if not self.cards:
             messagebox.showinfo("Пусто", "Нет карточек для ознакомления.")
@@ -13890,16 +13953,15 @@ class OverviewWindow(tk.Toplevel):
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Изображение
-        image_container = tk.Frame(content, bg="white")
-        image_container.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-        image_label = ResizableImageLabel(
-            image_container,
-            bg=card_bg,
-            relief="flat",
-            bd=0
+        image_container = tk.Frame(
+            content,
+            bg="white",
+            width=MEDIA_SLOT_W,
+            height=MEDIA_SLOT_H,
         )
-        style_card_surface(image_label, colors)
-        image_label.pack(fill=tk.BOTH, expand=True)
+        image_container.pack_propagate(False)
+        image_container.grid_propagate(False)
+        image_container.pack(anchor="nw", pady=(10, 0))
 
         # Аудио блок
         audio_frame = ttk.Frame(content, style="CardSurface.TFrame")
@@ -13920,18 +13982,11 @@ class OverviewWindow(tk.Toplevel):
             print("[IMG] media_container missing or destroyed in mode: overview")
             return
         try:
-            image_container.configure(bg="white")
+            image_container.configure(bg="white", width=MEDIA_SLOT_W, height=MEDIA_SLOT_H)
         except Exception:
             pass
-        for widget in image_container.winfo_children():
-            try:
-                widget.destroy()
-            except Exception:
-                pass
-        image_parent = tk.Frame(image_container, bg="white")
-        image_parent.pack(fill="both", expand=True, anchor="nw")
-        render_key = (self.current_card.get("id") or self.current_card.get("note_id") or "card", side)
-        render_image_hard_shared(self, image_parent, image_path, render_key)
+        render_key = ("overview", self.current_card.get("id") or self.current_card.get("note_id") or "card", side, "image")
+        CardRenderer.render_image_to_slot(self, image_container, image_path, render_key, zoom=1.0)
     
     def mark_as_learned(self):
         """Отметить карточку как изученную"""
