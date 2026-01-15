@@ -960,6 +960,16 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
     resolved_path = resolve_media_path(image_path) if image_path else None
     if resolved_path:
         resolved_path = os.path.abspath(resolved_path)
+    print(
+        "[PREVIEW] side=",
+        getattr(label, "_render_side", None),
+        "img=",
+        image_path,
+        "abs=",
+        resolved_path,
+        "exists=",
+        os.path.exists(resolved_path) if resolved_path else False,
+    )
     exists = bool(resolved_path and os.path.exists(resolved_path))
     try:
         cont_w = int(container_widget.winfo_width())
@@ -4876,6 +4886,7 @@ class CardRenderer:
 
         self.image_label._render_mode = self.render_mode
         self.image_label._render_card_id = card.get("id") or card.get("note_id")
+        self.image_label._render_side = side_key
         if media["image_exists"] and media["image_path"]:
             if self.render_mode == "preview" and card.get("id") is None and card.get("note_id") is None:
                 render_key = ("manual_preview", side_key, "image")
@@ -10501,10 +10512,12 @@ class AnkiApp(tk.Tk):
             def _fmt_not_ready() -> None:
                 set_status("Функция в разработке")
 
-            manual_media = {
-                "front": {"image": None, "video": None, "audio": None, "pos": None},
-                "back": {"image": None, "video": None, "audio": None, "pos": None},
+            # PATCH: manual new-card media unified (manual_media front/back) + preview reads same data + no front->back inherit
+            self.manual_media = {
+                "front": {"image": "", "video": "", "audio": [], "pos": None},
+                "back": {"image": "", "video": "", "audio": [], "pos": None},
             }
+            manual_media = self.manual_media
             preview_state = {"window": None, "renderer": None, "side": "front"}
 
             self._front_img_photo = None
@@ -10932,7 +10945,8 @@ class AnkiApp(tk.Tk):
                 side = current_side()
                 image_path = manual_media[side]["image"]
                 video_path = manual_media[side]["video"]
-                audio_path = manual_media[side]["audio"]
+                audio_paths = manual_media[side]["audio"] or []
+                audio_path = audio_paths[-1] if audio_paths else ""
 
                 media_canvas.delete("all")
                 canvas_width = media_canvas.winfo_width() or 600
@@ -11007,26 +11021,30 @@ class AnkiApp(tk.Tk):
 
             def attach_image(path: str) -> None:
                 side = current_side()
-                manual_media[side]["image"] = path
+                stored_path = os.path.abspath(path)
+                manual_media[side]["image"] = stored_path
                 manual_media[side]["pos"] = None
                 if side == "front":
-                    self.front_image_path = path
+                    self.front_image_path = stored_path
                 else:
-                    self.back_image_path = path
-                print("[PREVIEW] set image side=", side, "path=", path, "exists=", os.path.exists(path))
+                    self.back_image_path = stored_path
+                print("[PREVIEW] set image side=", side, "path=", stored_path, "exists=", os.path.exists(stored_path))
                 add_change_log(f"Прикреплено изображение: {os.path.basename(path)}")
                 render_media_blocks()
+                refresh_preview(full_refresh=True)
 
             def attach_audio(path: str) -> None:
                 side = current_side()
-                manual_media[side]["audio"] = path
+                stored_path = os.path.abspath(path)
+                manual_media[side]["audio"] = [stored_path]
                 manual_media[side]["pos"] = None
                 add_change_log(f"Прикреплено аудио: {os.path.basename(path)}")
                 render_media_blocks()
 
             def attach_video(path: str) -> None:
                 side = current_side()
-                manual_media[side]["video"] = path
+                stored_path = os.path.abspath(path)
+                manual_media[side]["video"] = stored_path
                 manual_media[side]["pos"] = None
                 add_change_log(f"Прикреплено видео: {os.path.basename(path)}")
                 render_media_blocks()
@@ -11135,7 +11153,7 @@ class AnkiApp(tk.Tk):
                         fh.write(data)
                     if not os.path.exists(filename) or os.path.getsize(filename) < 1024:
                         raise RuntimeError("TTS файл не создан или пустой")
-                    manual_media[side]["audio"] = filename
+                    manual_media[side]["audio"] = [filename]
                     manual_media[side]["pos"] = None
                     add_change_log(f"Озвучка добавлена: {os.path.basename(filename)}")
                     render_media_blocks()
@@ -11144,9 +11162,9 @@ class AnkiApp(tk.Tk):
 
             def clear_media():
                 side = current_side()
-                manual_media[side]["image"] = None
-                manual_media[side]["audio"] = None
-                manual_media[side]["video"] = None
+                manual_media[side]["image"] = ""
+                manual_media[side]["audio"] = []
+                manual_media[side]["video"] = ""
                 manual_media[side]["pos"] = None
                 add_change_log("Удалены прикрепления для текущей стороны")
                 render_media_blocks()
@@ -11175,7 +11193,7 @@ class AnkiApp(tk.Tk):
             def add_card_to_intro(card_id: int, deck_id: int) -> None:
                 mark_card_for_overview(card_id)
 
-            def update_preview_if_open(full_refresh: bool = False) -> None:
+            def refresh_preview(full_refresh: bool = False) -> None:
                 try:
                     preview_win = preview_state.get("window")
                     renderer = preview_state.get("renderer")
@@ -11189,24 +11207,30 @@ class AnkiApp(tk.Tk):
                     side = preview_state.get("side") or "front"
                     media = manual_media.get(side, {})
 
-                    front_image_raw = self.front_image_path or manual_media.get("front", {}).get("image")
-                    back_image_raw = self.back_image_path or manual_media.get("back", {}).get("image")
+                    front_image_raw = manual_media.get("front", {}).get("image")
+                    back_image_raw = manual_media.get("back", {}).get("image")
                     front_image_abs = resolve_media_path(front_image_raw) if front_image_raw else None
                     back_image_abs = resolve_media_path(back_image_raw) if back_image_raw else None
-                    if front_image_abs:
-                        print(
-                            "[PREVIEW] abs_path=",
-                            front_image_abs,
-                            "exists=",
-                            os.path.exists(front_image_abs),
-                        )
-                    if back_image_abs:
-                        print(
-                            "[PREVIEW] abs_path=",
-                            back_image_abs,
-                            "exists=",
-                            os.path.exists(back_image_abs),
-                        )
+                    print(
+                        "[PREVIEW] side=",
+                        "front",
+                        "img=",
+                        front_image_raw,
+                        "abs=",
+                        front_image_abs,
+                        "exists=",
+                        os.path.exists(front_image_abs) if front_image_abs else False,
+                    )
+                    print(
+                        "[PREVIEW] side=",
+                        "back",
+                        "img=",
+                        back_image_raw,
+                        "abs=",
+                        back_image_abs,
+                        "exists=",
+                        os.path.exists(back_image_abs) if back_image_abs else False,
+                    )
 
                     if preview_container is not None:
                         preview_container.update_idletasks()
@@ -11221,14 +11245,16 @@ class AnkiApp(tk.Tk):
                             media_slot.winfo_height(),
                         )
 
+                    audio_entries = media.get("audio") or []
+                    audio_path = audio_entries[-1] if audio_entries else None
                     card_data = {
                         "front": front_text.get("1.0", tk.END).strip(),
                         "back": back_text.get("1.0", tk.END).strip(),
-                        "front_image_path": front_image_abs,
-                        "back_image_path": back_image_abs,
+                        "front_image_path": front_image_raw,
+                        "back_image_path": back_image_raw,
                         "front_video_path": manual_media.get("front", {}).get("video"),
                         "back_video_path": manual_media.get("back", {}).get("video"),
-                        "audio_path": media.get("audio"),
+                        "audio_path": audio_path,
                     }
                     header_text = "Предпросмотр | след. повтор: —"
                     # PATCH: manual new card preview image render fixed (refresh call + unique cache_key + PhotoImage cache + path resolver)
@@ -11243,6 +11269,9 @@ class AnkiApp(tk.Tk):
 
                     print("[PREVIEW] EXC:", exc)
                     traceback.print_exc()
+
+            def update_preview_if_open(full_refresh: bool = False) -> None:
+                refresh_preview(full_refresh=full_refresh)
 
             def open_preview() -> None:
                 preview_win = tk.Toplevel(win)
@@ -11334,14 +11363,16 @@ class AnkiApp(tk.Tk):
                         level=1,
                     )
                     media_entries = []
-                    front_audio = manual_media["front"]["audio"]
-                    back_audio = manual_media["back"]["audio"]
+                    front_audio_entries = manual_media["front"]["audio"] or []
+                    back_audio_entries = manual_media["back"]["audio"] or []
                     front_video = manual_media["front"]["video"]
                     back_video = manual_media["back"]["video"]
-                    if front_audio:
-                        media_entries.append((copy_audio_asset_to_media(front_audio, "front_audio"), "audio", "front", None))
-                    if back_audio:
-                        media_entries.append((copy_audio_asset_to_media(back_audio, "back_audio"), "audio", "back", None))
+                    if front_audio_entries:
+                        for audio_path in front_audio_entries:
+                            media_entries.append((copy_audio_asset_to_media(audio_path, "front_audio"), "audio", "front", None))
+                    if back_audio_entries:
+                        for audio_path in back_audio_entries:
+                            media_entries.append((copy_audio_asset_to_media(audio_path, "back_audio"), "audio", "back", None))
                     if front_video:
                         media_entries.append((copy_video_asset_to_media(front_video, "front_video"), "video", "front", None))
                     if back_video:
