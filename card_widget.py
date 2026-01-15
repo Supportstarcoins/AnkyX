@@ -9,6 +9,13 @@ from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
 PIL_AVAILABLE = True
 
 
+def _pil_lanczos():
+    try:
+        return Image.Resampling.LANCZOS
+    except Exception:
+        return getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", 1))
+
+
 class CardWidget(tk.Frame):
     def __init__(
         self,
@@ -297,7 +304,7 @@ class CardWidget(tk.Frame):
             else:
                 scale = max(0.1, self.zoom_factor)
             new_size = (max(1, int(img_w * scale)), max(1, int(img_h * scale)))
-            resized = img.resize(new_size, Image.Resampling.LANCZOS)
+            resized = img.resize(new_size, _pil_lanczos())
             self._img_ref = ImageTk.PhotoImage(resized)
             self.image_canvas.delete("card_preview")
             self.image_canvas.create_image(
