@@ -1140,7 +1140,19 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
 
 
 def render_image(label, container_widget, image_path, zoom, key):
-    return render_image_safe(label, container_widget, image_path, key, zoom=zoom)
+    try:
+        return render_image_safe(label, container_widget, image_path, key, zoom=zoom)
+    except Exception as exc:
+        import traceback
+
+        print("[PREVIEW] EXC:", exc)
+        traceback.print_exc()
+        try:
+            label.config(image="", text="")
+            label.image = None
+        except Exception:
+            pass
+        return False
 
 
 def copy_image_to_media(src: str, target_id: int, move: bool = False) -> str:
@@ -4865,7 +4877,10 @@ class CardRenderer:
         self.image_label._render_mode = self.render_mode
         self.image_label._render_card_id = card.get("id") or card.get("note_id")
         if media["image_exists"] and media["image_path"]:
-            render_key = (card.get("id") or card.get("note_id") or "card", side_key)
+            if self.render_mode == "preview" and card.get("id") is None and card.get("note_id") is None:
+                render_key = ("manual_preview", side_key, "image")
+            else:
+                render_key = (card.get("id") or card.get("note_id") or "card", side_key)
             self.image_label.load_image(
                 media["image_path"],
                 key=render_key,
@@ -10499,6 +10514,8 @@ class AnkiApp(tk.Tk):
             self._manual_img_photo_front = None
             self._manual_img_photo_back = None
             self.manual_side = "front"
+            self.front_image_path = None
+            self.back_image_path = None
 
             def current_side() -> str:
                 return self.manual_side
@@ -10992,6 +11009,11 @@ class AnkiApp(tk.Tk):
                 side = current_side()
                 manual_media[side]["image"] = path
                 manual_media[side]["pos"] = None
+                if side == "front":
+                    self.front_image_path = path
+                else:
+                    self.back_image_path = path
+                print("[PREVIEW] set image side=", side, "path=", path, "exists=", os.path.exists(path))
                 add_change_log(f"Прикреплено изображение: {os.path.basename(path)}")
                 render_media_blocks()
 
@@ -11154,32 +11176,73 @@ class AnkiApp(tk.Tk):
                 mark_card_for_overview(card_id)
 
             def update_preview_if_open(full_refresh: bool = False) -> None:
-                preview_win = preview_state.get("window")
-                renderer = preview_state.get("renderer")
-                if not preview_win or not renderer:
-                    return
-                if not preview_win.winfo_exists():
-                    preview_state["window"] = None
-                    preview_state["renderer"] = None
-                    return
-                side = preview_state.get("side") or "front"
-                media = manual_media.get(side, {})
-                card_data = {
-                    "front": front_text.get("1.0", tk.END).strip(),
-                    "back": back_text.get("1.0", tk.END).strip(),
-                    "front_image_path": manual_media.get("front", {}).get("image"),
-                    "back_image_path": manual_media.get("back", {}).get("image"),
-                    "front_video_path": manual_media.get("front", {}).get("video"),
-                    "back_video_path": manual_media.get("back", {}).get("video"),
-                    "audio_path": media.get("audio"),
-                }
-                header_text = "Предпросмотр | след. повтор: —"
-                renderer.render_side(
-                    card_data,
-                    side,
-                    prefer_audio_side=side,
-                    header_text=header_text,
-                )
+                try:
+                    preview_win = preview_state.get("window")
+                    renderer = preview_state.get("renderer")
+                    preview_container = preview_state.get("container")
+                    if not preview_win or not renderer:
+                        return
+                    if not preview_win.winfo_exists():
+                        preview_state["window"] = None
+                        preview_state["renderer"] = None
+                        return
+                    side = preview_state.get("side") or "front"
+                    media = manual_media.get(side, {})
+
+                    front_image_raw = self.front_image_path or manual_media.get("front", {}).get("image")
+                    back_image_raw = self.back_image_path or manual_media.get("back", {}).get("image")
+                    front_image_abs = resolve_media_path(front_image_raw) if front_image_raw else None
+                    back_image_abs = resolve_media_path(back_image_raw) if back_image_raw else None
+                    if front_image_abs:
+                        print(
+                            "[PREVIEW] abs_path=",
+                            front_image_abs,
+                            "exists=",
+                            os.path.exists(front_image_abs),
+                        )
+                    if back_image_abs:
+                        print(
+                            "[PREVIEW] abs_path=",
+                            back_image_abs,
+                            "exists=",
+                            os.path.exists(back_image_abs),
+                        )
+
+                    if preview_container is not None:
+                        preview_container.update_idletasks()
+
+                    media_slot = getattr(renderer, "image_container", None)
+                    if media_slot is not None:
+                        print(
+                            "[PREVIEW] media_slot exists=",
+                            media_slot.winfo_exists(),
+                            "size=",
+                            media_slot.winfo_width(),
+                            media_slot.winfo_height(),
+                        )
+
+                    card_data = {
+                        "front": front_text.get("1.0", tk.END).strip(),
+                        "back": back_text.get("1.0", tk.END).strip(),
+                        "front_image_path": front_image_abs,
+                        "back_image_path": back_image_abs,
+                        "front_video_path": manual_media.get("front", {}).get("video"),
+                        "back_video_path": manual_media.get("back", {}).get("video"),
+                        "audio_path": media.get("audio"),
+                    }
+                    header_text = "Предпросмотр | след. повтор: —"
+                    # PATCH: manual new card preview image render fixed (refresh call + unique cache_key + PhotoImage cache + path resolver)
+                    renderer.update_text(
+                        card_data,
+                        show_back=side == "back",
+                    )
+                    renderer.update_media(card_data, prefer_audio_side=side)
+                    renderer.set_header_text(header_text)
+                except Exception as exc:
+                    import traceback
+
+                    print("[PREVIEW] EXC:", exc)
+                    traceback.print_exc()
 
             def open_preview() -> None:
                 preview_win = tk.Toplevel(win)
@@ -11229,6 +11292,7 @@ class AnkiApp(tk.Tk):
                 )
                 preview_state["window"] = preview_win
                 preview_state["renderer"] = renderer
+                preview_state["container"] = card_wrap
                 preview_state["side"] = side_var.get()
 
                 def _on_close():
