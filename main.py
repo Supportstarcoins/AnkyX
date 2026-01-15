@@ -266,6 +266,7 @@ SCROLL_BG = getattr(_ui_theme, "SCROLL_BG", "#0b0f16")
 SCROLL_ACTIVE = getattr(_ui_theme, "SCROLL_ACTIVE", "#121a26")
 CARD_VIEW_WIDTH = 700
 CARD_VIEW_HEIGHT = 420
+REPEAT_MEDIA_SLOT_SIZE = (260, 240)
 from card_widget import CardWidget
 from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
 
@@ -949,6 +950,7 @@ def _ensure_image_caches(owner) -> None:
         owner._orig_path_cache = {}
 
 
+# PATCH: stop auto-shrinking image (no in-place thumbnail, orig cache + debounce Configure + fixed slot/min-size gate)
 # PATCH: image rendering restored (Pillow resample fallback + PhotoImage cache + min-size debounce + shared render)
 def render_image_safe(label, container_widget, image_path, key, zoom=None):
     if not image_path:
@@ -965,6 +967,13 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
     except Exception:
         cont_w = 0
         cont_h = 0
+    fixed_slot = getattr(label, "_fixed_slot_size", None) or getattr(container_widget, "_fixed_slot_size", None)
+    if fixed_slot:
+        try:
+            cont_w = max(1, int(fixed_slot[0]))
+            cont_h = max(1, int(fixed_slot[1]))
+        except Exception:
+            pass
     if cont_w < 80 or cont_h < 80:
         prev_job = getattr(label, "_min_size_job", None)
         if prev_job:
@@ -989,11 +998,17 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
     if orig is None or path_changed:
         if PIL_AVAILABLE:
             try:
-                img, resized_for_pixels = load_preview_image(
-                    resolved_path,
-                    None,
-                    max_pixels=MAX_PREVIEW_PIXELS,
-                )
+                img = Image.open(resolved_path)
+                img = ImageOps.exif_transpose(img)
+                if img.mode not in ("RGBA", "RGB"):
+                    img = img.convert("RGBA")
+                total_pixels = img.width * img.height
+                resized_for_pixels = False
+                if MAX_PREVIEW_PIXELS and total_pixels > MAX_PREVIEW_PIXELS:
+                    scale = (MAX_PREVIEW_PIXELS / float(total_pixels)) ** 0.5
+                    new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+                    img = img.resize(new_size, _pil_lanczos())
+                    resized_for_pixels = True
                 if resized_for_pixels and getattr(label, "_warned_large_path", None) != resolved_path:
                     try:
                         messagebox.showinfo(
@@ -1071,6 +1086,10 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
         clamped_ratio = max(0.05, min(desired_ratio, base_ratio * max_scale))
         width = max(1, int(img_w * clamped_ratio))
         height = max(1, int(img_h * clamped_ratio))
+        min_w = 120
+        min_h = 120
+        if (width < min_w or height < min_h) and getattr(label, "current_image", None) is not None:
+            return False
         pil_copy = orig.copy()
         resized_image = pil_copy.resize((width, height), _pil_lanczos())
         photo = ImageTk.PhotoImage(resized_image)
@@ -1078,6 +1097,25 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
         label.current_image = photo
         label.config(image=photo, text="")
         label.image = photo
+        last_size = getattr(label, "_last_render_size", None)
+        if last_size != (width, height):
+            render_mode = getattr(label, "_render_mode", "unknown")
+            card_id = getattr(label, "_render_card_id", None)
+            print(
+                "[IMG-RESIZE] mode=",
+                render_mode,
+                "card=",
+                card_id,
+                "slot=",
+                cont_w,
+                cont_h,
+                "new=",
+                width,
+                height,
+                "zoom=",
+                zoom_factor,
+            )
+            label._last_render_size = (width, height)
         if not getattr(label, "_img_ok_logged", False):
             print(
                 "[IMG] ok:",
@@ -4447,6 +4485,8 @@ class CardRenderer:
         show_media_placeholder: bool = True,
         on_media_state_change=None,
         enable_state_restore: bool = False,
+        fixed_media_slot: tuple[int, int] | None = None,
+        render_mode: str = "generic",
     ) -> None:
         self.palette = palette or getattr(parent, "palette", None) or {}
         self.on_media_state_change = on_media_state_change
@@ -4455,6 +4495,9 @@ class CardRenderer:
         self.card_widget = card_widget
         self.image_zoom = 1.0
         self.media_width = 260
+        self._orig_pil_cache = {}
+        self._fixed_media_slot = fixed_media_slot
+        self.render_mode = render_mode
         self._current_video_path: str | None = None
         self._current_audio_key: str | None = None
         self._current_show_back = False
@@ -4526,6 +4569,9 @@ class CardRenderer:
         self.media_col.grid_propagate(False)
 
         self.image_container = tk.Frame(self.media_col, bg="white")
+        if self._fixed_media_slot:
+            self.image_container.config(width=self._fixed_media_slot[0], height=self._fixed_media_slot[1])
+            self.image_container.pack_propagate(False)
         self.image_container.pack(fill=tk.BOTH, expand=True)
         self.image_label = ResizableImageLabel(
             self.image_container,
@@ -4534,6 +4580,9 @@ class CardRenderer:
             bd=0,
             enable_mousewheel=False,
         )
+        self.image_label._orig_pil_cache = self._orig_pil_cache
+        if self._fixed_media_slot:
+            self.image_label.set_fixed_slot_size(self._fixed_media_slot[0], self._fixed_media_slot[1])
         self.image_label.pack(fill=tk.BOTH, expand=True)
 
         self.zoom_frame = tk.Frame(self.media_col, bg="white")
@@ -4758,6 +4807,8 @@ class CardRenderer:
         else:
             self.custom_text_frame.grid_remove()
 
+        self.image_label._render_mode = self.render_mode
+        self.image_label._render_card_id = card.get("id") or card.get("note_id")
         if image_path:
             render_key = (card.get("id") or card.get("note_id") or "card", "back" if show_back else "front")
             self.image_label.load_image(
@@ -4961,6 +5012,7 @@ class ResizableImageLabel(tk.Label):
         self._render_key = None
         self._render_zoom = None
         self._render_container = None
+        self._fixed_slot_size: tuple[int, int] | None = None
         self.max_scale_factor = 3.0
         self.configure(anchor="center")
         
@@ -4981,6 +5033,9 @@ class ResizableImageLabel(tk.Label):
                 self.after_cancel(self._configure_job)
             except Exception:
                 pass
+        if event.width < 80 or event.height < 80:
+            self._configure_job = self.after(80, self._render_from_state)
+            return
         self._configure_job = self.after(80, self._render_from_state)
 
     def _render_from_state(self):
@@ -4995,6 +5050,9 @@ class ResizableImageLabel(tk.Label):
         """Установить размеры контейнера для подгонки изображения под доступную область."""
         self._container_size = (max(1, int(width)), max(1, int(height)))
         self.update_display()
+
+    def set_fixed_slot_size(self, width: int, height: int) -> None:
+        self._fixed_slot_size = (max(1, int(width)), max(1, int(height)))
         
     def load_image(self, image_path, *, key=None, zoom=None, container_widget=None):
         """Загрузить изображение"""
@@ -14113,6 +14171,8 @@ class RepeatWindow(tk.Toplevel):
             image_layout="side",
             on_media_state_change=self._handle_media_state_update,
             enable_state_restore=True,
+            fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
+            render_mode="repeat",
         )
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
@@ -14695,6 +14755,8 @@ class ReviewWindow(tk.Toplevel):
             height=CARD_VIEW_HEIGHT,
             show_image_toolbar=False,
             image_layout="side",
+            fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
+            render_mode="playback",
         )
 
         # Прогресс-бар
