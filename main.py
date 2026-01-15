@@ -913,24 +913,33 @@ def ensure_media_dir() -> str:
     return MEDIA_FOLDER
 
 
-def resolve_media_path(path: str | None) -> str | None:
-    if not path:
-        return None
-    normalized = os.path.expanduser(path)
-    if os.path.isabs(normalized) and os.path.exists(normalized):
-        return normalized
-    if os.path.exists(normalized):
-        return normalized
-    if normalized.startswith(MEDIA_FOLDER + os.sep):
-        candidate = normalized
-    else:
-        candidate = os.path.join(MEDIA_FOLDER, normalized)
-    if os.path.exists(candidate):
-        return candidate
-    basename_candidate = os.path.join(MEDIA_FOLDER, os.path.basename(normalized))
-    if os.path.exists(basename_candidate):
-        return basename_candidate
-    return normalized
+class MediaPathResolver:
+    def __init__(self, media_dir: str, project_root: str) -> None:
+        self.media_dir = media_dir
+        self.project_root = project_root
+
+    def resolve_media_path(self, p: str) -> str:
+        if not p:
+            return ""
+        normalized = os.path.normpath(p.replace("\\", "/"))
+        if os.path.isabs(normalized):
+            return os.path.abspath(normalized)
+        if normalized.replace("\\", "/").startswith("media/") or normalized.replace("\\", "/").startswith("media\\"):
+            candidate = os.path.join(self.project_root, normalized)
+        else:
+            candidate = os.path.join(self.media_dir, normalized)
+        return os.path.abspath(os.path.normpath(candidate))
+
+
+MEDIA_PATH_RESOLVER = MediaPathResolver(MEDIA_FOLDER, BASE_DIR)
+
+
+def resolve_media_path(path: str | None) -> str:
+    return MEDIA_PATH_RESOLVER.resolve_media_path(path or "")
+
+
+def get_side_image_path(card: dict, side: str) -> str | None:
+    return card.get("front_image_path") if side == "front" else card.get("back_image_path")
 
 
 def _pil_lanczos():
@@ -947,6 +956,39 @@ def _ensure_image_caches(owner) -> None:
         owner._orig_pil_cache = {}
     if not hasattr(owner, "_orig_path_cache"):
         owner._orig_path_cache = {}
+
+
+def render_image_hard_shared(owner, parent_frame, image_path, cache_key):
+    _ensure_image_caches(owner)
+    abs_path = resolve_media_path(image_path) if image_path else ""
+    abs_path = os.path.abspath(abs_path) if abs_path else ""
+    print("[IMG] path:", image_path, "abs:", abs_path, "exists:", os.path.exists(abs_path))
+    if not abs_path or not os.path.exists(abs_path):
+        try:
+            for widget in parent_frame.winfo_children():
+                widget.destroy()
+        except Exception:
+            pass
+        return False
+    try:
+        if not PIL_AVAILABLE:
+            print("[IMG] PIL not available for render_image_hard_shared")
+            return False
+        img = Image.open(abs_path)
+        img = img.convert("RGBA")
+        img2 = img.copy()
+        img2.thumbnail((420, 420), resample=_pil_lanczos())
+        photo = ImageTk.PhotoImage(img2)
+        owner._tk_img_cache[cache_key] = photo
+        label = tk.Label(parent_frame, image=photo, bg="white")
+        label.image = photo
+        label.pack(fill="both", expand=False, anchor="nw")
+        return True
+    except Exception as e:
+        import traceback
+        print("[IMG] EXC:", e)
+        traceback.print_exc()
+        return False
 
 
 # PATCH: image rendering restored (Pillow resample fallback + PhotoImage cache + min-size debounce + shared render)
@@ -4467,6 +4509,8 @@ class CardRenderer:
         self._current_audio_key: str | None = None
         self._current_show_back = False
         self._current_side_media: tuple[str, str] | None = None
+        self._current_image_override: str | None = None
+        self._tk_img_cache: dict = {}
         self.video_player = None
         self._use_custom_text = False
         self._custom_text_widgets: list[tk.Widget] = []
@@ -4715,13 +4759,14 @@ class CardRenderer:
         if isinstance(self.back_text, tk.Label):
             self.back_text.configure(wraplength=width)
 
+    def render_image_hard(self, parent_frame, image_path, cache_key):
+        return render_image_hard_shared(self, parent_frame, image_path, cache_key)
+
     def _resolve_image_path(self, card: dict, show_back: bool, image_override: str | None = None) -> str | None:
         if image_override is not None:
             return resolve_media_path(image_override)
-        if show_back:
-            path = card.get("back_image_path") or card.get("front_image_path") or card.get("image_path")
-        else:
-            path = card.get("front_image_path") or card.get("image_path")
+        side = "back" if show_back else "front"
+        path = get_side_image_path(card, side)
         return resolve_media_path(path)
 
     def _resolve_video_path(
@@ -4863,6 +4908,7 @@ class CardRenderer:
             else:
                 self.back_text.configure(text=back_text)
         self._current_show_back = show_back
+        self._current_image_override = image_override
         side_media = self._select_side_media(
             card,
             show_back=show_back,
@@ -4885,16 +4931,9 @@ class CardRenderer:
         else:
             self.custom_text_frame.grid_remove()
 
-        if image_path:
-            render_key = (card.get("id") or card.get("note_id") or "card", "back" if show_back else "front")
-            self.image_label.load_image(
-                image_path,
-                key=render_key,
-                zoom=self.image_zoom,
-                container_widget=self.image_container,
-            )
-        else:
-            self.image_label.config(image="", text="Нет изображения")
+        if not image_path:
+            if self.image_label is not None and self.image_label.winfo_exists():
+                self.image_label.config(image="", text="Нет изображения")
 
     def _get_audio_entries(self, card: dict, prefer_side: str | None) -> list[dict]:
         if "audio_entries" in card:
@@ -4915,9 +4954,38 @@ class CardRenderer:
             return get_card_audio_entries(card, prefer_side=prefer_side)
         return []
 
-    def update_media(self, card: dict, *, prefer_audio_side: str | None = None) -> None:
+    def update_media(
+        self,
+        card: dict,
+        *,
+        prefer_audio_side: str | None = None,
+        mode: str = "unknown",
+        side: str | None = None,
+    ) -> None:
         if not self.audio_frame or not self.audio_frame.winfo_exists():
             return
+        side_for_image = side or ("back" if self._current_show_back else "front")
+        picked_path = self._current_image_override if self._current_image_override is not None else get_side_image_path(card, side_for_image)
+        print("[IMG] mode=", mode, "side=", side_for_image, "picked=", picked_path)
+
+        media_container = self.image_container
+        if not media_container or not media_container.winfo_exists():
+            print("[IMG] media_container missing or destroyed in mode:", mode)
+        else:
+            try:
+                media_container.configure(bg="white")
+            except Exception:
+                pass
+            for widget in media_container.winfo_children():
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass
+            image_parent = tk.Frame(media_container, bg="white")
+            image_parent.pack(fill="both", expand=True, anchor="nw")
+            render_key = (card.get("id") or card.get("note_id") or "card", side_for_image)
+            self.render_image_hard(image_parent, picked_path, render_key)
+
         prefer_side = prefer_audio_side or "back"
         entries = self._get_audio_entries(card, prefer_side)
         if entries:
@@ -5023,6 +5091,7 @@ class CardRenderer:
         video_override: str | None = None,
         custom_items: list | None = None,
         header_text: str | None = None,
+        mode: str = "unknown",
     ) -> None:
         if header_text is not None:
             self.set_header_text(header_text)
@@ -5033,7 +5102,7 @@ class CardRenderer:
             video_override=video_override,
             custom_items=custom_items,
         )
-        self.update_media(card, prefer_audio_side=prefer_audio_side)
+        self.update_media(card, prefer_audio_side=prefer_audio_side, mode=mode)
 
     def get_audio_widget(self):
         return getattr(self.audio_frame, "audio_widget", None)
@@ -5084,6 +5153,7 @@ class ResizableImageLabel(tk.Label):
         self._warned_large_path: str | None = None
         self._configure_job = None
         self._min_size_job = None
+        self.enable_auto_fit = False
         self._tk_img_cache: dict = {}
         self._orig_pil_cache: dict = {}
         self._orig_path_cache: dict = {}
@@ -5107,6 +5177,8 @@ class ResizableImageLabel(tk.Label):
         self.bind("<Configure>", self._handle_configure)
 
     def _handle_configure(self, event):
+        if not self.enable_auto_fit:
+            return
         self._container_size = (max(1, int(event.width)), max(1, int(event.height)))
         if self._configure_job:
             try:
@@ -11157,12 +11229,19 @@ class AnkiApp(tk.Tk):
                         prefer_audio_side=side,
                         header_text=header_text,
                         image_override=image_override,
+                        mode="new_card_preview",
                     )
                 else:
                     renderer.update_text(
                         card_data,
                         show_back=(side == "back"),
                         image_override=image_override,
+                    )
+                    renderer.update_media(
+                        card_data,
+                        prefer_audio_side=side,
+                        mode="new_card_preview",
+                        side=side,
                     )
 
             def open_preview() -> None:
@@ -13640,6 +13719,7 @@ class OverviewWindow(tk.Toplevel):
         super().__init__(master)
         self.master = master
         self.cards = [dict(c) for c in cards]
+        self._tk_img_cache = {}
         
         if not self.cards:
             messagebox.showinfo("Пусто", "Нет карточек для ознакомления.")
@@ -13810,14 +13890,16 @@ class OverviewWindow(tk.Toplevel):
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Изображение
+        image_container = tk.Frame(content, bg="white")
+        image_container.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         image_label = ResizableImageLabel(
-            content,
+            image_container,
             bg=card_bg,
             relief="flat",
             bd=0
         )
         style_card_surface(image_label, colors)
-        image_label.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        image_label.pack(fill=tk.BOTH, expand=True)
 
         # Аудио блок
         audio_frame = ttk.Frame(content, style="CardSurface.TFrame")
@@ -13831,7 +13913,25 @@ class OverviewWindow(tk.Toplevel):
         style_card_surface(video_frame, colors, padded=False)
         video_frame.pack(fill=tk.X, pady=(5, 0))
 
-        return text_widget, image_label, audio_frame, video_frame
+        return text_widget, image_container, audio_frame, video_frame
+
+    def _render_overview_image(self, image_container, image_path, side: str) -> None:
+        if not image_container or not image_container.winfo_exists():
+            print("[IMG] media_container missing or destroyed in mode: overview")
+            return
+        try:
+            image_container.configure(bg="white")
+        except Exception:
+            pass
+        for widget in image_container.winfo_children():
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+        image_parent = tk.Frame(image_container, bg="white")
+        image_parent.pack(fill="both", expand=True, anchor="nw")
+        render_key = (self.current_card.get("id") or self.current_card.get("note_id") or "card", side)
+        render_image_hard_shared(self, image_parent, image_path, render_key)
     
     def mark_as_learned(self):
         """Отметить карточку как изученную"""
@@ -13893,11 +13993,9 @@ class OverviewWindow(tk.Toplevel):
         create_context_menu(self.front_text)  # Добавляем контекстное меню
         
         # Загружаем изображение лицевой стороны
-        front_img_path = resolve_media_path(c.get("front_image_path") or c.get("image_path"))
-        if front_img_path:
-            self.front_image_label.load_image(front_img_path)
-        else:
-            self.front_image_label.load_image(None)
+        front_img_path = get_side_image_path(c, "front")
+        print("[IMG] mode=", "overview", "side=", "front", "picked=", front_img_path)
+        self._render_overview_image(self.front_image_label, front_img_path, "front")
         
         # Обновляем аудио плеер для лицевой стороны
         self.update_audio_player(self.front_audio_frame, c, prefer_side="front")
@@ -13924,11 +14022,9 @@ class OverviewWindow(tk.Toplevel):
         create_context_menu(self.back_text)  # Добавляем контекстное меню
         
         # Загружаем изображение задней стороны
-        back_img_path = resolve_media_path(c.get("back_image_path") or c.get("image_path"))
-        if back_img_path:
-            self.back_image_label.load_image(back_img_path)
-        else:
-            self.back_image_label.load_image(None)
+        back_img_path = get_side_image_path(c, "back")
+        print("[IMG] mode=", "overview", "side=", "back", "picked=", back_img_path)
+        self._render_overview_image(self.back_image_label, back_img_path, "back")
         
         # Обновляем аудио плеер для задней стороны
         self.update_audio_player(self.back_audio_frame, c, prefer_side="back")
@@ -14313,7 +14409,12 @@ class RepeatWindow(tk.Toplevel):
         if not self.card_renderer:
             return
         prefer_side = "back" if self.show_back else "front"
-        self.card_renderer.update_media(self.current_card, prefer_audio_side=prefer_side)
+        self.card_renderer.update_media(
+            self.current_card,
+            prefer_audio_side=prefer_side,
+            mode="repeat",
+            side=prefer_side,
+        )
         self.audio_widget = self.card_renderer.get_audio_widget()
 
     def _build_actions_menu(self, parent) -> ttk.Menubutton:
@@ -14623,18 +14724,12 @@ class RepeatWindow(tk.Toplevel):
 
         front_text = c["front"]
         back_text = c["back"]
-        if self.show_back:
-            img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
-        else:
-            img_path = c["front_image_path"] or c["image_path"]
-
         use_custom = (not self.show_back) and self.show_translations and c["leitner_level"] == 1
         custom_items = self.extract_words_with_translations(front_text) if use_custom else None
         if self.card_renderer is not None:
             self.card_renderer.update_text(
                 c,
                 show_back=self.show_back,
-                image_override=img_path,
                 custom_items=custom_items,
             )
 
@@ -14651,6 +14746,12 @@ class RepeatWindow(tk.Toplevel):
         if self.card_renderer is not None:
             self.card_renderer.set_header_text("")
             self.card_renderer.update_text({"front": "На сегодня всё", "back": ""}, show_back=False)
+            self.card_renderer.update_media(
+                {"front": "На сегодня всё", "back": ""},
+                prefer_audio_side="front",
+                mode="repeat",
+                side="front",
+            )
         for btn in [
             self.btn_prev,
             self.btn_next,
@@ -14918,7 +15019,12 @@ class ReviewWindow(tk.Toplevel):
         if not hasattr(self, "card_renderer") or self.card_renderer is None:
             return
         prefer_side = "back" if self.show_back else "front"
-        self.card_renderer.update_media(self.current_card, prefer_audio_side=prefer_side)
+        self.card_renderer.update_media(
+            self.current_card,
+            prefer_audio_side=prefer_side,
+            mode="playback",
+            side=prefer_side,
+        )
         self.audio_widget = self.card_renderer.get_audio_widget()
 
     def _show_audio_error(self, title: str, message: str):
@@ -15102,11 +15208,6 @@ class ReviewWindow(tk.Toplevel):
         if self.card_renderer is not None:
             self.card_renderer.set_header_text(header_text)
 
-        if self.show_back:
-            img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
-        else:
-            img_path = c["front_image_path"] or c["image_path"]
-
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
 
         self.update_progress_view()
@@ -15117,8 +15218,8 @@ class ReviewWindow(tk.Toplevel):
                 c,
                 show_back=self.show_back,
                 prefer_audio_side="back" if self.show_back else "front",
-                image_override=img_path,
                 header_text=header_text,
+                mode="playback",
             )
             self.audio_widget = self.card_renderer.get_audio_widget()
         else:
@@ -15558,3 +15659,4 @@ if __name__ == "__main__":
 # PATCH: tabs moved + dark scrollbar + video embed fixed + upload video in generator + unified card renderer
 # PATCH: unify card renderer sizes + white video background + image-over-video rule
 # PATCH: fix random image shrink (configure debounce + min size + orig cache) + fix preview image render (PhotoImage refs + shared renderer)
+# PATCH: hard restore image render everywhere (absolute path resolver + PhotoImage cache + shared renderer)
