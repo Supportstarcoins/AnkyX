@@ -814,9 +814,6 @@ MIC_DEVICE_INDEX = None
 DEFAULT_FRONT_TEMPLATE = "{sentence_with_gap}"
 DEFAULT_BACK_TEMPLATE = "{word} [{ipa}] ({gender}; pl. {plural})\n\n{sentence}\n\n{translation}"
 MEDIA_FOLDER = "media"
-# PATCH: unified fixed media slot 512x384 + shared image renderer for preview/repeat/playback (no container autosize)
-MEDIA_SLOT_W = 512
-MEDIA_SLOT_H = 384
 MEDIA_IMPORT_SUBDIR = "anki_import"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 
@@ -916,33 +913,24 @@ def ensure_media_dir() -> str:
     return MEDIA_FOLDER
 
 
-class MediaPathResolver:
-    def __init__(self, media_dir: str, project_root: str) -> None:
-        self.media_dir = media_dir
-        self.project_root = project_root
-
-    def resolve_media_path(self, p: str) -> str:
-        if not p:
-            return ""
-        normalized = os.path.normpath(p.replace("\\", "/"))
-        if os.path.isabs(normalized):
-            return os.path.abspath(normalized)
-        if normalized.replace("\\", "/").startswith("media/") or normalized.replace("\\", "/").startswith("media\\"):
-            candidate = os.path.join(self.project_root, normalized)
-        else:
-            candidate = os.path.join(self.media_dir, normalized)
-        return os.path.abspath(os.path.normpath(candidate))
-
-
-MEDIA_PATH_RESOLVER = MediaPathResolver(MEDIA_FOLDER, BASE_DIR)
-
-
-def resolve_media_path(path: str | None) -> str:
-    return MEDIA_PATH_RESOLVER.resolve_media_path(path or "")
-
-
-def get_side_image_path(card: dict, side: str) -> str | None:
-    return card.get("front_image_path") if side == "front" else card.get("back_image_path")
+def resolve_media_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    normalized = os.path.expanduser(path)
+    if os.path.isabs(normalized) and os.path.exists(normalized):
+        return normalized
+    if os.path.exists(normalized):
+        return normalized
+    if normalized.startswith(MEDIA_FOLDER + os.sep):
+        candidate = normalized
+    else:
+        candidate = os.path.join(MEDIA_FOLDER, normalized)
+    if os.path.exists(candidate):
+        return candidate
+    basename_candidate = os.path.join(MEDIA_FOLDER, os.path.basename(normalized))
+    if os.path.exists(basename_candidate):
+        return basename_candidate
+    return normalized
 
 
 def _pil_lanczos():
@@ -959,39 +947,6 @@ def _ensure_image_caches(owner) -> None:
         owner._orig_pil_cache = {}
     if not hasattr(owner, "_orig_path_cache"):
         owner._orig_path_cache = {}
-
-
-def render_image_hard_shared(owner, parent_frame, image_path, cache_key):
-    _ensure_image_caches(owner)
-    abs_path = resolve_media_path(image_path) if image_path else ""
-    abs_path = os.path.abspath(abs_path) if abs_path else ""
-    print("[IMG] path:", image_path, "abs:", abs_path, "exists:", os.path.exists(abs_path))
-    if not abs_path or not os.path.exists(abs_path):
-        try:
-            for widget in parent_frame.winfo_children():
-                widget.destroy()
-        except Exception:
-            pass
-        return False
-    try:
-        if not PIL_AVAILABLE:
-            print("[IMG] PIL not available for render_image_hard_shared")
-            return False
-        img = Image.open(abs_path)
-        img = img.convert("RGBA")
-        img2 = img.copy()
-        img2.thumbnail((420, 420), resample=_pil_lanczos())
-        photo = ImageTk.PhotoImage(img2)
-        owner._tk_img_cache[cache_key] = photo
-        label = tk.Label(parent_frame, image=photo, bg="white")
-        label.image = photo
-        label.pack(fill="both", expand=False, anchor="nw")
-        return True
-    except Exception as e:
-        import traceback
-        print("[IMG] EXC:", e)
-        traceback.print_exc()
-        return False
 
 
 # PATCH: image rendering restored (Pillow resample fallback + PhotoImage cache + min-size debounce + shared render)
@@ -2406,35 +2361,27 @@ def remove_media_entry(media_id: int):
 
 
 def display_audio_entries_on_frame(audio_frame, entries: list[dict]):
-    if not audio_frame or not audio_frame.winfo_exists():
-        return
-    for child in audio_frame.winfo_children():
-        try:
-            child.destroy()
-        except Exception:
-            pass
-    audio_frame.audio_widget = None
-    audio_frame.audio_selector = None
-    audio_frame.audio_selector_frame = None
-    audio_frame.audio_selector_var = None
-    audio_frame.audio_entry_map = {}
-    audio_widget = AudioPlayerWidget(audio_frame)
-    audio_frame.audio_widget = audio_widget
-    audio_widget.pack(fill=tk.X)
+    audio_widget = getattr(audio_frame, "audio_widget", None)
+    if audio_widget is None:
+        audio_widget = AudioPlayerWidget(audio_frame)
+        audio_frame.audio_widget = audio_widget
+        audio_widget.pack(fill=tk.X)
 
-    audio_bg = audio_frame.cget("bg") if hasattr(audio_frame, "cget") else "white"
-    selector_frame = tk.Frame(audio_frame, bg=audio_bg)
-    selector_frame.pack(fill=tk.X, pady=(0, 2))
-    tk.Label(selector_frame, text="Аудиофайлы:", bg=audio_bg).pack(side=tk.LEFT, padx=(0, 5))
-    audio_frame.audio_selector_var = tk.StringVar()
-    combo = ttk.Combobox(
-        selector_frame,
-        textvariable=audio_frame.audio_selector_var,
-        state="readonly",
-    )
-    combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    audio_frame.audio_selector = combo
-    audio_frame.audio_selector_frame = selector_frame
+    selector_frame = getattr(audio_frame, "audio_selector_frame", None)
+    if selector_frame is None:
+        audio_bg = audio_frame.cget("bg") if hasattr(audio_frame, "cget") else "white"
+        selector_frame = tk.Frame(audio_frame, bg=audio_bg)
+        selector_frame.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(selector_frame, text="Аудиофайлы:", bg=audio_bg).pack(side=tk.LEFT, padx=(0, 5))
+        audio_frame.audio_selector_var = tk.StringVar()
+        combo = ttk.Combobox(
+            selector_frame,
+            textvariable=audio_frame.audio_selector_var,
+            state="readonly",
+        )
+        combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        audio_frame.audio_selector = combo
+        audio_frame.audio_selector_frame = selector_frame
 
     combo: ttk.Combobox = getattr(audio_frame, "audio_selector", None)
     if not entries:
@@ -4507,26 +4454,18 @@ class CardRenderer:
         self.show_media_placeholder = show_media_placeholder
         self.card_widget = card_widget
         self.image_zoom = 1.0
-        self.media_width = MEDIA_SLOT_W
+        self.media_width = 260
         self._current_video_path: str | None = None
         self._current_audio_key: str | None = None
         self._current_show_back = False
         self._current_side_media: tuple[str, str] | None = None
-        self._current_image_override: str | None = None
-        self._current_image_path: str | None = None
-        self._current_image_key = None
-        self._tk_img_cache: dict = {}
-        self._orig_pil_cache: dict = {}
-        self._orig_path_cache: dict = {}
         self.video_player = None
         self._use_custom_text = False
-        self._custom_text_widgets: list[tk.Widget] = []
 
         card_bg, card_text, _ = get_card_surface_colors(parent)
         self.card_bg = card_bg
         self.card_text = card_text
         self.container = tk.Frame(parent, bg=card_bg, width=width, height=height)
-        self.root_frame = self.container
         self.container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
         self.container.pack_propagate(False)
         self.container.grid_rowconfigure(1, weight=1)
@@ -4585,18 +4524,17 @@ class CardRenderer:
         self.media_col = tk.Frame(self.content_row, bg="white", width=self.media_width)
         self.media_col.grid(row=0, column=0, sticky="nw", padx=(0, 12))
         self.media_col.grid_propagate(False)
-        self.media_col.pack_propagate(False)
 
-        self.image_container = tk.Frame(
-            self.media_col,
+        self.image_container = tk.Frame(self.media_col, bg="white")
+        self.image_container.pack(fill=tk.BOTH, expand=True)
+        self.image_label = ResizableImageLabel(
+            self.image_container,
             bg="white",
-            width=MEDIA_SLOT_W,
-            height=MEDIA_SLOT_H,
+            relief="flat",
+            bd=0,
+            enable_mousewheel=False,
         )
-        self.image_container.pack_propagate(False)
-        self.image_container.grid_propagate(False)
-        self.image_container.pack(anchor="nw")
-        self.media_slot = self.image_container
+        self.image_label.pack(fill=tk.BOTH, expand=True)
 
         self.zoom_frame = tk.Frame(self.media_col, bg="white")
         self.zoom_frame.pack(anchor="w", pady=(6, 0))
@@ -4673,70 +4611,6 @@ class CardRenderer:
         self._bind_mousewheel(self.content_canvas)
         self._bind_mousewheel(self.content_inner)
 
-    def is_alive(self) -> bool:
-        return self.root_frame is not None and self.root_frame.winfo_exists()
-
-    def _extract_custom_text_item(self, item, *, card_bg: str, card_text: str) -> dict:
-        if isinstance(item, (tk.Label, tk.Message)):
-            font = item.cget("font") if hasattr(item, "cget") else ("Segoe UI", 12)
-            fg = item.cget("fg") if hasattr(item, "cget") else card_text
-            bg = item.cget("bg") if hasattr(item, "cget") else card_bg
-            wraplength = item.cget("wraplength") if hasattr(item, "cget") else 0
-            anchor = item.cget("anchor") if hasattr(item, "cget") else "w"
-            justify = item.cget("justify") if hasattr(item, "cget") else "left"
-            text = item.cget("text") if hasattr(item, "cget") else str(item)
-            return {
-                "type": "text",
-                "text": text,
-                "font": font,
-                "fg": fg,
-                "bg": bg,
-                "wraplength": wraplength,
-                "anchor": anchor,
-                "justify": justify,
-                "widget": "message" if isinstance(item, tk.Message) else "label",
-            }
-        if isinstance(item, tk.Frame):
-            bg = item.cget("bg") if hasattr(item, "cget") else card_bg
-            children = []
-            for child in item.winfo_children():
-                if isinstance(child, (tk.Label, tk.Message)):
-                    font = child.cget("font") if hasattr(child, "cget") else ("Segoe UI", 12)
-                    fg = child.cget("fg") if hasattr(child, "cget") else card_text
-                    cbg = child.cget("bg") if hasattr(child, "cget") else card_bg
-                    wraplength = child.cget("wraplength") if hasattr(child, "cget") else 0
-                    anchor = child.cget("anchor") if hasattr(child, "cget") else "w"
-                    justify = child.cget("justify") if hasattr(child, "cget") else "left"
-                    text = child.cget("text") if hasattr(child, "cget") else ""
-                    children.append(
-                        {
-                            "text": text,
-                            "font": font,
-                            "fg": fg,
-                            "bg": cbg,
-                            "wraplength": wraplength,
-                            "anchor": anchor,
-                            "justify": justify,
-                            "widget": "message" if isinstance(child, tk.Message) else "label",
-                        }
-                    )
-            return {
-                "type": "frame",
-                "bg": bg,
-                "children": children,
-            }
-        return {
-            "type": "text",
-            "text": str(item),
-            "font": ("Segoe UI", 12),
-            "fg": card_text,
-            "bg": card_bg,
-            "wraplength": 0,
-            "anchor": "w",
-            "justify": "left",
-            "widget": "label",
-        }
-
     def _bind_mousewheel(self, target: tk.Widget) -> None:
         def _on_mousewheel(event):
             if event.num == 4:
@@ -4767,66 +4641,13 @@ class CardRenderer:
         if isinstance(self.back_text, tk.Label):
             self.back_text.configure(wraplength=width)
 
-    def render_image_to_slot(self, slot_parent, image_path, cache_key, zoom=1.0):
-        if not slot_parent or not slot_parent.winfo_exists():
-            return False
-        if not hasattr(self, "_tk_img_cache"):
-            self._tk_img_cache = {}
-        if not hasattr(self, "_orig_pil_cache"):
-            self._orig_pil_cache = {}
-        if not hasattr(self, "_orig_path_cache"):
-            self._orig_path_cache = {}
-        for widget in slot_parent.winfo_children():
-            try:
-                widget.destroy()
-            except Exception:
-                pass
-        abs_path = resolve_media_path(image_path) if image_path else ""
-        abs_path = os.path.abspath(abs_path) if abs_path else ""
-        if not abs_path or not os.path.exists(abs_path):
-            return False
-        if not PIL_AVAILABLE:
-            return False
-        path_changed = self._orig_path_cache.get(cache_key) != abs_path
-        orig = self._orig_pil_cache.get(cache_key)
-        if orig is None or path_changed:
-            try:
-                img = Image.open(abs_path)
-                img = img.convert("RGBA")
-            except Exception:
-                return False
-            self._orig_pil_cache[cache_key] = img
-            self._orig_path_cache[cache_key] = abs_path
-            orig = img
-        img_w, img_h = orig.size
-        if img_w <= 0 or img_h <= 0:
-            return False
-        scale = min(MEDIA_SLOT_W / img_w, MEDIA_SLOT_H / img_h) * float(zoom)
-        new_w = max(1, int(img_w * scale))
-        new_h = max(1, int(img_h * scale))
-        try:
-            resample = Image.Resampling.LANCZOS
-        except Exception:
-            resample = getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", 1))
-        try:
-            resized = orig.copy().resize((new_w, new_h), resample)
-            photo = ImageTk.PhotoImage(resized)
-        except Exception:
-            return False
-        self._tk_img_cache[cache_key] = photo
-        lbl = tk.Label(slot_parent, image=photo, bg="white")
-        lbl.image = photo
-        lbl.place(relx=0.5, rely=0.5, anchor="center")
-        return True
-
-    def render_image_hard(self, parent_frame, image_path, cache_key):
-        return render_image_hard_shared(self, parent_frame, image_path, cache_key)
-
     def _resolve_image_path(self, card: dict, show_back: bool, image_override: str | None = None) -> str | None:
         if image_override is not None:
             return resolve_media_path(image_override)
-        side = "back" if show_back else "front"
-        path = get_side_image_path(card, side)
+        if show_back:
+            path = card.get("back_image_path") or card.get("front_image_path") or card.get("image_path")
+        else:
+            path = card.get("front_image_path") or card.get("image_path")
         return resolve_media_path(path)
 
     def _resolve_video_path(
@@ -4858,84 +4679,31 @@ class CardRenderer:
         return get_side_media({"image_path": image_path, "video_path": video_path})
 
     def _apply_custom_text(self, items: list, *, card_bg: str, card_text: str) -> None:
-        # PATCH: fix TclError bad window path by recreating widgets (no reuse) + winfo_exists guards
         self._use_custom_text = True
-        for widget in self._custom_text_widgets:
-            if widget.winfo_exists():
-                widget.destroy()
-        self._custom_text_widgets.clear()
         for widget in self.custom_text_frame.winfo_children():
-            try:
-                widget.destroy()
-            except Exception:
-                pass
-        extracted_items: list[dict] = []
-        for item in items:
-            if isinstance(item, dict):
-                extracted_items.append(item)
-            else:
-                extracted_items.append(self._extract_custom_text_item(item, card_bg=card_bg, card_text=card_text))
+            widget.destroy()
         row = 0
         col = 0
         max_cols = 3
-        for item in extracted_items:
-            item_type = item.get("type")
-            if item_type == "frame":
-                frame = tk.Frame(self.custom_text_frame, bg=item.get("bg") or card_bg)
-                for child in item.get("children", []):
-                    widget_type = child.get("widget")
-                    if widget_type == "message":
-                        child_widget = tk.Message(
-                            frame,
-                            text=child.get("text", ""),
-                            bg=child.get("bg") or card_bg,
-                            fg=child.get("fg") or card_text,
-                            font=child.get("font") or ("Segoe UI", 12),
-                            wraplength=child.get("wraplength") or 0,
-                            anchor=child.get("anchor") or "w",
-                            justify=child.get("justify") or "left",
-                        )
-                    else:
-                        child_widget = tk.Label(
-                            frame,
-                            text=child.get("text", ""),
-                            bg=child.get("bg") or card_bg,
-                            fg=child.get("fg") or card_text,
-                            font=child.get("font") or ("Segoe UI", 12),
-                            wraplength=child.get("wraplength") or 0,
-                            anchor=child.get("anchor") or "w",
-                            justify=child.get("justify") or "left",
-                        )
-                    child_widget.pack(side=tk.LEFT, padx=(0, 5))
-                    self._custom_text_widgets.append(child_widget)
-                frame.grid(row=row, column=col, sticky="w", padx=5, pady=2)
-                self._custom_text_widgets.append(frame)
+        for item in items:
+            if isinstance(item, tk.Frame):
+                item.grid(
+                    row=row,
+                    column=col,
+                    sticky="w",
+                    padx=5,
+                    pady=2,
+                    in_=self.custom_text_frame,
+                )
             else:
-                widget_type = item.get("widget")
-                if widget_type == "message":
-                    label = tk.Message(
-                        self.custom_text_frame,
-                        text=item.get("text", ""),
-                        bg=item.get("bg") or card_bg,
-                        fg=item.get("fg") or card_text,
-                        font=item.get("font") or ("Segoe UI", 12),
-                        wraplength=item.get("wraplength") or 0,
-                        anchor=item.get("anchor") or "w",
-                        justify=item.get("justify") or "left",
-                    )
-                else:
-                    label = tk.Label(
-                        self.custom_text_frame,
-                        text=item.get("text", ""),
-                        bg=item.get("bg") or card_bg,
-                        fg=item.get("fg") or card_text,
-                        font=item.get("font") or ("Segoe UI", 12),
-                        wraplength=item.get("wraplength") or 0,
-                        anchor=item.get("anchor") or "w",
-                        justify=item.get("justify") or "left",
-                    )
+                label = tk.Label(
+                    self.custom_text_frame,
+                    text=item,
+                    bg="white",
+                    fg=card_text,
+                    font=("Segoe UI", 12),
+                )
                 label.grid(row=row, column=col, sticky="w", padx=5, pady=2)
-                self._custom_text_widgets.append(label)
             col += 1
             if col >= max_cols:
                 col = 0
@@ -4968,7 +4736,6 @@ class CardRenderer:
             else:
                 self.back_text.configure(text=back_text)
         self._current_show_back = show_back
-        self._current_image_override = image_override
         side_media = self._select_side_media(
             card,
             show_back=show_back,
@@ -4991,13 +4758,16 @@ class CardRenderer:
         else:
             self.custom_text_frame.grid_remove()
 
-        if not image_path:
-            if self.media_slot is not None and self.media_slot.winfo_exists():
-                for widget in self.media_slot.winfo_children():
-                    try:
-                        widget.destroy()
-                    except Exception:
-                        pass
+        if image_path:
+            render_key = (card.get("id") or card.get("note_id") or "card", "back" if show_back else "front")
+            self.image_label.load_image(
+                image_path,
+                key=render_key,
+                zoom=self.image_zoom,
+                container_widget=self.image_container,
+            )
+        else:
+            self.image_label.config(image="", text="Нет изображения")
 
     def _get_audio_entries(self, card: dict, prefer_side: str | None) -> list[dict]:
         if "audio_entries" in card:
@@ -5018,33 +4788,7 @@ class CardRenderer:
             return get_card_audio_entries(card, prefer_side=prefer_side)
         return []
 
-    def update_media(
-        self,
-        card: dict,
-        *,
-        prefer_audio_side: str | None = None,
-        mode: str = "unknown",
-        side: str | None = None,
-    ) -> None:
-        if not self.audio_frame or not self.audio_frame.winfo_exists():
-            return
-        side_for_image = side or ("back" if self._current_show_back else "front")
-        picked_path = self._current_image_override if self._current_image_override is not None else get_side_image_path(card, side_for_image)
-        print("[IMG] mode=", mode, "side=", side_for_image, "picked=", picked_path)
-
-        media_container = self.media_slot
-        if not media_container or not media_container.winfo_exists():
-            print("[IMG] media_container missing or destroyed in mode:", mode)
-        else:
-            try:
-                media_container.configure(bg="white", width=MEDIA_SLOT_W, height=MEDIA_SLOT_H)
-            except Exception:
-                pass
-            render_key = (mode, card.get("id") or card.get("note_id") or "card", side_for_image, "image")
-            self._current_image_path = picked_path
-            self._current_image_key = render_key
-            self.render_image_to_slot(media_container, picked_path, render_key, zoom=self.image_zoom)
-
+    def update_media(self, card: dict, *, prefer_audio_side: str | None = None) -> None:
         prefer_side = prefer_audio_side or "back"
         entries = self._get_audio_entries(card, prefer_side)
         if entries:
@@ -5071,10 +4815,7 @@ class CardRenderer:
                 _apply_audio_selection()
         else:
             for widget in self.audio_frame.winfo_children():
-                try:
-                    widget.destroy()
-                except Exception:
-                    pass
+                widget.destroy()
             ttk.Label(self.audio_frame, text="Аудио не прикреплено").pack(anchor="center")
 
         self._render_video(card)
@@ -5150,7 +4891,6 @@ class CardRenderer:
         video_override: str | None = None,
         custom_items: list | None = None,
         header_text: str | None = None,
-        mode: str = "unknown",
     ) -> None:
         if header_text is not None:
             self.set_header_text(header_text)
@@ -5161,7 +4901,7 @@ class CardRenderer:
             video_override=video_override,
             custom_items=custom_items,
         )
-        self.update_media(card, prefer_audio_side=prefer_audio_side, mode=mode)
+        self.update_media(card, prefer_audio_side=prefer_audio_side)
 
     def get_audio_widget(self):
         return getattr(self.audio_frame, "audio_widget", None)
@@ -5170,11 +4910,8 @@ class CardRenderer:
         self.header_label.config(text=text)
 
     def adjust_image_zoom(self, factor: float) -> None:
-        self.image_zoom = max(0.5, min(2.5, self.image_zoom * float(factor)))
-        if self.media_slot is not None and self.media_slot.winfo_exists():
-            image_path = self._current_image_path
-            cache_key = self._current_image_key or ("zoom", image_path or "empty")
-            self.render_image_to_slot(self.media_slot, image_path, cache_key, zoom=self.image_zoom)
+        self.image_zoom = max(0.1, min(3.0, self.image_zoom * float(factor)))
+        self.image_label.set_zoom_factor(self.image_zoom)
 
 def create_action_menubutton(parent, palette: dict | None = None) -> tuple[ttk.Menubutton, tk.Menu]:
     palette = palette or {}
@@ -5215,7 +4952,6 @@ class ResizableImageLabel(tk.Label):
         self._warned_large_path: str | None = None
         self._configure_job = None
         self._min_size_job = None
-        self.enable_auto_fit = False
         self._tk_img_cache: dict = {}
         self._orig_pil_cache: dict = {}
         self._orig_path_cache: dict = {}
@@ -5239,8 +4975,6 @@ class ResizableImageLabel(tk.Label):
         self.bind("<Configure>", self._handle_configure)
 
     def _handle_configure(self, event):
-        if not self.enable_auto_fit:
-            return
         self._container_size = (max(1, int(event.width)), max(1, int(event.height)))
         if self._configure_job:
             try:
@@ -11291,19 +11025,12 @@ class AnkiApp(tk.Tk):
                         prefer_audio_side=side,
                         header_text=header_text,
                         image_override=image_override,
-                        mode="new_card_preview",
                     )
                 else:
                     renderer.update_text(
                         card_data,
                         show_back=(side == "back"),
                         image_override=image_override,
-                    )
-                    renderer.update_media(
-                        card_data,
-                        prefer_audio_side=side,
-                        mode="new_card_preview",
-                        side=side,
                     )
 
             def open_preview() -> None:
@@ -13781,8 +13508,6 @@ class OverviewWindow(tk.Toplevel):
         super().__init__(master)
         self.master = master
         self.cards = [dict(c) for c in cards]
-        self._tk_img_cache = {}
-        self._orig_pil_cache = {}
         
         if not self.cards:
             messagebox.showinfo("Пусто", "Нет карточек для ознакомления.")
@@ -13953,15 +13678,14 @@ class OverviewWindow(tk.Toplevel):
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Изображение
-        image_container = tk.Frame(
+        image_label = ResizableImageLabel(
             content,
-            bg="white",
-            width=MEDIA_SLOT_W,
-            height=MEDIA_SLOT_H,
+            bg=card_bg,
+            relief="flat",
+            bd=0
         )
-        image_container.pack_propagate(False)
-        image_container.grid_propagate(False)
-        image_container.pack(anchor="nw", pady=(10, 0))
+        style_card_surface(image_label, colors)
+        image_label.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
         # Аудио блок
         audio_frame = ttk.Frame(content, style="CardSurface.TFrame")
@@ -13975,18 +13699,7 @@ class OverviewWindow(tk.Toplevel):
         style_card_surface(video_frame, colors, padded=False)
         video_frame.pack(fill=tk.X, pady=(5, 0))
 
-        return text_widget, image_container, audio_frame, video_frame
-
-    def _render_overview_image(self, image_container, image_path, side: str) -> None:
-        if not image_container or not image_container.winfo_exists():
-            print("[IMG] media_container missing or destroyed in mode: overview")
-            return
-        try:
-            image_container.configure(bg="white", width=MEDIA_SLOT_W, height=MEDIA_SLOT_H)
-        except Exception:
-            pass
-        render_key = ("overview", self.current_card.get("id") or self.current_card.get("note_id") or "card", side, "image")
-        CardRenderer.render_image_to_slot(self, image_container, image_path, render_key, zoom=1.0)
+        return text_widget, image_label, audio_frame, video_frame
     
     def mark_as_learned(self):
         """Отметить карточку как изученную"""
@@ -14048,9 +13761,11 @@ class OverviewWindow(tk.Toplevel):
         create_context_menu(self.front_text)  # Добавляем контекстное меню
         
         # Загружаем изображение лицевой стороны
-        front_img_path = get_side_image_path(c, "front")
-        print("[IMG] mode=", "overview", "side=", "front", "picked=", front_img_path)
-        self._render_overview_image(self.front_image_label, front_img_path, "front")
+        front_img_path = resolve_media_path(c.get("front_image_path") or c.get("image_path"))
+        if front_img_path:
+            self.front_image_label.load_image(front_img_path)
+        else:
+            self.front_image_label.load_image(None)
         
         # Обновляем аудио плеер для лицевой стороны
         self.update_audio_player(self.front_audio_frame, c, prefer_side="front")
@@ -14077,9 +13792,11 @@ class OverviewWindow(tk.Toplevel):
         create_context_menu(self.back_text)  # Добавляем контекстное меню
         
         # Загружаем изображение задней стороны
-        back_img_path = get_side_image_path(c, "back")
-        print("[IMG] mode=", "overview", "side=", "back", "picked=", back_img_path)
-        self._render_overview_image(self.back_image_label, back_img_path, "back")
+        back_img_path = resolve_media_path(c.get("back_image_path") or c.get("image_path"))
+        if back_img_path:
+            self.back_image_label.load_image(back_img_path)
+        else:
+            self.back_image_label.load_image(None)
         
         # Обновляем аудио плеер для задней стороны
         self.update_audio_player(self.back_audio_frame, c, prefer_side="back")
@@ -14464,12 +14181,7 @@ class RepeatWindow(tk.Toplevel):
         if not self.card_renderer:
             return
         prefer_side = "back" if self.show_back else "front"
-        self.card_renderer.update_media(
-            self.current_card,
-            prefer_audio_side=prefer_side,
-            mode="repeat",
-            side=prefer_side,
-        )
+        self.card_renderer.update_media(self.current_card, prefer_audio_side=prefer_side)
         self.audio_widget = self.card_renderer.get_audio_widget()
 
     def _build_actions_menu(self, parent) -> ttk.Menubutton:
@@ -14676,81 +14388,51 @@ class RepeatWindow(tk.Toplevel):
         """Извлечь слова из текста и добавить переводы из словаря."""
         # Удаляем перевод в скобках если он есть
         text = re.sub(r'\([^)]*\)', '', text).strip()
-
-        card_bg, card_text, _ = get_card_surface_colors(self.master)
+        
         words = re.findall(r'\b\w+\b', text, re.UNICODE)
         result = []
 
         for word in words:
             if len(word) < 2:  # Пропускаем очень короткие слова
-                result.append(
-                    {
-                        "type": "text",
-                        "text": word,
-                        "font": ("Segoe UI", 12),
-                        "fg": card_text,
-                        "bg": card_bg,
-                        "wraplength": 0,
-                        "anchor": "w",
-                        "justify": "left",
-                        "widget": "label",
-                    }
-                )
+                result.append(word)
                 continue
 
             translation = get_translation(word, use_openai=False) if self.show_translations else ""
             if translation:
+                # Создаем фрейм для слова и перевода
                 colors = getattr(self.master, "palette", None)
-                result.append(
-                    {
-                        "type": "frame",
-                        "bg": card_bg,
-                        "children": [
-                            {
-                                "text": word,
-                                "font": ("Segoe UI", 12),
-                                "fg": card_text,
-                                "bg": card_bg,
-                                "wraplength": 0,
-                                "anchor": "w",
-                                "justify": "left",
-                                "widget": "label",
-                            },
-                            {
-                                "text": f"({translation})",
-                                "font": ("Segoe UI", 10, "italic"),
-                                "fg": colors["accent"] if colors else "blue",
-                                "bg": card_bg,
-                                "wraplength": 0,
-                                "anchor": "w",
-                                "justify": "left",
-                                "widget": "label",
-                            },
-                        ],
-                    }
+                card_bg, card_text, _ = get_card_surface_colors(self.master)
+                parent = self.card_renderer.custom_text_frame if self.card_renderer else self
+                word_frame = tk.Frame(parent, bg=card_bg)
+
+                # Слово
+                word_label = tk.Label(
+                    word_frame,
+                    text=word,
+                    bg=card_bg,
+                    fg=card_text,
+                    font=("Segoe UI", 12)
                 )
+                word_label.pack(side=tk.LEFT, padx=(0, 5))
+
+                # Перевод
+                if self.show_translations:
+                    trans_label = tk.Label(
+                        word_frame,
+                        text=f"({translation})",
+                        bg=card_bg,
+                        fg=colors["accent"] if colors else "blue",
+                        font=("Segoe UI", 10, "italic")
+                    )
+                    trans_label.pack(side=tk.LEFT)
+
+                result.append(word_frame)
             else:
-                result.append(
-                    {
-                        "type": "text",
-                        "text": word,
-                        "font": ("Segoe UI", 12),
-                        "fg": card_text,
-                        "bg": card_bg,
-                        "wraplength": 0,
-                        "anchor": "w",
-                        "justify": "left",
-                        "widget": "label",
-                    }
-                )
+                result.append(word)
         
         return result
 
     def update_view(self):
-        if not self.winfo_exists():
-            return
-        if not self.card_renderer or not self.card_renderer.is_alive():
-            return
         total = len(self.session.cards)
         idx = self.session.index + 1
         c = self.current_card
@@ -14779,12 +14461,18 @@ class RepeatWindow(tk.Toplevel):
 
         front_text = c["front"]
         back_text = c["back"]
+        if self.show_back:
+            img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
+        else:
+            img_path = c["front_image_path"] or c["image_path"]
+
         use_custom = (not self.show_back) and self.show_translations and c["leitner_level"] == 1
         custom_items = self.extract_words_with_translations(front_text) if use_custom else None
         if self.card_renderer is not None:
             self.card_renderer.update_text(
                 c,
                 show_back=self.show_back,
+                image_override=img_path,
                 custom_items=custom_items,
             )
 
@@ -14801,12 +14489,6 @@ class RepeatWindow(tk.Toplevel):
         if self.card_renderer is not None:
             self.card_renderer.set_header_text("")
             self.card_renderer.update_text({"front": "На сегодня всё", "back": ""}, show_back=False)
-            self.card_renderer.update_media(
-                {"front": "На сегодня всё", "back": ""},
-                prefer_audio_side="front",
-                mode="repeat",
-                side="front",
-            )
         for btn in [
             self.btn_prev,
             self.btn_next,
@@ -14912,10 +14594,6 @@ class RepeatWindow(tk.Toplevel):
         self.reset_timer_for_card()
 
     def next_card(self):
-        if not self.winfo_exists():
-            return
-        if not self.card_renderer or not self.card_renderer.is_alive():
-            return
         self.goto_next_card()
 
     def prev_card(self):
@@ -15074,12 +14752,7 @@ class ReviewWindow(tk.Toplevel):
         if not hasattr(self, "card_renderer") or self.card_renderer is None:
             return
         prefer_side = "back" if self.show_back else "front"
-        self.card_renderer.update_media(
-            self.current_card,
-            prefer_audio_side=prefer_side,
-            mode="playback",
-            side=prefer_side,
-        )
+        self.card_renderer.update_media(self.current_card, prefer_audio_side=prefer_side)
         self.audio_widget = self.card_renderer.get_audio_widget()
 
     def _show_audio_error(self, title: str, message: str):
@@ -15263,6 +14936,11 @@ class ReviewWindow(tk.Toplevel):
         if self.card_renderer is not None:
             self.card_renderer.set_header_text(header_text)
 
+        if self.show_back:
+            img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
+        else:
+            img_path = c["front_image_path"] or c["image_path"]
+
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
 
         self.update_progress_view()
@@ -15273,8 +14951,8 @@ class ReviewWindow(tk.Toplevel):
                 c,
                 show_back=self.show_back,
                 prefer_audio_side="back" if self.show_back else "front",
+                image_override=img_path,
                 header_text=header_text,
-                mode="playback",
             )
             self.audio_widget = self.card_renderer.get_audio_widget()
         else:
@@ -15714,4 +15392,3 @@ if __name__ == "__main__":
 # PATCH: tabs moved + dark scrollbar + video embed fixed + upload video in generator + unified card renderer
 # PATCH: unify card renderer sizes + white video background + image-over-video rule
 # PATCH: fix random image shrink (configure debounce + min size + orig cache) + fix preview image render (PhotoImage refs + shared renderer)
-# PATCH: hard restore image render everywhere (absolute path resolver + PhotoImage cache + shared renderer)
