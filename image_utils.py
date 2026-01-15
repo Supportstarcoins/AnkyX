@@ -9,6 +9,13 @@ from PIL import Image, ImageOps
 MAX_PREVIEW_PIXELS = 25_000_000
 
 
+def _pil_lanczos():
+    try:
+        return Image.Resampling.LANCZOS
+    except Exception:
+        return getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", 1))
+
+
 def log_image_error(path: str, exc: Exception, log_path: str = "image_load_error.log") -> None:
     try:
         timestamp = datetime.datetime.now().isoformat(timespec="seconds")
@@ -50,16 +57,16 @@ def load_preview_image(
         if max_pixels and total_pixels > max_pixels:
             scale = (max_pixels / float(total_pixels)) ** 0.5
             new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
+            img = img.resize(new_size, _pil_lanczos())
             resized_for_pixels = True
 
         if max_dimension:
             if img.width > max_dimension or img.height > max_dimension:
-                img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+                img.thumbnail((max_dimension, max_dimension), _pil_lanczos())
 
         if target_size:
             width, height = target_size
-            img.thumbnail((max(1, int(width)), max(1, int(height))), Image.Resampling.LANCZOS)
+            img.thumbnail((max(1, int(width)), max(1, int(height))), _pil_lanczos())
 
         return img, resized_for_pixels
     except Exception as exc:

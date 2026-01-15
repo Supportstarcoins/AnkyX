@@ -933,14 +933,31 @@ def resolve_media_path(path: str | None) -> str | None:
     return normalized
 
 
-def render_image(label, container_widget, image_path, zoom, key):
+def _pil_lanczos():
+    try:
+        return Image.Resampling.LANCZOS
+    except Exception:
+        return getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", 1))
+
+
+def _ensure_image_caches(owner) -> None:
+    if not hasattr(owner, "_tk_img_cache"):
+        owner._tk_img_cache = {}
+    if not hasattr(owner, "_orig_pil_cache"):
+        owner._orig_pil_cache = {}
+    if not hasattr(owner, "_orig_path_cache"):
+        owner._orig_path_cache = {}
+
+
+# PATCH: image rendering restored (Pillow resample fallback + PhotoImage cache + min-size debounce + shared render)
+def render_image_safe(label, container_widget, image_path, key, zoom=None):
     if not image_path:
         label.config(image="", text="Нет изображения")
         label.image = None
         return False
     resolved_path = resolve_media_path(image_path) if image_path else None
-    if resolved_path and not os.path.isabs(resolved_path):
-        resolved_path = os.path.abspath(os.path.join(MEDIA_FOLDER, resolved_path))
+    if resolved_path:
+        resolved_path = os.path.abspath(resolved_path)
     exists = bool(resolved_path and os.path.exists(resolved_path))
     try:
         cont_w = int(container_widget.winfo_width())
@@ -948,17 +965,6 @@ def render_image(label, container_widget, image_path, zoom, key):
     except Exception:
         cont_w = 0
         cont_h = 0
-    print(
-        "[render_image] container:",
-        cont_w,
-        cont_h,
-        "zoom:",
-        zoom,
-        "path:",
-        resolved_path,
-        "exists:",
-        exists,
-    )
     if cont_w < 80 or cont_h < 80:
         prev_job = getattr(label, "_min_size_job", None)
         if prev_job:
@@ -966,20 +972,20 @@ def render_image(label, container_widget, image_path, zoom, key):
                 label.after_cancel(prev_job)
             except Exception:
                 pass
-        label._min_size_job = label.after(80, lambda: render_image(label, container_widget, image_path, zoom, key))
+        label._min_size_job = label.after(
+            80,
+            lambda: render_image_safe(label, container_widget, image_path, key, zoom=zoom),
+        )
         return False
     if not exists:
         label.config(image="", text="Нет изображения")
         label.image = None
         return False
-    if not hasattr(label, "_orig_pil_by_key"):
-        label._orig_pil_by_key = {}
-    if not hasattr(label, "_tkimg_by_key"):
-        label._tkimg_by_key = {}
-    if not hasattr(label, "_orig_path_by_key"):
-        label._orig_path_by_key = {}
-    path_changed = label._orig_path_by_key.get(key) != resolved_path
-    orig = label._orig_pil_by_key.get(key)
+    _ensure_image_caches(label)
+    if not hasattr(label, "_warned_large_path"):
+        label._warned_large_path = None
+    path_changed = label._orig_path_cache.get(key) != resolved_path
+    orig = label._orig_pil_cache.get(key)
     if orig is None or path_changed:
         if PIL_AVAILABLE:
             try:
@@ -997,23 +1003,49 @@ def render_image(label, container_widget, image_path, zoom, key):
                     except Exception:
                         pass
                     label._warned_large_path = resolved_path
-                label._orig_pil_by_key[key] = img
-                label._orig_path_by_key[key] = resolved_path
+                label._orig_pil_cache[key] = img
+                label._orig_path_cache[key] = resolved_path
                 orig = img
             except Exception as exc:
                 log_image_error(resolved_path, exc)
+                if getattr(label, "_img_fail_logged", None) != resolved_path:
+                    print(
+                        "[IMG] fail:",
+                        f"path={resolved_path}",
+                        f"exists={exists}",
+                        f"pil={PIL_AVAILABLE}",
+                        f"err={exc}",
+                    )
+                    label._img_fail_logged = resolved_path
                 label.config(image="", text="Нет изображения")
                 label.image = None
                 return False
         else:
             try:
                 tk_img = tk.PhotoImage(file=resolved_path)
-                label._tkimg_by_key[key] = tk_img
+                label._tk_img_cache[key] = tk_img
                 label.config(image=tk_img, text="")
                 label.image = tk_img
+                label.current_image = tk_img
+                label.image = tk_img
+                if not getattr(label, "_img_ok_logged", False):
+                    print(
+                        "[IMG] ok:",
+                        f"{cont_w}x{cont_h} container -> {tk_img.width()}x{tk_img.height()} image",
+                    )
+                    label._img_ok_logged = True
                 return True
             except Exception as exc:
                 log_image_error(resolved_path, exc)
+                if getattr(label, "_img_fail_logged", None) != resolved_path:
+                    print(
+                        "[IMG] fail:",
+                        f"path={resolved_path}",
+                        f"exists={exists}",
+                        f"pil={PIL_AVAILABLE}",
+                        f"err={exc}",
+                    )
+                    label._img_fail_logged = resolved_path
                 label.config(image="", text="Нет изображения")
                 label.image = None
                 return False
@@ -1040,18 +1072,37 @@ def render_image(label, container_widget, image_path, zoom, key):
         width = max(1, int(img_w * clamped_ratio))
         height = max(1, int(img_h * clamped_ratio))
         pil_copy = orig.copy()
-        resized_image = pil_copy.resize((width, height), Image.Resampling.LANCZOS)
+        resized_image = pil_copy.resize((width, height), _pil_lanczos())
         photo = ImageTk.PhotoImage(resized_image)
-        label._tkimg_by_key[key] = photo
+        label._tk_img_cache[key] = photo
         label.current_image = photo
         label.config(image=photo, text="")
         label.image = photo
+        if not getattr(label, "_img_ok_logged", False):
+            print(
+                "[IMG] ok:",
+                f"{cont_w}x{cont_h} container -> {width}x{height} image",
+            )
+            label._img_ok_logged = True
         return True
     except Exception as exc:
         log_image_error(resolved_path, exc)
+        if getattr(label, "_img_fail_logged", None) != resolved_path:
+            print(
+                "[IMG] fail:",
+                f"path={resolved_path}",
+                f"exists={exists}",
+                f"pil={PIL_AVAILABLE}",
+                f"err={exc}",
+            )
+            label._img_fail_logged = resolved_path
         label.config(image="", text="Нет изображения")
         label.image = None
         return False
+
+
+def render_image(label, container_widget, image_path, zoom, key):
+    return render_image_safe(label, container_widget, image_path, key, zoom=zoom)
 
 
 def copy_image_to_media(src: str, target_id: int, move: bool = False) -> str:
@@ -4901,6 +4952,9 @@ class ResizableImageLabel(tk.Label):
         self._warned_large_path: str | None = None
         self._configure_job = None
         self._min_size_job = None
+        self._tk_img_cache: dict = {}
+        self._orig_pil_cache: dict = {}
+        self._orig_path_cache: dict = {}
         self._orig_pil_by_key: dict = {}
         self._tkimg_by_key: dict = {}
         self._orig_path_by_key: dict = {}
@@ -7853,7 +7907,7 @@ class AnkiApp(tk.Tk):
             try:
                 if PIL_AVAILABLE:
                     img = Image.open(path)
-                    img = img.resize((size, size), Image.Resampling.LANCZOS)
+                    img = img.resize((size, size), _pil_lanczos())
                     return ImageTk.PhotoImage(img)
                 if path.suffix.lower() in (".png", ".gif"):
                     return tk.PhotoImage(file=str(path))
@@ -9292,7 +9346,7 @@ class AnkiApp(tk.Tk):
                 if deck["icon_path"] and os.path.exists(deck["icon_path"]) and PIL_AVAILABLE:
                     try:
                         img = Image.open(deck["icon_path"])
-                        img = img.resize((16, 16), Image.Resampling.LANCZOS)
+                        img = img.resize((16, 16), _pil_lanczos())
                         icon = ImageTk.PhotoImage(img)
                         self.deck_icons[deck["id"]] = icon
                     except Exception:
@@ -9375,7 +9429,7 @@ class AnkiApp(tk.Tk):
                     ratio = min(max_width / img_width, max_height / img_height)
                     display_width = int(img_width * ratio)
                     display_height = int(img_height * ratio)
-                    img = img.resize((display_width, display_height), Image.Resampling.LANCZOS)
+                    img = img.resize((display_width, display_height), _pil_lanczos())
                 
                 photo = ImageTk.PhotoImage(img)
                 self.deck_preview_images[self.selected_deck_id] = photo
