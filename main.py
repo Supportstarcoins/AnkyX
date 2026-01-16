@@ -266,6 +266,13 @@ SCROLL_BG = getattr(_ui_theme, "SCROLL_BG", "#0b0f16")
 SCROLL_ACTIVE = getattr(_ui_theme, "SCROLL_ACTIVE", "#121a26")
 CARD_VIEW_WIDTH = 700
 CARD_VIEW_HEIGHT = 420
+
+
+def build_center_host(parent):
+    host = tk.Frame(parent, bg=parent.cget("bg") if hasattr(parent, "cget") else None)
+    host.grid_rowconfigure(0, weight=1)
+    host.grid_columnconfigure(0, weight=1)
+    return host
 MEDIA_SLOT_W = 512
 MEDIA_SLOT_H = 384
 REPEAT_MEDIA_SLOT_SIZE = (MEDIA_SLOT_W, MEDIA_SLOT_H)
@@ -10472,14 +10479,20 @@ class AnkiApp(tk.Tk):
             card_container = tk.Frame(content_row, bg=background)
             card_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=12)
 
+            card_host = build_center_host(card_container)
+            card_host.pack(fill=tk.BOTH, expand=True)
+
             card_surface = tk.Frame(
-                card_container,
+                card_host,
                 bg=card_surface_bg,
                 highlightthickness=1,
                 highlightbackground=card_border,
                 relief=tk.FLAT,
+                width=CARD_VIEW_WIDTH,
+                height=CARD_VIEW_HEIGHT,
             )
-            card_surface.pack(fill=tk.BOTH, expand=True)
+            card_surface.grid(row=0, column=0)
+            card_surface.grid_propagate(False)
 
             layout = render_card_layout(
                 card_surface,
@@ -14437,8 +14450,10 @@ class RepeatWindow(tk.Toplevel):
         # Основной фрейм карточки
         cards_bg = tk.Frame(frame_main, bg=DARK_BG)
         cards_bg.pack(fill=tk.BOTH, expand=True, pady=10, anchor="nw")
+        card_host = build_center_host(cards_bg)
+        card_host.pack(fill=tk.BOTH, expand=True)
         card_wrap = tk.Frame(
-            cards_bg,
+            card_host,
             bg=DARK_BG,
             highlightbackground=CARD_BORDER,
             highlightthickness=1,
@@ -14446,8 +14461,8 @@ class RepeatWindow(tk.Toplevel):
             width=CARD_VIEW_WIDTH,
             height=CARD_VIEW_HEIGHT,
         )
-        card_wrap.pack(padx=10, pady=10, anchor="nw")
-        card_wrap.pack_propagate(False)
+        card_wrap.grid(row=0, column=0)
+        card_wrap.grid_propagate(False)
         self.card_frame = card_wrap
         self.card_renderer = CardRenderer(
             self.card_frame,
@@ -15009,8 +15024,10 @@ class ReviewWindow(tk.Toplevel):
         self.timer_label.pack(anchor="center", pady=(3, 5))
 
         # Фрейм карточки
+        card_host = build_center_host(frame_main)
+        card_host.pack(fill=tk.BOTH, expand=True)
         self.card_frame = tk.Frame(
-            frame_main,
+            card_host,
             bg=card_bg,
             bd=0,
             relief="flat",
@@ -15018,8 +15035,8 @@ class ReviewWindow(tk.Toplevel):
             height=CARD_VIEW_HEIGHT
         )
         style_card_surface(self.card_frame, colors)
-        self.card_frame.pack(pady=10, anchor="nw")
-        self.card_frame.pack_propagate(False)
+        self.card_frame.grid(row=0, column=0)
+        self.card_frame.grid_propagate(False)
 
         # Индикатор загрузки
         self.dot_canvas = tk.Canvas(self.card_frame, width=20, height=20,
@@ -15733,3 +15750,4 @@ if __name__ == "__main__":
 # PATCH: preview image render + playback left alignment + clip shows instead of text + strict per-side media (no front->back inherit)
 # PATCH: manual preview uses same media data + fixed media-slot geometry + prevent TclError bad window path
 # PATCH: preview layout unified with repeat/playback (left fixed media slot + shared zoom controls)
+# PATCH: centered card render area in repeat/playback/manual preview via center_host (grid weights + no sticky on card_surface)
