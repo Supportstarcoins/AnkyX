@@ -986,7 +986,13 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
             cont_h = max(1, int(fixed_slot[1]))
         except Exception:
             pass
-    if cont_w < 80 or cont_h < 80:
+    if fixed_slot:
+        target_w = MEDIA_SLOT_W
+        target_h = MEDIA_SLOT_H
+    else:
+        target_w = cont_w
+        target_h = cont_h
+    if target_w < 80 or target_h < 80:
         prev_job = getattr(label, "_min_size_job", None)
         if prev_job:
             try:
@@ -1086,18 +1092,27 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
         return False
     try:
         label.original_image = orig
-        cont_w = max(1, cont_w - 6)
-        cont_h = max(1, cont_h - 6)
+        cont_w = max(1, target_w - 6)
+        cont_h = max(1, target_h - 6)
         img_w, img_h = orig.size
         if img_w <= 0 or img_h <= 0:
             return False
-        base_ratio = min(cont_w / img_w, cont_h / img_h) if cont_w and cont_h else 1.0
         zoom_factor = float(zoom) if zoom is not None else 1.0
+        base_ratio = min(cont_w / img_w, cont_h / img_h) if cont_w and cont_h else 1.0
         desired_ratio = max(0.05, base_ratio * zoom_factor)
-        max_scale = getattr(label, "max_scale_factor", 3.0)
+        max_scale = getattr(label, "max_scale_factor", 2.5)
         clamped_ratio = max(0.05, min(desired_ratio, base_ratio * max_scale))
         width = max(1, int(img_w * clamped_ratio))
         height = max(1, int(img_h * clamped_ratio))
+        print(
+            "[IMG] mode=",
+            getattr(label, "_render_mode", "unknown"),
+            "zoom=",
+            zoom_factor,
+            "new=",
+            width,
+            height,
+        )
         min_w = 120
         min_h = 120
         if (width < min_w or height < min_h) and getattr(label, "current_image", None) is not None:
@@ -4604,14 +4619,14 @@ class CardRenderer:
         self.content_inner.grid_columnconfigure(0, weight=1)
         self.content_row = tk.Frame(self.content_inner, bg="white")
         self.content_row.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        self.content_row.grid_rowconfigure(0, weight=1)
+        self.content_row.grid_rowconfigure(0, weight=0)
         self.content_row.grid_columnconfigure(0, weight=0)
         self.content_row.grid_columnconfigure(1, weight=1)
 
         self.media_col = tk.Frame(self.content_row, bg="white", width=self.media_width)
-        self.media_col.grid(row=0, column=0, sticky="nw", padx=(12, 10))
+        self.media_col.grid(row=0, column=0, sticky="nw", padx=(12, 10), pady=(8, 8))
         self.media_col.grid_propagate(False)
-        self.media_col.grid_rowconfigure(0, weight=1)
+        self.media_col.grid_rowconfigure(0, weight=0)
 
         self.image_container = tk.Frame(
             self.media_col,
@@ -4622,7 +4637,8 @@ class CardRenderer:
         self.image_container._fixed_slot_size = self._fixed_media_slot
         self.image_container.grid_propagate(False)
         self.image_container.pack_propagate(False)
-        self.image_container.pack(fill=tk.BOTH, expand=True)
+        self.image_container.pack(anchor="nw")
+        print("[SLOT] mode=", self.render_mode, "slot=", MEDIA_SLOT_W, MEDIA_SLOT_H)
         self.image_label = ResizableImageLabel(
             self.image_container,
             bg="white",
@@ -4633,7 +4649,8 @@ class CardRenderer:
         self.image_label._orig_pil_cache = self._orig_pil_cache
         if self._fixed_media_slot:
             self.image_label.set_fixed_slot_size(self._fixed_media_slot[0], self._fixed_media_slot[1])
-        self.image_label.pack(fill=tk.BOTH, expand=True)
+        self.image_label.place(relx=0.5, rely=0.5, anchor="center")
+        # PATCH: preview uses same fixed media-slot and contain scaling as repeat/playback (no stretching by grid/pack)
 
         self.zoom_frame = self.build_zoom_controls(
             self.media_col,
@@ -5133,10 +5150,12 @@ class CardRenderer:
     def render_image_to_slot(self) -> None:
         if not getattr(self, "image_label", None):
             return
+        if self.image_label is not None:
+            self.image_label.set_fixed_slot_size(MEDIA_SLOT_W, MEDIA_SLOT_H)
         self.image_label.set_zoom_factor(self.image_zoom)
 
     def adjust_image_zoom(self, factor: float) -> None:
-        self.image_zoom = max(0.1, min(3.0, self.image_zoom * float(factor)))
+        self.image_zoom = max(0.5, min(2.5, self.image_zoom * float(factor)))
         self.render_image_to_slot()
 
 def create_action_menubutton(parent, palette: dict | None = None) -> tuple[ttk.Menubutton, tk.Menu]:
@@ -5188,7 +5207,7 @@ class ResizableImageLabel(tk.Label):
         self._render_zoom = None
         self._render_container = None
         self._fixed_slot_size: tuple[int, int] | None = None
-        self.max_scale_factor = 3.0
+        self.max_scale_factor = 2.5
         self.configure(anchor="center")
         
         # Привязываем события мыши
