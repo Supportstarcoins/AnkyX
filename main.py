@@ -2559,6 +2559,8 @@ def ensure_notes_for_cards(cards: list[sqlite3.Row]) -> list[dict]:
     sanitized: list[dict] = []
     for card in cards:
         card_dict = ensure_note_for_card(card)
+        card_dict["front_rich"] = deserialize_rich_doc(card_dict.get("front_rich"))
+        card_dict["back_rich"] = deserialize_rich_doc(card_dict.get("back_rich"))
         sanitized.append(sanitize_card_sounds(card_dict))
     return sanitized
 
@@ -2618,6 +2620,8 @@ def init_db():
             leitner_level INTEGER NOT NULL DEFAULT 1,
             front_image_path TEXT,
             back_image_path TEXT,
+            front_rich TEXT,
+            back_rich TEXT,
             image_path TEXT,
             audio_path TEXT,
             note_id INTEGER,
@@ -2641,7 +2645,8 @@ def init_db():
 
     # Миграции для старых БД (cards)
     for col in ("leitner_level", "front_image_path", "back_image_path",
-                "image_path", "audio_path", "progress", "translation_shown", "overview_added"):
+                "front_rich", "back_rich", "image_path", "audio_path",
+                "progress", "translation_shown", "overview_added"):
         try:
             if col == "leitner_level":
                 cur.execute(
@@ -2778,7 +2783,7 @@ def get_cards_in_deck(deck_id):
     cur = conn.cursor()
     cur.execute("""
         SELECT id, deck_id, front, back, next_review, leitner_level,
-               front_image_path, back_image_path, image_path,
+               front_image_path, back_image_path, front_rich, back_rich, image_path,
                audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
@@ -2796,7 +2801,7 @@ def get_due_cards(deck_id):
     cur = conn.cursor()
     cur.execute("""
         SELECT id, deck_id, front, back, next_review, leitner_level,
-               front_image_path, back_image_path, image_path,
+               front_image_path, back_image_path, front_rich, back_rich, image_path,
                audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
@@ -2819,7 +2824,7 @@ def get_cards_for_repeat(deck_id):
     cur = conn.cursor()
     cur.execute("""
         SELECT id, deck_id, front, back, next_review, leitner_level,
-               front_image_path, back_image_path, image_path,
+               front_image_path, back_image_path, front_rich, back_rich, image_path,
                audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
@@ -2843,7 +2848,7 @@ def get_cards_for_playback(deck_id):
     cur = conn.cursor()
     cur.execute("""
         SELECT id, deck_id, front, back, next_review, leitner_level,
-               front_image_path, back_image_path, image_path,
+               front_image_path, back_image_path, front_rich, back_rich, image_path,
                audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
@@ -2865,7 +2870,7 @@ def get_overview_cards(deck_id):
     cur = conn.cursor()
     cur.execute("""
         SELECT id, deck_id, front, back, next_review, leitner_level,
-               front_image_path, back_image_path, image_path,
+               front_image_path, back_image_path, front_rich, back_rich, image_path,
                audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
@@ -3473,6 +3478,8 @@ def insert_card(
     back: str,
     front_image_path: str | None = None,
     back_image_path: str | None = None,
+    front_rich: dict | None = None,
+    back_rich: dict | None = None,
     audio_path: str | None = None,
     level: int = 1,
     note_id: int | None = None,
@@ -3515,9 +3522,9 @@ def insert_card(
     cur.execute(
         """
         INSERT INTO cards (deck_id, front, back, next_review, leitner_level,
-                           front_image_path, back_image_path, audio_path,
+                           front_image_path, back_image_path, front_rich, back_rich, audio_path,
                            note_id, template_ord, translation_shown, overview_added)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1);
     """,
         (
             deck_id,
@@ -3527,6 +3534,8 @@ def insert_card(
             level,
             front_image_path,
             back_image_path,
+            serialize_rich_doc(front_rich),
+            serialize_rich_doc(back_rich),
             actual_audio_path,
             note_id,
             template_ord,
@@ -4771,8 +4780,24 @@ class CardRenderer:
         card_bg, card_text, _ = get_card_surface_colors(self.container)
         front_text = card.get("front") or ""
         back_text = card.get("back") or ""
+        front_rich = deserialize_rich_doc(card.get("front_rich"))
+        back_rich = deserialize_rich_doc(card.get("back_rich"))
+        rich_doc = back_rich if show_back else front_rich
+        use_rich = bool(rich_doc)
+        print(
+            "[RENDER TEXT]",
+            "mode=",
+            self.render_mode,
+            "side=",
+            "back" if show_back else "front",
+            "use_rich=",
+            use_rich,
+        )
         if custom_items is not None:
             self._apply_custom_text(custom_items, card_bg=card_bg, card_text=card_text)
+        elif use_rich:
+            self._use_custom_text = True
+            render_rich_to_container(self.custom_text_frame, rich_doc, card_bg=card_bg, card_text_color=card_text)
         else:
             self._use_custom_text = False
             if isinstance(self.front_text, tk.Text):
@@ -4802,6 +4827,10 @@ class CardRenderer:
             self.back_text.grid_remove()
             self.front_text.grid()
         if custom_items is not None:
+            self.front_text.grid_remove()
+            self.back_text.grid_remove()
+            self.custom_text_frame.grid()
+        elif use_rich:
             self.front_text.grid_remove()
             self.back_text.grid_remove()
             self.custom_text_frame.grid()
@@ -5023,6 +5052,111 @@ class CardRenderer:
     def adjust_image_zoom(self, factor: float) -> None:
         self.image_zoom = max(0.1, min(3.0, self.image_zoom * float(factor)))
         self.image_label.set_zoom_factor(self.image_zoom)
+
+
+# PATCH: manual preview text rendering fixed + toolbar rich formatting exported and rendered in preview/repeat/playback/intro
+def export_rich_from_editor(text_widget: tk.Text) -> dict:
+    text_value = text_widget.get("1.0", tk.END).rstrip("\n")
+    tags_payload: list[dict] = []
+    for tag in text_widget.tag_names():
+        if tag == "sel":
+            continue
+        ranges = text_widget.tag_ranges(tag)
+        if not ranges:
+            continue
+        config: dict[str, object] = {}
+        for key in ("font", "foreground", "background", "underline", "offset", "justify", "elide"):
+            value = text_widget.tag_cget(tag, key)
+            if value in ("", None):
+                continue
+            if key in ("underline", "offset"):
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    pass
+            config[key] = value
+        range_pairs: list[tuple[str, str]] = []
+        for idx in range(0, len(ranges), 2):
+            start = str(ranges[idx])
+            end = str(ranges[idx + 1])
+            range_pairs.append((start, end))
+        tags_payload.append(
+            {
+                "name": tag,
+                "config": config,
+                "ranges": range_pairs,
+            }
+        )
+    return {
+        "text": text_value,
+        "tags": tags_payload,
+    }
+
+
+def serialize_rich_doc(rich_doc: dict | None) -> str | None:
+    if rich_doc is None:
+        return None
+    try:
+        return json.dumps(rich_doc, ensure_ascii=False)
+    except Exception:
+        return None
+
+
+def deserialize_rich_doc(value: str | None) -> dict | None:
+    if not value:
+        return None
+    if isinstance(value, dict):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+
+def render_rich_to_container(parent: tk.Widget, rich_doc: dict, card_bg: str, card_text_color: str) -> tk.Text:
+    for child in parent.winfo_children():
+        child.destroy()
+    text_widget = tk.Text(
+        parent,
+        wrap=tk.WORD,
+        bg="white",
+        fg=card_text_color,
+        relief=tk.FLAT,
+        bd=0,
+        height=10,
+    )
+    text_widget.pack(fill=tk.BOTH, expand=True)
+    text_widget.configure(state=tk.NORMAL)
+    text_widget.delete("1.0", tk.END)
+    text_widget.insert("1.0", rich_doc.get("text") or "")
+    for tag_info in rich_doc.get("tags", []) or []:
+        tag_name = tag_info.get("name")
+        if not tag_name:
+            continue
+        config = tag_info.get("config") or {}
+        safe_config: dict[str, object] = {}
+        for key, value in config.items():
+            if value in ("", None):
+                continue
+            if key in ("underline", "offset"):
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    pass
+            safe_config[key] = value
+        if safe_config:
+            try:
+                text_widget.tag_configure(tag_name, **safe_config)
+            except tk.TclError:
+                pass
+        ranges = tag_info.get("ranges") or []
+        for start, end in ranges:
+            try:
+                text_widget.tag_add(tag_name, start, end)
+            except tk.TclError:
+                pass
+    text_widget.configure(state=tk.DISABLED)
+    return text_widget
 
 def create_action_menubutton(parent, palette: dict | None = None) -> tuple[ttk.Menubutton, tk.Menu]:
     palette = palette or {}
@@ -11126,9 +11260,17 @@ class AnkiApp(tk.Tk):
                 side = preview_state.get("side") or "front"
                 media = manual_media.get(side, {})
                 image_override = ""
+                plain_widget = front_text if side == "front" else back_text
+                plain_text = plain_widget.get("1.0", tk.END).rstrip("\n")
+                front_rich_doc = export_rich_from_editor(front_text)
+                back_rich_doc = export_rich_from_editor(back_text)
+                has_rich = bool((back_rich_doc if side == "back" else front_rich_doc).get("tags"))
+                print("[PREVIEW TEXT]", "side=", side, "plain_len=", len(plain_text), "has_rich=", has_rich)
                 card_data = {
                     "front": front_text.get("1.0", tk.END).strip(),
                     "back": back_text.get("1.0", tk.END).strip(),
+                    "front_rich": front_rich_doc,
+                    "back_rich": back_rich_doc,
                     "front_image_path": manual_media.get("front", {}).get("image"),
                     "back_image_path": manual_media.get("back", {}).get("image"),
                     "front_video_path": manual_media.get("front", {}).get("video"),
@@ -11245,6 +11387,8 @@ class AnkiApp(tk.Tk):
                 try:
                     front_value = front_text.get("1.0", tk.END).strip()
                     back_value = back_text.get("1.0", tk.END).strip()
+                    front_rich_doc = export_rich_from_editor(front_text)
+                    back_rich_doc = export_rich_from_editor(back_text)
                     if not front_value and not back_value:
                         messagebox.showwarning(
                             "Пустая карточка",
@@ -11268,6 +11412,8 @@ class AnkiApp(tk.Tk):
                         back_value,
                         front_image_path=stored_front,
                         back_image_path=stored_back,
+                        front_rich=front_rich_doc,
+                        back_rich=back_rich_doc,
                         audio_path=None,
                         level=1,
                     )
