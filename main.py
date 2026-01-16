@@ -954,7 +954,6 @@ def _ensure_image_caches(owner) -> None:
 
 # PATCH: stop auto-shrinking image (no in-place thumbnail, orig cache + debounce Configure + fixed slot/min-size gate)
 # PATCH: image rendering restored (Pillow resample fallback + PhotoImage cache + min-size debounce + shared render)
-# PATCH: fix preview image collapse (fixed media-slot size + contain uses constants + prevent 1px container resize)
 def render_image_safe(label, container_widget, image_path, key, zoom=None):
     if not image_path:
         label.config(image="", text="Нет изображения")
@@ -974,20 +973,31 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
         os.path.exists(resolved_path) if resolved_path else False,
     )
     exists = bool(resolved_path and os.path.exists(resolved_path))
+    try:
+        cont_w = int(container_widget.winfo_width())
+        cont_h = int(container_widget.winfo_height())
+    except Exception:
+        cont_w = 0
+        cont_h = 0
     fixed_slot = getattr(label, "_fixed_slot_size", None) or getattr(container_widget, "_fixed_slot_size", None)
-    slot_w = MEDIA_SLOT_W
-    slot_h = MEDIA_SLOT_H
     if fixed_slot:
         try:
-            slot_w = max(1, int(fixed_slot[0]))
-            slot_h = max(1, int(fixed_slot[1]))
+            cont_w = max(1, int(fixed_slot[0]))
+            cont_h = max(1, int(fixed_slot[1]))
         except Exception:
-            slot_w = MEDIA_SLOT_W
-            slot_h = MEDIA_SLOT_H
-    if slot_w < 50 or slot_h < 50:
+            pass
+    if cont_w < 80 or cont_h < 80:
+        prev_job = getattr(label, "_min_size_job", None)
+        if prev_job:
+            try:
+                label.after_cancel(prev_job)
+            except Exception:
+                pass
+        label._min_size_job = label.after(
+            80,
+            lambda: render_image_safe(label, container_widget, image_path, key, zoom=zoom),
+        )
         return False
-    cont_w = max(1, slot_w)
-    cont_h = max(1, slot_h)
     if not exists:
         label.config(image="", text="Нет изображения")
         label.image = None
@@ -1081,16 +1091,13 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
         img_w, img_h = orig.size
         if img_w <= 0 or img_h <= 0:
             return False
-        base_ratio = min(cont_w / img_w, cont_h / img_h)
+        base_ratio = min(cont_w / img_w, cont_h / img_h) if cont_w and cont_h else 1.0
         zoom_factor = float(zoom) if zoom is not None else 1.0
-        desired_ratio = base_ratio * zoom_factor
+        desired_ratio = max(0.05, base_ratio * zoom_factor)
         max_scale = getattr(label, "max_scale_factor", 3.0)
         clamped_ratio = max(0.05, min(desired_ratio, base_ratio * max_scale))
         width = max(1, int(img_w * clamped_ratio))
         height = max(1, int(img_h * clamped_ratio))
-        if width <= 5 or height <= 5:
-            print("[IMG] BAD SIZE", width, height, "slot", cont_w, cont_h)
-            return False
         min_w = 120
         min_h = 120
         if (width < min_w or height < min_h) and getattr(label, "current_image", None) is not None:
@@ -1169,8 +1176,8 @@ def render_image(label, container_widget, image_path, zoom, key):
                 slot_w = int(fixed_slot[0])
                 slot_h = int(fixed_slot[1])
             else:
-                slot_w = int(MEDIA_SLOT_W)
-                slot_h = int(MEDIA_SLOT_H)
+                slot_w = int(container_widget.winfo_width())
+                slot_h = int(container_widget.winfo_height())
         except Exception:
             slot_w = 0
             slot_h = 0
@@ -4601,21 +4608,10 @@ class CardRenderer:
         self.content_row.grid_columnconfigure(0, weight=0)
         self.content_row.grid_columnconfigure(1, weight=1)
 
-        self.media_col = tk.Frame(
-            self.content_row,
-            bg="white",
-            width=self.media_width,
-            height=self._fixed_media_slot[1],
-        )
+        self.media_col = tk.Frame(self.content_row, bg="white", width=self.media_width)
         self.media_col.grid(row=0, column=0, sticky="nw", padx=(12, 10))
         self.media_col.grid_propagate(False)
-        if self.render_mode == "preview":
-            self.media_col.grid_configure(pady=(8, 8))
-            self.media_col.pack_propagate(False)
-            self.content_row.grid_columnconfigure(0, weight=0)
-            self.content_row.grid_columnconfigure(1, weight=1)
-            self.content_row.grid_rowconfigure(0, weight=0)
-        self.media_col.grid_rowconfigure(0, weight=0)
+        self.media_col.grid_rowconfigure(0, weight=1)
 
         self.image_container = tk.Frame(
             self.media_col,
@@ -4626,7 +4622,7 @@ class CardRenderer:
         self.image_container._fixed_slot_size = self._fixed_media_slot
         self.image_container.grid_propagate(False)
         self.image_container.pack_propagate(False)
-        self.image_container.pack(anchor="nw")
+        self.image_container.pack(fill=tk.BOTH, expand=True)
         self.image_label = ResizableImageLabel(
             self.image_container,
             bg="white",
@@ -4637,10 +4633,7 @@ class CardRenderer:
         self.image_label._orig_pil_cache = self._orig_pil_cache
         if self._fixed_media_slot:
             self.image_label.set_fixed_slot_size(self._fixed_media_slot[0], self._fixed_media_slot[1])
-        if self.render_mode == "preview":
-            self.image_label.place(relx=0.5, rely=0.5, anchor="center")
-        else:
-            self.image_label.pack(fill=tk.BOTH, expand=True)
+        self.image_label.pack(fill=tk.BOTH, expand=True)
 
         self.zoom_frame = self.build_zoom_controls(
             self.media_col,
@@ -4782,19 +4775,7 @@ class CardRenderer:
         }
 
     def pick_media_for_side(self, side_data: dict) -> dict:
-        side_key = (side_data.get("side") or "front").lower()
         image_path = resolve_media_path(side_data.get("image_path")) if side_data.get("image_path") else None
-        abs_path = os.path.abspath(image_path) if image_path else None
-        print(
-            "[SIDE IMG]",
-            self.render_mode,
-            "side=",
-            side_key,
-            "path=",
-            image_path,
-            "exists=",
-            os.path.exists(abs_path) if image_path else None,
-        )
         video_path = resolve_media_path(side_data.get("video_path")) if side_data.get("video_path") else None
         image_exists = bool(image_path and os.path.exists(image_path))
         video_exists = bool(video_path and os.path.exists(video_path))
@@ -4933,14 +4914,9 @@ class CardRenderer:
         self.image_label._render_side = side_key
         if media["image_exists"] and media["image_path"]:
             if self.render_mode == "preview" and card.get("id") is None and card.get("note_id") is None:
-                render_key = (self.render_mode, "manual_preview", side_key, "image")
+                render_key = ("manual_preview", side_key, "image")
             else:
-                render_key = (
-                    self.render_mode,
-                    card.get("id") or card.get("note_id") or "card",
-                    side_key,
-                    "image",
-                )
+                render_key = (card.get("id") or card.get("note_id") or "card", side_key)
             self.image_label.load_image(
                 media["image_path"],
                 key=render_key,
@@ -4949,10 +4925,6 @@ class CardRenderer:
             )
         else:
             self.image_label.config(image="", text="Нет изображения")
-            self.image_label.image = None
-            self.image_label.current_image = None
-            self.image_label.original_image = None
-            self.image_label.image_path = None
 
         if media["video_exists"] and media["video_path"]:
             self.video_frame.grid()
@@ -11396,7 +11368,6 @@ class AnkiApp(tk.Tk):
                     show_image_toolbar=False,
                     image_layout="side",
                     show_media_placeholder=False,
-                    fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
                     render_mode="preview",
                 )
                 preview_state["window"] = preview_win
