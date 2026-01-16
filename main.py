@@ -4502,6 +4502,7 @@ class CardRenderer:
         self._current_audio_key: str | None = None
         self._current_show_back = False
         self._current_side_media: tuple[str, str] | None = None
+        self._tk_img_cache: dict = {}
         self.video_player = None
         self._use_custom_text = False
 
@@ -4959,6 +4960,65 @@ class CardRenderer:
 
     def set_header_text(self, text: str) -> None:
         self.header_label.config(text=text)
+
+    def get_repeat_media_slot_size(self) -> tuple[int, int]:
+        if self._fixed_media_slot:
+            return int(self._fixed_media_slot[0]), int(self._fixed_media_slot[1])
+        container = getattr(self, "image_container", None)
+        if container is None:
+            return int(REPEAT_MEDIA_SLOT_SIZE[0]), int(REPEAT_MEDIA_SLOT_SIZE[1])
+        width = container.winfo_width() or container.winfo_reqwidth()
+        height = container.winfo_height() or container.winfo_reqheight()
+        if width <= 0 or height <= 0:
+            return int(REPEAT_MEDIA_SLOT_SIZE[0]), int(REPEAT_MEDIA_SLOT_SIZE[1])
+        return int(width), int(height)
+
+    def render_image_to_container(
+        self,
+        container: tk.Widget,
+        image_path: str | None,
+        cache_key: str,
+        target_w: int,
+        target_h: int,
+    ) -> bool:
+        if not hasattr(self, "_tk_img_cache"):
+            self._tk_img_cache = {}
+        label = getattr(container, "_preview_image_label", None)
+        if label is None:
+            if container is self.image_container and hasattr(self, "image_label"):
+                label = self.image_label
+            else:
+                label = tk.Label(container, bg="white", bd=0, relief=tk.FLAT)
+                label.pack(fill=tk.BOTH, expand=True)
+            container._preview_image_label = label
+        resolved_path = resolve_media_path(image_path)
+        if resolved_path:
+            resolved_path = os.path.abspath(resolved_path)
+        exists = bool(resolved_path and os.path.exists(resolved_path))
+        if not exists:
+            label.config(image="", text="Нет изображения")
+            label.image = None
+            return False
+        try:
+            if not PIL_AVAILABLE:
+                raise RuntimeError("Pillow не доступен для предпросмотра")
+            img = Image.open(resolved_path)
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in ("RGBA", "RGB"):
+                img = img.convert("RGBA")
+            target_w = max(1, int(target_w))
+            target_h = max(1, int(target_h))
+            img.thumbnail((target_w, target_h), _pil_lanczos())
+            photo = ImageTk.PhotoImage(img)
+            self._tk_img_cache[cache_key] = photo
+            label.config(image=photo, text="")
+            label.image = photo
+            return True
+        except Exception as exc:
+            log_image_error(resolved_path or "missing_path", exc)
+            label.config(image="", text="Нет изображения")
+            label.image = None
+            return False
 
     def adjust_image_zoom(self, factor: float) -> None:
         self.image_zoom = max(0.1, min(3.0, self.image_zoom * float(factor)))
@@ -10390,7 +10450,7 @@ class AnkiApp(tk.Tk):
                 "front": {"image": None, "video": None, "audio": None, "pos": None},
                 "back": {"image": None, "video": None, "audio": None, "pos": None},
             }
-            preview_state = {"window": None, "renderer": None, "side": "front"}
+            preview_state = {"window": None, "renderer": None, "side": "front", "slot_size": None}
 
             self._front_img_photo = None
             self._back_img_photo = None
@@ -11053,6 +11113,7 @@ class AnkiApp(tk.Tk):
             def add_card_to_intro(card_id: int, deck_id: int) -> None:
                 mark_card_for_overview(card_id)
 
+            # PATCH: manual preview image renders + preview media frame matches repeat media slot size (auto-detected)
             def update_preview_if_open(full_refresh: bool = False) -> None:
                 preview_win = preview_state.get("window")
                 renderer = preview_state.get("renderer")
@@ -11064,7 +11125,7 @@ class AnkiApp(tk.Tk):
                     return
                 side = preview_state.get("side") or "front"
                 media = manual_media.get(side, {})
-                image_override = manual_media.get(side, {}).get("image")
+                image_override = ""
                 card_data = {
                     "front": front_text.get("1.0", tk.END).strip(),
                     "back": back_text.get("1.0", tk.END).strip(),
@@ -11074,6 +11135,21 @@ class AnkiApp(tk.Tk):
                     "back_video_path": manual_media.get("back", {}).get("video"),
                     "audio_path": media.get("audio"),
                 }
+                image_path = manual_media.get(side, {}).get("image")
+                resolved_preview_path = resolve_media_path(image_path)
+                if resolved_preview_path:
+                    resolved_preview_path = os.path.abspath(resolved_preview_path)
+                print(
+                    "[PREVIEW IMG]",
+                    "side=",
+                    side,
+                    "path=",
+                    image_path,
+                    "abs=",
+                    resolved_preview_path,
+                    "exists=",
+                    bool(resolved_preview_path and os.path.exists(resolved_preview_path)),
+                )
                 header_text = "Предпросмотр | след. повтор: —"
                 renderer.set_header_text(header_text)
                 if full_refresh:
@@ -11090,6 +11166,16 @@ class AnkiApp(tk.Tk):
                         show_back=(side == "back"),
                         image_override=image_override,
                     )
+                slot_size = preview_state.get("slot_size") or renderer.get_repeat_media_slot_size()
+                preview_state["slot_size"] = slot_size
+                repeat_slot_w, repeat_slot_h = slot_size
+                renderer.render_image_to_container(
+                    renderer.image_container,
+                    image_path,
+                    f"manual_preview_{side}",
+                    repeat_slot_w,
+                    repeat_slot_h,
+                )
 
             def open_preview() -> None:
                 preview_win = tk.Toplevel(win)
@@ -11135,10 +11221,17 @@ class AnkiApp(tk.Tk):
                     show_image_toolbar=False,
                     image_layout="side",
                     show_media_placeholder=False,
+                    fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
                 )
+                repeat_slot_w, repeat_slot_h = renderer.get_repeat_media_slot_size()
+                print("[REPEAT SLOT]", repeat_slot_w, repeat_slot_h)
+                renderer.image_container.config(width=repeat_slot_w, height=repeat_slot_h)
+                renderer.image_container.pack_propagate(False)
+                renderer.image_container.grid_propagate(False)
                 preview_state["window"] = preview_win
                 preview_state["renderer"] = renderer
                 preview_state["side"] = side_var.get()
+                preview_state["slot_size"] = (repeat_slot_w, repeat_slot_h)
 
                 def _on_close():
                     preview_state["window"] = None
