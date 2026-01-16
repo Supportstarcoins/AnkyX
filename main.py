@@ -4611,6 +4611,11 @@ class CardRenderer:
         self.media_col = tk.Frame(self.content_row, bg="white", width=self.media_width)
         self.media_col.grid(row=0, column=0, sticky="nw", padx=(12, 10))
         self.media_col.grid_propagate(False)
+        if self.render_mode == "preview":
+            self.media_col.grid_configure(pady=(8, 8))
+            self.media_col.pack_propagate(False)
+            self.content_row.grid_columnconfigure(0, weight=0)
+            self.content_row.grid_columnconfigure(1, weight=1)
         self.media_col.grid_rowconfigure(0, weight=1)
 
         self.image_container = tk.Frame(
@@ -4775,7 +4780,19 @@ class CardRenderer:
         }
 
     def pick_media_for_side(self, side_data: dict) -> dict:
+        side_key = (side_data.get("side") or "front").lower()
         image_path = resolve_media_path(side_data.get("image_path")) if side_data.get("image_path") else None
+        abs_path = os.path.abspath(image_path) if image_path else None
+        print(
+            "[SIDE IMG]",
+            self.render_mode,
+            "side=",
+            side_key,
+            "path=",
+            image_path,
+            "exists=",
+            os.path.exists(abs_path) if image_path else None,
+        )
         video_path = resolve_media_path(side_data.get("video_path")) if side_data.get("video_path") else None
         image_exists = bool(image_path and os.path.exists(image_path))
         video_exists = bool(video_path and os.path.exists(video_path))
@@ -4914,9 +4931,14 @@ class CardRenderer:
         self.image_label._render_side = side_key
         if media["image_exists"] and media["image_path"]:
             if self.render_mode == "preview" and card.get("id") is None and card.get("note_id") is None:
-                render_key = ("manual_preview", side_key, "image")
+                render_key = (self.render_mode, "manual_preview", side_key, "image")
             else:
-                render_key = (card.get("id") or card.get("note_id") or "card", side_key)
+                render_key = (
+                    self.render_mode,
+                    card.get("id") or card.get("note_id") or "card",
+                    side_key,
+                    "image",
+                )
             self.image_label.load_image(
                 media["image_path"],
                 key=render_key,
@@ -4925,6 +4947,10 @@ class CardRenderer:
             )
         else:
             self.image_label.config(image="", text="Нет изображения")
+            self.image_label.image = None
+            self.image_label.current_image = None
+            self.image_label.original_image = None
+            self.image_label.image_path = None
 
         if media["video_exists"] and media["video_path"]:
             self.video_frame.grid()
@@ -11368,6 +11394,7 @@ class AnkiApp(tk.Tk):
                     show_image_toolbar=False,
                     image_layout="side",
                     show_media_placeholder=False,
+                    fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
                     render_mode="preview",
                 )
                 preview_state["window"] = preview_win
