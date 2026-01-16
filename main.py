@@ -11363,8 +11363,11 @@ class AnkiApp(tk.Tk):
                     side=tk.LEFT, padx=4
                 )
 
+                card_host = build_center_host(container)
+                card_host.pack(fill=tk.BOTH, expand=True)
+
                 card_wrap = tk.Frame(
-                    container,
+                    card_host,
                     bg=DARK_BG,
                     highlightbackground=CARD_BORDER,
                     highlightthickness=1,
@@ -11372,8 +11375,8 @@ class AnkiApp(tk.Tk):
                     width=CARD_VIEW_WIDTH,
                     height=CARD_VIEW_HEIGHT,
                 )
-                card_wrap.pack(padx=10, pady=10, anchor="nw")
-                card_wrap.pack_propagate(False)
+                card_wrap.grid(row=0, column=0)
+                card_wrap.grid_propagate(False)
                 renderer = CardRenderer(
                     card_wrap,
                     palette=colors,
@@ -15751,3 +15754,4 @@ if __name__ == "__main__":
 # PATCH: manual preview uses same media data + fixed media-slot geometry + prevent TclError bad window path
 # PATCH: preview layout unified with repeat/playback (left fixed media slot + shared zoom controls)
 # PATCH: centered card render area in repeat/playback/manual preview via center_host (grid weights + no sticky on card_surface)
+# PATCH: centered card render area only (no size changes; restored original dimensions)
