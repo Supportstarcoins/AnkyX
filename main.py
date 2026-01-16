@@ -266,16 +266,7 @@ SCROLL_BG = getattr(_ui_theme, "SCROLL_BG", "#0b0f16")
 SCROLL_ACTIVE = getattr(_ui_theme, "SCROLL_ACTIVE", "#121a26")
 CARD_VIEW_WIDTH = 700
 CARD_VIEW_HEIGHT = 420
-
-
-def build_center_host(parent):
-    host = tk.Frame(parent, bg=parent.cget("bg") if hasattr(parent, "cget") else None)
-    host.grid_rowconfigure(0, weight=1)
-    host.grid_columnconfigure(0, weight=1)
-    return host
-MEDIA_SLOT_W = 512
-MEDIA_SLOT_H = 384
-REPEAT_MEDIA_SLOT_SIZE = (MEDIA_SLOT_W, MEDIA_SLOT_H)
+REPEAT_MEDIA_SLOT_SIZE = (260, 240)
 from card_widget import CardWidget
 from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
 
@@ -969,16 +960,6 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
     resolved_path = resolve_media_path(image_path) if image_path else None
     if resolved_path:
         resolved_path = os.path.abspath(resolved_path)
-    print(
-        "[PREVIEW] side=",
-        getattr(label, "_render_side", None),
-        "img=",
-        image_path,
-        "abs=",
-        resolved_path,
-        "exists=",
-        os.path.exists(resolved_path) if resolved_path else False,
-    )
     exists = bool(resolved_path and os.path.exists(resolved_path))
     try:
         cont_w = int(container_widget.winfo_width())
@@ -1159,42 +1140,7 @@ def render_image_safe(label, container_widget, image_path, key, zoom=None):
 
 
 def render_image(label, container_widget, image_path, zoom, key):
-    rendered = False
-    err = None
-    try:
-        rendered = render_image_safe(label, container_widget, image_path, key, zoom=zoom)
-        return rendered
-    except Exception as exc:
-        err = exc
-        import traceback
-
-        print("[PREVIEW] EXC:", exc)
-        traceback.print_exc()
-        try:
-            label.config(image="", text="")
-            label.image = None
-        except Exception:
-            pass
-        return False
-    finally:
-        try:
-            fixed_slot = getattr(label, "_fixed_slot_size", None) or getattr(container_widget, "_fixed_slot_size", None)
-            if fixed_slot:
-                slot_w = int(fixed_slot[0])
-                slot_h = int(fixed_slot[1])
-            else:
-                slot_w = int(container_widget.winfo_width())
-                slot_h = int(container_widget.winfo_height())
-        except Exception:
-            slot_w = 0
-            slot_h = 0
-        print(
-            "[IMG]",
-            f"slot={slot_w}x{slot_h}",
-            f"side={getattr(label, '_render_side', None)}",
-            f"rendered={rendered}",
-            f"err={err}",
-        )
+    return render_image_safe(label, container_widget, image_path, key, zoom=zoom)
 
 
 def copy_image_to_media(src: str, target_id: int, move: bool = False) -> str:
@@ -2453,33 +2399,39 @@ def remove_media_entry(media_id: int):
 
 
 def display_audio_entries_on_frame(audio_frame, entries: list[dict]):
-    if not audio_frame or not audio_frame.winfo_exists():
-        return
-    for widget in audio_frame.winfo_children():
-        widget.destroy()
+    audio_widget = getattr(audio_frame, "audio_widget", None)
+    if audio_widget is None:
+        audio_widget = AudioPlayerWidget(audio_frame)
+        audio_frame.audio_widget = audio_widget
+        audio_widget.pack(fill=tk.X)
 
-    audio_bg = audio_frame.cget("bg") if hasattr(audio_frame, "cget") else "white"
-    selector_frame = tk.Frame(audio_frame, bg=audio_bg)
-    selector_frame.pack(fill=tk.X, pady=(0, 2))
-    tk.Label(selector_frame, text="Аудиофайлы:", bg=audio_bg).pack(side=tk.LEFT, padx=(0, 5))
-    audio_frame.audio_selector_var = tk.StringVar()
-    combo = ttk.Combobox(
-        selector_frame,
-        textvariable=audio_frame.audio_selector_var,
-        state="readonly",
-    )
-    combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    audio_frame.audio_selector = combo
-    audio_frame.audio_selector_frame = selector_frame
+    selector_frame = getattr(audio_frame, "audio_selector_frame", None)
+    if selector_frame is None:
+        audio_bg = audio_frame.cget("bg") if hasattr(audio_frame, "cget") else "white"
+        selector_frame = tk.Frame(audio_frame, bg=audio_bg)
+        selector_frame.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(selector_frame, text="Аудиофайлы:", bg=audio_bg).pack(side=tk.LEFT, padx=(0, 5))
+        audio_frame.audio_selector_var = tk.StringVar()
+        combo = ttk.Combobox(
+            selector_frame,
+            textvariable=audio_frame.audio_selector_var,
+            state="readonly",
+        )
+        combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        audio_frame.audio_selector = combo
+        audio_frame.audio_selector_frame = selector_frame
 
-    audio_widget = AudioPlayerWidget(audio_frame)
-    audio_frame.audio_widget = audio_widget
-    audio_widget.pack(fill=tk.X)
-
+    combo: ttk.Combobox = getattr(audio_frame, "audio_selector", None)
     if not entries:
         audio_widget.load(None)
-        selector_frame.pack_forget()
+        audio_widget.pack_forget()
+        if combo:
+            combo.set("")
+            selector_frame.pack_forget()
         return
+
+    selector_frame.pack(fill=tk.X, pady=(0, 2))
+    audio_widget.pack(fill=tk.X)
     entry_map = {entry.get("label"): entry for entry in entries}
     audio_frame.audio_entry_map = entry_map
     labels = list(entry_map.keys())
@@ -4542,16 +4494,15 @@ class CardRenderer:
         self.show_media_placeholder = show_media_placeholder
         self.card_widget = card_widget
         self.image_zoom = 1.0
-        self.media_width = (fixed_media_slot[0] if fixed_media_slot else MEDIA_SLOT_W)
+        self.media_width = 260
         self._orig_pil_cache = {}
-        self._fixed_media_slot = fixed_media_slot or (MEDIA_SLOT_W, MEDIA_SLOT_H)
+        self._fixed_media_slot = fixed_media_slot
         self.render_mode = render_mode
         self._current_video_path: str | None = None
         self._current_audio_key: str | None = None
         self._current_show_back = False
         self._current_side_media: tuple[str, str] | None = None
         self.video_player = None
-        self._video_players: dict[str, VlcPlayerWidget] = {}
         self._use_custom_text = False
 
         card_bg, card_text, _ = get_card_surface_colors(parent)
@@ -4611,24 +4562,16 @@ class CardRenderer:
         self.content_inner.grid_columnconfigure(0, weight=1)
         self.content_row = tk.Frame(self.content_inner, bg="white")
         self.content_row.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        self.content_row.grid_rowconfigure(0, weight=1)
-        self.content_row.grid_columnconfigure(0, weight=0)
         self.content_row.grid_columnconfigure(1, weight=1)
 
         self.media_col = tk.Frame(self.content_row, bg="white", width=self.media_width)
-        self.media_col.grid(row=0, column=0, sticky="nw", padx=(12, 10))
+        self.media_col.grid(row=0, column=0, sticky="nw", padx=(0, 12))
         self.media_col.grid_propagate(False)
-        self.media_col.grid_rowconfigure(0, weight=1)
 
-        self.image_container = tk.Frame(
-            self.media_col,
-            bg="white",
-            width=self._fixed_media_slot[0],
-            height=self._fixed_media_slot[1],
-        )
-        self.image_container._fixed_slot_size = self._fixed_media_slot
-        self.image_container.grid_propagate(False)
-        self.image_container.pack_propagate(False)
+        self.image_container = tk.Frame(self.media_col, bg="white")
+        if self._fixed_media_slot:
+            self.image_container.config(width=self._fixed_media_slot[0], height=self._fixed_media_slot[1])
+            self.image_container.pack_propagate(False)
         self.image_container.pack(fill=tk.BOTH, expand=True)
         self.image_label = ResizableImageLabel(
             self.image_container,
@@ -4642,24 +4585,33 @@ class CardRenderer:
             self.image_label.set_fixed_slot_size(self._fixed_media_slot[0], self._fixed_media_slot[1])
         self.image_label.pack(fill=tk.BOTH, expand=True)
 
-        self.zoom_frame = self.build_zoom_controls(
-            self.media_col,
-            on_zoom_in=lambda: self.adjust_image_zoom(1.1),
-            on_zoom_out=lambda: self.adjust_image_zoom(0.9),
-        )
+        self.zoom_frame = tk.Frame(self.media_col, bg="white")
+        self.zoom_frame.pack(anchor="w", pady=(6, 0))
+        tk.Button(
+            self.zoom_frame,
+            text="+",
+            width=2,
+            command=lambda: self.adjust_image_zoom(1.1),
+            bg="white",
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(
+            self.zoom_frame,
+            text="-",
+            width=2,
+            command=lambda: self.adjust_image_zoom(0.9),
+            bg="white",
+        ).pack(side=tk.LEFT)
+
+        self.video_frame = tk.Frame(self.media_col, bg="white")
+        self.video_frame.pack(fill=tk.X, pady=(6, 0))
 
         self.text_col = tk.Frame(self.content_row, bg="white")
         self.text_col.grid(row=0, column=1, sticky="nsew")
-        self.text_col.grid_rowconfigure(0, weight=0)
-        self.text_col.grid_rowconfigure(1, weight=1)
+        self.text_col.grid_rowconfigure(0, weight=1)
         self.text_col.grid_columnconfigure(0, weight=1)
 
-        self.video_frame = tk.Frame(self.text_col, bg="white")
-        self.video_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
-        self.video_frame.grid_remove()
-
         self.text_frame = tk.Frame(self.text_col, bg="white")
-        self.text_frame.grid(row=1, column=0, sticky="nsew")
+        self.text_frame.grid(row=0, column=0, sticky="nsew")
         self.text_frame.grid_columnconfigure(0, weight=1)
         self.text_frame.grid_rowconfigure(0, weight=1)
 
@@ -4742,9 +4694,9 @@ class CardRenderer:
         if image_override is not None:
             return resolve_media_path(image_override)
         if show_back:
-            path = card.get("back_image_path")
+            path = card.get("back_image_path") or card.get("front_image_path") or card.get("image_path")
         else:
-            path = card.get("front_image_path")
+            path = card.get("front_image_path") or card.get("image_path")
         return resolve_media_path(path)
 
     def _resolve_video_path(
@@ -4756,42 +4708,12 @@ class CardRenderer:
         if video_override is not None:
             return resolve_media_path(video_override)
         if show_back:
-            video_path = card.get("back_video_path")
+            video_path = card.get("back_video_path") or card.get("video_path")
         else:
-            video_path = card.get("front_video_path")
+            video_path = card.get("front_video_path") or card.get("video_path")
         if not video_path and (card.get("id") is not None or card.get("note_id") is not None):
             video_path = find_video_media_path_for_side(card, "back" if show_back else "front")
         return resolve_media_path(video_path)
-
-    def get_side_data(self, card: dict, side: str) -> dict:
-        side_key = (side or "front").lower()
-        if side_key not in ("front", "back"):
-            side_key = "front"
-        text = card.get("front") if side_key == "front" else card.get("back")
-        image_path = card.get("front_image_path") if side_key == "front" else card.get("back_image_path")
-        video_path = card.get("front_video_path") if side_key == "front" else card.get("back_video_path")
-        if not video_path and (card.get("id") is not None or card.get("note_id") is not None):
-            video_path = find_video_media_path_for_side(card, side_key)
-        audio_entries = self._get_audio_entries(card, side_key)
-        return {
-            "side": side_key,
-            "text": text or "",
-            "image_path": image_path,
-            "video_path": video_path,
-            "audio_entries": audio_entries,
-        }
-
-    def pick_media_for_side(self, side_data: dict) -> dict:
-        image_path = resolve_media_path(side_data.get("image_path")) if side_data.get("image_path") else None
-        video_path = resolve_media_path(side_data.get("video_path")) if side_data.get("video_path") else None
-        image_exists = bool(image_path and os.path.exists(image_path))
-        video_exists = bool(video_path and os.path.exists(video_path))
-        return {
-            "image_path": image_path if image_exists else None,
-            "video_path": video_path if video_exists else None,
-            "image_exists": image_exists,
-            "video_exists": video_exists,
-        }
 
     def _select_side_media(
         self,
@@ -4807,30 +4729,21 @@ class CardRenderer:
 
     def _apply_custom_text(self, items: list, *, card_bg: str, card_text: str) -> None:
         self._use_custom_text = True
-        if not self.custom_text_frame.winfo_exists():
-            return
         for widget in self.custom_text_frame.winfo_children():
             widget.destroy()
         row = 0
         col = 0
         max_cols = 3
         for item in items:
-            if not self.custom_text_frame.winfo_exists():
-                return
-            if isinstance(item, tk.Widget):
-                if not item.winfo_exists():
-                    continue
-                try:
-                    item.grid(
-                        row=row,
-                        column=col,
-                        sticky="w",
-                        padx=5,
-                        pady=2,
-                        in_=self.custom_text_frame,
-                    )
-                except tk.TclError:
-                    continue
+            if isinstance(item, tk.Frame):
+                item.grid(
+                    row=row,
+                    column=col,
+                    sticky="w",
+                    padx=5,
+                    pady=2,
+                    in_=self.custom_text_frame,
+                )
             else:
                 label = tk.Label(
                     self.custom_text_frame,
@@ -4845,108 +4758,6 @@ class CardRenderer:
                 col = 0
                 row += 1
 
-    def render_side(
-        self,
-        card: dict,
-        side: str,
-        *,
-        prefer_audio_side: str | None = None,
-        image_override: str | None = None,
-        video_override: str | None = None,
-        custom_items: list | None = None,
-        header_text: str | None = None,
-    ) -> None:
-        card_bg, card_text, _ = get_card_surface_colors(self.container)
-        side_key = (side or "front").lower()
-        if side_key not in ("front", "back"):
-            side_key = "front"
-        show_back = side_key == "back"
-        if header_text is not None:
-            self.set_header_text(header_text)
-        side_data = self.get_side_data(card, side_key)
-        if image_override is not None:
-            side_data["image_path"] = image_override
-        if video_override is not None:
-            side_data["video_path"] = video_override
-        media = self.pick_media_for_side(side_data)
-        print(
-            "[RENDER]",
-            f"mode={self.render_mode}",
-            f"side={side_key}",
-            f"img_exists={media['image_exists']}",
-            f"vid_exists={media['video_exists']}",
-            f"path_img={media['image_path']}",
-            f"path_vid={media['video_path']}",
-        )
-
-        if custom_items is not None:
-            self._apply_custom_text(custom_items, card_bg=card_bg, card_text=card_text)
-        else:
-            self._use_custom_text = False
-            if isinstance(self.front_text, tk.Text):
-                self.front_text.delete("1.0", tk.END)
-                self.front_text.insert("1.0", card.get("front") or "")
-            else:
-                self.front_text.configure(text=card.get("front") or "")
-            if isinstance(self.back_text, tk.Text):
-                self.back_text.delete("1.0", tk.END)
-                self.back_text.insert("1.0", card.get("back") or "")
-            else:
-                self.back_text.configure(text=card.get("back") or "")
-
-        self._current_show_back = show_back
-        self._current_side_media = (
-            ("image", media["image_path"]) if media["image_exists"] else None
-        )
-        if media["video_exists"]:
-            self._current_side_media = ("video", media["video_path"])
-        self._current_video_path = media["video_path"] if media["video_exists"] else None
-
-        if show_back:
-            self.front_text.grid_remove()
-            self.back_text.grid()
-        else:
-            self.back_text.grid_remove()
-            self.front_text.grid()
-
-        if custom_items is not None:
-            self.front_text.grid_remove()
-            self.back_text.grid_remove()
-            self.custom_text_frame.grid()
-        else:
-            self.custom_text_frame.grid_remove()
-
-        self.image_label._render_mode = self.render_mode
-        self.image_label._render_card_id = card.get("id") or card.get("note_id")
-        self.image_label._render_side = side_key
-        if media["image_exists"] and media["image_path"]:
-            if self.render_mode == "preview" and card.get("id") is None and card.get("note_id") is None:
-                render_key = ("manual_preview", side_key, "image")
-            else:
-                render_key = (card.get("id") or card.get("note_id") or "card", side_key)
-            self.image_label.load_image(
-                media["image_path"],
-                key=render_key,
-                zoom=self.image_zoom,
-                container_widget=self.image_container,
-            )
-        else:
-            self.image_label.config(image="", text="Нет изображения")
-
-        if media["video_exists"] and media["video_path"]:
-            self.video_frame.grid()
-            self.text_col.grid_rowconfigure(0, weight=1)
-            self.text_col.grid_rowconfigure(1, weight=0)
-            self.text_frame.grid_remove()
-            self.custom_text_frame.grid_remove()
-        else:
-            self.video_frame.grid_remove()
-            self.text_col.grid_rowconfigure(0, weight=0)
-            self.text_col.grid_rowconfigure(1, weight=1)
-            self.text_frame.grid()
-
-        self.update_media(card, prefer_audio_side=prefer_audio_side or side_key)
-
     def update_text(
         self,
         card: dict,
@@ -4956,31 +4767,66 @@ class CardRenderer:
         video_override: str | None = None,
         custom_items: list | None = None,
     ) -> None:
-        side = "back" if show_back else "front"
-        self.render_side(
+        card_bg, card_text, _ = get_card_surface_colors(self.container)
+        front_text = card.get("front") or ""
+        back_text = card.get("back") or ""
+        if custom_items is not None:
+            self._apply_custom_text(custom_items, card_bg=card_bg, card_text=card_text)
+        else:
+            self._use_custom_text = False
+            if isinstance(self.front_text, tk.Text):
+                self.front_text.delete("1.0", tk.END)
+                self.front_text.insert("1.0", front_text)
+            else:
+                self.front_text.configure(text=front_text)
+            if isinstance(self.back_text, tk.Text):
+                self.back_text.delete("1.0", tk.END)
+                self.back_text.insert("1.0", back_text)
+            else:
+                self.back_text.configure(text=back_text)
+        self._current_show_back = show_back
+        side_media = self._select_side_media(
             card,
-            side,
+            show_back=show_back,
             image_override=image_override,
             video_override=video_override,
-            custom_items=custom_items,
         )
+        self._current_side_media = side_media
+        image_path = side_media[1] if side_media and side_media[0] == "image" else None
+        self._current_video_path = side_media[1] if side_media and side_media[0] == "video" else None
+        if show_back:
+            self.front_text.grid_remove()
+            self.back_text.grid()
+        else:
+            self.back_text.grid_remove()
+            self.front_text.grid()
+        if custom_items is not None:
+            self.front_text.grid_remove()
+            self.back_text.grid_remove()
+            self.custom_text_frame.grid()
+        else:
+            self.custom_text_frame.grid_remove()
 
-    def _filter_audio_entries_for_side(self, entries: list[dict], side: str | None) -> list[dict]:
-        side_key = (side or "back").lower()
-        return [
-            entry
-            for entry in entries
-            if (entry.get("side") or "back").lower() == side_key
-        ]
+        self.image_label._render_mode = self.render_mode
+        self.image_label._render_card_id = card.get("id") or card.get("note_id")
+        if image_path:
+            render_key = (card.get("id") or card.get("note_id") or "card", "back" if show_back else "front")
+            self.image_label.load_image(
+                image_path,
+                key=render_key,
+                zoom=self.image_zoom,
+                container_widget=self.image_container,
+            )
+        else:
+            self.image_label.config(image="", text="Нет изображения")
 
     def _get_audio_entries(self, card: dict, prefer_side: str | None) -> list[dict]:
         if "audio_entries" in card:
-            entries = list(card.get("audio_entries") or [])
-            return self._filter_audio_entries_for_side(entries, prefer_side)
+            return list(card.get("audio_entries") or [])
         audio_path = card.get("audio_path")
         if audio_path:
             label = os.path.basename(audio_path) or "Аудио"
-            entries = [
+            return [
                 {
                     "path": audio_path,
                     "label": label,
@@ -4989,10 +4835,8 @@ class CardRenderer:
                     "media_id": None,
                 }
             ]
-            return self._filter_audio_entries_for_side(entries, prefer_side)
         if card.get("id") is not None:
-            entries = get_card_audio_entries(card, prefer_side=prefer_side)
-            return self._filter_audio_entries_for_side(entries, prefer_side)
+            return get_card_audio_entries(card, prefer_side=prefer_side)
         return []
 
     def update_media(self, card: dict, *, prefer_audio_side: str | None = None) -> None:
@@ -5025,24 +4869,24 @@ class CardRenderer:
                 widget.destroy()
             ttk.Label(self.audio_frame, text="Аудио не прикреплено").pack(anchor="center")
 
-        self._render_video(card, self._current_video_path)
+        self._render_video(card)
 
-    def _render_video(self, card: dict, video_path: str | None) -> None:
+    def _render_video(self, card: dict) -> None:
         for widget in self.video_frame.winfo_children():
             widget.destroy()
-        if not video_path:
+        side_media = self._current_side_media or self._select_side_media(card, show_back=self._current_show_back)
+        if not side_media or side_media[0] != "video":
             self._current_video_path = None
             self.video_player = None
-            self._video_players = {}
-            if self.show_media_placeholder:
+            if not side_media and self.show_media_placeholder:
                 ttk.Label(self.video_frame, text="Видео не прикреплено").pack(anchor="w", padx=5, pady=5)
             return
 
+        video_path = side_media[1]
         if not os.path.exists(video_path):
             print(f"[Video] Файл видео не найден: {video_path}")
             self._current_video_path = None
             self.video_player = None
-            self._video_players = {}
             if self.show_media_placeholder:
                 ttk.Label(self.video_frame, text="Видео не найдено").pack(anchor="w", padx=5, pady=5)
             return
@@ -5073,7 +4917,6 @@ class CardRenderer:
                         player.set_media_key(media_key)
                         player.apply_state(load_media_state(card["id"], media_key))
                     self.video_frame.vlc_player = player
-                    self._video_players = {video_path: player}
                     self.video_player = player
                     self._current_video_path = video_path
                     return
@@ -5087,7 +4930,6 @@ class CardRenderer:
             command=lambda: open_in_external_player(video_path),
         ).pack(anchor="w", padx=5, pady=5)
         self.video_player = None
-        self._video_players = {}
         self._current_video_path = video_path
 
     def render(
@@ -5101,16 +4943,16 @@ class CardRenderer:
         custom_items: list | None = None,
         header_text: str | None = None,
     ) -> None:
-        side = "back" if show_back else "front"
-        self.render_side(
+        if header_text is not None:
+            self.set_header_text(header_text)
+        self.update_text(
             card,
-            side,
-            prefer_audio_side=prefer_audio_side,
+            show_back=show_back,
             image_override=image_override,
             video_override=video_override,
             custom_items=custom_items,
-            header_text=header_text,
         )
+        self.update_media(card, prefer_audio_side=prefer_audio_side)
 
     def get_audio_widget(self):
         return getattr(self.audio_frame, "audio_widget", None)
@@ -5118,33 +4960,9 @@ class CardRenderer:
     def set_header_text(self, text: str) -> None:
         self.header_label.config(text=text)
 
-    def build_zoom_controls(self, parent, on_zoom_in, on_zoom_out):
-        zoom_frame = tk.Frame(parent, bg="white")
-        zoom_frame.pack(anchor="w", pady=(6, 0))
-        tk.Button(
-            zoom_frame,
-            text="+",
-            width=2,
-            command=on_zoom_in,
-            bg="white",
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(
-            zoom_frame,
-            text="-",
-            width=2,
-            command=on_zoom_out,
-            bg="white",
-        ).pack(side=tk.LEFT)
-        return zoom_frame
-
-    def render_image_to_slot(self) -> None:
-        if not getattr(self, "image_label", None):
-            return
-        self.image_label.set_zoom_factor(self.image_zoom)
-
     def adjust_image_zoom(self, factor: float) -> None:
         self.image_zoom = max(0.1, min(3.0, self.image_zoom * float(factor)))
-        self.render_image_to_slot()
+        self.image_label.set_zoom_factor(self.image_zoom)
 
 def create_action_menubutton(parent, palette: dict | None = None) -> tuple[ttk.Menubutton, tk.Menu]:
     palette = palette or {}
@@ -10479,20 +10297,14 @@ class AnkiApp(tk.Tk):
             card_container = tk.Frame(content_row, bg=background)
             card_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=12)
 
-            card_host = build_center_host(card_container)
-            card_host.pack(fill=tk.BOTH, expand=True)
-
             card_surface = tk.Frame(
-                card_host,
+                card_container,
                 bg=card_surface_bg,
                 highlightthickness=1,
                 highlightbackground=card_border,
                 relief=tk.FLAT,
-                width=CARD_VIEW_WIDTH,
-                height=CARD_VIEW_HEIGHT,
             )
-            card_surface.grid(row=0, column=0)
-            card_surface.grid_propagate(False)
+            card_surface.pack(fill=tk.BOTH, expand=True)
 
             layout = render_card_layout(
                 card_surface,
@@ -10574,12 +10386,10 @@ class AnkiApp(tk.Tk):
             def _fmt_not_ready() -> None:
                 set_status("Функция в разработке")
 
-            # PATCH: manual new-card media unified (manual_media front/back) + preview reads same data + no front->back inherit
-            self.manual_media = {
-                "front": {"image": "", "video": "", "audio": [], "pos": None},
-                "back": {"image": "", "video": "", "audio": [], "pos": None},
+            manual_media = {
+                "front": {"image": None, "video": None, "audio": None, "pos": None},
+                "back": {"image": None, "video": None, "audio": None, "pos": None},
             }
-            manual_media = self.manual_media
             preview_state = {"window": None, "renderer": None, "side": "front"}
 
             self._front_img_photo = None
@@ -10589,8 +10399,6 @@ class AnkiApp(tk.Tk):
             self._manual_img_photo_front = None
             self._manual_img_photo_back = None
             self.manual_side = "front"
-            self.front_image_path = None
-            self.back_image_path = None
 
             def current_side() -> str:
                 return self.manual_side
@@ -11007,8 +10815,7 @@ class AnkiApp(tk.Tk):
                 side = current_side()
                 image_path = manual_media[side]["image"]
                 video_path = manual_media[side]["video"]
-                audio_paths = manual_media[side]["audio"] or []
-                audio_path = audio_paths[-1] if audio_paths else ""
+                audio_path = manual_media[side]["audio"]
 
                 media_canvas.delete("all")
                 canvas_width = media_canvas.winfo_width() or 600
@@ -11083,37 +10890,24 @@ class AnkiApp(tk.Tk):
 
             def attach_image(path: str) -> None:
                 side = current_side()
-                stored_path = os.path.abspath(path)
-                manual_media[side]["image"] = stored_path
+                manual_media[side]["image"] = path
                 manual_media[side]["pos"] = None
-                if side == "front":
-                    self.front_image_path = stored_path
-                else:
-                    self.back_image_path = stored_path
-                print("[MANUAL] set", side, "image=", stored_path, "exists=", os.path.exists(stored_path))
                 add_change_log(f"Прикреплено изображение: {os.path.basename(path)}")
                 render_media_blocks()
-                refresh_preview(full_refresh=True)
 
             def attach_audio(path: str) -> None:
                 side = current_side()
-                stored_path = os.path.abspath(path)
-                manual_media[side]["audio"] = [stored_path]
+                manual_media[side]["audio"] = path
                 manual_media[side]["pos"] = None
-                print("[MANUAL] set", side, "audio=", stored_path, "exists=", os.path.exists(stored_path))
                 add_change_log(f"Прикреплено аудио: {os.path.basename(path)}")
                 render_media_blocks()
-                refresh_preview(full_refresh=True)
 
             def attach_video(path: str) -> None:
                 side = current_side()
-                stored_path = os.path.abspath(path)
-                manual_media[side]["video"] = stored_path
+                manual_media[side]["video"] = path
                 manual_media[side]["pos"] = None
-                print("[MANUAL] set", side, "video=", stored_path, "exists=", os.path.exists(stored_path))
                 add_change_log(f"Прикреплено видео: {os.path.basename(path)}")
                 render_media_blocks()
-                refresh_preview(full_refresh=True)
 
             def _on_media_press(event) -> None:
                 item = media_canvas.find_withtag("current")
@@ -11219,24 +11013,21 @@ class AnkiApp(tk.Tk):
                         fh.write(data)
                     if not os.path.exists(filename) or os.path.getsize(filename) < 1024:
                         raise RuntimeError("TTS файл не создан или пустой")
-                    manual_media[side]["audio"] = [filename]
+                    manual_media[side]["audio"] = filename
                     manual_media[side]["pos"] = None
-                    print("[MANUAL] set", side, "audio=", filename, "exists=", os.path.exists(filename))
                     add_change_log(f"Озвучка добавлена: {os.path.basename(filename)}")
                     render_media_blocks()
-                    refresh_preview(full_refresh=True)
                 except Exception as exc:
                     messagebox.showerror("Озвучка", f"Не удалось озвучить: {exc}", parent=win)
 
             def clear_media():
                 side = current_side()
-                manual_media[side]["image"] = ""
-                manual_media[side]["audio"] = []
-                manual_media[side]["video"] = ""
+                manual_media[side]["image"] = None
+                manual_media[side]["audio"] = None
+                manual_media[side]["video"] = None
                 manual_media[side]["pos"] = None
                 add_change_log("Удалены прикрепления для текущей стороны")
                 render_media_blocks()
-                refresh_preview(full_refresh=True)
 
             icon_active_bg = colors.get("surface", "#111827")
             icon_active_fg = colors.get("text", "#E5E7EB")
@@ -11262,80 +11053,43 @@ class AnkiApp(tk.Tk):
             def add_card_to_intro(card_id: int, deck_id: int) -> None:
                 mark_card_for_overview(card_id)
 
-            def refresh_preview(full_refresh: bool = False) -> None:
-                try:
-                    preview_win = preview_state.get("window")
-                    renderer = preview_state.get("renderer")
-                    preview_container = preview_state.get("container")
-                    if not preview_win or not renderer:
-                        return
-                    if not preview_win.winfo_exists():
-                        preview_state["window"] = None
-                        preview_state["renderer"] = None
-                        return
-                    side = preview_state.get("side") or "front"
-                    front_image_raw = manual_media.get("front", {}).get("image")
-                    back_image_raw = manual_media.get("back", {}).get("image")
-                    image_raw = manual_media.get(side, {}).get("image")
-                    image_abs = resolve_media_path(image_raw) if image_raw else None
-                    print(
-                        "[PREVIEW]",
-                        f"side={side}",
-                        f"img={image_raw}",
-                        f"abs={image_abs}",
-                        f"exists={os.path.exists(image_abs) if image_abs else False}",
+            def update_preview_if_open(full_refresh: bool = False) -> None:
+                preview_win = preview_state.get("window")
+                renderer = preview_state.get("renderer")
+                if not preview_win or not renderer:
+                    return
+                if not preview_win.winfo_exists():
+                    preview_state["window"] = None
+                    preview_state["renderer"] = None
+                    return
+                side = preview_state.get("side") or "front"
+                media = manual_media.get(side, {})
+                image_override = manual_media.get(side, {}).get("image")
+                card_data = {
+                    "front": front_text.get("1.0", tk.END).strip(),
+                    "back": back_text.get("1.0", tk.END).strip(),
+                    "front_image_path": manual_media.get("front", {}).get("image"),
+                    "back_image_path": manual_media.get("back", {}).get("image"),
+                    "front_video_path": manual_media.get("front", {}).get("video"),
+                    "back_video_path": manual_media.get("back", {}).get("video"),
+                    "audio_path": media.get("audio"),
+                }
+                header_text = "Предпросмотр | след. повтор: —"
+                renderer.set_header_text(header_text)
+                if full_refresh:
+                    renderer.render(
+                        card_data,
+                        show_back=(side == "back"),
+                        prefer_audio_side=side,
+                        header_text=header_text,
+                        image_override=image_override,
                     )
-
-                    if preview_container is not None:
-                        preview_container.update_idletasks()
-
-                    media_slot = getattr(renderer, "image_container", None)
-                    if media_slot is not None:
-                        print(
-                            "[PREVIEW] media_slot exists=",
-                            media_slot.winfo_exists(),
-                            "size=",
-                            media_slot.winfo_width(),
-                            media_slot.winfo_height(),
-                        )
-
-                    audio_entries = []
-                    for side_key in ("front", "back"):
-                        for audio_path in manual_media.get(side_key, {}).get("audio") or []:
-                            audio_entries.append(
-                                {
-                                    "path": audio_path,
-                                    "label": os.path.basename(audio_path) or "Аудио",
-                                    "side": side_key,
-                                    "missing": not os.path.exists(audio_path),
-                                    "media_id": None,
-                                }
-                            )
-                    card_data = {
-                        "front": front_text.get("1.0", tk.END).strip(),
-                        "back": back_text.get("1.0", tk.END).strip(),
-                        "front_image_path": front_image_raw,
-                        "back_image_path": back_image_raw,
-                        "front_video_path": manual_media.get("front", {}).get("video"),
-                        "back_video_path": manual_media.get("back", {}).get("video"),
-                        "audio_entries": audio_entries,
-                    }
-                    header_text = "Предпросмотр | след. повтор: —"
-                    # PATCH: manual new card preview image render fixed (refresh call + unique cache_key + PhotoImage cache + path resolver)
+                else:
                     renderer.update_text(
                         card_data,
-                        show_back=side == "back",
+                        show_back=(side == "back"),
+                        image_override=image_override,
                     )
-                    renderer.update_media(card_data, prefer_audio_side=side)
-                    renderer.set_header_text(header_text)
-                except Exception as exc:
-                    import traceback
-
-                    print("[PREVIEW] EXC:", exc)
-                    traceback.print_exc()
-
-            def update_preview_if_open(full_refresh: bool = False) -> None:
-                refresh_preview(full_refresh=full_refresh)
 
             def open_preview() -> None:
                 preview_win = tk.Toplevel(win)
@@ -11363,11 +11117,8 @@ class AnkiApp(tk.Tk):
                     side=tk.LEFT, padx=4
                 )
 
-                card_host = build_center_host(container)
-                card_host.pack(fill=tk.BOTH, expand=True)
-
                 card_wrap = tk.Frame(
-                    card_host,
+                    container,
                     bg=DARK_BG,
                     highlightbackground=CARD_BORDER,
                     highlightthickness=1,
@@ -11375,8 +11126,8 @@ class AnkiApp(tk.Tk):
                     width=CARD_VIEW_WIDTH,
                     height=CARD_VIEW_HEIGHT,
                 )
-                card_wrap.grid(row=0, column=0)
-                card_wrap.grid_propagate(False)
+                card_wrap.pack(padx=10, pady=10)
+                card_wrap.pack_propagate(False)
                 renderer = CardRenderer(
                     card_wrap,
                     palette=colors,
@@ -11384,11 +11135,9 @@ class AnkiApp(tk.Tk):
                     show_image_toolbar=False,
                     image_layout="side",
                     show_media_placeholder=False,
-                    render_mode="preview",
                 )
                 preview_state["window"] = preview_win
                 preview_state["renderer"] = renderer
-                preview_state["container"] = card_wrap
                 preview_state["side"] = side_var.get()
 
                 def _on_close():
@@ -11430,16 +11179,14 @@ class AnkiApp(tk.Tk):
                         level=1,
                     )
                     media_entries = []
-                    front_audio_entries = manual_media["front"]["audio"] or []
-                    back_audio_entries = manual_media["back"]["audio"] or []
+                    front_audio = manual_media["front"]["audio"]
+                    back_audio = manual_media["back"]["audio"]
                     front_video = manual_media["front"]["video"]
                     back_video = manual_media["back"]["video"]
-                    if front_audio_entries:
-                        for audio_path in front_audio_entries:
-                            media_entries.append((copy_audio_asset_to_media(audio_path, "front_audio"), "audio", "front", None))
-                    if back_audio_entries:
-                        for audio_path in back_audio_entries:
-                            media_entries.append((copy_audio_asset_to_media(audio_path, "back_audio"), "audio", "back", None))
+                    if front_audio:
+                        media_entries.append((copy_audio_asset_to_media(front_audio, "front_audio"), "audio", "front", None))
+                    if back_audio:
+                        media_entries.append((copy_audio_asset_to_media(back_audio, "back_audio"), "audio", "back", None))
                     if front_video:
                         media_entries.append((copy_video_asset_to_media(front_video, "front_video"), "video", "front", None))
                     if back_video:
@@ -13911,75 +13658,7 @@ class OverviewWindow(tk.Toplevel):
         )
         self.right_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.right_frame.pack_propagate(False)
-
-        self.left_content = ttk.Frame(self.left_frame, style="CardSurface.TFrame")
-        style_card_surface(self.left_content, palette, padded=False)
-        self.left_content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        left_header = ttk.Frame(self.left_content, style="CardSurface.TFrame")
-        style_card_surface(left_header, palette, padded=False)
-        left_header.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(
-            left_header,
-            text="🔊 Озвучить",
-            command=lambda: self.play_side_audio("front"),
-        ).pack(side=tk.LEFT, padx=4)
-        ttk.Label(left_header, text="Язык:").pack(side=tk.LEFT, padx=(10, 4))
-        left_lang_combo = ttk.Combobox(
-            left_header,
-            values=self.tts_languages,
-            textvariable=self.front_tts_lang_var,
-            width=6,
-            state="readonly",
-            style="Dark.TCombobox",
-        )
-        left_lang_combo.pack(side=tk.LEFT, padx=4)
-
-        self.left_card_container = tk.Frame(self.left_content, bg=palette.get("surface", "#111827"))
-        self.left_card_container.pack(fill=tk.BOTH, expand=True)
-        self.front_renderer = CardRenderer(
-            self.left_card_container,
-            palette=palette,
-            editable=False,
-            show_image_toolbar=False,
-            image_layout="side",
-            fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
-            render_mode="overview",
-        )
-
-        self.right_content = ttk.Frame(self.right_frame, style="CardSurface.TFrame")
-        style_card_surface(self.right_content, palette, padded=False)
-        self.right_content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        right_header = ttk.Frame(self.right_content, style="CardSurface.TFrame")
-        style_card_surface(right_header, palette, padded=False)
-        right_header.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(
-            right_header,
-            text="🔊 Озвучить",
-            command=lambda: self.play_side_audio("back"),
-        ).pack(side=tk.LEFT, padx=4)
-        ttk.Label(right_header, text="Язык:").pack(side=tk.LEFT, padx=(10, 4))
-        right_lang_combo = ttk.Combobox(
-            right_header,
-            values=self.tts_languages,
-            textvariable=self.back_tts_lang_var,
-            width=6,
-            state="readonly",
-            style="Dark.TCombobox",
-        )
-        right_lang_combo.pack(side=tk.LEFT, padx=4)
-
-        self.right_card_container = tk.Frame(self.right_content, bg=palette.get("surface", "#111827"))
-        self.right_card_container.pack(fill=tk.BOTH, expand=True)
-        self.back_renderer = CardRenderer(
-            self.right_card_container,
-            palette=palette,
-            editable=False,
-            show_image_toolbar=False,
-            image_layout="side",
-            fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
-            render_mode="overview",
-        )
-
+        
         # Панель кнопок навигации
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -14130,9 +13809,33 @@ class OverviewWindow(tk.Toplevel):
         # Обновляем прогресс бар
         self.progress_var.set((idx / total) * 100)
         
+        # Создаем виджеты для лицевой стороны
+        self.front_text, self.front_image_label, self.front_audio_frame, self.front_video_frame = self.create_card_widgets(self.left_frame, is_front=True)
+        
+        # Обновляем лицевую сторону (FRONT)
         front_content = c["front"]
+        self.front_text.insert(1.0, front_content)
+        self.front_text.configure(state='disabled')
+        create_context_menu(self.front_text)  # Добавляем контекстное меню
+        
+        # Загружаем изображение лицевой стороны
+        front_img_path = resolve_media_path(c.get("front_image_path") or c.get("image_path"))
+        if front_img_path:
+            self.front_image_label.load_image(front_img_path)
+        else:
+            self.front_image_label.load_image(None)
+        
+        # Обновляем аудио плеер для лицевой стороны
+        self.update_audio_player(self.front_audio_frame, c, prefer_side="front")
+        self.update_video_player(self.front_video_frame, c)
+        
+        # Создаем виджеты для задней стороны
+        self.back_text, self.back_image_label, self.back_audio_frame, self.back_video_frame = self.create_card_widgets(self.right_frame, is_front=False)
+        
+        # Обновляем заднюю сторону (BACK)
         back_content = c["back"]
-
+        
+        # ВСЕГДА добавляем перевод для режима ознакомления
         if TRANSLATION_SETTINGS.show_back_translation:
             lines = front_content.split('\n')
             if lines:
@@ -14141,28 +13844,21 @@ class OverviewWindow(tk.Toplevel):
                     translation = translate_sentence(sentence, use_openai=True)
                     if translation and translation != sentence:
                         back_content = f"{back_content}\n\n🇷🇺 Перевод: {translation}"
-
-        front_card = dict(c)
-        front_card["front"] = front_content
-        front_card["back"] = c.get("back") or ""
-        back_card = dict(c)
-        back_card["front"] = c.get("front") or ""
-        back_card["back"] = back_content
-
-        if getattr(self, "front_renderer", None) is not None:
-            self.front_renderer.render(
-                front_card,
-                show_back=False,
-                prefer_audio_side="front",
-                header_text="",
-            )
-        if getattr(self, "back_renderer", None) is not None:
-            self.back_renderer.render(
-                back_card,
-                show_back=True,
-                prefer_audio_side="back",
-                header_text="",
-            )
+        
+        self.back_text.insert(1.0, back_content)
+        self.back_text.configure(state='disabled')
+        create_context_menu(self.back_text)  # Добавляем контекстное меню
+        
+        # Загружаем изображение задней стороны
+        back_img_path = resolve_media_path(c.get("back_image_path") or c.get("image_path"))
+        if back_img_path:
+            self.back_image_label.load_image(back_img_path)
+        else:
+            self.back_image_label.load_image(None)
+        
+        # Обновляем аудио плеер для задней стороны
+        self.update_audio_player(self.back_audio_frame, c, prefer_side="back")
+        self.update_video_player(self.back_video_frame, c)
     
     def update_audio_player(self, audio_frame, card, prefer_side: str = "back"):
         """Обновить аудио плеер"""
@@ -14452,11 +14148,9 @@ class RepeatWindow(tk.Toplevel):
 
         # Основной фрейм карточки
         cards_bg = tk.Frame(frame_main, bg=DARK_BG)
-        cards_bg.pack(fill=tk.BOTH, expand=True, pady=10, anchor="nw")
-        card_host = build_center_host(cards_bg)
-        card_host.pack(fill=tk.BOTH, expand=True)
+        cards_bg.pack(fill=tk.BOTH, expand=True, pady=10)
         card_wrap = tk.Frame(
-            card_host,
+            cards_bg,
             bg=DARK_BG,
             highlightbackground=CARD_BORDER,
             highlightthickness=1,
@@ -14464,8 +14158,8 @@ class RepeatWindow(tk.Toplevel):
             width=CARD_VIEW_WIDTH,
             height=CARD_VIEW_HEIGHT,
         )
-        card_wrap.grid(row=0, column=0)
-        card_wrap.grid_propagate(False)
+        card_wrap.pack(padx=10, pady=10)
+        card_wrap.pack_propagate(False)
         self.card_frame = card_wrap
         self.card_renderer = CardRenderer(
             self.card_frame,
@@ -14826,20 +14520,26 @@ class RepeatWindow(tk.Toplevel):
             self.card_renderer.set_header_text(header_text)
 
         front_text = c["front"]
+        back_text = c["back"]
+        if self.show_back:
+            img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
+        else:
+            img_path = c["front_image_path"] or c["image_path"]
 
         use_custom = (not self.show_back) and self.show_translations and c["leitner_level"] == 1
         custom_items = self.extract_words_with_translations(front_text) if use_custom else None
         if self.card_renderer is not None:
-            self.card_renderer.render(
+            self.card_renderer.update_text(
                 c,
                 show_back=self.show_back,
-                prefer_audio_side="back" if self.show_back else "front",
+                image_override=img_path,
                 custom_items=custom_items,
-                header_text=header_text,
             )
-            self.audio_widget = self.card_renderer.get_audio_widget()
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
+
+        # Обновляем аудио/видео
+        self.update_audio_player()
 
     def show_end_state(self):
         self.stop_timer()
@@ -15027,10 +14727,8 @@ class ReviewWindow(tk.Toplevel):
         self.timer_label.pack(anchor="center", pady=(3, 5))
 
         # Фрейм карточки
-        card_host = build_center_host(frame_main)
-        card_host.pack(fill=tk.BOTH, expand=True)
         self.card_frame = tk.Frame(
-            card_host,
+            frame_main,
             bg=card_bg,
             bd=0,
             relief="flat",
@@ -15038,8 +14736,8 @@ class ReviewWindow(tk.Toplevel):
             height=CARD_VIEW_HEIGHT
         )
         style_card_surface(self.card_frame, colors)
-        self.card_frame.grid(row=0, column=0)
-        self.card_frame.grid_propagate(False)
+        self.card_frame.pack(pady=10)
+        self.card_frame.pack_propagate(False)
 
         # Индикатор загрузки
         self.dot_canvas = tk.Canvas(self.card_frame, width=20, height=20,
@@ -15300,6 +14998,11 @@ class ReviewWindow(tk.Toplevel):
         if self.card_renderer is not None:
             self.card_renderer.set_header_text(header_text)
 
+        if self.show_back:
+            img_path = c["back_image_path"] or c["front_image_path"] or c["image_path"]
+        else:
+            img_path = c["front_image_path"] or c["image_path"]
+
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
 
         self.update_progress_view()
@@ -15310,6 +15013,7 @@ class ReviewWindow(tk.Toplevel):
                 c,
                 show_back=self.show_back,
                 prefer_audio_side="back" if self.show_back else "front",
+                image_override=img_path,
                 header_text=header_text,
             )
             self.audio_widget = self.card_renderer.get_audio_widget()
@@ -15750,8 +15454,3 @@ if __name__ == "__main__":
 # PATCH: tabs moved + dark scrollbar + video embed fixed + upload video in generator + unified card renderer
 # PATCH: unify card renderer sizes + white video background + image-over-video rule
 # PATCH: fix random image shrink (configure debounce + min size + orig cache) + fix preview image render (PhotoImage refs + shared renderer)
-# PATCH: preview image render + playback left alignment + clip shows instead of text + strict per-side media (no front->back inherit)
-# PATCH: manual preview uses same media data + fixed media-slot geometry + prevent TclError bad window path
-# PATCH: preview layout unified with repeat/playback (left fixed media slot + shared zoom controls)
-# PATCH: centered card render area in repeat/playback/manual preview via center_host (grid weights + no sticky on card_surface)
-# PATCH: centered card render area only (no size changes; restored original dimensions)
