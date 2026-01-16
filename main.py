@@ -20,7 +20,7 @@ import shutil
 import webbrowser
 import urllib.parse
 import urllib.request
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageOps, ImageDraw, ImageEnhance
 from pathlib import Path
 from uuid import uuid4
 csv.field_size_limit(10 * 1024 * 1024)
@@ -5432,6 +5432,7 @@ class AnkiApp(tk.Tk):
         self.package_choice_var = tk.StringVar(value="pack_500")
         self.balance_labels: list[tk.Variable] = []
         self.balance_widgets: list[tk.Label] = []
+        self.balance_observers: list[callable] = []
         self.credit_icon_image = None
         self.credit_icon_small = None
         self.credit_icon_large = None
@@ -5647,7 +5648,7 @@ class AnkiApp(tk.Tk):
         gen_menu.add_command(label="Видео → клипы → карточки",
                              command=self.open_video_clip_window)
         gen_menu.add_command(
-            label="Импорт картинок по ID (CSV) 👑 (5⚡/операция)",
+            label="Импорт картинок по ID (CSV) (15⚡/10 или 5⚡/15)",
             command=self.open_image_id_import_window,
         )
         self.generation_menu_indexes["image_id_import"] = gen_menu.index("end")
@@ -5882,7 +5883,7 @@ class AnkiApp(tk.Tk):
             ("Генерация через цифровой слух...", self.open_generate_from_speech_window, None, False, None),
             ("Генерация из видео (цифровой слух)...", self.open_generate_from_video_window, None, False, None),
             ("Видео → клипы → карточки", self.open_video_clip_window, None, False, None),
-            ("Импорт картинок по ID (CSV)", self.open_image_id_import_window, "5/операция", True, "image_id_import"),
+            ("Импорт картинок по ID (CSV)", self.open_image_id_import_window, "15 за 10 / 5 за 15", False, "image_id_import"),
             ("Импорт CSV колоды", self.open_csv_import_window, None, False, None),
             ("Картинки по CSV (Wikimedia)", self.open_wikimedia_csv_window, "5 за 10 импортов", True, "wikimedia"),
         ]
@@ -6196,13 +6197,6 @@ class AnkiApp(tk.Tk):
             messagebox.showerror("Импорт изображений недоступен", "Чтобы прикреплять картинки, установите пакет Pillow и попробуйте снова.")
             return
 
-        if not self.is_premium_active():
-            messagebox.showinfo(
-                "Нужна подписка",
-                "Импорт картинок по ID доступен в Pro. Откройте личный кабинет для активации.",
-            )
-            return
-
         win = tk.Toplevel(self)
         win.title("Импорт картинок по ID (CSV)")
         win.geometry("820x680")
@@ -6220,6 +6214,17 @@ class AnkiApp(tk.Tk):
         auto_confirm_var = tk.BooleanVar(value=True)
         interval_var = tk.IntVar(value=5)
         stop_flag = {"stop": False}
+        pack_state = {
+            "limit": 0,
+            "cost": 0,
+            "label": "",
+            "remaining": 0,
+            "limit_reached": False,
+            "next_index": None,
+        }
+        import_label_var = tk.StringVar(value="")
+        import_enabled = {"value": True}
+        import_busy = {"value": False}
 
         decks = list_decks()
         if self.selected_deck_id:
@@ -6248,37 +6253,71 @@ class AnkiApp(tk.Tk):
             kind = event[0]
             if kind == "progress":
                 done, total, label = event[1:]
-                progress_bar.configure(maximum=max(total, 1))
+                display_total = pack_state["limit"] if pack_state["limit"] else total
+                progress_bar.configure(maximum=max(display_total, 1))
                 progress_var.set(done)
-                progress_label_var.set(f"{label}: {done}/{total}")
-                self.update_loading(done, total, f"{label}: {done}/{total}")
+                progress_label_var.set(f"{label}: {done}/{display_total}")
+                self.update_loading(done, display_total, f"{label}: {done}/{display_total}")
             elif kind == "log":
                 log_msg(event[1])
+            elif kind == "limit_reached":
+                pack_state["limit_reached"] = True
+                stop_flag["stop"] = True
+                pack_state["remaining"] = 0
+                progress_var.set(0)
+                progress_label_var.set("")
+                progress_bar.configure(maximum=max(pack_state["limit"], 1))
+                self.hide_loading()
+                messagebox.showinfo(
+                    "Лимит пакета",
+                    "Достигнут лимит пакета. Оплатите следующий пакет для продолжения.",
+                )
             elif kind == "done":
                 summary = event[1] or {"total": 0, "imported": 0, "updated": 0, "skipped": 0, "errors": 0}
                 self.unregister_bg_handler(processing_task["task"].queue)
                 processing_task["task"] = None
                 btn_check.config(state=tk.NORMAL)
-                btn_import.config(state=tk.NORMAL)
+                import_busy["value"] = False
+                update_import_button_state()
                 btn_stop.config(state=tk.NORMAL)
                 self.hide_loading()
-                msg = (
-                    f"Всего: {summary['total']}\n"
-                    f"Создано: {summary['imported']}\n"
-                    f"Обновлено: {summary['updated']}\n"
-                    f"Пропущено: {summary['skipped']}\n"
-                    f"Ошибки: {summary['errors']}"
-                )
-                messagebox.showinfo("Импорт завершен", msg)
-                if summary.get("imported") or summary.get("updated"):
-                    self.mark_first_import()
-                if running_watch_mode["value"] and watch_var.get() and not stop_flag.get("stop"):
-                    self.image_import_watch_job = win.after(interval_var.get() * 1000, lambda: process_files(False, True))
+                processed_in_pack = int(summary.get("processed_in_pack") or 0)
+                if pack_state["remaining"]:
+                    pack_state["remaining"] = max(0, int(pack_state["remaining"]) - processed_in_pack)
+                if not pack_state["limit_reached"]:
+                    msg = (
+                        f"Всего: {summary['total']}\n"
+                        f"Создано: {summary['imported']}\n"
+                        f"Обновлено: {summary['updated']}\n"
+                        f"Пропущено: {summary['skipped']}\n"
+                        f"Ошибки: {summary['errors']}"
+                    )
+                    messagebox.showinfo("Импорт завершен", msg)
+                    if summary.get("imported") or summary.get("updated"):
+                        self.mark_first_import()
+                    if (
+                        running_watch_mode["value"]
+                        and watch_var.get()
+                        and not stop_flag.get("stop")
+                        and pack_state.get("remaining", 0) > 0
+                    ):
+                        self.image_import_watch_job = win.after(
+                            interval_var.get() * 1000,
+                            lambda: process_files(
+                                False,
+                                True,
+                                pack_limit=pack_state.get("remaining"),
+                                pack_cost=pack_state.get("cost"),
+                                pack_label=pack_state.get("label"),
+                                charge_pack=False,
+                            ),
+                        )
             elif kind == "error":
                 self.unregister_bg_handler(processing_task["task"].queue)
                 processing_task["task"] = None
                 btn_check.config(state=tk.NORMAL)
-                btn_import.config(state=tk.NORMAL)
+                import_busy["value"] = False
+                update_import_button_state()
                 btn_stop.config(state=tk.NORMAL)
                 messagebox.showerror("Ошибка", event[1])
                 self.hide_loading()
@@ -6292,6 +6331,27 @@ class AnkiApp(tk.Tk):
             path = filedialog.askdirectory()
             if path:
                 folder_var.set(path)
+
+        def show_coin_hint(_event=None):
+            messagebox.showinfo(
+                "Оплата и запуск",
+                "Нажмите на монету для оплаты и запуска.",
+            )
+            return "break"
+
+        def show_pro_required_hint(_event=None):
+            messagebox.showinfo(
+                "Требуется PRO подписка",
+                "Требуется PRO подписка.",
+            )
+            return "break"
+
+        def show_pro_feature_hint(_event=None):
+            messagebox.showinfo(
+                "Доступно в PRO",
+                "Доступно в PRO.",
+            )
+            return "break"
 
         def ask_semi_confirmation(image_path: str, detected_id: int | None, csv_entry: dict | None):
             result = {"action": "skip", "data": None, "auto": auto_confirm_var.get()}
@@ -6385,12 +6445,26 @@ class AnkiApp(tk.Tk):
             auto_confirm_var.set(auto_apply_var.get())
             return result
 
-        def process_files(dry_run=False, watch_mode=False):
+        def process_files(
+            dry_run=False,
+            watch_mode=False,
+            pack_limit: int | None = None,
+            pack_cost: int | None = None,
+            pack_label: str | None = None,
+            charge_pack: bool = False,
+        ):
             if processing_task["task"]:
                 messagebox.showinfo("Занято", "Импорт уже выполняется")
                 return
             stop_flag["stop"] = False
             running_watch_mode["value"] = watch_mode
+            pack_state["limit_reached"] = False
+            pack_state["next_index"] = None
+            pack_state["limit"] = int(pack_limit or 0) if not dry_run else 0
+            pack_state["cost"] = int(pack_cost or 0) if not dry_run else 0
+            pack_state["label"] = pack_label or ""
+            if not dry_run and charge_pack and pack_limit is not None:
+                pack_state["remaining"] = pack_limit
             csv_path = csv_path_var.get().strip()
             folder = folder_var.get().strip()
             if not csv_path or not os.path.exists(csv_path):
@@ -6427,25 +6501,42 @@ class AnkiApp(tk.Tk):
                 if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
             ]
             files.sort()
-            if not dry_run:
-                if not self.guard_premium_and_spend(
+            if not dry_run and charge_pack:
+                if pack_cost is None:
+                    messagebox.showerror("Ошибка", "Не удалось определить стоимость пакета")
+                    return
+                if not self.can_afford(pack_cost):
+                    messagebox.showerror("Недостаточно кредитов", "Недостаточно кредитов. Пополните баланс.")
+                    update_import_button_state()
+                    return
+                if not self.charge_credits(
+                    pack_cost,
                     "image_id_import",
-                    IMAGE_ID_IMPORT_COST,
-                    require_premium=True,
-                    meta={"files": len(files), "csv": os.path.basename(csv_path)},
+                    meta={
+                        "files": pack_limit or len(files),
+                        "csv": os.path.basename(csv_path),
+                        "pack_limit": pack_limit or 0,
+                    },
                 ):
+                    messagebox.showerror("Ошибка", "Не удалось списать кредиты")
+                    update_import_button_state()
                     return
 
-            self.show_loading("Импорт картинок", determinate=True, total=max(len(files), 1))
+            progress_total = pack_limit if (pack_limit and not dry_run) else len(files)
+            progress_bar.configure(maximum=max(progress_total, 1))
+            self.show_loading("Импорт картинок", determinate=True, total=max(progress_total, 1))
 
             def worker(task_obj):
                 summary = {"total": 0, "imported": 0, "updated": 0, "skipped": 0, "errors": 0}
                 total_files = len(files)
+                processed_in_pack = 0
                 for idx, fp in enumerate(files, start=1):
                     if stop_flag.get("stop") or task_obj.cancelled():
                         break
                     if watch_mode and fp in imported_files:
                         continue
+                    if pack_limit and not dry_run and processed_in_pack >= pack_limit:
+                        break
 
                     summary["total"] += 1
                     id_val = None
@@ -6457,6 +6548,8 @@ class AnkiApp(tk.Tk):
                     if id_val is None:
                         task_obj.queue.put(("log", f"[ошибка] Не найден ID для {os.path.basename(fp)}"))
                         summary["errors"] += 1
+                        processed_in_pack += 1
+                        task_obj.queue.put(("progress", processed_in_pack, max(progress_total, 1), "Импорт"))
                         continue
 
                     entry = csv_data.get(id_val) if id_val is not None else None
@@ -6464,12 +6557,16 @@ class AnkiApp(tk.Tk):
                     if entry is None:
                         task_obj.queue.put(("log", f"[пропуск] ID {id_val} отсутствует в CSV"))
                         summary["skipped"] += 1
+                        processed_in_pack += 1
+                        task_obj.queue.put(("progress", processed_in_pack, max(progress_total, 1), "Импорт"))
                         continue
 
                     existing = find_note_by_source_id(deck_id_int, id_val)
                     if existing and not update_existing_var.get():
                         task_obj.queue.put(("log", f"[пропуск] ID {id_val} уже существует"))
                         summary["skipped"] += 1
+                        processed_in_pack += 1
+                        task_obj.queue.put(("progress", processed_in_pack, max(progress_total, 1), "Импорт"))
                         continue
 
                     media_path = copy_image_to_media(fp, id_val, move_files_var.get()) if not dry_run else fp
@@ -6486,7 +6583,8 @@ class AnkiApp(tk.Tk):
                     if dry_run:
                         task_obj.queue.put(("log", f"[проверка] готова карточка ID {id_val}: {fields['word']} -> {fields['translation']}"))
                         summary["imported"] += 1
-                        task_obj.queue.put(("progress", idx, max(total_files, 1), "Импорт"))
+                        processed_in_pack += 1
+                        task_obj.queue.put(("progress", processed_in_pack, max(progress_total, 1), "Импорт"))
                         continue
 
                     if existing:
@@ -6522,14 +6620,27 @@ class AnkiApp(tk.Tk):
                     if watch_mode:
                         log_imported_file(fp)
 
-                    task_obj.queue.put(("progress", idx, max(total_files, 1), "Импорт"))
+                    processed_in_pack += 1
+                    task_obj.queue.put(("progress", processed_in_pack, max(progress_total, 1), "Импорт"))
 
+                summary["processed_in_pack"] = processed_in_pack
+                if (
+                    pack_limit
+                    and not dry_run
+                    and processed_in_pack >= pack_limit
+                    and total_files > processed_in_pack
+                    and not stop_flag.get("stop")
+                    and not task_obj.cancelled()
+                ):
+                    pack_state["next_index"] = processed_in_pack + 1
+                    task_obj.queue.put(("limit_reached",))
                 return summary
 
             progress_var.set(0)
             progress_label_var.set("")
             btn_check.config(state=tk.DISABLED)
-            btn_import.config(state=tk.DISABLED)
+            import_busy["value"] = True
+            update_import_button_state()
             btn_stop.config(state=tk.DISABLED)
             processing_task["task"] = start_background_task(worker)
             self.register_bg_handler(processing_task["task"].queue, handle_import_event)
@@ -6539,7 +6650,8 @@ class AnkiApp(tk.Tk):
             if processing_task["task"]:
                 processing_task["task"].cancel()
             btn_check.config(state=tk.NORMAL)
-            btn_import.config(state=tk.NORMAL)
+            import_busy["value"] = False
+            update_import_button_state()
             btn_stop.config(state=tk.NORMAL)
             if self.image_import_watch_job:
                 try:
@@ -6550,9 +6662,39 @@ class AnkiApp(tk.Tk):
             log_msg("[остановлено] Импорт остановлен пользователем")
             self.hide_loading()
 
-        def start_watch_loop():
+        def start_watch_loop(pack_limit: int, pack_cost: int, pack_label: str):
             stop_flag["stop"] = False
-            process_files(dry_run=False, watch_mode=True)
+            process_files(
+                dry_run=False,
+                watch_mode=True,
+                pack_limit=pack_limit,
+                pack_cost=pack_cost,
+                pack_label=pack_label,
+                charge_pack=True,
+            )
+
+        def on_coin_click(_event=None):
+            limit, cost, pack_label = self.get_csv_import_pack_config()
+            if import_busy["value"]:
+                messagebox.showinfo("Занято", "Импорт уже выполняется")
+                return "break"
+            if not self.can_afford(cost):
+                messagebox.showerror("Недостаточно кредитов", "Недостаточно кредитов. Пополните баланс.")
+                update_import_button_state()
+                return "break"
+            pack_state["remaining"] = limit
+            if watch_var.get():
+                start_watch_loop(limit, cost, pack_label)
+            else:
+                process_files(
+                    dry_run=False,
+                    watch_mode=False,
+                    pack_limit=limit,
+                    pack_cost=cost,
+                    pack_label=pack_label,
+                    charge_pack=True,
+                )
+            return "break"
 
         # Layout
         main_frame = ttk.Frame(win)
@@ -6583,15 +6725,50 @@ class AnkiApp(tk.Tk):
         note_combo['values'] = [str(nt["id"]) for nt in note_types]
         note_combo.grid(row=0, column=3, sticky="ew", padx=5, pady=3)
 
+        pro_active = self.is_premium_active()
+        if not pro_active and id_mode_var.get() in ("ocr", "semi"):
+            id_mode_var.set("filename")
+        if not pro_active:
+            update_existing_var.set(False)
+
         ttk.Label(options_frame, text="Режим ID:").grid(row=1, column=0, sticky="w", padx=5)
         ttk.Radiobutton(options_frame, text="Имя файла", variable=id_mode_var, value="filename").grid(row=1, column=1, sticky="w")
-        ttk.Radiobutton(options_frame, text="OCR", variable=id_mode_var, value="ocr").grid(row=1, column=2, sticky="w")
-        ttk.Radiobutton(options_frame, text="Полуавто", variable=id_mode_var, value="semi").grid(row=1, column=3, sticky="w")
 
-        ttk.Checkbutton(options_frame, text="Обновлять существующие", variable=update_existing_var).grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        ocr_frame = ttk.Frame(options_frame)
+        ocr_frame.grid(row=1, column=2, sticky="w")
+        ocr_rb = ttk.Radiobutton(ocr_frame, text="OCR", variable=id_mode_var, value="ocr")
+        ocr_rb.pack(side=tk.LEFT)
+        ocr_crown = ttk.Label(ocr_frame, text="👑")
+        ocr_crown.pack(side=tk.LEFT, padx=(2, 0))
+
+        semi_frame = ttk.Frame(options_frame)
+        semi_frame.grid(row=1, column=3, sticky="w")
+        semi_rb = ttk.Radiobutton(semi_frame, text="Полуавто", variable=id_mode_var, value="semi")
+        semi_rb.pack(side=tk.LEFT)
+        semi_crown = ttk.Label(semi_frame, text="👑")
+        semi_crown.pack(side=tk.LEFT, padx=(2, 0))
+
+        update_frame = ttk.Frame(options_frame)
+        update_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        update_cb = ttk.Checkbutton(update_frame, text="Обновлять существующие", variable=update_existing_var)
+        update_cb.pack(side=tk.LEFT)
+        update_crown = ttk.Label(update_frame, text="👑")
+        update_crown.pack(side=tk.LEFT, padx=(2, 0))
+
         ttk.Checkbutton(options_frame, text="Перемещать файлы", variable=move_files_var).grid(row=2, column=1, sticky="w", padx=5, pady=3)
         ttk.Checkbutton(options_frame, text="Следить за папкой (watch)", variable=watch_var).grid(row=2, column=2, sticky="w", padx=5, pady=3)
         ttk.Checkbutton(options_frame, text="Автоподтверждать при совпадении (semi)", variable=auto_confirm_var).grid(row=2, column=3, sticky="w", padx=5, pady=3)
+
+        if not pro_active:
+            ocr_rb.configure(state=tk.DISABLED)
+            semi_rb.configure(state=tk.DISABLED)
+            update_cb.configure(state=tk.DISABLED)
+            for widget in (ocr_frame, ocr_crown):
+                widget.bind("<Button-1>", show_pro_required_hint)
+            for widget in (semi_frame, semi_crown):
+                widget.bind("<Button-1>", show_pro_required_hint)
+            for widget in (update_frame, update_crown):
+                widget.bind("<Button-1>", show_pro_feature_hint)
 
         ttk.Label(options_frame, text="Интервал watch (сек)").grid(row=3, column=0, sticky="w", padx=5)
         ttk.Spinbox(options_frame, from_=2, to=60, textvariable=interval_var, width=5).grid(row=3, column=1, sticky="w", padx=5)
@@ -6608,13 +6785,64 @@ class AnkiApp(tk.Tk):
         btn_frame.pack(fill=tk.X, pady=5)
         btn_check = ttk.Button(btn_frame, text="Проверить", command=lambda: process_files(dry_run=True))
         btn_check.pack(side=tk.LEFT, padx=5)
-        btn_import = ttk.Button(btn_frame, text="Импортировать", command=lambda: (start_watch_loop() if watch_var.get() else process_files(dry_run=False)))
-        btn_import.pack(side=tk.LEFT, padx=5)
+        btn_import_frame = tk.Frame(btn_frame, relief="groove", bd=1, padx=6, pady=2)
+        btn_import_frame.pack(side=tk.LEFT, padx=5)
+        btn_import_text = tk.Label(btn_import_frame, textvariable=import_label_var)
+        btn_import_text.pack(side=tk.LEFT, padx=(2, 6))
+        default_import_fg = btn_import_text.cget("fg")
+        coin_icon, coin_icon_disabled = self._load_credit_icon_pair(size=32)
+        btn_import_coin = tk.Label(btn_import_frame, image=coin_icon)
+        btn_import_coin.pack(side=tk.LEFT)
         btn_stop = ttk.Button(btn_frame, text="Остановить", command=stop_processing)
         btn_stop.pack(side=tk.LEFT, padx=5)
 
         log_text = tk.Text(main_frame, height=15, state="disabled")
         log_text.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        def update_import_button_state():
+            limit, cost, pack_label = self.get_csv_import_pack_config()
+            import_label_var.set(f"Импортировать ({cost} ⚡)")
+            pack_state["limit"] = limit
+            pack_state["cost"] = cost
+            pack_state["label"] = pack_label
+            if import_busy["value"]:
+                btn_import_text.configure(fg="gray")
+                btn_import_coin.configure(cursor="arrow")
+                current_icon = coin_icon_disabled or coin_icon
+                btn_import_coin.configure(image=current_icon)
+                btn_import_coin.image = current_icon
+                return
+            if not self.can_afford(cost):
+                import_enabled["value"] = False
+                btn_import_text.configure(fg="gray")
+                btn_import_coin.configure(cursor="arrow")
+                current_icon = coin_icon_disabled or coin_icon
+                btn_import_coin.configure(image=current_icon)
+                btn_import_coin.image = current_icon
+            else:
+                import_enabled["value"] = True
+                btn_import_text.configure(fg=default_import_fg)
+                btn_import_coin.configure(cursor="hand2")
+                current_icon = coin_icon or coin_icon_disabled
+                btn_import_coin.configure(image=current_icon)
+                btn_import_coin.image = current_icon
+
+        btn_import_text.bind("<Button-1>", show_coin_hint)
+        btn_import_frame.bind("<Button-1>", show_coin_hint)
+        btn_import_coin.bind("<Button-1>", on_coin_click)
+        if coin_icon:
+            btn_import_coin.image = coin_icon
+        if coin_icon_disabled:
+            btn_import_coin.disabled_image = coin_icon_disabled
+
+        update_import_button_state()
+        self.register_balance_observer(update_import_button_state)
+
+        def on_close():
+            self.unregister_balance_observer(update_import_button_state)
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
 
     def open_wikimedia_csv_window(self):
         if not PIL_AVAILABLE:
@@ -8167,6 +8395,27 @@ class AnkiApp(tk.Tk):
                 continue
         return None
 
+    def _load_credit_icon_pair(self, size: int = 18):
+        search_paths = [Path("iconcoin1.png"), Path("icon credits.jpeg")]
+        for path in search_paths:
+            if not path.exists():
+                continue
+            try:
+                if PIL_AVAILABLE:
+                    img = Image.open(path)
+                    img = img.resize((size, size), _pil_lanczos())
+                    normal = ImageTk.PhotoImage(img)
+                    gray = ImageOps.grayscale(img)
+                    gray = ImageEnhance.Brightness(gray).enhance(0.7)
+                    disabled = ImageTk.PhotoImage(gray)
+                    return normal, disabled
+                if path.suffix.lower() in (".png", ".gif"):
+                    normal = tk.PhotoImage(file=str(path))
+                    return normal, normal
+            except Exception:
+                continue
+        return None, None
+
     def open_personal_tab(self):
         if self.main_notebook and self.personal_tab:
             self.main_notebook.select(self.personal_tab)
@@ -8205,11 +8454,44 @@ class AnkiApp(tk.Tk):
                 continue
         self.refresh_generation_menu_state()
 
+    def register_balance_observer(self, handler) -> None:
+        if handler not in self.balance_observers:
+            self.balance_observers.append(handler)
+
+    def unregister_balance_observer(self, handler) -> None:
+        if handler in self.balance_observers:
+            self.balance_observers.remove(handler)
+
+    def get_csv_import_pack_config(self):
+        if self.is_premium_active():
+            return 15, 5, "15 карточек"
+        return 10, 15, "10 карточек"
+
+    def can_afford(self, cost: int) -> bool:
+        balance = self.credits_service.get_balance(self.user_id)
+        return balance >= cost
+
+    def charge_credits(self, cost: int, feature_key: str, meta: dict | None = None) -> bool:
+        if cost <= 0:
+            return True
+        reason = self._build_credit_reason(feature_key, cost, meta or {})
+        try:
+            self.credits_service.spend_credits(
+                self.user_id,
+                cost,
+                reason=reason,
+                meta=meta or {},
+            )
+        except Exception:
+            return False
+        self._after_balance_change()
+        return True
+
     def refresh_generation_menu_state(self):
         if not self.generation_menu:
             return
         state = tk.NORMAL if self.is_premium_active() else tk.DISABLED
-        for key in ("ocr", "image_id_import", "wikimedia", "text_ai"):
+        for key in ("ocr", "wikimedia", "text_ai"):
             idx = self.generation_menu_indexes.get(key)
             if idx is None:
                 continue
@@ -8250,6 +8532,11 @@ class AnkiApp(tk.Tk):
         self.refresh_referral_info()
         self.refresh_activation_progress_ui()
         self.refresh_account_status_vars()
+        for handler in list(self.balance_observers):
+            try:
+                handler()
+            except Exception:
+                continue
 
     def _ensure_initial_credits(self):
         self.user_profile = ensure_user_profile_row(self.user_id)
@@ -15693,3 +15980,4 @@ if __name__ == "__main__":
 # PATCH: tabs moved + dark scrollbar + video embed fixed + upload video in generator + unified card renderer
 # PATCH: unify card renderer sizes + white video background + image-over-video rule
 # PATCH: fix random image shrink (configure debounce + min size + orig cache) + fix preview image render (PhotoImage refs + shared renderer)
+# PATCH: CSV image import packs (limit+cost by PRO), coin-click charge, progress-synced hard stop, PRO-only options with crown
