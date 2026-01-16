@@ -268,7 +268,7 @@ CARD_VIEW_WIDTH = 700
 CARD_VIEW_HEIGHT = 420
 MEDIA_SLOT_W = 512
 MEDIA_SLOT_H = 384
-REPEAT_MEDIA_SLOT_SIZE = (260, 240)
+REPEAT_MEDIA_SLOT_SIZE = (MEDIA_SLOT_W, MEDIA_SLOT_H)
 from card_widget import CardWidget
 from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
 
@@ -4605,10 +4605,11 @@ class CardRenderer:
         self.content_row = tk.Frame(self.content_inner, bg="white")
         self.content_row.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.content_row.grid_rowconfigure(0, weight=1)
+        self.content_row.grid_columnconfigure(0, weight=0)
         self.content_row.grid_columnconfigure(1, weight=1)
 
         self.media_col = tk.Frame(self.content_row, bg="white", width=self.media_width)
-        self.media_col.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        self.media_col.grid(row=0, column=0, sticky="nw", padx=(12, 10))
         self.media_col.grid_propagate(False)
         self.media_col.grid_rowconfigure(0, weight=1)
 
@@ -4634,22 +4635,11 @@ class CardRenderer:
             self.image_label.set_fixed_slot_size(self._fixed_media_slot[0], self._fixed_media_slot[1])
         self.image_label.pack(fill=tk.BOTH, expand=True)
 
-        self.zoom_frame = tk.Frame(self.media_col, bg="white")
-        self.zoom_frame.pack(anchor="w", pady=(6, 0))
-        tk.Button(
-            self.zoom_frame,
-            text="+",
-            width=2,
-            command=lambda: self.adjust_image_zoom(1.1),
-            bg="white",
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(
-            self.zoom_frame,
-            text="-",
-            width=2,
-            command=lambda: self.adjust_image_zoom(0.9),
-            bg="white",
-        ).pack(side=tk.LEFT)
+        self.zoom_frame = self.build_zoom_controls(
+            self.media_col,
+            on_zoom_in=lambda: self.adjust_image_zoom(1.1),
+            on_zoom_out=lambda: self.adjust_image_zoom(0.9),
+        )
 
         self.text_col = tk.Frame(self.content_row, bg="white")
         self.text_col.grid(row=0, column=1, sticky="nsew")
@@ -5121,9 +5111,33 @@ class CardRenderer:
     def set_header_text(self, text: str) -> None:
         self.header_label.config(text=text)
 
+    def build_zoom_controls(self, parent, on_zoom_in, on_zoom_out):
+        zoom_frame = tk.Frame(parent, bg="white")
+        zoom_frame.pack(anchor="w", pady=(6, 0))
+        tk.Button(
+            zoom_frame,
+            text="+",
+            width=2,
+            command=on_zoom_in,
+            bg="white",
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(
+            zoom_frame,
+            text="-",
+            width=2,
+            command=on_zoom_out,
+            bg="white",
+        ).pack(side=tk.LEFT)
+        return zoom_frame
+
+    def render_image_to_slot(self) -> None:
+        if not getattr(self, "image_label", None):
+            return
+        self.image_label.set_zoom_factor(self.image_zoom)
+
     def adjust_image_zoom(self, factor: float) -> None:
         self.image_zoom = max(0.1, min(3.0, self.image_zoom * float(factor)))
-        self.image_label.set_zoom_factor(self.image_zoom)
+        self.render_image_to_slot()
 
 def create_action_menubutton(parent, palette: dict | None = None) -> tuple[ttk.Menubutton, tk.Menu]:
     palette = palette or {}
@@ -15718,3 +15732,4 @@ if __name__ == "__main__":
 # PATCH: fix random image shrink (configure debounce + min size + orig cache) + fix preview image render (PhotoImage refs + shared renderer)
 # PATCH: preview image render + playback left alignment + clip shows instead of text + strict per-side media (no front->back inherit)
 # PATCH: manual preview uses same media data + fixed media-slot geometry + prevent TclError bad window path
+# PATCH: preview layout unified with repeat/playback (left fixed media slot + shared zoom controls)
