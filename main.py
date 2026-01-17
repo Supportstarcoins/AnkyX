@@ -79,6 +79,42 @@ _HAS_DND = importlib.util.find_spec("tkinterdnd2") is not None
 if _HAS_DND:
     from tkinterdnd2 import DND_FILES
 
+OCR_DEBUG_LOG_PATH = os.path.join(BASE_DIR, "ocr_debug.log")
+_OCR_DEBUG_LOG_HANDLE = None
+
+
+def open_ocr_debug_log():
+    global _OCR_DEBUG_LOG_HANDLE
+    if _OCR_DEBUG_LOG_HANDLE is None:
+        try:
+            _OCR_DEBUG_LOG_HANDLE = open(OCR_DEBUG_LOG_PATH, "a", encoding="utf-8")
+        except Exception:
+            _OCR_DEBUG_LOG_HANDLE = None
+    return _OCR_DEBUG_LOG_HANDLE
+
+
+def log_ocr_error(name: str, tb: str) -> None:
+    handle = _OCR_DEBUG_LOG_HANDLE
+    if handle is None:
+        return
+    try:
+        ts = datetime.now().isoformat(sep=" ", timespec="seconds")
+        handle.write(f"[{ts}] {name}\n{tb}\n")
+        handle.flush()
+    except Exception:
+        pass
+
+
+def safe_action(name, fn):
+    try:
+        fn()
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print("[OCR ERROR]", name, tb)
+        log_ocr_error(name, tb)
+        messagebox.showerror("Ошибка", f"{name}: {e}\n\n{tb}")
+
 
 def safe_enable_dnd(widget, on_drop_callback) -> bool:
     try:
@@ -13766,8 +13802,60 @@ class AnkiApp(tk.Tk):
         win.grab_set()
 
         apply_dark_theme_to_window(win, self.palette)
+        open_ocr_debug_log()
+        style = ttk.Style(win)
+        style.configure(
+            "Dark.Vertical.TScrollbar",
+            background="#111",
+            troughcolor="#0b0f1a",
+            bordercolor="#0b0f1a",
+            arrowcolor="#ddd",
+        )
 
-        main_frame = ttk.Frame(win, style="Surface.TFrame")
+        scroll_container = ttk.Frame(win, style="Surface.TFrame")
+        scroll_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        canvas_bg = self.palette.get("background", "#0B0D12")
+        scroll_canvas = tk.Canvas(scroll_container, highlightthickness=0, bg=canvas_bg)
+        scroll_bar = ttk.Scrollbar(
+            scroll_container, orient="vertical", command=scroll_canvas.yview, style="Dark.Vertical.TScrollbar"
+        )
+        scroll_canvas.configure(yscrollcommand=scroll_bar.set)
+        scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll_bar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        scroll_frame = ttk.Frame(scroll_canvas, style="Surface.TFrame")
+        scroll_window = scroll_canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+
+        def _sync_scrollregion(_event=None):
+            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
+
+        def _sync_width(event):
+            scroll_canvas.itemconfigure(scroll_window, width=event.width)
+
+        scroll_frame.bind("<Configure>", _sync_scrollregion)
+        scroll_canvas.bind("<Configure>", _sync_width)
+
+        def _on_mousewheel(event):
+            if event.num == 4 or event.delta > 0:
+                scroll_canvas.yview_scroll(-1, "units")
+            elif event.num == 5 or event.delta < 0:
+                scroll_canvas.yview_scroll(1, "units")
+
+        def _bind_mousewheel(_event=None):
+            scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            scroll_canvas.bind_all("<Button-4>", _on_mousewheel)
+            scroll_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_mousewheel(_event=None):
+            scroll_canvas.unbind_all("<MouseWheel>")
+            scroll_canvas.unbind_all("<Button-4>")
+            scroll_canvas.unbind_all("<Button-5>")
+
+        scroll_canvas.bind("<Enter>", _bind_mousewheel)
+        scroll_canvas.bind("<Leave>", _unbind_mousewheel)
+
+        main_frame = ttk.Frame(scroll_frame, style="Surface.TFrame")
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # PATCH: OCR postprocess pipeline + paid OCR + paid card/video generation packs + preview renderer + pricing by plan (free/pro/premium)
@@ -13925,7 +14013,7 @@ class AnkiApp(tk.Tk):
             action_buttons_frame,
             "PRO постобработка",
             postprocess_cost_var,
-            lambda: run_postprocess(),
+            lambda: safe_action("PRO постобработка", run_postprocess),
         )
         postprocess_button_frame.pack(anchor="e", pady=(0, 4))
         ttk.Label(action_buttons_frame, textvariable=postprocess_insufficient_var, foreground="red")\
@@ -13942,7 +14030,7 @@ class AnkiApp(tk.Tk):
             action_buttons_frame,
             "Запустить OCR",
             ocr_cost_var,
-            lambda: run_ocr(),
+            lambda: safe_action("OCR", run_ocr),
         )
         ocr_button_frame.pack(anchor="e", pady=(0, 4))
         ttk.Label(action_buttons_frame, textvariable=ocr_insufficient_var, foreground="red")\
@@ -14015,6 +14103,7 @@ class AnkiApp(tk.Tk):
                     postprocess_state["run_ocr_after"] = False
                     run_ocr(skip_postprocess_prompt=True)
             elif kind == "postprocess_error":
+                error_text = str(event[1] or "")
                 if postprocess_task_holder["task"]:
                     self.unregister_bg_handler(postprocess_task_holder["task"].queue)
                 postprocess_task_holder["task"] = None
@@ -14022,7 +14111,12 @@ class AnkiApp(tk.Tk):
                 postprocess_cancel_btn.config(state=tk.DISABLED)
                 ocr_progress_label.set("Ошибка постобработки")
                 update_pricing_ui()
-                messagebox.showerror("Ошибка постобработки", event[1])
+                log_ocr_error("PRO постобработка", error_text)
+                messagebox.showerror("Ошибка постобработки", error_text)
+            elif kind == "done":
+                handle_postprocess_event(("postprocess_done", event[1]))
+            elif kind == "error":
+                handle_postprocess_event(("postprocess_error", event[1]))
 
         def run_postprocess():
             if not PIL_AVAILABLE:
@@ -14056,8 +14150,8 @@ class AnkiApp(tk.Tk):
             postprocess_cancel_btn.config(state=tk.NORMAL)
 
             def worker(task_obj):
+                step_path = original_image_path
                 try:
-                    step_path = original_image_path
                     img = Image.open(step_path)
                     img = ImageOps.exif_transpose(img)
                     img = img.convert("RGB")
@@ -14141,9 +14235,12 @@ class AnkiApp(tk.Tk):
                         step_path = _save_step(img, idx)
                         task_obj.queue.put(("postprocess_progress", idx, OCR_POSTPROCESS_STEPS, label, step_path))
 
-                    return {"done": True, "paid": True, "path": step_path, "cancelled": False}
-                except Exception as exc:
-                    task_obj.queue.put(("postprocess_error", str(exc)))
+                    result = {"done": True, "paid": True, "path": step_path, "cancelled": False}
+                    task_obj.queue.put(("postprocess_done", result))
+                    return result
+                except Exception:
+                    tb = traceback.format_exc()
+                    task_obj.queue.put(("postprocess_error", tb))
                     return {"done": False, "paid": True, "path": step_path, "cancelled": False}
 
             postprocess_task_holder["task"] = start_background_task(worker)
@@ -14186,7 +14283,9 @@ class AnkiApp(tk.Tk):
                 ocr_task_holder["task"] = None
                 ocr_progress_label.set("Ошибка")
                 set_ocr_enabled(True)
-                messagebox.showerror("Ошибка OCR", event[1])
+                error_text = str(event[1] or "")
+                log_ocr_error("OCR", error_text)
+                messagebox.showerror("Ошибка OCR", error_text)
 
         def run_ocr(skip_postprocess_prompt: bool = False):
             if not CV2_AVAILABLE:
@@ -14275,9 +14374,10 @@ class AnkiApp(tk.Tk):
                     src_path = processed_image_path if postprocess_state["done"] and processed_image_path else img_path
                     text = perform_page_ocr(src_path, options, progress_cb)
                     return text
-                except Exception as e:
-                    task_obj.queue.put(("log", str(e)))
-                    raise
+                except Exception:
+                    tb = traceback.format_exc()
+                    task_obj.queue.put(("log", tb))
+                    raise RuntimeError(tb)
 
             ocr_task_holder["task"] = start_background_task(worker)
             self.register_bg_handler(ocr_task_holder["task"].queue, handle_ocr_event)
@@ -17031,3 +17131,4 @@ if __name__ == "__main__":
 # PATCH: fix random image shrink (configure debounce + min size + orig cache) + fix preview image render (PhotoImage refs + shared renderer)
 # PATCH: CSV image import packs (limit+cost by PRO), coin-click charge, progress-synced hard stop, PRO-only options with crown
 # PATCH: OCR PRO postprocess pipeline + OCR result textbox + paid card autogen (pro/free) + image placeholder sync + repeated-word masking rule
+# PATCH: OCR crash-proof (safe_action + traceback), dark scrollbar restored, OCR result textbox, paid card autogen + placeholder images + repeated-word masking
