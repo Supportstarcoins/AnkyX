@@ -1,5 +1,8 @@
 import os, tempfile
 import sys
+import logging
+import faulthandler
+import subprocess
 os.environ.setdefault("DISABLE_MODEL_SOURCE_CHECK", "True")
 import io
 safe = tempfile.gettempdir()
@@ -32,6 +35,36 @@ SYNC_CONFIG_DEFAULT = {
     "token": None,
     "user_email": None,
 }
+
+CRASH_LOG_PATH = os.path.join(BASE_DIR, "ocr_crash.log")
+FAULT_LOG_PATH = os.path.join(BASE_DIR, "ocr_fault.log")
+_CRASH_LOG_HANDLE = None
+_FAULT_LOG_HANDLE = None
+
+
+def _configure_global_crash_logging() -> None:
+    global _CRASH_LOG_HANDLE, _FAULT_LOG_HANDLE
+    crash_handler = logging.FileHandler(CRASH_LOG_PATH, encoding="utf-8", mode="a")
+    crash_handler.setLevel(logging.DEBUG)
+    crash_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s")
+    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(crash_handler)
+    root_logger.propagate = False
+
+    crash_stream = open(CRASH_LOG_PATH, "a", buffering=1, encoding="utf-8")
+    sys.stdout = crash_stream
+    sys.stderr = crash_stream
+    _CRASH_LOG_HANDLE = crash_stream
+
+    fault_stream = open(FAULT_LOG_PATH, "a", buffering=1, encoding="utf-8")
+    faulthandler.enable(file=fault_stream, all_threads=True)
+    _FAULT_LOG_HANDLE = fault_stream
+
+
+_configure_global_crash_logging()
 import gzip
 import pickle
 from datetime import date, datetime, timedelta
@@ -74,6 +107,53 @@ from tkinter import ttk, messagebox, filedialog, colorchooser, simpledialog, scr
 import tkinter.font as tkfont
 import importlib.util
 from addons_manager import AddonManager, UIAdapter, MWContext, CollectionAdapter, gui_hooks, set_mw
+
+_EXCEPTIONBOX_LOCK = threading.Lock()
+
+
+def _format_exception_message(exc_type, exc, tb) -> str:
+    formatted = "".join(traceback.format_exception(exc_type, exc, tb))
+    return formatted
+
+
+def _show_fatal_messagebox(title: str, body: str) -> None:
+    with _EXCEPTIONBOX_LOCK:
+        try:
+            root = tk._default_root
+            if root is None:
+                temp_root = tk.Tk()
+                temp_root.withdraw()
+                messagebox.showerror(title, body)
+                temp_root.destroy()
+            else:
+                messagebox.showerror(title, body)
+        except Exception:
+            logging.exception("Failed to show messagebox for exception")
+
+
+def _global_excepthook(exc_type, exc, tb) -> None:
+    formatted = _format_exception_message(exc_type, exc, tb)
+    logging.error("Unhandled exception:\n%s", formatted)
+    _show_fatal_messagebox(
+        "Ошибка приложения",
+        f"Произошла необработанная ошибка:\n{exc}\n\n"
+        f"Подробности в {CRASH_LOG_PATH} / {FAULT_LOG_PATH}",
+    )
+
+
+def _thread_excepthook(args) -> None:
+    formatted = _format_exception_message(args.exc_type, args.exc_value, args.exc_traceback)
+    logging.error("Unhandled thread exception:\n%s", formatted)
+    _show_fatal_messagebox(
+        "Ошибка в фоне",
+        f"Произошла ошибка в фоновом потоке:\n{args.exc_value}\n\n"
+        f"Подробности в {CRASH_LOG_PATH} / {FAULT_LOG_PATH}",
+    )
+
+
+sys.excepthook = _global_excepthook
+if hasattr(threading, "excepthook"):
+    threading.excepthook = _thread_excepthook
 
 _HAS_DND = importlib.util.find_spec("tkinterdnd2") is not None
 if _HAS_DND:
@@ -13803,6 +13883,7 @@ class AnkiApp(tk.Tk):
 
         apply_dark_theme_to_window(win, self.palette)
         open_ocr_debug_log()
+        logging.info("OCR module opened")
         style = ttk.Style(win)
         style.configure(
             "Dark.Vertical.TScrollbar",
@@ -14052,6 +14133,7 @@ class AnkiApp(tk.Tk):
 
         ocr_task_holder = {"task": None}
         postprocess_task_holder = {"task": None}
+        postprocess_proc_holder = {"proc": None}
 
         # Фрейм для текста OCR
         ocr_frame = ttk.LabelFrame(main_frame, text="Результат OCR")
@@ -14092,8 +14174,10 @@ class AnkiApp(tk.Tk):
                 if postprocess_task_holder["task"]:
                     self.unregister_bg_handler(postprocess_task_holder["task"].queue)
                 postprocess_task_holder["task"] = None
+                postprocess_proc_holder["proc"] = None
                 set_postprocess_enabled(True)
                 postprocess_cancel_btn.config(state=tk.DISABLED)
+                set_ocr_enabled(True)
                 if result.get("cancelled"):
                     ocr_progress_label.set("Постобработка отменена")
                 else:
@@ -14107,8 +14191,10 @@ class AnkiApp(tk.Tk):
                 if postprocess_task_holder["task"]:
                     self.unregister_bg_handler(postprocess_task_holder["task"].queue)
                 postprocess_task_holder["task"] = None
+                postprocess_proc_holder["proc"] = None
                 set_postprocess_enabled(True)
                 postprocess_cancel_btn.config(state=tk.DISABLED)
+                set_ocr_enabled(True)
                 ocr_progress_label.set("Ошибка постобработки")
                 update_pricing_ui()
                 log_ocr_error("PRO постобработка", error_text)
@@ -14141,107 +14227,158 @@ class AnkiApp(tk.Tk):
                 },
             ):
                 return
+            ocr_bar.config(maximum=OCR_POSTPROCESS_STEPS)
             ocr_progress_var.set(0)
-            ocr_progress_label.set("Запуск постобработки…")
+            ocr_progress_label.set(f"Этап 1/{OCR_POSTPROCESS_STEPS}: Запуск постобработки…")
             log_text.configure(state=tk.NORMAL)
             log_text.delete("1.0", tk.END)
             log_text.configure(state=tk.DISABLED)
             set_postprocess_enabled(False)
+            set_ocr_enabled(False)
             postprocess_cancel_btn.config(state=tk.NORMAL)
 
             def worker(task_obj):
                 step_path = original_image_path
+                stdout_lines = []
+                stderr_lines = []
+                result_payload = None
+                output_path = str(Path(tempfile.gettempdir()) / f"anky_postprocess_{uuid4().hex}_final.png")
+                worker_path = os.path.join(BASE_DIR, "ocr_postprocess_worker.py")
+                cmd = [
+                    sys.executable,
+                    "-u",
+                    worker_path,
+                    "--in",
+                    original_image_path,
+                    "--out",
+                    output_path,
+                    "--preset",
+                    preprocess_preset_var.get(),
+                    "--binarize",
+                    binarize_mode_var.get(),
+                    "--psm",
+                    psm_var.get(),
+                ]
+                logging.info("Start postprocess in=%s out=%s", original_image_path, output_path)
                 try:
-                    img = Image.open(step_path)
-                    img = ImageOps.exif_transpose(img)
-                    img = img.convert("RGB")
-                    use_cv = bool(CV2_AVAILABLE and NUMPY_AVAILABLE)
-                    ocr_photo_module = None
-                    if use_cv:
-                        _ensure_ocr_photo_loaded()
-                        ocr_photo_module = sys.modules.get("ocr_photo")
-
-                    def _pil_to_bgr(pil_img):
-                        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-
-                    def _bgr_to_pil(bgr_img):
-                        return Image.fromarray(cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB))
-
-                    def _save_step(current_img, step_index):
-                        tmp_path = Path(tempfile.gettempdir()) / f"anky_postprocess_{uuid4().hex}_{step_index}.png"
-                        current_img.save(tmp_path, format="PNG")
-                        return str(tmp_path)
-
-                    steps = [
-                        ("Ч/б (binarize)", "binarize"),
-                        ("Улучшение качества", "enhance"),
-                        ("Выравнивание перспективы", "perspective"),
-                        ("Убрать тени / выровнять фон", "shadow"),
-                        ("Выравнивать наклон (deskew)", "deskew"),
-                    ]
-
-                    for idx, (label_text, stage) in enumerate(steps, start=1):
-                        if task_obj.cancelled():
-                            return {"done": False, "paid": True, "path": step_path, "cancelled": True}
-                        if stage == "binarize":
-                            if use_cv:
-                                bgr = _pil_to_bgr(img)
-                                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                                binary = cv2.adaptiveThreshold(
-                                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 11
-                                )
-                                bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-                                img = _bgr_to_pil(bgr)
-                            else:
-                                gray = ImageOps.grayscale(img)
-                                bw = gray.point(lambda x: 255 if x > 150 else 0, mode="1")
-                                img = bw.convert("RGB")
-                        elif stage == "enhance":
-                            if use_cv:
-                                bgr = _pil_to_bgr(img)
-                                bgr = cv2.fastNlMeansDenoisingColored(bgr, None, 10, 10, 7, 21)
-                                img = _bgr_to_pil(bgr)
-                            img = ImageEnhance.Contrast(img).enhance(1.4)
-                            img = ImageEnhance.Sharpness(img).enhance(1.6)
-                        elif stage == "perspective":
-                            if use_cv and ocr_photo_module is not None:
-                                detect_and_warp_page = getattr(ocr_photo_module, "detect_and_warp_page", None)
-                                if callable(detect_and_warp_page):
-                                    bgr = _pil_to_bgr(img)
-                                    warped, _ = detect_and_warp_page(bgr)
-                                    img = _bgr_to_pil(warped)
-                        elif stage == "shadow":
-                            if use_cv and ocr_photo_module is not None:
-                                flatten_background = getattr(ocr_photo_module, "flatten_background", None)
-                                if callable(flatten_background):
-                                    bgr = _pil_to_bgr(img)
-                                    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                                    flat = flatten_background(gray)
-                                    bgr = cv2.cvtColor(flat, cv2.COLOR_GRAY2BGR)
-                                    img = _bgr_to_pil(bgr)
-                            else:
-                                img = ImageOps.equalize(img)
-                        elif stage == "deskew":
-                            if use_cv and ocr_photo_module is not None:
-                                deskew_fn = getattr(ocr_photo_module, "deskew", None)
-                                if callable(deskew_fn):
-                                    bgr = _pil_to_bgr(img)
-                                    deskewed = deskew_fn(bgr)
-                                    img = _bgr_to_pil(deskewed)
-                            else:
-                                img = ImageOps.autocontrast(img)
-
-                        label = f"Этап {idx}/{OCR_POSTPROCESS_STEPS}: {label_text}"
-                        step_path = _save_step(img, idx)
-                        task_obj.queue.put(("postprocess_progress", idx, OCR_POSTPROCESS_STEPS, label, step_path))
-
-                    result = {"done": True, "paid": True, "path": step_path, "cancelled": False}
-                    task_obj.queue.put(("postprocess_done", result))
-                    return result
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        bufsize=1,
+                    )
                 except Exception:
                     tb = traceback.format_exc()
-                    task_obj.queue.put(("postprocess_error", tb))
+                    logging.error("Failed to start postprocess worker:\n%s", tb)
+                    task_obj.queue.put(
+                        (
+                            "postprocess_error",
+                            f"Не удалось запустить воркер постобработки.\n\n{tb}\n"
+                            f"Смотрите {CRASH_LOG_PATH} / {FAULT_LOG_PATH}",
+                        )
+                    )
                     return {"done": False, "paid": True, "path": step_path, "cancelled": False}
+
+                postprocess_proc_holder["proc"] = proc
+
+                def _read_stderr():
+                    if proc.stderr is None:
+                        return
+                    for line in proc.stderr:
+                        stderr_lines.append(line)
+
+                stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+                stderr_thread.start()
+
+                if proc.stdout is not None:
+                    for line in proc.stdout:
+                        if task_obj.cancelled():
+                            break
+                        stdout_lines.append(line)
+                        payload = None
+                        stripped = line.strip()
+                        if stripped:
+                            try:
+                                payload = json.loads(stripped)
+                            except Exception:
+                                payload = None
+                        if isinstance(payload, dict):
+                            if payload.get("event") == "progress":
+                                step = int(payload.get("step", 0) or 0)
+                                total = int(payload.get("total", OCR_POSTPROCESS_STEPS) or OCR_POSTPROCESS_STEPS)
+                                label = payload.get("label") or f"Этап {step}/{total}"
+                                step_path = payload.get("path") or step_path
+                                task_obj.queue.put(("postprocess_progress", step, total, label, step_path))
+                            elif "ok" in payload:
+                                result_payload = payload
+
+                if task_obj.cancelled():
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    logging.info("Postprocess cancelled by user")
+                    result = {"done": False, "paid": True, "path": step_path, "cancelled": True}
+                    task_obj.queue.put(("postprocess_done", result))
+                    return result
+
+                rc = proc.wait()
+                stderr_thread.join(timeout=1)
+                stderr_text = "".join(stderr_lines)
+                stdout_text = "".join(stdout_lines)
+                logging.info("Postprocess finished rc=%s", rc)
+
+                if rc != 0:
+                    logging.error(
+                        "Postprocess worker failed rc=%s stderr=%s stdout=%s",
+                        rc,
+                        stderr_text,
+                        stdout_text,
+                    )
+                    task_obj.queue.put(
+                        (
+                            "postprocess_error",
+                            f"Постобработка завершилась аварийно (код {rc}).\n"
+                            f"Смотрите {CRASH_LOG_PATH} / {FAULT_LOG_PATH}",
+                        )
+                    )
+                    return {"done": False, "paid": True, "path": step_path, "cancelled": False}
+
+                if not result_payload:
+                    logging.error(
+                        "Postprocess worker returned empty result rc=%s stderr=%s stdout=%s",
+                        rc,
+                        stderr_text,
+                        stdout_text,
+                    )
+                    task_obj.queue.put(
+                        (
+                            "postprocess_error",
+                            f"Постобработка завершилась с ошибкой.\n"
+                            f"Смотрите {CRASH_LOG_PATH} / {FAULT_LOG_PATH}",
+                        )
+                    )
+                    return {"done": False, "paid": True, "path": step_path, "cancelled": False}
+
+                if not result_payload.get("ok"):
+                    error_message = result_payload.get("error") or "Неизвестная ошибка постобработки"
+                    trace_text = result_payload.get("trace") or ""
+                    logging.error("Postprocess worker error: %s\n%s", error_message, trace_text)
+                    task_obj.queue.put(
+                        (
+                            "postprocess_error",
+                            f"{error_message}\n\nСмотрите {CRASH_LOG_PATH} / {FAULT_LOG_PATH}",
+                        )
+                    )
+                    return {"done": False, "paid": True, "path": step_path, "cancelled": False}
+
+                processed_path = result_payload.get("out_path") or output_path
+                result = {"done": True, "paid": True, "path": processed_path, "cancelled": False}
+                task_obj.queue.put(("postprocess_done", result))
+                return result
 
             postprocess_task_holder["task"] = start_background_task(worker)
             self.register_bg_handler(postprocess_task_holder["task"].queue, handle_postprocess_event)
@@ -14249,6 +14386,13 @@ class AnkiApp(tk.Tk):
         def cancel_postprocess():
             if postprocess_task_holder["task"]:
                 postprocess_task_holder["task"].cancel()
+                proc = postprocess_proc_holder.get("proc")
+                if proc is not None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                logging.info("Postprocess cancel requested")
                 append_ocr_log("Отмена постобработки запрошена…")
 
         def handle_ocr_event(event):
@@ -17132,3 +17276,4 @@ if __name__ == "__main__":
 # PATCH: CSV image import packs (limit+cost by PRO), coin-click charge, progress-synced hard stop, PRO-only options with crown
 # PATCH: OCR PRO postprocess pipeline + OCR result textbox + paid card autogen (pro/free) + image placeholder sync + repeated-word masking rule
 # PATCH: OCR crash-proof (safe_action + traceback), dark scrollbar restored, OCR result textbox, paid card autogen + placeholder images + repeated-word masking
+# PATCH: crash-proof postprocess via subprocess + faulthandler + global hooks + always-on logs
