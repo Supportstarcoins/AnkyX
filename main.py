@@ -70,7 +70,7 @@ except ImportError:
     NUMPY_AVAILABLE = False
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, colorchooser, simpledialog
+from tkinter import ttk, messagebox, filedialog, colorchooser, simpledialog, scrolledtext
 import tkinter.font as tkfont
 import importlib.util
 from addons_manager import AddonManager, UIAdapter, MWContext, CollectionAdapter, gui_hooks, set_mw
@@ -1566,25 +1566,28 @@ ACTIVATION_MIN_HOURS = 24
 ACTIVATION_MIN_CARDS = 10
 ACTIVATION_MIN_REVIEWS = 20
 OCR_PACK_SIZE = 1
-OCR_POSTPROCESS_STEPS = 6
+OCR_POSTPROCESS_STEPS = 5
 CARDS_GEN_PACK_SIZE = 25
 VIDEO_GEN_PACK_SIZE = 20
 PRICING_BY_PLAN = {
     "free": {
         "postprocess": 20,
         "ocr": 15,
+        "ocr_cards_gen": 5,
         "cards_gen": 50,
         "video_gen": 100,
     },
     "pro": {
         "postprocess": 2,
         "ocr": 2,
+        "ocr_cards_gen": 1,
         "cards_gen": 15,
         "video_gen": 65,
     },
     "premium": {
         "postprocess": 5,
         "ocr": 5,
+        "ocr_cards_gen": 1,
         "cards_gen": 10,
         "video_gen": 65,
     },
@@ -3399,6 +3402,31 @@ def get_repeated_word_flag(word: str) -> str:
     return "нет"
 
 
+def is_repeated_word(word: str) -> bool:
+    return get_repeated_word_flag(word) == "повторено"
+
+
+def mask_text_by_repeated_words(text: str) -> tuple[str, list[str]]:
+    hidden_words: list[str] = []
+
+    def replace_word(match: re.Match) -> str:
+        word = match.group(0)
+        if is_repeated_word(word):
+            return word
+        hidden_words.append(word)
+        return "—"
+
+    masked = re.sub(r"\w+", replace_word, text)
+    seen: set[str] = set()
+    unique_hidden: list[str] = []
+    for word in hidden_words:
+        key = normalize_word(word)
+        if key and key not in seen:
+            seen.add(key)
+            unique_hidden.append(word)
+    return masked, unique_hidden
+
+
 # ==========================
 # Wiktionary
 # ==========================
@@ -4073,6 +4101,117 @@ def auto_generate_cards_from_text(deck_id: int,
     add_new_words(all_new_words)
     if progress_queue is not None:
         progress_queue.put(("log", f"Создано карточек: {created}"))
+    return created
+
+
+def split_ocr_text_into_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def auto_generate_cards_from_ocr_text(
+    deck_id: int,
+    text: str,
+    front_template: str,
+    back_template: str,
+    language_mode: str,
+    progress_queue: queue.Queue | None = None,
+    cancel_check=None,
+    max_cards: int | None = None,
+    created_card_ids: list[int] | None = None,
+    placeholder_image_path: str | None = None,
+    skip_sentences: set[str] | None = None,
+) -> int:
+    sentences = split_ocr_text_into_sentences(text)
+    if not sentences:
+        return 0
+
+    skip_sentences = skip_sentences or set()
+    created = 0
+
+    def emit_progress(label: str, done: int, total: int) -> None:
+        if progress_queue is None:
+            return
+        progress_queue.put(("progress", done, max(total, 1), label))
+
+    remaining_sentences = [s for s in sentences if normalize_word(s) not in skip_sentences]
+    total_target = len(remaining_sentences)
+    emit_progress("Разбивка текста", 0, total_target)
+
+    sentence_limit = 10 if language_mode == "native" else 1
+    chunks: list[list[str]] = []
+    buffer: list[str] = []
+    for sentence in remaining_sentences:
+        buffer.append(sentence)
+        if len(buffer) >= sentence_limit:
+            chunks.append(buffer)
+            buffer = []
+    if buffer:
+        chunks.append(buffer)
+
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        if cancel_check and cancel_check():
+            break
+        if max_cards is not None and created >= max_cards:
+            break
+        combined_text = " ".join(chunk)
+        masked_text, hidden_words = mask_text_by_repeated_words(combined_text)
+        words_in_text = extract_words_from_text(combined_text)
+        primary_word = words_in_text[0] if words_in_text else ""
+        primary_display = primary_word if primary_word and is_repeated_word(primary_word) else "—"
+        hidden_text = ", ".join(hidden_words)
+        back_word = hidden_words[0] if hidden_words else ""
+
+        front = front_template.format(
+            translation="",
+            sentence_with_gap=masked_text,
+            word=primary_display,
+            ipa="",
+            gender="",
+            plural="",
+            sentence=combined_text,
+        )
+        back = back_template.format(
+            translation=hidden_text,
+            sentence_with_gap=masked_text,
+            word=back_word,
+            ipa="",
+            gender="",
+            plural="",
+            sentence=combined_text,
+        )
+
+        note_fields = {
+            "word": primary_word or combined_text,
+            "translation": hidden_text,
+            "example": combined_text,
+            "level": 1,
+            "image": placeholder_image_path or "",
+            "front_image_path": placeholder_image_path or "",
+            "back_image_path": "",
+            "audio_path": None,
+            "front": front,
+            "back": back,
+            "repeated_flag": get_repeated_word_flag(primary_word or ""),
+            "image_generated": False,
+            "image_placeholder": bool(placeholder_image_path),
+        }
+
+        _, cards_created = create_note_with_cards(
+            deck_id,
+            note_fields,
+            note_type_id=ensure_generated_note_type_id(),
+            created_card_ids=created_card_ids,
+        )
+        created += cards_created
+        emit_progress("Генерация карточек", created, max(total_target, 1))
+        for sentence in chunk:
+            skip_sentences.add(normalize_word(sentence))
+        if progress_queue is not None:
+            progress_queue.put(("log", f"{combined_text}: скрыто {len(hidden_words)}"))
+        if max_cards is not None and created >= max_cards:
+            break
+
     return created
 
 
@@ -12188,6 +12327,24 @@ class AnkiApp(tk.Tk):
 
     # --------- генерация из текста ---------
 
+    def _ensure_generated_placeholder_image(self) -> str | None:
+        if not PIL_AVAILABLE:
+            return None
+        ensure_media_dir()
+        filename = "generated_placeholder.png"
+        path = os.path.join(MEDIA_FOLDER, filename)
+        if not os.path.exists(path):
+            img = Image.new("RGB", (640, 360), color="#F3F4F6")
+            draw = ImageDraw.Draw(img)
+            draw.rectangle([0, 0, 639, 359], outline="#9CA3AF", width=2)
+            text = "Generated Placeholder"
+            draw.text((20, 20), text, fill="#111827")
+            try:
+                img.save(path, format="PNG")
+            except Exception:
+                return None
+        return path
+
     def _create_ai_placeholder_image(self, prompt: str) -> str | None:
         if not PIL_AVAILABLE:
             return None
@@ -13664,27 +13821,15 @@ class AnkiApp(tk.Tk):
             width=12,
         ).grid(row=1, column=1, sticky="w", padx=5)
 
-        preprocess_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ocr_opts, text="Улучшить фото (OpenCV)", variable=preprocess_var).grid(row=2, column=0, sticky="w", padx=10, pady=5)
-
-        perspective_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ocr_opts, text="Выравнивать перспективу (лист)", variable=perspective_var).grid(row=2, column=1, sticky="w", padx=5, pady=5)
-
-        flatten_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ocr_opts, text="Убрать тени / выровнять фон", variable=flatten_var).grid(row=2, column=2, sticky="w", padx=5, pady=5)
-
-        deskew_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ocr_opts, text="Выравнивать наклон (deskew)", variable=deskew_var).grid(row=2, column=3, sticky="w", padx=5, pady=5)
-
         pages_count = 1
         use_postprocess_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             ocr_opts,
             text="С постобработкой (PRO постобработка)",
             variable=use_postprocess_var,
-        ).grid(row=3, column=2, sticky="w", padx=5, pady=5)
+        ).grid(row=2, column=2, sticky="w", padx=5, pady=5)
 
-        ttk.Label(ocr_opts, text="Пресет предобработки:").grid(row=3, column=0, sticky="e", padx=(10, 5), pady=5)
+        ttk.Label(ocr_opts, text="Пресет предобработки:").grid(row=2, column=0, sticky="e", padx=(10, 5), pady=5)
         preprocess_preset_var = tk.StringVar(value="auto_pro")
         ttk.Combobox(
             ocr_opts,
@@ -13692,9 +13837,9 @@ class AnkiApp(tk.Tk):
             values=("auto_pro", "basic"),
             state="readonly",
             width=12,
-        ).grid(row=3, column=1, sticky="w", padx=5)
+        ).grid(row=2, column=1, sticky="w", padx=5)
 
-        ttk.Label(ocr_opts, text="Binarize:").grid(row=4, column=0, sticky="e", padx=(10, 5), pady=5)
+        ttk.Label(ocr_opts, text="Binarize:").grid(row=3, column=0, sticky="e", padx=(10, 5), pady=5)
         binarize_mode_var = tk.StringVar(value="adaptive")
         ttk.Combobox(
             ocr_opts,
@@ -13702,25 +13847,25 @@ class AnkiApp(tk.Tk):
             values=("adaptive", "otsu", "none"),
             state="readonly",
             width=10,
-        ).grid(row=4, column=1, sticky="w", padx=5)
+        ).grid(row=3, column=1, sticky="w", padx=5)
 
-        ttk.Label(ocr_opts, text="PSM:").grid(row=4, column=2, sticky="e")
+        ttk.Label(ocr_opts, text="PSM:").grid(row=3, column=2, sticky="e")
         psm_var = tk.StringVar(value="4")
-        ttk.Combobox(ocr_opts, textvariable=psm_var, values=("3", "4", "6", "11"), state="readonly", width=5).grid(row=4, column=3, sticky="w", padx=5)
+        ttk.Combobox(ocr_opts, textvariable=psm_var, values=("3", "4", "6", "11"), state="readonly", width=5).grid(row=3, column=3, sticky="w", padx=5)
 
         dictionary_mode_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ocr_opts, text="Словарь/учебник", variable=dictionary_mode_var).grid(row=5, column=0, sticky="w", padx=10, pady=5)
+        ttk.Checkbutton(ocr_opts, text="Словарь/учебник", variable=dictionary_mode_var).grid(row=4, column=0, sticky="w", padx=10, pady=5)
 
         debug_images_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ocr_opts, text="Сохранять debug картинки", variable=debug_images_var).grid(row=5, column=1, sticky="w", padx=5, pady=5)
+        ttk.Checkbutton(ocr_opts, text="Сохранять debug картинки", variable=debug_images_var).grid(row=4, column=1, sticky="w", padx=5, pady=5)
 
         split_offset_var = tk.DoubleVar(value=0.0)
-        ttk.Label(ocr_opts, text="2 колонки: Авто-разделение").grid(row=6, column=0, sticky="w", padx=10)
-        ttk.Label(ocr_opts, text="Сдвиг разделителя (%):").grid(row=6, column=1, sticky="e")
+        ttk.Label(ocr_opts, text="2 колонки: Авто-разделение").grid(row=5, column=0, sticky="w", padx=10)
+        ttk.Label(ocr_opts, text="Сдвиг разделителя (%):").grid(row=5, column=1, sticky="e")
         split_slider = ttk.Scale(ocr_opts, from_=-20, to=20, orient=tk.HORIZONTAL, variable=split_offset_var)
-        split_slider.grid(row=6, column=2, sticky="we", padx=5)
+        split_slider.grid(row=5, column=2, sticky="we", padx=5)
         split_val_label = ttk.Label(ocr_opts, textvariable=tk.StringVar(value="0"))
-        split_val_label.grid(row=6, column=3, sticky="w")
+        split_val_label.grid(row=5, column=3, sticky="w")
 
         def _update_split_label(*_args):
             split_val_label.config(text=f"{split_offset_var.get():.1f}")
@@ -13821,19 +13966,16 @@ class AnkiApp(tk.Tk):
         postprocess_task_holder = {"task": None}
 
         # Фрейм для текста OCR
-        ocr_frame = ttk.LabelFrame(main_frame, text="Распознанный текст (редактируйте перед генерацией)")
+        ocr_frame = ttk.LabelFrame(main_frame, text="Результат OCR")
         ocr_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         text_frame = ttk.Frame(ocr_frame)
         text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        txt_ocr = tk.Text(text_frame, height=15, wrap=tk.WORD)
+        txt_ocr = scrolledtext.ScrolledText(text_frame, height=15, wrap=tk.WORD)
         style_text_widget(txt_ocr, self.palette)
         create_context_menu(txt_ocr)
-        scrollbar = ttk.Scrollbar(text_frame, command=txt_ocr.yview)
-        txt_ocr.configure(yscrollcommand=scrollbar.set)
         txt_ocr.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         attach_simple_toolbar(ocr_frame, txt_ocr)
 
@@ -13918,43 +14060,84 @@ class AnkiApp(tk.Tk):
                     step_path = original_image_path
                     img = Image.open(step_path)
                     img = ImageOps.exif_transpose(img)
-                    steps = [
-                        ("Этап 1/6: Ч/б (binarize)", "binarize"),
-                        ("Этап 2/6: Улучшение качества", "enhance"),
-                        ("Этап 2.1/6: Автоповорот", "autorotate"),
-                        ("Этап 3/6: Выравнивание перспективы", "deskew"),
-                        ("Этап 5/6: Убрать тени", "shadow"),
-                        ("Этап 6/6: Финальный deskew", "final"),
-                    ]
+                    img = img.convert("RGB")
+                    use_cv = bool(CV2_AVAILABLE and NUMPY_AVAILABLE)
+                    ocr_photo_module = None
+                    if use_cv:
+                        _ensure_ocr_photo_loaded()
+                        ocr_photo_module = sys.modules.get("ocr_photo")
+
+                    def _pil_to_bgr(pil_img):
+                        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+                    def _bgr_to_pil(bgr_img):
+                        return Image.fromarray(cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB))
 
                     def _save_step(current_img, step_index):
                         tmp_path = Path(tempfile.gettempdir()) / f"anky_postprocess_{uuid4().hex}_{step_index}.png"
                         current_img.save(tmp_path, format="PNG")
                         return str(tmp_path)
 
-                    for idx, (label, stage) in enumerate(steps, start=1):
+                    steps = [
+                        ("Ч/б (binarize)", "binarize"),
+                        ("Улучшение качества", "enhance"),
+                        ("Выравнивание перспективы", "perspective"),
+                        ("Убрать тени / выровнять фон", "shadow"),
+                        ("Выравнивать наклон (deskew)", "deskew"),
+                    ]
+
+                    for idx, (label_text, stage) in enumerate(steps, start=1):
                         if task_obj.cancelled():
                             return {"done": False, "paid": True, "path": step_path, "cancelled": True}
                         if stage == "binarize":
-                            gray = ImageOps.grayscale(img)
-                            bw = gray.point(lambda x: 255 if x > 150 else 0, mode="1")
-                            img = bw.convert("RGB")
+                            if use_cv:
+                                bgr = _pil_to_bgr(img)
+                                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                                binary = cv2.adaptiveThreshold(
+                                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 11
+                                )
+                                bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+                                img = _bgr_to_pil(bgr)
+                            else:
+                                gray = ImageOps.grayscale(img)
+                                bw = gray.point(lambda x: 255 if x > 150 else 0, mode="1")
+                                img = bw.convert("RGB")
                         elif stage == "enhance":
-                            img = img.convert("RGB")
+                            if use_cv:
+                                bgr = _pil_to_bgr(img)
+                                bgr = cv2.fastNlMeansDenoisingColored(bgr, None, 10, 10, 7, 21)
+                                img = _bgr_to_pil(bgr)
                             img = ImageEnhance.Contrast(img).enhance(1.4)
                             img = ImageEnhance.Sharpness(img).enhance(1.6)
-                        elif stage == "autorotate":
-                            img = ImageOps.exif_transpose(img)
-                            if img.width > img.height:
-                                img = img.rotate(90, expand=True, fillcolor="white")
-                        elif stage == "deskew":
-                            img = ImageOps.autocontrast(img)
+                        elif stage == "perspective":
+                            if use_cv and ocr_photo_module is not None:
+                                detect_and_warp_page = getattr(ocr_photo_module, "detect_and_warp_page", None)
+                                if callable(detect_and_warp_page):
+                                    bgr = _pil_to_bgr(img)
+                                    warped, _ = detect_and_warp_page(bgr)
+                                    img = _bgr_to_pil(warped)
                         elif stage == "shadow":
-                            img = ImageOps.equalize(img)
-                            img = ImageEnhance.Brightness(img).enhance(1.1)
-                        elif stage == "final":
-                            img = img.rotate(0.3, expand=True, fillcolor="white")
+                            if use_cv and ocr_photo_module is not None:
+                                flatten_background = getattr(ocr_photo_module, "flatten_background", None)
+                                if callable(flatten_background):
+                                    bgr = _pil_to_bgr(img)
+                                    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                                    flat = flatten_background(gray)
+                                    bgr = cv2.cvtColor(flat, cv2.COLOR_GRAY2BGR)
+                                    img = _bgr_to_pil(bgr)
+                            else:
+                                img = ImageOps.equalize(img)
+                        elif stage == "deskew":
+                            if use_cv and ocr_photo_module is not None:
+                                deskew_fn = getattr(ocr_photo_module, "deskew", None)
+                                if callable(deskew_fn):
+                                    bgr = _pil_to_bgr(img)
+                                    deskewed = deskew_fn(bgr)
+                                    img = _bgr_to_pil(deskewed)
+                            else:
+                                img = ImageOps.autocontrast(img)
 
+                        label = f"Этап {idx}/{OCR_POSTPROCESS_STEPS}: {label_text}"
                         step_path = _save_step(img, idx)
                         task_obj.queue.put(("postprocess_progress", idx, OCR_POSTPROCESS_STEPS, label, step_path))
 
@@ -14072,26 +14255,22 @@ class AnkiApp(tk.Tk):
                     task_obj.queue.put(("ocr_progress", step, total, label))
 
                 try:
+                    use_processed = bool(postprocess_state["done"] and processed_image_path)
                     options = OcrRunOptions(
                         ocr_mode=selected_mode,
                         lang_mode=selected_lang,
-                        perspective_correction=perspective_var.get(),
-                        flatten_background=flatten_var.get(),
+                        perspective_correction=not use_processed,
+                        flatten_background=not use_processed,
                         binarize_mode=binarize_mode_var.get(),
-                        deskew=deskew_var.get(),
+                        deskew=not use_processed,
                         debug_images=debug_images_var.get(),
                         psm=int(psm_var.get()),
                         dictionary_mode=dictionary_mode_var.get(),
                         split_offset_percent=float(split_offset_var.get()),
                         preserve_spaces=True,
                         prefer_paddle_for_columns=True,
-                        preprocess_preset=preprocess_preset_var.get(),
+                        preprocess_preset="none" if use_processed else preprocess_preset_var.get(),
                     )
-                    if not preprocess_var.get():
-                        options.flatten_background = False
-                        options.deskew = False
-                        options.perspective_correction = False
-                        options.preprocess_preset = "none"
                     task_obj.queue.put(("log", f"OCR режим: {options.ocr_mode}, lang={options.lang_mode}"))
                     src_path = processed_image_path if postprocess_state["done"] and processed_image_path else img_path
                     text = perform_page_ocr(src_path, options, progress_cb)
@@ -14151,56 +14330,6 @@ class AnkiApp(tk.Tk):
             width=8,
         ).pack(anchor="w", padx=10, pady=(0, 5))
 
-        lang_mode_var = tk.StringVar(value="foreign")
-        ttk.Label(settings_frame, text="Режим языка:").pack(anchor="w", padx=10, pady=(5, 0))
-        ttk.Radiobutton(
-            settings_frame,
-            text="Иностранный язык",
-            variable=lang_mode_var,
-            value="foreign",
-        ).pack(anchor="w", padx=25)
-        ttk.Radiobutton(
-            settings_frame,
-            text="Родной язык",
-            variable=lang_mode_var,
-            value="native",
-        ).pack(anchor="w", padx=25)
-
-        sentence_limit_var = tk.StringVar(value="Лимит предложений на карточку: 2")
-        ttk.Label(settings_frame, textvariable=sentence_limit_var).pack(anchor="w", padx=10, pady=(0, 5))
-
-        def update_sentence_limit(*_args):
-            if lang_mode_var.get() == "native":
-                sentence_limit_var.set("Лимит предложений на карточку: 10")
-            else:
-                sentence_limit_var.set("Лимит предложений на карточку: 2")
-
-        lang_mode_var.trace_add("write", update_sentence_limit)
-        update_sentence_limit()
-
-        use_ai_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            settings_frame,
-            text="Генерировать картинку для каждой новой карточки (OpenAI)",
-            variable=use_ai_var
-        ).pack(anchor="w", padx=10, pady=5)
-
-        ttk.Label(settings_frame, text="Как делить длинный текст:")\
-            .pack(anchor="w", padx=10, pady=(5, 0))
-        split_mode_var = tk.StringVar(value="sentence")
-        ttk.Radiobutton(
-            settings_frame,
-            text="1 предложение = 1 карточка",
-            variable=split_mode_var,
-            value="sentence"
-        ).pack(anchor="w", padx=25)
-        ttk.Radiobutton(
-            settings_frame,
-            text="Отдельные слова (новое слово = карточка)",
-            variable=split_mode_var,
-            value="word"
-        ).pack(anchor="w", padx=25)
-
         ttk.Label(settings_frame, text="Шаблон FRONT:").pack(anchor="w", padx=10, pady=(5, 0))
         entry_front = tk.Text(settings_frame, height=2)
         style_text_widget(entry_front, self.palette)
@@ -14219,6 +14348,18 @@ class AnkiApp(tk.Tk):
             settings_frame,
             text="Переменные: {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
         ).pack(anchor="w", padx=10, pady=(0, 5))
+
+        lang_mode_var = tk.StringVar(value="foreign")
+        sentence_limit_var = tk.StringVar(value="Лимит предложений на карточку: 1")
+
+        def update_sentence_limit(*_args):
+            if lang_mode_var.get() == "native":
+                sentence_limit_var.set("Лимит предложений на карточку: 10")
+            else:
+                sentence_limit_var.set("Лимит предложений на карточку: 1")
+
+        lang_mode_var.trace_add("write", update_sentence_limit)
+        update_sentence_limit()
 
         progress_frame = ttk.LabelFrame(main_frame, text="Прогресс генерации карточек (пакет 25)")
         progress_frame.pack(fill=tk.X, pady=(0, 10))
@@ -14249,7 +14390,7 @@ class AnkiApp(tk.Tk):
         task_holder = {"task": None}
         image_task_holder = {"task": None}
         video_task_holder = {"task": None}
-        cards_pack_state = {"skip_sentences": set(), "skip_words": set()}
+        cards_pack_state = {"skip_sentences": set()}
         image_state = {"processed": set()}
         video_state = {"processed": set()}
         generated_card_ids: list[int] = []
@@ -14260,26 +14401,18 @@ class AnkiApp(tk.Tk):
         video_insufficient_var = tk.StringVar(value="")
 
         def get_sentence_limit_value() -> int:
-            return 10 if lang_mode_var.get() == "native" else 2
+            return 10 if lang_mode_var.get() == "native" else 1
 
         def get_remaining_sentences(text: str) -> list[str]:
-            sentences = split_into_sentences(text)
+            sentences = split_ocr_text_into_sentences(text)
             return [s for s in sentences if normalize_word(s) not in cards_pack_state["skip_sentences"]]
 
-        def get_remaining_words(text: str) -> list[str]:
-            known = get_known_words()
-            return sorted(
-                {
-                    w for w in extract_words_from_text(text)
-                    if w and w not in known and w not in cards_pack_state["skip_words"]
-                }
-            )
-
         def update_cards_pricing_ui(*_args):
-            cards_cost = self.get_cost("cards_gen", CARDS_GEN_PACK_SIZE)
+            cards_cost = self.get_cost("ocr_cards_gen", 1)
             video_cost = self.get_cost("video_gen", VIDEO_GEN_PACK_SIZE)
             cards_cost_var.set(str(cards_cost))
             video_cost_var.set(str(video_cost))
+            cards_generate_btn.configure(text=f"Сгенерировать карточки {cards_cost}")
 
             if task_holder["task"] is None and self.can_afford(cards_cost):
                 cards_insufficient_var.set("")
@@ -14309,21 +14442,23 @@ class AnkiApp(tk.Tk):
                 messagebox.showerror("Ошибка", "Текст пустой.")
                 return
 
-            one_sent = (split_mode_var.get() == "sentence")
-            remaining_items = get_remaining_sentences(text) if one_sent else get_remaining_words(text)
+            generated_card_ids.clear()
+            image_state["processed"].clear()
+
+            remaining_items = get_remaining_sentences(text)
             if not remaining_items:
-                messagebox.showinfo("Результат", "Новых слов/предложений не найдено.")
+                messagebox.showinfo("Результат", "Новых предложений не найдено.")
                 return
 
-            cards_cost = self.get_cost("cards_gen", CARDS_GEN_PACK_SIZE)
+            cards_cost = self.get_cost("ocr_cards_gen", 1)
             if not self.can_afford(cards_cost):
                 messagebox.showwarning("Недостаточно кредитов", "Недостаточно кредитов. Пополните")
                 return
             if not self.charge(
                 cards_cost,
-                "cards_gen",
+                "ocr_cards_gen",
                 meta={
-                    "operation": "cards_gen",
+                    "operation": "ocr_cards_gen",
                     "pack_size": CARDS_GEN_PACK_SIZE,
                     "language": ocr_lang_var.get(),
                     "language_mode": lang_mode_var.get(),
@@ -14332,7 +14467,6 @@ class AnkiApp(tk.Tk):
             ):
                 return
 
-            use_ai_images = use_ai_var.get()
             front_t = entry_front.get("1.0", tk.END).strip() or DEFAULT_FRONT_TEMPLATE
             back_t = entry_back.get("1.0", tk.END).strip() or DEFAULT_BACK_TEMPLATE
             self.front_template = front_t
@@ -14340,8 +14474,10 @@ class AnkiApp(tk.Tk):
             if self.selected_deck_id is not None:
                 save_deck_templates(self.selected_deck_id, front_t, back_t)
 
-            api_key = OPENAI_API_KEY if OPENAI_API_KEY else None
-            sentence_limit = get_sentence_limit_value()
+            placeholder_path = self._ensure_generated_placeholder_image()
+            if not placeholder_path:
+                messagebox.showerror("Ошибка", "Не удалось создать placeholder-картинку.")
+                return
 
             progress_var.set(0)
             progress_label_var.set("")
@@ -14366,13 +14502,14 @@ class AnkiApp(tk.Tk):
                     task_holder["task"] = None
                     set_cards_enabled(True)
                     btn_cancel.config(state=tk.DISABLED)
-                    remaining_after = get_remaining_sentences(text) if one_sent else get_remaining_words(text)
+                    image_state["processed"].update(generated_card_ids)
+                    remaining_after = get_remaining_sentences(text)
                     progress_var.set(0)
                     progress_label_var.set("")
                     if result == 0:
-                        messagebox.showinfo("Результат", "Новых слов/предложений не найдено.")
+                        messagebox.showinfo("Результат", "Новых предложений не найдено.")
                     else:
-                        messagebox.showinfo("Результат", f"Создано карточек (включая синонимы/примеры): {result}")
+                        messagebox.showinfo("Результат", f"Создано карточек: {result}")
                     if remaining_after:
                         messagebox.showinfo(
                             "Лимит пакета",
@@ -14389,23 +14526,18 @@ class AnkiApp(tk.Tk):
                     update_cards_pricing_ui()
 
             def worker(task_obj):
-                return auto_generate_cards_from_text(
-                    self.selected_deck_id, text,
-                    use_ai_images, api_key,
-                    front_t, back_t,
-                    one_sentence_one_card=one_sent,
-                    audio_path=None,
+                return auto_generate_cards_from_ocr_text(
+                    self.selected_deck_id,
+                    text,
+                    front_t,
+                    back_t,
+                    lang_mode_var.get(),
                     progress_queue=task_obj.queue,
                     cancel_check=task_obj.cancelled,
-                    image_spend_cb=None,
                     max_cards=CARDS_GEN_PACK_SIZE,
-                    skip_sentences=cards_pack_state["skip_sentences"],
-                    skip_words=cards_pack_state["skip_words"],
-                    max_sentences_per_card=sentence_limit,
                     created_card_ids=generated_card_ids,
-                    repeated_flag_cb=get_repeated_word_flag,
-                    image_placeholder_cb=self._create_ai_placeholder_image if use_ai_images else None,
-                    progress_by_created=True,
+                    placeholder_image_path=placeholder_path,
+                    skip_sentences=cards_pack_state["skip_sentences"],
                 )
 
             set_cards_enabled(False)
@@ -14424,6 +14556,10 @@ class AnkiApp(tk.Tk):
                 return
             if not generated_card_ids:
                 messagebox.showinfo("Нет карточек", "Сначала сгенерируйте карточки.")
+                return
+            placeholder_path = self._ensure_generated_placeholder_image()
+            if not placeholder_path:
+                messagebox.showerror("Ошибка", "Не удалось создать placeholder-картинку.")
                 return
             media_progress_var.set(0)
             media_progress_label_var.set("")
@@ -14458,17 +14594,16 @@ class AnkiApp(tk.Tk):
                     card = get_card_by_id(card_id)
                     if not card:
                         continue
-                    placeholder = self._create_ai_placeholder_image(card.get("front") or "")
-                    if placeholder:
+                    if not card.get("front_image_path") and not card.get("image_path"):
                         try:
                             conn = get_connection()
                             conn.execute(
-                                "UPDATE cards SET front_image_path = ? WHERE id = ?;",
-                                (placeholder, card_id),
+                                "UPDATE cards SET front_image_path = ?, image_path = ? WHERE id = ?;",
+                                (placeholder_path, placeholder_path, card_id),
                             )
                             conn.commit()
                             conn.close()
-                            attach_media_to_card(card_id, [(placeholder, "image", "front", "ocr_placeholder")])
+                            attach_media_to_card(card_id, [(placeholder_path, "image", "front", "ocr_placeholder")])
                         except Exception:
                             pass
                     image_state["processed"].add(card_id)
@@ -14659,13 +14794,43 @@ class AnkiApp(tk.Tk):
                    command=lambda: txt_ocr.delete("1.0", tk.END))\
             .pack(side=tk.LEFT, padx=5)
 
-        cards_button_frame, set_cards_enabled = build_coin_action(
+        mode_frame = ttk.LabelFrame(right_actions, text="Режим генерации")
+        mode_frame.pack(anchor="e", padx=5, pady=(0, 6), fill=tk.X)
+        ttk.Radiobutton(
+            mode_frame,
+            text="Иностранный язык",
+            variable=lang_mode_var,
+            value="foreign",
+        ).pack(anchor="w", padx=6, pady=(4, 0))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Родной язык",
+            variable=lang_mode_var,
+            value="native",
+        ).pack(anchor="w", padx=6)
+        ttk.Label(mode_frame, textvariable=sentence_limit_var).pack(anchor="w", padx=6, pady=(0, 4))
+
+        cards_generate_btn = tk.Button(
             right_actions,
-            "Оплатить и сгенерировать",
-            cards_cost_var,
-            lambda: run_generation(),
+            text="Сгенерировать карточки",
+            image=coin_icon,
+            compound=tk.RIGHT,
+            command=run_generation,
+            padx=10,
+            pady=6,
         )
-        cards_button_frame.pack(anchor="e", padx=5, pady=(0, 2))
+        cards_generate_btn.pack(anchor="e", padx=5, pady=(0, 2))
+        cards_generate_btn.image = coin_icon
+
+        def set_cards_enabled(enabled: bool):
+            if enabled:
+                cards_generate_btn.configure(state=tk.NORMAL, image=coin_icon)
+                cards_generate_btn.image = coin_icon
+            else:
+                disabled_icon = coin_icon_disabled or coin_icon
+                cards_generate_btn.configure(state=tk.DISABLED, image=disabled_icon)
+                cards_generate_btn.image = disabled_icon
+
         ttk.Label(right_actions, textvariable=cards_insufficient_var, foreground="red").pack(anchor="e")
 
         btn_cancel = ttk.Button(right_actions, text="Остановить генерацию", command=cancel_generation)
@@ -14675,7 +14840,7 @@ class AnkiApp(tk.Tk):
         ttk.Button(right_actions, text="Предпросмотр карточек", command=open_cards_preview)\
             .pack(anchor="e", padx=5, pady=(6, 2))
 
-        ttk.Button(right_actions, text="Сгенерировать картинки для всех карточек", command=generate_placeholder_images)\
+        ttk.Button(right_actions, text="Сгенерировать картинки", command=generate_placeholder_images)\
             .pack(anchor="e", padx=5, pady=(6, 2))
 
         btn_image_cancel = ttk.Button(right_actions, text="Остановить картинки", command=cancel_image_generation)
@@ -16865,3 +17030,4 @@ if __name__ == "__main__":
 # PATCH: unify card renderer sizes + white video background + image-over-video rule
 # PATCH: fix random image shrink (configure debounce + min size + orig cache) + fix preview image render (PhotoImage refs + shared renderer)
 # PATCH: CSV image import packs (limit+cost by PRO), coin-click charge, progress-synced hard stop, PRO-only options with crown
+# PATCH: OCR PRO postprocess pipeline + OCR result textbox + paid card autogen (pro/free) + image placeholder sync + repeated-word masking rule
