@@ -17,6 +17,8 @@ preserved.
 from __future__ import annotations
 
 import datetime
+import importlib
+import importlib.util
 import os
 import platform
 import re
@@ -24,7 +26,7 @@ import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, TYPE_CHECKING, Any
 from uuid import uuid4
 
 import cv2
@@ -44,27 +46,39 @@ PADDLE_VERSION: str | None = None
 PADDLEOCR_AVAILABLE = False
 PADDLEOCR_VERSION: str | None = None
 
-try:
-    import paddle
+if TYPE_CHECKING:
+    from paddleocr import PaddleOCR as PaddleOCRType
+else:
+    PaddleOCRType = Any
 
+PaddleOCR = None  # type: ignore
+
+_PADDLE_OCR_CACHE: dict[str, PaddleOCRType] = {}
+
+
+def _import_paddle():
+    global PADDLE_AVAILABLE, PADDLE_VERSION
+    if importlib.util.find_spec("paddle") is None:
+        PADDLE_AVAILABLE = False
+        PADDLE_VERSION = None
+        return None
+    module = importlib.import_module("paddle")
     PADDLE_AVAILABLE = True
-    PADDLE_VERSION = getattr(paddle, "__version__", None)
-except Exception:
-    PADDLE_AVAILABLE = False
-
-try:
-    import paddleocr
-    from paddleocr import PaddleOCR
-
-    PADDLEOCR_AVAILABLE = True
-    PADDLEOCR_VERSION = getattr(paddleocr, "__version__", None)
-except Exception:
-    PaddleOCR = None  # type: ignore
-    PADDLEOCR_AVAILABLE = False
-    PADDLEOCR_VERSION = None
+    PADDLE_VERSION = getattr(module, "__version__", None)
+    return module
 
 
-_PADDLE_OCR_CACHE: dict[str, PaddleOCR] = {}
+def _import_paddleocr():
+    global PADDLEOCR_AVAILABLE, PADDLEOCR_VERSION, PaddleOCR
+    if importlib.util.find_spec("paddleocr") is None:
+        PADDLEOCR_AVAILABLE = False
+        PADDLEOCR_VERSION = None
+        return None
+    module = importlib.import_module("paddleocr")
+    PaddleOCR = getattr(module, "PaddleOCR", None)
+    PADDLEOCR_AVAILABLE = PaddleOCR is not None
+    PADDLEOCR_VERSION = getattr(module, "__version__", None)
+    return module
 
 
 @dataclass
@@ -106,6 +120,8 @@ def _show_message_async(title: str, message: str):
 
 
 def _is_paddle_ready() -> bool:
+    _import_paddle()
+    _import_paddleocr()
     return bool(PADDLE_AVAILABLE and PADDLEOCR_AVAILABLE and PaddleOCR is not None)
 
 
@@ -797,6 +813,11 @@ def get_paddle_ocr(lang: str) -> PaddleOCR:
     if lang in _PADDLE_OCR_CACHE:
         return _PADDLE_OCR_CACHE[lang]
 
+    _import_paddle()
+    _import_paddleocr()
+    if PaddleOCR is None:
+        raise RuntimeError("PaddleOCR недоступен")
+
     def _create(with_show_log: bool):
         kwargs = {"lang": lang, "use_angle_cls": True}
         if with_show_log:
@@ -844,7 +865,15 @@ def _run_paddle_single_pass(image: np.ndarray, lang: str, fallback_lang: str | N
 
 
 def ocr_with_paddle(image: np.ndarray, lang_mode: str) -> str:
-    if not _is_paddle_ready():
+    try:
+        ready = _is_paddle_ready()
+    except Exception as e:  # noqa: BLE001
+        _notify_paddle_missing()
+        raise RuntimeError(
+            "PaddleOCR недоступен. Проверьте установку paddlepaddle и paddleocr."
+        ) from e
+
+    if not ready:
         _notify_paddle_missing()
         raise RuntimeError(
             "PaddleOCR недоступен. Проверьте установку paddlepaddle и paddleocr."

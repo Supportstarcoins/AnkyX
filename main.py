@@ -3,6 +3,7 @@ import sys
 import logging
 import faulthandler
 import subprocess
+import ctypes
 os.environ.setdefault("DISABLE_MODEL_SOURCE_CHECK", "True")
 import io
 safe = tempfile.gettempdir()
@@ -36,8 +37,8 @@ SYNC_CONFIG_DEFAULT = {
     "user_email": None,
 }
 
-CRASH_LOG_PATH = os.path.join(BASE_DIR, "ocr_crash.log")
-FAULT_LOG_PATH = os.path.join(BASE_DIR, "ocr_fault.log")
+CRASH_LOG_PATH = os.path.join(BASE_DIR, "app_crash.log")
+FAULT_LOG_PATH = os.path.join(BASE_DIR, "fault.log")
 _CRASH_LOG_HANDLE = None
 _FAULT_LOG_HANDLE = None
 
@@ -119,16 +120,9 @@ def _format_exception_message(exc_type, exc, tb) -> str:
 def _show_fatal_messagebox(title: str, body: str) -> None:
     with _EXCEPTIONBOX_LOCK:
         try:
-            root = tk._default_root
-            if root is None:
-                temp_root = tk.Tk()
-                temp_root.withdraw()
-                messagebox.showerror(title, body)
-                temp_root.destroy()
-            else:
-                messagebox.showerror(title, body)
+            ctypes.windll.user32.MessageBoxW(0, body, title, 0x10)
         except Exception:
-            logging.exception("Failed to show messagebox for exception")
+            logging.exception("Failed to show WinAPI messagebox for exception")
 
 
 def _global_excepthook(exc_type, exc, tb) -> None:
@@ -193,7 +187,11 @@ def safe_action(name, fn):
         tb = traceback.format_exc()
         print("[OCR ERROR]", name, tb)
         log_ocr_error(name, tb)
-        messagebox.showerror("Ошибка", f"{name}: {e}\n\n{tb}")
+        root = tk._default_root
+        if root is not None:
+            messagebox.showerror("Ошибка", f"{name}: {e}\n\n{tb}")
+        else:
+            logging.error("UI error without root: %s\n%s", name, tb)
 
 
 def safe_enable_dnd(widget, on_drop_callback) -> bool:
@@ -795,6 +793,76 @@ except ImportError:
     FigureCanvasTkAgg = None
     Figure = None
 
+# PATCH: avoid paddle import crash (lazy import + subprocess sanity check + fallback OCR engines) + crash-safe logging + WinAPI MessageBox (no Tk in excepthook)
+_PADDLE_SANITY_CACHE = {
+    "checked": False,
+    "available": False,
+    "rc": None,
+    "stdout": "",
+    "stderr": "",
+}
+
+
+def is_paddle_available() -> bool:
+    if _PADDLE_SANITY_CACHE["checked"]:
+        return bool(_PADDLE_SANITY_CACHE["available"])
+
+    script_path = os.path.join(BASE_DIR, "tools", "paddle_sanity_check.py")
+    cmd = [sys.executable, "-u", script_path]
+    logging.info("Running Paddle sanity check: %s", cmd)
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception:
+        tb = traceback.format_exc()
+        logging.error("Paddle sanity check failed to start:\n%s", tb)
+        _PADDLE_SANITY_CACHE.update(
+            {"checked": True, "available": False, "rc": None, "stdout": "", "stderr": tb}
+        )
+        return False
+
+    rc = completed.returncode
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    _PADDLE_SANITY_CACHE.update(
+        {"checked": True, "available": rc == 0, "rc": rc, "stdout": stdout, "stderr": stderr}
+    )
+    logging.info("Paddle sanity check rc=%s stdout=%s stderr=%s", rc, stdout, stderr)
+    return rc == 0
+
+
+_EASYOCR_AVAILABLE = importlib.util.find_spec("easyocr") is not None
+_EASYOCR_READER_CACHE: dict[str, object] = {}
+
+
+def is_easyocr_available() -> bool:
+    return bool(_EASYOCR_AVAILABLE)
+
+
+def _normalize_easyocr_langs(lang_mode: str) -> list[str]:
+    langs: list[str] = []
+    lang_mode = (lang_mode or "").lower()
+    if "deu" in lang_mode:
+        langs.append("de")
+    if "rus" in lang_mode:
+        langs.append("ru")
+    if not langs:
+        langs.append("en")
+    if "en" not in langs:
+        langs.append("en")
+    return langs
+
+
+def _get_easyocr_reader(lang_mode: str):
+    langs = _normalize_easyocr_langs(lang_mode)
+    key = ",".join(langs)
+    if key in _EASYOCR_READER_CACHE:
+        return _EASYOCR_READER_CACHE[key]
+    import easyocr
+
+    reader = easyocr.Reader(langs, gpu=False)
+    _EASYOCR_READER_CACHE[key] = reader
+    return reader
+
 # --------------------------
 # OCR Photo (OpenCV/PaddleOCR) — optional. Load lazily to avoid startup crashes/spam.
 # --------------------------
@@ -804,6 +872,8 @@ class OcrRunOptions:  # noqa: N801
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
+        if not hasattr(self, "ocr_engine"):
+            setattr(self, "ocr_engine", "tesseract")
 
 # Lazily populated when/if ocr_photo is successfully imported
 PADDLE_AVAILABLE = False
@@ -914,14 +984,88 @@ def _perform_page_ocr_tesseract(img_path: str, options, progress_cb=None) -> str
             pass
     return (result or "").strip()
 
+
+def _perform_page_ocr_easyocr(img_path: str, options, progress_cb=None) -> str:
+    if not is_easyocr_available():
+        raise RuntimeError("EasyOCR не установлен")
+    if not NUMPY_AVAILABLE:
+        raise RuntimeError("EasyOCR требует NumPy")
+
+    if progress_cb:
+        try:
+            progress_cb(0, 3, "Загрузка изображения")
+        except Exception:
+            pass
+
+    lang = getattr(options, "lang_mode", DEFAULT_OCR_LANG) or DEFAULT_OCR_LANG
+    preprocess_preset = str(getattr(options, "preprocess_preset", "none") or "none")
+    use_preprocess = preprocess_preset != "none"
+
+    try:
+        if use_preprocess and CV2_AVAILABLE and NUMPY_AVAILABLE:
+            pil_img = preprocess_for_ocr(img_path)
+        else:
+            pil_img = load_image_for_ocr(img_path)
+    except Exception:
+        pil_img = load_image_for_ocr(img_path)
+
+    reader = _get_easyocr_reader(lang)
+
+    mode = str(getattr(options, "ocr_mode", "standard") or "standard")
+    if mode == "two_columns":
+        left_img, right_img = split_two_columns(pil_img)
+        if progress_cb:
+            try:
+                progress_cb(1, 3, "OCR левая колонка")
+            except Exception:
+                pass
+        left_text = "\n".join(reader.readtext(np.array(left_img), detail=0, paragraph=True))
+        if progress_cb:
+            try:
+                progress_cb(2, 3, "OCR правая колонка")
+            except Exception:
+                pass
+        right_text = "\n".join(reader.readtext(np.array(right_img), detail=0, paragraph=True))
+        result = (left_text or "").strip() + "\n\n" + (right_text or "").strip()
+    else:
+        if progress_cb:
+            try:
+                progress_cb(1, 3, "OCR")
+            except Exception:
+                pass
+        result = "\n".join(reader.readtext(np.array(pil_img), detail=0, paragraph=True))
+
+    if progress_cb:
+        try:
+            progress_cb(3, 3, "Готово")
+        except Exception:
+            pass
+    return (result or "").strip()
+
 def perform_page_ocr(img_path: str, options, progress_cb=None) -> str:
-    """Unified entrypoint used by UI: tries PaddleOCR pipeline if available, else falls back to Tesseract."""
-    if getattr(options, "ocr_mode", "") == "pro":
-        if _ensure_ocr_photo_loaded() and _perform_page_ocr_impl is not None and PADDLE_AVAILABLE and PADDLEOCR_AVAILABLE:
-            return _perform_page_ocr_impl(img_path, options, progress_cb)
-        # If 'pro' selected but PaddleOCR isn't available, fall back gracefully:
+    """Unified entrypoint used by UI: dispatches to selected OCR engine with safe fallbacks."""
+    engine = str(getattr(options, "ocr_engine", "tesseract") or "tesseract").lower()
+
+    if engine == "paddle":
+        if not is_paddle_available():
+            logging.warning("PaddleOCR unavailable, falling back to Tesseract.")
+            return _perform_page_ocr_tesseract(img_path, options, progress_cb)
+        if _ensure_ocr_photo_loaded() and _perform_page_ocr_impl is not None:
+            try:
+                return _perform_page_ocr_impl(img_path, options, progress_cb)
+            except Exception:
+                logging.exception("PaddleOCR failed, falling back to Tesseract.")
+                return _perform_page_ocr_tesseract(img_path, options, progress_cb)
+        logging.warning("PaddleOCR module not loaded, falling back to Tesseract.")
         return _perform_page_ocr_tesseract(img_path, options, progress_cb)
-    # Non-pro modes: always use Tesseract fallback (stable, no paddle deps)
+
+    if engine == "easyocr":
+        try:
+            return _perform_page_ocr_easyocr(img_path, options, progress_cb)
+        except Exception:
+            logging.exception("EasyOCR failed, falling back to Tesseract.")
+            return _perform_page_ocr_tesseract(img_path, options, progress_cb)
+
     return _perform_page_ocr_tesseract(img_path, options, progress_cb)
 
 # OpenAI key только в памяти
@@ -13862,8 +14006,11 @@ class AnkiApp(tk.Tk):
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
             return
 
-        if not is_tesseract_available():
-            messagebox.showerror("OCR недоступен", "Tesseract OCR не найден.")
+        if not (is_tesseract_available() or is_easyocr_available() or is_paddle_available()):
+            messagebox.showerror(
+                "OCR недоступен",
+                "Не найдены доступные OCR движки. Установите Tesseract, EasyOCR или PaddleOCR.",
+            )
             return
 
         img_path = filedialog.askopenfilename(
@@ -13884,6 +14031,13 @@ class AnkiApp(tk.Tk):
         apply_dark_theme_to_window(win, self.palette)
         open_ocr_debug_log()
         logging.info("OCR module opened")
+        paddle_available = is_paddle_available()
+        if not paddle_available:
+            messagebox.showwarning(
+                "PaddleOCR недоступен",
+                "PaddleOCR недоступен на этой системе (Illegal instruction). "
+                "Используйте Tesseract/EasyOCR.",
+            )
         style = ttk.Style(win)
         style.configure(
             "Dark.Vertical.TScrollbar",
@@ -13974,13 +14128,32 @@ class AnkiApp(tk.Tk):
         ocr_opts = ttk.LabelFrame(main_frame, text="OCR настройки")
         ocr_opts.pack(fill=tk.X, pady=(0, 10))
 
-        ocr_mode_var = tk.StringVar(value="fast")
-        ttk.Label(ocr_opts, text="OCR MODE:").grid(row=0, column=0, sticky="w", padx=(10, 5), pady=5)
-        ttk.Radiobutton(ocr_opts, text="Быстрый (Tesseract)", variable=ocr_mode_var, value="fast").grid(row=0, column=1, sticky="w", padx=5, pady=5)
-        ttk.Radiobutton(ocr_opts, text="PRO (PaddleOCR)", variable=ocr_mode_var, value="pro").grid(row=0, column=2, sticky="w", padx=5, pady=5)
-        ttk.Radiobutton(ocr_opts, text="Авто 2 колонки (DE|RU)", variable=ocr_mode_var, value="two_columns").grid(row=0, column=3, sticky="w", padx=5, pady=5)
+        engine_options = ["Tesseract"]
+        if is_easyocr_available():
+            engine_options.append("EasyOCR")
+        if paddle_available:
+            engine_options.append("PaddleOCR")
+        ocr_engine_var = tk.StringVar(value=engine_options[0])
+        ttk.Label(ocr_opts, text="OCR движок:").grid(row=0, column=0, sticky="e", padx=(10, 5), pady=5)
+        ttk.Combobox(
+            ocr_opts,
+            textvariable=ocr_engine_var,
+            values=tuple(engine_options),
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=1, sticky="w", padx=5)
 
-        ttk.Label(ocr_opts, text="LANG MODE:").grid(row=1, column=0, sticky="e", padx=(10, 5), pady=5)
+        ocr_mode_var = tk.StringVar(value="fast")
+        ttk.Label(ocr_opts, text="OCR MODE:").grid(row=1, column=0, sticky="w", padx=(10, 5), pady=5)
+        ttk.Radiobutton(ocr_opts, text="Быстрый", variable=ocr_mode_var, value="fast").grid(row=1, column=1, sticky="w", padx=5, pady=5)
+        pro_rb = ttk.Radiobutton(ocr_opts, text="PRO (только PaddleOCR)", variable=ocr_mode_var, value="pro")
+        pro_rb.grid(row=1, column=2, sticky="w", padx=5, pady=5)
+        ttk.Radiobutton(ocr_opts, text="Авто 2 колонки (DE|RU)", variable=ocr_mode_var, value="two_columns").grid(row=1, column=3, sticky="w", padx=5, pady=5)
+
+        if not paddle_available:
+            pro_rb.configure(state=tk.DISABLED)
+
+        ttk.Label(ocr_opts, text="LANG MODE:").grid(row=2, column=0, sticky="e", padx=(10, 5), pady=5)
         lang_mode_var = tk.StringVar(value="deu+rus")
         ttk.Combobox(
             ocr_opts,
@@ -13988,7 +14161,7 @@ class AnkiApp(tk.Tk):
             values=("deu+rus", "deu", "rus"),
             state="readonly",
             width=12,
-        ).grid(row=1, column=1, sticky="w", padx=5)
+        ).grid(row=2, column=1, sticky="w", padx=5)
 
         pages_count = 1
         use_postprocess_var = tk.BooleanVar(value=False)
@@ -13996,9 +14169,9 @@ class AnkiApp(tk.Tk):
             ocr_opts,
             text="С постобработкой (PRO постобработка)",
             variable=use_postprocess_var,
-        ).grid(row=2, column=2, sticky="w", padx=5, pady=5)
+        ).grid(row=3, column=2, sticky="w", padx=5, pady=5)
 
-        ttk.Label(ocr_opts, text="Пресет предобработки:").grid(row=2, column=0, sticky="e", padx=(10, 5), pady=5)
+        ttk.Label(ocr_opts, text="Пресет предобработки:").grid(row=3, column=0, sticky="e", padx=(10, 5), pady=5)
         preprocess_preset_var = tk.StringVar(value="auto_pro")
         ttk.Combobox(
             ocr_opts,
@@ -14006,9 +14179,9 @@ class AnkiApp(tk.Tk):
             values=("auto_pro", "basic"),
             state="readonly",
             width=12,
-        ).grid(row=2, column=1, sticky="w", padx=5)
+        ).grid(row=3, column=1, sticky="w", padx=5)
 
-        ttk.Label(ocr_opts, text="Binarize:").grid(row=3, column=0, sticky="e", padx=(10, 5), pady=5)
+        ttk.Label(ocr_opts, text="Binarize:").grid(row=4, column=0, sticky="e", padx=(10, 5), pady=5)
         binarize_mode_var = tk.StringVar(value="adaptive")
         ttk.Combobox(
             ocr_opts,
@@ -14016,25 +14189,25 @@ class AnkiApp(tk.Tk):
             values=("adaptive", "otsu", "none"),
             state="readonly",
             width=10,
-        ).grid(row=3, column=1, sticky="w", padx=5)
+        ).grid(row=4, column=1, sticky="w", padx=5)
 
-        ttk.Label(ocr_opts, text="PSM:").grid(row=3, column=2, sticky="e")
+        ttk.Label(ocr_opts, text="PSM:").grid(row=4, column=2, sticky="e")
         psm_var = tk.StringVar(value="4")
-        ttk.Combobox(ocr_opts, textvariable=psm_var, values=("3", "4", "6", "11"), state="readonly", width=5).grid(row=3, column=3, sticky="w", padx=5)
+        ttk.Combobox(ocr_opts, textvariable=psm_var, values=("3", "4", "6", "11"), state="readonly", width=5).grid(row=4, column=3, sticky="w", padx=5)
 
         dictionary_mode_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ocr_opts, text="Словарь/учебник", variable=dictionary_mode_var).grid(row=4, column=0, sticky="w", padx=10, pady=5)
+        ttk.Checkbutton(ocr_opts, text="Словарь/учебник", variable=dictionary_mode_var).grid(row=5, column=0, sticky="w", padx=10, pady=5)
 
         debug_images_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ocr_opts, text="Сохранять debug картинки", variable=debug_images_var).grid(row=4, column=1, sticky="w", padx=5, pady=5)
+        ttk.Checkbutton(ocr_opts, text="Сохранять debug картинки", variable=debug_images_var).grid(row=5, column=1, sticky="w", padx=5, pady=5)
 
         split_offset_var = tk.DoubleVar(value=0.0)
-        ttk.Label(ocr_opts, text="2 колонки: Авто-разделение").grid(row=5, column=0, sticky="w", padx=10)
-        ttk.Label(ocr_opts, text="Сдвиг разделителя (%):").grid(row=5, column=1, sticky="e")
+        ttk.Label(ocr_opts, text="2 колонки: Авто-разделение").grid(row=6, column=0, sticky="w", padx=10)
+        ttk.Label(ocr_opts, text="Сдвиг разделителя (%):").grid(row=6, column=1, sticky="e")
         split_slider = ttk.Scale(ocr_opts, from_=-20, to=20, orient=tk.HORIZONTAL, variable=split_offset_var)
-        split_slider.grid(row=5, column=2, sticky="we", padx=5)
+        split_slider.grid(row=6, column=2, sticky="we", padx=5)
         split_val_label = ttk.Label(ocr_opts, textvariable=tk.StringVar(value="0"))
-        split_val_label.grid(row=5, column=3, sticky="w")
+        split_val_label.grid(row=6, column=3, sticky="w")
 
         def _update_split_label(*_args):
             split_val_label.config(text=f"{split_offset_var.get():.1f}")
@@ -14088,7 +14261,7 @@ class AnkiApp(tk.Tk):
             return frame, _set_state
 
         action_buttons_frame = ttk.Frame(ocr_opts)
-        action_buttons_frame.grid(row=0, column=4, rowspan=6, padx=10, sticky="ne")
+        action_buttons_frame.grid(row=0, column=4, rowspan=7, padx=10, sticky="ne")
 
         postprocess_button_frame, set_postprocess_enabled = build_coin_action(
             action_buttons_frame,
@@ -14205,6 +14378,7 @@ class AnkiApp(tk.Tk):
                 handle_postprocess_event(("postprocess_error", event[1]))
 
         def run_postprocess():
+            logging.info("Postprocess button pressed")
             if not PIL_AVAILABLE:
                 messagebox.showerror(
                     "Не удалось открыть изображение",
@@ -14432,12 +14606,7 @@ class AnkiApp(tk.Tk):
                 messagebox.showerror("Ошибка OCR", error_text)
 
         def run_ocr(skip_postprocess_prompt: bool = False):
-            if not CV2_AVAILABLE:
-                messagebox.showerror(
-                    "Недоступна обработка изображения",
-                    "Для OCR нужен OpenCV и NumPy.\nУстановите пакеты: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
-                )
-                return
+            logging.info("OCR button pressed")
             if not PIL_AVAILABLE:
                 messagebox.showerror(
                     "Не удалось открыть изображение",
@@ -14448,16 +14617,41 @@ class AnkiApp(tk.Tk):
                 return
             selected_mode = ocr_mode_var.get()
             selected_lang = lang_mode_var.get()
-            if selected_mode == "pro":
-                _ensure_ocr_photo_loaded()
-            if selected_mode == "pro" and not (PADDLE_AVAILABLE and PADDLEOCR_AVAILABLE):
-                messagebox.showinfo(
-                    "PaddleOCR недоступен",
-                    "Установите зависимости внутри venv:\n"
-                    "C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install paddleocr paddlepaddle",
+            selected_engine = ocr_engine_var.get()
+            logging.info(
+                "OCR requested mode=%s engine=%s lang=%s",
+                selected_mode,
+                selected_engine,
+                selected_lang,
+            )
+            if selected_engine == "PaddleOCR" and not CV2_AVAILABLE:
+                messagebox.showerror(
+                    "Недоступна обработка изображения",
+                    "Для PaddleOCR нужен OpenCV и NumPy.\n"
+                    "Установите пакеты: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
                 )
                 return
-            if selected_mode != "pro":
+            if selected_engine == "PaddleOCR":
+                if not is_paddle_available():
+                    messagebox.showinfo(
+                        "PaddleOCR недоступен",
+                        "PaddleOCR недоступен на этой системе (Illegal instruction). "
+                        "Используйте Tesseract/EasyOCR.",
+                    )
+                    return
+                if selected_mode != "pro":
+                    selected_mode = "pro"
+                    ocr_mode_var.set("pro")
+                _ensure_ocr_photo_loaded()
+            elif selected_mode == "pro":
+                selected_mode = "fast"
+                ocr_mode_var.set("fast")
+                messagebox.showinfo(
+                    "Режим PRO",
+                    "PRO режим доступен только для PaddleOCR. Переключено на быстрый режим.",
+                )
+
+            if selected_engine == "Tesseract":
                 if not _ensure_deu_rus_present(selected_lang):
                     return
                 if not _ensure_required_lang_files():
@@ -14499,8 +14693,17 @@ class AnkiApp(tk.Tk):
 
                 try:
                     use_processed = bool(postprocess_state["done"] and processed_image_path)
+                    engine_key = selected_engine.lower()
+                    if engine_key == "paddleocr":
+                        engine_key = "paddle"
+                    elif engine_key == "easyocr":
+                        engine_key = "easyocr"
+                    else:
+                        engine_key = "tesseract"
+
                     options = OcrRunOptions(
                         ocr_mode=selected_mode,
+                        ocr_engine=engine_key,
                         lang_mode=selected_lang,
                         perspective_correction=not use_processed,
                         flatten_background=not use_processed,
@@ -14514,14 +14717,17 @@ class AnkiApp(tk.Tk):
                         prefer_paddle_for_columns=True,
                         preprocess_preset="none" if use_processed else preprocess_preset_var.get(),
                     )
-                    task_obj.queue.put(("log", f"OCR режим: {options.ocr_mode}, lang={options.lang_mode}"))
+                    task_obj.queue.put(
+                        ("log", f"OCR режим: {options.ocr_mode}, движок={options.ocr_engine}, lang={options.lang_mode}")
+                    )
                     src_path = processed_image_path if postprocess_state["done"] and processed_image_path else img_path
                     text = perform_page_ocr(src_path, options, progress_cb)
                     return text
                 except Exception:
                     tb = traceback.format_exc()
                     task_obj.queue.put(("log", tb))
-                    raise RuntimeError(tb)
+                    task_obj.queue.put(("error", tb))
+                    return ""
 
             ocr_task_holder["task"] = start_background_task(worker)
             self.register_bg_handler(ocr_task_holder["task"].queue, handle_ocr_event)
