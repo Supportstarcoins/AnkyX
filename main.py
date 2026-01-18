@@ -235,7 +235,6 @@ from payments import PACKAGES, build_payment_url, verify_payment
 from srs import schedule_review
 from bg_tasks import BackgroundTask, start_background_task
 from ui_progress import BusyDialog, TaskRunner
-from ocr_shared_utils import load_image_for_ocr
 from importers import (
     DEFAULT_CHUNK_CHARS,
     DEFAULT_MAX_PDF_PAGES_SOFT,
@@ -588,6 +587,46 @@ def _format_ocr_diag(
     return "\n\n".join(blocks)
 
 
+def _format_image_diag(image_path: str, img: Image.Image) -> str:
+    exists = os.path.exists(image_path)
+    size = os.path.getsize(image_path) if exists else 0
+    pil_version = _get_pil_version()
+    dimensions = getattr(img, "size", None)
+    width, height = dimensions if dimensions else ("unknown", "unknown")
+    image_format = getattr(img, "_anky_original_format", None) or getattr(img, "format", None) or "unknown"
+    return "\n".join(
+        [
+            f"image_path: {image_path}",
+            f"exists/size bytes: {exists}/{size}",
+            f"dimensions: {width}x{height}",
+            f"PIL version: {pil_version}",
+            f"image format: {image_format}",
+            f"image mode: {getattr(img, 'mode', 'unknown')}",
+        ]
+    )
+
+
+def load_image_for_ocr(path: str) -> Image.Image:
+    if not PIL_AVAILABLE:
+        messagebox.showerror(
+            "Не удалось открыть изображение",
+            "Для загрузки изображений нужен модуль Pillow.\n"
+            "Установите его и повторите попытку: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow",
+        )
+        raise RuntimeError("Pillow недоступен")
+
+    with open(path, "rb") as f:
+        data = f.read()
+
+    img = Image.open(io.BytesIO(data))
+    img._anky_original_format = getattr(img, "format", None) or "unknown"
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    img.load()
+    return img
+
+
 def _get_pil_version() -> str:
     if PIL_AVAILABLE:
         try:
@@ -764,9 +803,9 @@ _PADDLE_SANITY_CACHE = {
 }
 
 
-def get_paddle_sanity_status(force: bool = False) -> dict:
-    if _PADDLE_SANITY_CACHE["checked"] and not force:
-        return dict(_PADDLE_SANITY_CACHE)
+def is_paddle_available() -> bool:
+    if _PADDLE_SANITY_CACHE["checked"]:
+        return bool(_PADDLE_SANITY_CACHE["available"])
 
     script_path = os.path.join(BASE_DIR, "tools", "paddle_sanity_check.py")
     cmd = [sys.executable, "-u", script_path]
@@ -779,7 +818,7 @@ def get_paddle_sanity_status(force: bool = False) -> dict:
         _PADDLE_SANITY_CACHE.update(
             {"checked": True, "available": False, "rc": None, "stdout": "", "stderr": tb}
         )
-        return dict(_PADDLE_SANITY_CACHE)
+        return False
 
     rc = completed.returncode
     stdout = (completed.stdout or "").strip()
@@ -788,11 +827,7 @@ def get_paddle_sanity_status(force: bool = False) -> dict:
         {"checked": True, "available": rc == 0, "rc": rc, "stdout": stdout, "stderr": stderr}
     )
     logging.info("Paddle sanity check rc=%s stdout=%s stderr=%s", rc, stdout, stderr)
-    return dict(_PADDLE_SANITY_CACHE)
-
-
-def is_paddle_available() -> bool:
-    return bool(get_paddle_sanity_status().get("available"))
+    return rc == 0
 
 
 _EASYOCR_AVAILABLE = importlib.util.find_spec("easyocr") is not None
@@ -829,7 +864,7 @@ def _get_easyocr_reader(lang_mode: str):
     return reader
 
 # --------------------------
-# OCR Photo (OpenCV/PaddleOCR) — optional.
+# OCR Photo (OpenCV/PaddleOCR) — optional. Load lazily to avoid startup crashes/spam.
 # --------------------------
 
 # Fallback options container (used even when PaddleOCR is not available)
@@ -839,6 +874,47 @@ class OcrRunOptions:  # noqa: N801
             setattr(self, k, v)
         if not hasattr(self, "ocr_engine"):
             setattr(self, "ocr_engine", "tesseract")
+
+# Lazily populated when/if ocr_photo is successfully imported
+PADDLE_AVAILABLE = False
+PADDLEOCR_AVAILABLE = False
+load_image_any = None  # type: ignore
+ocr_photo_document = None  # type: ignore
+_perform_page_ocr_impl = None  # type: ignore
+
+def _ensure_ocr_photo_loaded() -> bool:
+    """Try to import ocr_photo (and PaddleOCR) only when needed.
+
+    Returns True if import succeeded and PaddleOCR pipeline is available.
+    """
+    global PADDLE_AVAILABLE, PADDLEOCR_AVAILABLE, load_image_any, ocr_photo_document, _perform_page_ocr_impl, OcrRunOptions
+    if _perform_page_ocr_impl is not None:
+        return True
+    if not CV2_AVAILABLE:
+        return False
+    try:
+        from ocr_photo import (
+            OcrRunOptions as _OcrRunOptions,
+            PADDLE_AVAILABLE as _PADDLE_AVAILABLE,
+            PADDLEOCR_AVAILABLE as _PADDLEOCR_AVAILABLE,
+            load_image_any as _load_image_any,
+            ocr_photo_document as _ocr_photo_document,
+            perform_page_ocr as _perform_page_ocr,
+        )
+        OcrRunOptions = _OcrRunOptions  # type: ignore
+        PADDLE_AVAILABLE = bool(_PADDLE_AVAILABLE)
+        PADDLEOCR_AVAILABLE = bool(_PADDLEOCR_AVAILABLE)
+        load_image_any = _load_image_any  # type: ignore
+        ocr_photo_document = _ocr_photo_document  # type: ignore
+        _perform_page_ocr_impl = _perform_page_ocr  # type: ignore
+        return True
+    except Exception:
+        PADDLE_AVAILABLE = False
+        PADDLEOCR_AVAILABLE = False
+        load_image_any = None  # type: ignore
+        ocr_photo_document = None  # type: ignore
+        _perform_page_ocr_impl = None  # type: ignore
+        return False
 
 def _perform_page_ocr_tesseract(img_path: str, options, progress_cb=None) -> str:
     """Fallback OCR using pytesseract (no PaddleOCR).
@@ -969,6 +1045,19 @@ def _perform_page_ocr_easyocr(img_path: str, options, progress_cb=None) -> str:
 def perform_page_ocr(img_path: str, options, progress_cb=None) -> str:
     """Unified entrypoint used by UI: dispatches to selected OCR engine with safe fallbacks."""
     engine = str(getattr(options, "ocr_engine", "tesseract") or "tesseract").lower()
+
+    if engine == "paddle":
+        if not is_paddle_available():
+            logging.warning("PaddleOCR unavailable, falling back to Tesseract.")
+            return _perform_page_ocr_tesseract(img_path, options, progress_cb)
+        if _ensure_ocr_photo_loaded() and _perform_page_ocr_impl is not None:
+            try:
+                return _perform_page_ocr_impl(img_path, options, progress_cb)
+            except Exception:
+                logging.exception("PaddleOCR failed, falling back to Tesseract.")
+                return _perform_page_ocr_tesseract(img_path, options, progress_cb)
+        logging.warning("PaddleOCR module not loaded, falling back to Tesseract.")
+        return _perform_page_ocr_tesseract(img_path, options, progress_cb)
 
     if engine == "easyocr":
         try:
@@ -5906,8 +5995,6 @@ class AnkiApp(tk.Tk):
         self.balance_labels: list[tk.Variable] = []
         self.balance_widgets: list[tk.Label] = []
         self.balance_observers: list[callable] = []
-        self.paddle_ok = False
-        self.paddle_err = ""
         self.credit_icon_image = None
         self.credit_icon_small = None
         self.credit_icon_large = None
@@ -5958,27 +6045,6 @@ class AnkiApp(tk.Tk):
                 "Режим генерации из изображений (OCR) пока недоступен.\n"
                 "Установи Tesseract OCR или пропиши путь."
             )
-
-    def update_paddle_status(self, force: bool = False) -> bool:
-        status = get_paddle_sanity_status(force=force)
-        self.paddle_ok = bool(status.get("available"))
-        if self.paddle_ok:
-            self.paddle_err = ""
-            return True
-        rc = status.get("rc")
-        stdout = status.get("stdout") or ""
-        stderr = status.get("stderr") or ""
-        short = f"PaddleOCR недоступен (rc={rc})."
-        details = "\n".join(
-            [
-                short,
-                f"stdout: {stdout or '—'}",
-                f"stderr: {stderr or '—'}",
-            ]
-        )
-        self.paddle_err = details
-        logging.warning("Paddle sanity check failed: %s", details)
-        return False
 
     def register_bg_handler(self, queue_obj: queue.Queue, handler):
         self._bg_listeners.append((queue_obj, handler))
@@ -13940,8 +14006,7 @@ class AnkiApp(tk.Tk):
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
             return
 
-        paddle_ok = self.update_paddle_status()
-        if not (is_tesseract_available() or is_easyocr_available() or paddle_ok):
+        if not (is_tesseract_available() or is_easyocr_available() or is_paddle_available()):
             messagebox.showerror(
                 "OCR недоступен",
                 "Не найдены доступные OCR движки. Установите Tesseract, EasyOCR или PaddleOCR.",
@@ -13966,7 +14031,13 @@ class AnkiApp(tk.Tk):
         apply_dark_theme_to_window(win, self.palette)
         open_ocr_debug_log()
         logging.info("OCR module opened")
-        paddle_available = paddle_ok
+        paddle_available = is_paddle_available()
+        if not paddle_available:
+            messagebox.showwarning(
+                "PaddleOCR недоступен",
+                "PaddleOCR недоступен на этой системе (Illegal instruction). "
+                "Используйте Tesseract/EasyOCR.",
+            )
         style = ttk.Style(win)
         style.configure(
             "Dark.Vertical.TScrollbar",
@@ -14244,18 +14315,10 @@ class AnkiApp(tk.Tk):
         text_frame = ttk.Frame(ocr_frame)
         text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        txt_ocr = tk.Text(text_frame, height=15, wrap=tk.WORD)
+        txt_ocr = scrolledtext.ScrolledText(text_frame, height=15, wrap=tk.WORD)
         style_text_widget(txt_ocr, self.palette)
         create_context_menu(txt_ocr)
-        ocr_text_scroll = ttk.Scrollbar(
-            text_frame,
-            orient="vertical",
-            command=txt_ocr.yview,
-            style="Dark.Vertical.TScrollbar",
-        )
-        txt_ocr.configure(yscrollcommand=ocr_text_scroll.set)
         txt_ocr.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ocr_text_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         attach_simple_toolbar(ocr_frame, txt_ocr)
 
@@ -14264,32 +14327,6 @@ class AnkiApp(tk.Tk):
             log_text.insert(tk.END, message + "\n")
             log_text.see(tk.END)
             log_text.configure(state=tk.DISABLED)
-
-        if not paddle_available:
-            append_ocr_log(self.paddle_err or "PaddleOCR недоступен.")
-
-        def _report_paddle_unavailable():
-            short_msg = "PaddleOCR недоступен. Используйте Tesseract/EasyOCR."
-            append_ocr_log(self.paddle_err or short_msg)
-            logging.warning(self.paddle_err or short_msg)
-            messagebox.showwarning("PaddleOCR недоступен", short_msg)
-
-        def _reset_from_paddle():
-            ocr_engine_var.set("Tesseract")
-            ocr_mode_var.set("fast")
-
-        def _guard_paddle_mode(*_args):
-            if ocr_mode_var.get() == "pro" and not paddle_available:
-                _report_paddle_unavailable()
-                _reset_from_paddle()
-
-        def _guard_paddle_engine(*_args):
-            if ocr_engine_var.get() == "PaddleOCR" and not paddle_available:
-                _report_paddle_unavailable()
-                _reset_from_paddle()
-
-        ocr_mode_var.trace_add("write", _guard_paddle_mode)
-        ocr_engine_var.trace_add("write", _guard_paddle_engine)
 
         def handle_postprocess_event(event):
             nonlocal processed_image_path
@@ -14334,11 +14371,7 @@ class AnkiApp(tk.Tk):
                 ocr_progress_label.set("Ошибка постобработки")
                 update_pricing_ui()
                 log_ocr_error("PRO постобработка", error_text)
-                append_ocr_log(error_text)
-                messagebox.showerror(
-                    "Ошибка постобработки",
-                    "Постобработка завершилась с ошибкой. Подробности в журнале.",
-                )
+                messagebox.showerror("Ошибка постобработки", error_text)
             elif kind == "done":
                 handle_postprocess_event(("postprocess_done", event[1]))
             elif kind == "error":
@@ -14347,15 +14380,9 @@ class AnkiApp(tk.Tk):
         def run_postprocess():
             logging.info("Postprocess button pressed")
             if not PIL_AVAILABLE:
-                err_text = (
-                    "Для постобработки нужен модуль Pillow.\n"
-                    "Установите его: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow"
-                )
-                logging.error(err_text)
-                append_ocr_log(err_text)
                 messagebox.showerror(
                     "Не удалось открыть изображение",
-                    err_text,
+                    "Для постобработки нужен модуль Pillow.\nУстановите его: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow",
                 )
                 return
             if postprocess_task_holder["task"] is not None:
@@ -14386,150 +14413,107 @@ class AnkiApp(tk.Tk):
 
             def worker(task_obj):
                 step_path = original_image_path
-                stdout_lines = []
-                stderr_lines = []
-                result_payload = None
                 output_path = str(Path(tempfile.gettempdir()) / f"anky_postprocess_{uuid4().hex}_final.png")
-                worker_path = os.path.join(BASE_DIR, "ocr_postprocess_worker.py")
-                cmd = [
-                    sys.executable,
-                    "-u",
-                    worker_path,
-                    "--in",
-                    original_image_path,
-                    "--out",
-                    output_path,
-                    "--preset",
-                    preprocess_preset_var.get(),
-                    "--binarize",
-                    binarize_mode_var.get(),
-                    "--psm",
-                    psm_var.get(),
-                ]
-                logging.info("Start postprocess in=%s out=%s", original_image_path, output_path)
+
+                def emit_progress(step, label, path=None):
+                    nonlocal step_path
+                    if path:
+                        step_path = path
+                    task_obj.queue.put(("postprocess_progress", step, OCR_POSTPROCESS_STEPS, label, step_path))
+
+                def cancel_if_needed():
+                    if task_obj.cancelled():
+                        result = {"done": False, "paid": True, "path": step_path, "cancelled": True}
+                        task_obj.queue.put(("postprocess_done", result))
+                        return result
+                    return None
+
                 try:
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        encoding="utf-8",
-                        bufsize=1,
-                    )
-                except Exception:
-                    tb = traceback.format_exc()
-                    logging.error("Failed to start postprocess worker:\n%s", tb)
-                    task_obj.queue.put(
-                        (
-                            "postprocess_error",
-                            f"Не удалось запустить воркер постобработки.\n\n{tb}\n"
-                            f"Смотрите {CRASH_LOG_PATH} / {FAULT_LOG_PATH}",
-                        )
-                    )
-                    return {"done": False, "paid": True, "path": step_path, "cancelled": False}
+                    emit_progress(1, f"Step 1/{OCR_POSTPROCESS_STEPS}: loading image...", original_image_path)
+                    res = cancel_if_needed()
+                    if res:
+                        return res
 
-                postprocess_proc_holder["proc"] = proc
+                    img = Image.open(original_image_path)
+                    img = ImageOps.exif_transpose(img)
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
 
-                def _read_stderr():
-                    if proc.stderr is None:
-                        return
-                    for line in proc.stderr:
-                        stderr_lines.append(line)
+                    # Step 2: grayscale + autocontrast
+                    gray = ImageOps.grayscale(img)
+                    gray = ImageOps.autocontrast(gray, cutoff=2)
+                    step2_path = str(Path(tempfile.gettempdir()) / f"anky_postprocess_{uuid4().hex}_step2.png")
+                    gray.save(step2_path)
+                    emit_progress(2, f"Step 2/{OCR_POSTPROCESS_STEPS}: grayscale + autocontrast...", step2_path)
+                    res = cancel_if_needed()
+                    if res:
+                        return res
 
-                stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-                stderr_thread.start()
+                    # Step 3: readability enhance
+                    enhanced = ImageEnhance.Contrast(gray).enhance(1.35)
+                    enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.25)
+                    step3_path = str(Path(tempfile.gettempdir()) / f"anky_postprocess_{uuid4().hex}_step3.png")
+                    enhanced.save(step3_path)
+                    emit_progress(3, f"Step 3/{OCR_POSTPROCESS_STEPS}: enhance readability...", step3_path)
+                    res = cancel_if_needed()
+                    if res:
+                        return res
 
-                if proc.stdout is not None:
-                    for line in proc.stdout:
-                        if task_obj.cancelled():
-                            break
-                        stdout_lines.append(line)
-                        payload = None
-                        stripped = line.strip()
-                        if stripped:
-                            try:
-                                payload = json.loads(stripped)
-                            except Exception:
-                                payload = None
-                        if isinstance(payload, dict):
-                            if payload.get("event") == "progress":
-                                step = int(payload.get("step", 0) or 0)
-                                total = int(payload.get("total", OCR_POSTPROCESS_STEPS) or OCR_POSTPROCESS_STEPS)
-                                label = payload.get("label") or f"Этап {step}/{total}"
-                                step_path = payload.get("path") or step_path
-                                task_obj.queue.put(("postprocess_progress", step, total, label, step_path))
-                            elif "ok" in payload:
-                                result_payload = payload
+                    # Step 4: binarize (otsu/none/adaptive)
+                    mode = (binarize_mode_var.get() or "adaptive").lower()
+                    processed = enhanced
+                    if mode != "none":
+                        hist = processed.histogram()[:256]
+                        total = processed.size[0] * processed.size[1]
+                        sum_total = sum(i * hist[i] for i in range(256))
+                        sum_b = 0
+                        w_b = 0
+                        var_max = -1
+                        threshold = 127
+                        for i in range(256):
+                            w_b += hist[i]
+                            if w_b == 0:
+                                continue
+                            w_f = total - w_b
+                            if w_f == 0:
+                                break
+                            sum_b += i * hist[i]
+                            m_b = sum_b / w_b
+                            m_f = (sum_total - sum_b) / w_f
+                            var_between = w_b * w_f * (m_b - m_f) ** 2
+                            if var_between > var_max:
+                                var_max = var_between
+                                threshold = i
+                        processed = processed.point(lambda p, t=threshold: 255 if p > t else 0)
 
-                if task_obj.cancelled():
+                    # Ensure black text on white background (avoid black-page artifacts)
                     try:
-                        proc.terminate()
-                        proc.wait(timeout=5)
+                        hist2 = processed.histogram()
+                        black2 = hist2[0] if hist2 else 0
+                        white2 = hist2[255] if len(hist2) > 255 else 0
+                        if black2 > white2:
+                            processed = ImageOps.invert(processed)
                     except Exception:
                         pass
-                    logging.info("Postprocess cancelled by user")
-                    result = {"done": False, "paid": True, "path": step_path, "cancelled": True}
+
+
+                    step4_path = str(Path(tempfile.gettempdir()) / f"anky_postprocess_{uuid4().hex}_step4.png")
+                    processed.save(step4_path)
+                    emit_progress(4, f"Step 4/{OCR_POSTPROCESS_STEPS}: binarize ({mode})...", step4_path)
+                    res = cancel_if_needed()
+                    if res:
+                        return res
+
+                    # Step 5: final
+                    processed.save(output_path)
+                    emit_progress(5, f"Step 5/{OCR_POSTPROCESS_STEPS}: done", output_path)
+                    result = {"done": True, "paid": True, "path": output_path, "cancelled": False}
                     task_obj.queue.put(("postprocess_done", result))
                     return result
-
-                rc = proc.wait()
-                stderr_thread.join(timeout=1)
-                stderr_text = "".join(stderr_lines)
-                stdout_text = "".join(stdout_lines)
-                logging.info("Postprocess finished rc=%s", rc)
-
-                if rc != 0:
-                    logging.error(
-                        "Postprocess worker failed rc=%s stderr=%s stdout=%s",
-                        rc,
-                        stderr_text,
-                        stdout_text,
-                    )
-                    details = "\n".join(
-                        [
-                            f"Постобработка завершилась аварийно (код {rc}).",
-                            f"stderr: {stderr_text or '—'}",
-                            f"stdout: {stdout_text or '—'}",
-                        ]
-                    )
-                    task_obj.queue.put(("postprocess_error", details))
+                except Exception:
+                    tb = traceback.format_exc()
+                    task_obj.queue.put(("postprocess_error", tb))
                     return {"done": False, "paid": True, "path": step_path, "cancelled": False}
-
-                if not result_payload:
-                    logging.error(
-                        "Postprocess worker returned empty result rc=%s stderr=%s stdout=%s",
-                        rc,
-                        stderr_text,
-                        stdout_text,
-                    )
-                    details = "\n".join(
-                        [
-                            "Постобработка завершилась с ошибкой (нет ответа воркера).",
-                            f"stderr: {stderr_text or '—'}",
-                            f"stdout: {stdout_text or '—'}",
-                        ]
-                    )
-                    task_obj.queue.put(("postprocess_error", details))
-                    return {"done": False, "paid": True, "path": step_path, "cancelled": False}
-
-                if not result_payload.get("ok"):
-                    error_message = result_payload.get("error") or "Неизвестная ошибка постобработки"
-                    trace_text = result_payload.get("trace") or ""
-                    logging.error("Postprocess worker error: %s\n%s", error_message, trace_text)
-                    details = "\n".join(
-                        [
-                            error_message,
-                            f"trace: {trace_text or '—'}",
-                            f"stderr: {stderr_text or '—'}",
-                        ]
-                    )
-                    task_obj.queue.put(("postprocess_error", details))
-                    return {"done": False, "paid": True, "path": step_path, "cancelled": False}
-
-                processed_path = result_payload.get("out_path") or output_path
-                result = {"done": True, "paid": True, "path": processed_path, "cancelled": False}
-                task_obj.queue.put(("postprocess_done", result))
-                return result
 
             postprocess_task_holder["task"] = start_background_task(worker)
             self.register_bg_handler(postprocess_task_holder["task"].queue, handle_postprocess_event)
@@ -14580,24 +14564,14 @@ class AnkiApp(tk.Tk):
                 set_ocr_enabled(True)
                 error_text = str(event[1] or "")
                 log_ocr_error("OCR", error_text)
-                append_ocr_log(error_text)
-                messagebox.showerror(
-                    "Ошибка OCR",
-                    "OCR завершился с ошибкой. Подробности в журнале.",
-                )
+                messagebox.showerror("Ошибка OCR", error_text)
 
         def run_ocr(skip_postprocess_prompt: bool = False):
             logging.info("OCR button pressed")
             if not PIL_AVAILABLE:
-                err_text = (
-                    "Для OCR нужен модуль Pillow.\n"
-                    "Установите его: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow"
-                )
-                logging.error(err_text)
-                append_ocr_log(err_text)
                 messagebox.showerror(
                     "Не удалось открыть изображение",
-                    err_text,
+                    "Для OCR нужен модуль Pillow.\nУстановите его: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install pillow",
                 )
                 return
             if ocr_task_holder["task"] is not None:
@@ -14611,23 +14585,25 @@ class AnkiApp(tk.Tk):
                 selected_engine,
                 selected_lang,
             )
+            if selected_engine == "PaddleOCR" and not CV2_AVAILABLE:
+                messagebox.showerror(
+                    "Недоступна обработка изображения",
+                    "Для PaddleOCR нужен OpenCV и NumPy.\n"
+                    "Установите пакеты: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy",
+                )
+                return
             if selected_engine == "PaddleOCR":
-                if not paddle_available:
-                    _report_paddle_unavailable()
-                    _reset_from_paddle()
-                    return
-                if not (CV2_AVAILABLE and NUMPY_AVAILABLE):
-                    err_text = (
-                        "Для PaddleOCR нужен OpenCV и NumPy.\n"
-                        "Установите пакеты: C:\\AnkyX-main\\venv\\Scripts\\python.exe -m pip install opencv-python numpy"
-                    )
-                    logging.error(err_text)
-                    append_ocr_log(err_text)
-                    messagebox.showerror(
-                        "Недоступна обработка изображения",
-                        err_text,
+                if not is_paddle_available():
+                    messagebox.showinfo(
+                        "PaddleOCR недоступен",
+                        "PaddleOCR недоступен на этой системе (Illegal instruction). "
+                        "Используйте Tesseract/EasyOCR.",
                     )
                     return
+                if selected_mode != "pro":
+                    selected_mode = "pro"
+                    ocr_mode_var.set("pro")
+                _ensure_ocr_photo_loaded()
             elif selected_mode == "pro":
                 selected_mode = "fast"
                 ocr_mode_var.set("fast")
@@ -14638,10 +14614,8 @@ class AnkiApp(tk.Tk):
 
             if selected_engine == "Tesseract":
                 if not _ensure_deu_rus_present(selected_lang):
-                    append_ocr_log("Не найдены языковые файлы Tesseract для OCR.")
                     return
                 if not _ensure_required_lang_files():
-                    append_ocr_log("Не найдены файлы языков Tesseract.")
                     return
             if use_postprocess_var.get() and not postprocess_state["done"] and not skip_postprocess_prompt:
                 if messagebox.askyesno(
@@ -14680,130 +14654,10 @@ class AnkiApp(tk.Tk):
 
                 try:
                     use_processed = bool(postprocess_state["done"] and processed_image_path)
-                    src_path = processed_image_path if postprocess_state["done"] and processed_image_path else img_path
-
-                    if selected_engine == "PaddleOCR":
-                        stdout_lines: list[str] = []
-                        stderr_lines: list[str] = []
-                        result_payload = None
-                        worker_path = os.path.join(BASE_DIR, "tools", "ocr_pro_worker.py")
-                        cmd = [
-                            sys.executable,
-                            "-u",
-                            worker_path,
-                            "--image",
-                            src_path,
-                            "--ocr-mode",
-                            selected_mode,
-                            "--lang-mode",
-                            selected_lang,
-                            "--binarize",
-                            binarize_mode_var.get(),
-                            "--psm",
-                            psm_var.get(),
-                            "--split-offset",
-                            str(split_offset_var.get()),
-                            "--preprocess-preset",
-                            "none" if use_processed else preprocess_preset_var.get(),
-                        ]
-                        if debug_images_var.get():
-                            cmd.append("--debug-images")
-                        if dictionary_mode_var.get():
-                            cmd.append("--dictionary-mode")
-                        logging.info("Start OCR PRO worker: %s", cmd)
-                        try:
-                            proc = subprocess.Popen(
-                                cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                encoding="utf-8",
-                                bufsize=1,
-                            )
-                        except Exception:
-                            tb = traceback.format_exc()
-                            task_obj.queue.put(("log", tb))
-                            task_obj.queue.put(("error", "Не удалось запустить OCR PRO воркер."))
-                            return ""
-
-                        def _read_stderr():
-                            if proc.stderr is None:
-                                return
-                            for line in proc.stderr:
-                                stderr_lines.append(line)
-
-                        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-                        stderr_thread.start()
-
-                        if proc.stdout is not None:
-                            for line in proc.stdout:
-                                stdout_lines.append(line)
-                                stripped = line.strip()
-                                if not stripped:
-                                    continue
-                                try:
-                                    payload = json.loads(stripped)
-                                except Exception:
-                                    payload = None
-                                if isinstance(payload, dict):
-                                    if payload.get("event") == "progress":
-                                        step = int(payload.get("step", 0) or 0)
-                                        total = int(payload.get("total", 1) or 1)
-                                        label = payload.get("label") or ""
-                                        task_obj.queue.put(("ocr_progress", step, total, label))
-                                    elif payload.get("event") == "log":
-                                        task_obj.queue.put(("log", payload.get("message") or ""))
-                                    elif "ok" in payload:
-                                        result_payload = payload
-
-                        rc = proc.wait()
-                        stderr_thread.join(timeout=1)
-                        stderr_text = "".join(stderr_lines).strip()
-                        stdout_text = "".join(stdout_lines).strip()
-                        logging.info("OCR PRO worker finished rc=%s", rc)
-
-                        if rc != 0:
-                            details = "\n".join(
-                                [
-                                    f"OCR PRO завершился с ошибкой (rc={rc}).",
-                                    f"stderr: {stderr_text or '—'}",
-                                    f"stdout: {stdout_text or '—'}",
-                                ]
-                            )
-                            task_obj.queue.put(("log", details))
-                            task_obj.queue.put(("error", "OCR PRO завершился с ошибкой."))
-                            return ""
-
-                        if not result_payload:
-                            details = "\n".join(
-                                [
-                                    "OCR PRO не вернул ответ.",
-                                    f"stderr: {stderr_text or '—'}",
-                                    f"stdout: {stdout_text or '—'}",
-                                ]
-                            )
-                            task_obj.queue.put(("log", details))
-                            task_obj.queue.put(("error", "OCR PRO завершился с ошибкой."))
-                            return ""
-
-                        if not result_payload.get("ok"):
-                            error_message = result_payload.get("error") or "Ошибка OCR PRO"
-                            trace_text = result_payload.get("trace") or ""
-                            details = "\n".join(
-                                [
-                                    error_message,
-                                    f"trace: {trace_text or '—'}",
-                                    f"stderr: {stderr_text or '—'}",
-                                ]
-                            )
-                            task_obj.queue.put(("log", details))
-                            task_obj.queue.put(("error", error_message))
-                            return ""
-
-                        return result_payload.get("text") or ""
-
                     engine_key = selected_engine.lower()
-                    if engine_key == "easyocr":
+                    if engine_key == "paddleocr":
+                        engine_key = "paddle"
+                    elif engine_key == "easyocr":
                         engine_key = "easyocr"
                     else:
                         engine_key = "tesseract"
@@ -14827,12 +14681,13 @@ class AnkiApp(tk.Tk):
                     task_obj.queue.put(
                         ("log", f"OCR режим: {options.ocr_mode}, движок={options.ocr_engine}, lang={options.lang_mode}")
                     )
+                    src_path = processed_image_path if postprocess_state["done"] and processed_image_path else img_path
                     text = perform_page_ocr(src_path, options, progress_cb)
                     return text
                 except Exception:
                     tb = traceback.format_exc()
                     task_obj.queue.put(("log", tb))
-                    task_obj.queue.put(("error", "OCR завершился с ошибкой."))
+                    task_obj.queue.put(("error", tb))
                     return ""
 
             ocr_task_holder["task"] = start_background_task(worker)
@@ -14905,16 +14760,16 @@ class AnkiApp(tk.Tk):
             text="Переменные: {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
         ).pack(anchor="w", padx=10, pady=(0, 5))
 
-        lang_mode_var = tk.StringVar(value="foreign")
+        cards_lang_mode_var = tk.StringVar(value="foreign")
         sentence_limit_var = tk.StringVar(value="Лимит предложений на карточку: 1")
 
         def update_sentence_limit(*_args):
-            if lang_mode_var.get() == "native":
+            if cards_lang_mode_var.get() == "native":
                 sentence_limit_var.set("Лимит предложений на карточку: 10")
             else:
                 sentence_limit_var.set("Лимит предложений на карточку: 1")
 
-        lang_mode_var.trace_add("write", update_sentence_limit)
+        cards_lang_mode_var.trace_add("write", update_sentence_limit)
         update_sentence_limit()
 
         progress_frame = ttk.LabelFrame(main_frame, text="Прогресс генерации карточек (пакет 25)")
@@ -14957,7 +14812,7 @@ class AnkiApp(tk.Tk):
         video_insufficient_var = tk.StringVar(value="")
 
         def get_sentence_limit_value() -> int:
-            return 10 if lang_mode_var.get() == "native" else 1
+            return 10 if cards_lang_mode_var.get() == "native" else 1
 
         def get_remaining_sentences(text: str) -> list[str]:
             sentences = split_ocr_text_into_sentences(text)
@@ -15017,7 +14872,7 @@ class AnkiApp(tk.Tk):
                     "operation": "ocr_cards_gen",
                     "pack_size": CARDS_GEN_PACK_SIZE,
                     "language": ocr_lang_var.get(),
-                    "language_mode": lang_mode_var.get(),
+                    "language_mode": cards_lang_mode_var.get(),
                     "plan": self.get_pricing_plan(),
                 },
             ):
@@ -15087,7 +14942,7 @@ class AnkiApp(tk.Tk):
                     text,
                     front_t,
                     back_t,
-                    lang_mode_var.get(),
+                    cards_lang_mode_var.get(),
                     progress_queue=task_obj.queue,
                     cancel_check=task_obj.cancelled,
                     max_cards=CARDS_GEN_PACK_SIZE,
@@ -15128,8 +14983,6 @@ class AnkiApp(tk.Tk):
                     done, total, label = event[1:]
                     media_progress_var.set(done)
                     media_progress_label_var.set(f"{label}: {done}/{total}")
-                elif kind == "log":
-                    append_log(event[1])
                 elif kind == "done":
                     if image_task_holder["task"]:
                         self.unregister_bg_handler(image_task_holder["task"].queue)
@@ -15166,7 +15019,6 @@ class AnkiApp(tk.Tk):
                             pass
                     image_state["processed"].add(card_id)
                     done += 1
-                    task_obj.queue.put(("log", f"TODO generate image for card_id={card_id}"))
                     task_obj.queue.put(("progress", done, max(total, 1), "Картинки"))
                 return done
 
@@ -15355,35 +15207,19 @@ class AnkiApp(tk.Tk):
 
         mode_frame = ttk.LabelFrame(right_actions, text="Режим генерации")
         mode_frame.pack(anchor="e", padx=5, pady=(0, 6), fill=tk.X)
-        mode_options = {
-            "Иностранный язык": "foreign",
-            "Родной язык": "native",
-        }
-        lang_mode_display_var = tk.StringVar(value="Иностранный язык")
-
-        def _sync_lang_mode(*_args):
-            lang_mode_var.set(mode_options.get(lang_mode_display_var.get(), "foreign"))
-
-        lang_mode_display_var.trace_add("write", _sync_lang_mode)
-        ttk.Label(mode_frame, text="Режим:").pack(anchor="w", padx=6, pady=(4, 0))
-        ttk.Combobox(
+        ttk.Radiobutton(
             mode_frame,
-            textvariable=lang_mode_display_var,
-            values=tuple(mode_options.keys()),
-            state="readonly",
-            width=20,
+            text="Иностранный язык",
+            variable=cards_lang_mode_var,
+            value="foreign",
+        ).pack(anchor="w", padx=6, pady=(4, 0))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Родной язык",
+            variable=cards_lang_mode_var,
+            value="native",
         ).pack(anchor="w", padx=6)
         ttk.Label(mode_frame, textvariable=sentence_limit_var).pack(anchor="w", padx=6, pady=(0, 4))
-
-        cards_price_frame = ttk.Frame(right_actions)
-        cards_price_frame.pack(anchor="e", padx=5, pady=(0, 2))
-        cards_price_icon = ttk.Label(cards_price_frame, image=coin_icon)
-        cards_price_icon.pack(side=tk.LEFT, padx=(0, 6))
-        cards_price_icon.image = coin_icon
-        ttk.Label(
-            cards_price_frame,
-            text="PRO: 1 кредит • без PRO: 5 кредитов",
-        ).pack(side=tk.LEFT)
 
         cards_generate_btn = tk.Button(
             right_actions,
@@ -15415,7 +15251,7 @@ class AnkiApp(tk.Tk):
         ttk.Button(right_actions, text="Предпросмотр карточек", command=open_cards_preview)\
             .pack(anchor="e", padx=5, pady=(6, 2))
 
-        ttk.Button(right_actions, text="Сгенерировать картинки (заглушка)", command=generate_placeholder_images)\
+        ttk.Button(right_actions, text="Сгенерировать картинки", command=generate_placeholder_images)\
             .pack(anchor="e", padx=5, pady=(6, 2))
 
         btn_image_cancel = ttk.Button(right_actions, text="Остановить картинки", command=cancel_image_generation)
