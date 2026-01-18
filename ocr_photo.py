@@ -36,8 +36,8 @@ import pytesseract
 import tkinter as tk
 from tkinter import messagebox
 
+from ocr_shared_utils import _format_image_diag, load_image_for_ocr
 from tesseract_setup import get_tesseract_diag, to_short_path
-from main import load_image_for_ocr, _format_image_diag
 
 ProgressCallback = Callable[[int, int, str], None]
 
