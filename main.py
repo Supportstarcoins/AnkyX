@@ -1175,6 +1175,27 @@ def ensure_media_dir() -> str:
     return MEDIA_FOLDER
 
 
+def generate_sd_image_placeholder(prompt: str, out_path: str | None = None) -> str | None:
+    ensure_media_dir()
+    target_path = out_path or os.path.join(MEDIA_FOLDER, f"sd_placeholder_{uuid4().hex}.png")
+    if not PIL_AVAILABLE:
+        try:
+            with open(target_path, "wb") as handle:
+                handle.write(b"")
+        except Exception:
+            return None
+        return target_path
+    img = Image.new("RGB", (640, 360), color="#E0E7FF")
+    draw = ImageDraw.Draw(img)
+    text = "Stable Diffusion placeholder\n\n" + (prompt[:140] + "…" if len(prompt) > 140 else prompt)
+    draw.text((20, 20), text, fill="#111827")
+    try:
+        img.save(target_path, format="PNG")
+    except Exception:
+        return None
+    return target_path
+
+
 def resolve_media_path(path: str | None) -> str | None:
     if not path:
         return None
@@ -3601,8 +3622,26 @@ def extract_words_from_text(text: str) -> list:
     return [normalize_word(m.group(0)) for m in WORD_RE.finditer(text)]
 
 
+def auto_punctuate(text: str) -> str:
+    if not text:
+        return ""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized.split("\n")]
+    cleaned_lines: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        line = re.sub(r"\s+", " ", line)
+        if line and line[0].isalpha():
+            line = line[0].upper() + line[1:]
+        if not re.search(r"[.!?]$", line):
+            line += "."
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
+
+
 def split_into_sentences(text: str) -> list:
-    parts = re.split(r'(?<=[.!?])\s+', text)
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
     return [p.strip() for p in parts if p.strip()]
 
 
@@ -3664,6 +3703,42 @@ def get_repeated_word_flag(word: str) -> str:
 
 def is_repeated_word(word: str) -> bool:
     return get_repeated_word_flag(word) == "повторено"
+
+
+def is_word_repeated(word: str) -> bool:
+    return is_repeated_word(word)
+
+
+def calc_digital_ear_cost(sentences: list[str], plan: str) -> tuple[int, list[int], dict]:
+    plan_key = "pro" if plan in ("pro", "premium") else "free"
+    if plan_key == "pro":
+        base_cost = 2
+        new_word_cost = 1
+    else:
+        base_cost = 6
+        new_word_cost = 4
+    per_card_costs: list[int] = []
+    meta_cards: list[dict] = []
+    for sentence in sentences:
+        words = extract_words_from_text(sentence)
+        has_new_word = any(not is_word_repeated(w) for w in words) if words else False
+        card_cost = new_word_cost if has_new_word else base_cost
+        per_card_costs.append(card_cost)
+        meta_cards.append(
+            {
+                "sentence": sentence,
+                "has_new_word": has_new_word,
+                "cost": card_cost,
+            }
+        )
+    total_cost = int(sum(per_card_costs))
+    meta = {
+        "plan": plan_key,
+        "total_cards": len(sentences),
+        "per_card": meta_cards,
+        "pricing": {"base": base_cost, "new_word": new_word_cost},
+    }
+    return total_cost, per_card_costs, meta
 
 
 def mask_text_by_repeated_words(text: str) -> tuple[str, list[str]]:
@@ -4503,6 +4578,39 @@ def auto_generate_cards_from_image(deck_id: int,
         audio_path=None,
         image_spend_cb=image_spend_cb,
     )
+
+
+def record_speech_to_text(
+    duration_sec: int,
+    mic_index: int | None,
+    progress_queue: queue.Queue | None = None,
+    cancel_check=None,
+) -> tuple[str, str | None]:
+    if not SR_AVAILABLE:
+        raise RuntimeError("SpeechRecognition не установлен.")
+    if duration_sec <= 0:
+        raise ValueError("duration_sec must be > 0")
+    r = sr.Recognizer()
+    source = sr.Microphone(device_index=mic_index) if mic_index is not None else sr.Microphone()
+    if progress_queue is not None:
+        progress_queue.put(("progress", 0, max(duration_sec, 1), "Запись"))
+    with source as s:
+        r.adjust_for_ambient_noise(s, duration=0.5)
+        audio = r.record(s, duration=duration_sec)
+    if cancel_check and cancel_check():
+        return "", None
+    os.makedirs("recordings", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    audio_path = os.path.join("recordings", f"speech_{ts}.wav")
+    with open(audio_path, "wb") as f:
+        f.write(audio.get_wav_data())
+    if progress_queue is not None:
+        progress_queue.put(("progress", duration_sec, max(duration_sec, 1), "Распознавание"))
+    try:
+        text = r.recognize_google(audio, language="de-DE")
+    except Exception as e:
+        raise RuntimeError(f"Не удалось распознать речь: {e}")
+    return text, audio_path
 
 
 def auto_generate_cards_from_speech(deck_id: int,
@@ -6003,6 +6111,7 @@ class AnkiApp(tk.Tk):
         self.generation_drawer = None
         self.generation_drawer_buttons: dict[str, tk.Widget] = {}
         self.generation_drawer_coin_icon = None
+        self.pending_invoice = None
         self.hamburger_button = None
         self.mode_actions: dict[str, callable] = {}
         self.menubar: tk.Menu | None = None
@@ -15282,201 +15391,376 @@ class AnkiApp(tk.Tk):
         win.protocol("WM_DELETE_WINDOW", on_close)
 
     # --------- генерация через цифровой слух ---------
-
+    # PATCH: digital-ear STT -> auto punctuation -> 1 sentence per card -> preview+invoice -> paid generate with SD placeholder; plan-based pricing
     def open_generate_from_speech_window(self):
         if self.selected_deck_id is None:
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
             return
-        if not SR_AVAILABLE:
-            messagebox.showerror(
-                "Речь недоступна",
-                "Чтобы записывать речь, установите SpeechRecognition и PyAudio:\n"
-                "pip install SpeechRecognition pyaudio"
-            )
-            return
 
         win = tk.Toplevel(self)
-        win.title("Авто-генерация через цифровой слух")
-        win.geometry("520x500")
+        win.title("Цифровой слух")
+        win.geometry("820x720")
         win.grab_set()
         apply_dark_theme_to_window(win, self.palette)
 
-        ttk.Label(win, text="Длительность записи (сек):").pack(anchor="w", padx=10, pady=(10, 0))
-        entry_dur = ttk.Entry(win)
+        main_frame = ttk.Frame(win, style="Surface.TFrame")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        ttk.Label(
+            main_frame,
+            text="Цифровой слух: запись → автопунктуация → предпросмотр → оплата → карточки",
+            style="Section.TLabel",
+            wraplength=760,
+        ).pack(anchor="w", pady=(0, 8))
+
+        record_frame = ttk.LabelFrame(main_frame, text="Запись", style="Card.TLabelframe")
+        record_frame.pack(fill=tk.X, pady=(0, 10))
+        style_card(record_frame, self.palette, padded=True)
+
+        dur_row = ttk.Frame(record_frame)
+        dur_row.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Label(dur_row, text="Длительность записи (сек):").pack(side=tk.LEFT)
+        entry_dur = ttk.Entry(dur_row, width=10)
         entry_dur.insert(0, "10")
-        entry_dur.pack(fill=tk.X, padx=10)
-        create_context_menu(entry_dur)  # Добавляем контекстное меню
+        entry_dur.pack(side=tk.LEFT, padx=(8, 0))
+        create_context_menu(entry_dur)
 
         current_mic_text = (
             f"Текущее устройство: index={self.microphone_index}"
-            if self.microphone_index is not None else
-            "Текущее устройство: по умолчанию системы"
+            if self.microphone_index is not None
+            else "Текущее устройство: по умолчанию системы"
         )
-        ttk.Label(win, text=current_mic_text).pack(anchor="w", padx=10, pady=(5, 0))
+        ttk.Label(record_frame, text=current_mic_text).pack(anchor="w", padx=6, pady=(0, 6))
 
-        frame_opts = ttk.LabelFrame(win, text="Настройки шаблонов и разбиения текста")
-        frame_opts.pack(fill=tk.X, padx=10, pady=10)
+        record_status_var = tk.StringVar(value="")
+        ttk.Label(record_frame, textvariable=record_status_var, style="Muted.TLabel").pack(
+            anchor="w", padx=6, pady=(0, 6)
+        )
 
-        use_ai_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            frame_opts,
-            text="Генерировать картинку для каждой новой карточки (OpenAI)",
-            variable=use_ai_var
-        ).pack(anchor="w")
+        record_btn = ttk.Button(record_frame, text="Записать")
+        record_btn.pack(anchor="w", padx=6, pady=(0, 6))
 
-        ttk.Label(
-            frame_opts,
-            text="Как делить распознанный длинный текст:"
-        ).pack(anchor="w", padx=5, pady=(5, 0))
-        split_mode_var = tk.StringVar(value="sentence")
-        ttk.Radiobutton(
-            frame_opts,
-            text="1 предложение = 1 карточка",
-            variable=split_mode_var,
-            value="sentence"
-        ).pack(anchor="w", padx=15)
-        ttk.Radiobutton(
-            frame_opts,
-            text="Отдельные слова (новое слово = карточка)",
-            variable=split_mode_var,
-            value="word"
-        ).pack(anchor="w", padx=15)
+        text_frame = ttk.LabelFrame(main_frame, text="Текст", style="Card.TLabelframe")
+        text_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        style_card(text_frame, self.palette, padded=True)
 
-        ttk.Label(frame_opts, text="Шаблон FRONT:").pack(anchor="w", padx=5)
-        entry_front = tk.Text(frame_opts, height=2)
-        style_text_widget(entry_front, self.palette)
-        entry_front.pack(fill=tk.X, padx=5)
-        entry_front.insert("1.0", self.front_template)
-        create_context_menu(entry_front)  # Добавляем контекстное меню
+        text_box = scrolledtext.ScrolledText(text_frame, height=10)
+        style_text_widget(text_box, self.palette)
+        text_box.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        create_context_menu(text_box)
 
-        ttk.Label(frame_opts, text="Шаблон BACK:").pack(anchor="w", padx=5, pady=(5, 0))
-        entry_back = tk.Text(frame_opts, height=2)
-        style_text_widget(entry_back, self.palette)
-        entry_back.pack(fill=tk.X, padx=5)
-        entry_back.insert("1.0", self.back_template)
-        create_context_menu(entry_back)  # Добавляем контекстное меню
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Label(
-            frame_opts,
-            text="Переменные: {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
-        ).pack(anchor="w", padx=5, pady=(5, 0))
+        preview_btn = ttk.Button(action_frame, text="Подготовить карточки", width=24)
+        preview_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        progress_frame = ttk.LabelFrame(win, text="Прогресс")
-        progress_frame.pack(fill=tk.X, padx=10, pady=5)
-        progress_var = tk.DoubleVar(value=0)
-        progress_label_var = tk.StringVar(value="0/0")
-        status_var = tk.StringVar(value="")
-        progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=1)
-        progress_bar.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(progress_frame, textvariable=progress_label_var).pack(anchor="w", padx=5)
-        lbl_status = ttk.Label(progress_frame, textvariable=status_var)
-        lbl_status.pack(anchor="w", padx=5, pady=(0, 5))
+        coin_icon, coin_icon_disabled = self._load_credit_icon_pair(size=32)
+        invoice_total_var = tk.StringVar(value="0")
+        insufficient_var = tk.StringVar(value="")
 
-        dur = 0
+        invoice_frame = ttk.Frame(action_frame)
+        invoice_frame.pack(side=tk.LEFT, padx=(10, 6))
+        ttk.Label(invoice_frame, text="Счет:").pack(side=tk.LEFT, padx=(0, 6))
+        if coin_icon:
+            coin_label = tk.Label(invoice_frame, image=coin_icon)
+            coin_label.image = coin_icon
+            coin_label.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(invoice_frame, textvariable=invoice_total_var).pack(side=tk.LEFT)
 
-        task_holder = {"task": None}
+        generate_btn = tk.Button(
+            action_frame,
+            text="Сгенерировать — Итого: 0",
+            image=coin_icon,
+            compound=tk.LEFT,
+            padx=10,
+            pady=6,
+        )
+        generate_btn.pack(side=tk.RIGHT)
+        generate_btn.image = coin_icon
 
-        def handle_event(event):
+        ttk.Label(main_frame, textvariable=insufficient_var, foreground="red").pack(anchor="e")
+
+        self.pending_invoice = None
+        record_task_holder = {"task": None}
+
+        def update_generate_button_state():
+            invoice = self.pending_invoice
+            if not invoice:
+                invoice_total_var.set("0")
+                generate_btn.configure(state=tk.DISABLED, text="Сгенерировать — Итого: 0")
+                if coin_icon_disabled or coin_icon:
+                    generate_btn.configure(image=coin_icon_disabled or coin_icon)
+                    generate_btn.image = coin_icon_disabled or coin_icon
+                insufficient_var.set("")
+                return
+            total = int(invoice.get("total") or 0)
+            invoice_total_var.set(str(total))
+            generate_btn.configure(text=f"Сгенерировать — Итого: {total}")
+            if self.can_afford(total):
+                generate_btn.configure(state=tk.NORMAL, image=coin_icon or coin_icon_disabled)
+                generate_btn.image = coin_icon or coin_icon_disabled
+                insufficient_var.set("")
+            else:
+                generate_btn.configure(state=tk.DISABLED, image=coin_icon_disabled or coin_icon)
+                generate_btn.image = coin_icon_disabled or coin_icon
+                insufficient_var.set("Недостаточно кредитов для генерации")
+
+        def record_worker(task_obj):
+            try:
+                duration = int(entry_dur.get().strip() or "0")
+            except ValueError:
+                raise ValueError("Длительность должна быть целым числом секунд.")
+            if duration <= 0:
+                raise ValueError("Длительность должна быть > 0.")
+            return record_speech_to_text(
+                duration,
+                self.microphone_index,
+                progress_queue=task_obj.queue,
+                cancel_check=task_obj.cancelled,
+            )
+
+        def handle_record_event(event):
             kind = event[0]
             if kind == "progress":
                 done, total, label = event[1:]
-                progress_bar.config(maximum=max(total, 1))
-                progress_var.set(done)
-                progress_label_var.set(f"{int(done)}/{total}")
-                status_var.set(label)
-            elif kind == "log":
-                status_var.set(event[1])
-            elif kind == "done":
-                created = event[1] or 0
-                self.unregister_bg_handler(task_holder["task"].queue)
-                task_holder["task"] = None
-                btn_rec.config(state=tk.NORMAL)
-                btn_cancel.config(state=tk.DISABLED)
-                status_var.set("Готово")
-                if created == 0:
-                    messagebox.showinfo("Результат", "Новых слов/предложений не найдено.")
+                record_status_var.set(f"{label}: {int(done)}/{max(total, 1)}")
+                return
+            if kind == "done":
+                result = event[1]
+                task_obj = record_task_holder.get("task")
+                if task_obj:
+                    self.unregister_bg_handler(task_obj.queue)
+                record_task_holder["task"] = None
+                record_btn.config(state=tk.NORMAL)
+                if isinstance(result, tuple):
+                    raw_text = result[0] or ""
                 else:
-                    messagebox.showinfo("Результат", f"Создано карточек (включая синонимы/примеры): {created}")
-                win.destroy()
-            elif kind == "error":
-                self.unregister_bg_handler(task_holder["task"].queue)
-                task_holder["task"] = None
-                btn_rec.config(state=tk.NORMAL)
-                btn_cancel.config(state=tk.DISABLED)
-                status_var.set("")
-                messagebox.showerror("Ошибка", event[1])
-
-        def run_generation_thread():
-            nonlocal dur
-            use_ai_images = use_ai_var.get()
-            front_t = entry_front.get("1.0", tk.END).strip() or DEFAULT_FRONT_TEMPLATE
-            back_t = entry_back.get("1.0", tk.END).strip() or DEFAULT_BACK_TEMPLATE
-            self.front_template = front_t
-            self.back_template = back_t
-            if self.selected_deck_id is not None:
-                save_deck_templates(self.selected_deck_id, front_t, back_t)
-            api_key = OPENAI_API_KEY if OPENAI_API_KEY else None
-            one_sent = (split_mode_var.get() == "sentence")
-
-            def worker(task_obj):
-                return auto_generate_cards_from_speech(
-                    self.selected_deck_id, dur,
-                    use_ai_images, api_key,
-                    front_t, back_t,
-                    self.microphone_index,
-                    one_sentence_one_card=one_sent,
-                    progress_queue=task_obj.queue,
-                    cancel_check=task_obj.cancelled,
-                    image_spend_cb=self._spend_for_ai_image,
-                )
-
-            progress_var.set(0)
-            progress_label_var.set("0/0")
-            status_var.set("Запись…")
-            btn_rec.config(state=tk.DISABLED)
-            btn_cancel.config(state=tk.NORMAL)
-            task_holder["task"] = start_background_task(worker)
-            self.register_bg_handler(task_holder["task"].queue, handle_event)
+                    raw_text = str(result or "")
+                punct = auto_punctuate(raw_text)
+                if punct:
+                    text_box.delete("1.0", tk.END)
+                    text_box.insert("1.0", punct)
+                    record_status_var.set("Речь распознана и добавлена в текст.")
+                else:
+                    record_status_var.set("Распознано пусто.")
+                return
+            if kind == "error":
+                task_obj = record_task_holder.get("task")
+                if task_obj:
+                    self.unregister_bg_handler(task_obj.queue)
+                record_task_holder["task"] = None
+                record_btn.config(state=tk.NORMAL)
+                record_status_var.set("")
+                messagebox.showerror("Ошибка записи", event[1])
+                return
 
         def start_record():
-            nonlocal dur
+            if not SR_AVAILABLE:
+                messagebox.showerror(
+                    "Речь недоступна",
+                    "Чтобы записывать речь, установите SpeechRecognition и PyAudio:\n"
+                    "pip install SpeechRecognition pyaudio",
+                )
+                return
+            if record_task_holder["task"] is not None:
+                return
+            record_status_var.set("Запись…")
+            record_btn.config(state=tk.DISABLED)
+            task_obj = start_background_task(record_worker)
+            record_task_holder["task"] = task_obj
+            self.register_bg_handler(task_obj.queue, handle_record_event)
+
+        def build_preview_cards(sentences: list[str]) -> list[dict]:
+            preview_cards: list[dict] = []
+            for sentence in sentences:
+                placeholder_path = generate_sd_image_placeholder(sentence, None) or ""
+                preview_cards.append(
+                    {
+                        "front": sentence,
+                        "back": "",
+                        "front_rich": {"text": sentence, "tags": []},
+                        "back_rich": {"text": "", "tags": []},
+                        "front_image_path": placeholder_path,
+                        "back_image_path": "",
+                        "audio_path": None,
+                    }
+                )
+            return preview_cards
+
+        def open_cards_preview(cards: list[dict]) -> None:
+            if not cards:
+                messagebox.showwarning("Предпросмотр", "Нет карточек для предпросмотра.")
+                return
+            preview_win = tk.Toplevel(win)
+            preview_win.title("Предпросмотр карточек")
+            preview_win.geometry("980x680")
+            preview_win.grab_set()
+            apply_dark_theme_to_window(preview_win, self.palette)
+
+            preview_state = {"index": 0, "side": "front"}
+            container = tk.Frame(preview_win, bg=DARK_BG)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            nav_frame = tk.Frame(container, bg=DARK_BG)
+            nav_frame.pack(fill=tk.X, pady=(0, 8))
+            idx_var = tk.StringVar(value="1/1")
+
+            def update_index_label():
+                idx_var.set(f"{preview_state['index'] + 1}/{len(cards)}")
+
+            ttk.Label(nav_frame, textvariable=idx_var).pack(side=tk.LEFT, padx=(0, 12))
+            ttk.Button(nav_frame, text="Лицевая", command=lambda: set_side("front")).pack(
+                side=tk.LEFT, padx=4
+            )
+            ttk.Button(nav_frame, text="Обратная", command=lambda: set_side("back")).pack(
+                side=tk.LEFT, padx=4
+            )
+            ttk.Button(nav_frame, text="Назад", command=lambda: move_index(-1)).pack(side=tk.LEFT, padx=4)
+            ttk.Button(nav_frame, text="Вперед", command=lambda: move_index(1)).pack(side=tk.LEFT, padx=4)
+
+            card_wrap = tk.Frame(
+                container,
+                bg=DARK_BG,
+                highlightbackground=CARD_BORDER,
+                highlightthickness=1,
+                bd=0,
+                width=CARD_VIEW_WIDTH,
+                height=CARD_VIEW_HEIGHT,
+            )
+            card_wrap.pack(padx=10, pady=10)
+            card_wrap.pack_propagate(False)
+            renderer = CardRenderer(
+                card_wrap,
+                palette=self.palette,
+                editable=False,
+                show_image_toolbar=False,
+                image_layout="side",
+                show_media_placeholder=False,
+                fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
+                render_mode="preview",
+            )
+            repeat_slot_w, repeat_slot_h = renderer.get_repeat_media_slot_size()
+            renderer.image_container.config(width=repeat_slot_w, height=repeat_slot_h)
+            renderer.image_container.pack_propagate(False)
+            renderer.image_container.grid_propagate(False)
+
+            def render_current():
+                idx = preview_state["index"]
+                side = preview_state["side"]
+                card = cards[idx]
+                header_text = f"Карточка {idx + 1}/{len(cards)}"
+                renderer.render(card, show_back=(side == "back"), prefer_audio_side=side, header_text=header_text)
+                update_index_label()
+
+            def move_index(delta: int) -> None:
+                new_index = preview_state["index"] + delta
+                if new_index < 0 or new_index >= len(cards):
+                    return
+                preview_state["index"] = new_index
+                render_current()
+
+            def set_side(side: str) -> None:
+                preview_state["side"] = side
+                render_current()
+
+            render_current()
+
+        def prepare_preview():
             try:
-                dur = int(entry_dur.get().strip())
-            except ValueError:
-                messagebox.showerror("Ошибка", "Длительность должна быть целым числом секунд.")
-                return
-            if dur <= 0:
-                messagebox.showerror("Ошибка", "Длительность должна быть > 0.")
-                return
-
-            remaining = dur
-
-            def tick():
-                nonlocal remaining
-                if task_holder["task"] is None:
+                raw_text = text_box.get("1.0", tk.END).strip()
+                if not raw_text:
+                    messagebox.showinfo("Нет текста", "Нет текста для подготовки карточек.")
                     return
-                if remaining <= 0:
-                    status_var.set("Обработка записи…")
+                punct_text = auto_punctuate(raw_text)
+                if punct_text:
+                    text_box.delete("1.0", tk.END)
+                    text_box.insert("1.0", punct_text)
+                sentences = split_into_sentences(punct_text)
+                if not sentences:
+                    messagebox.showinfo("Не удалось выделить предложения", "Не удалось выделить предложения.")
                     return
-                status_var.set(f"Запись: осталось {remaining} с")
-                remaining -= 1
-                win.after(1000, tick)
+                plan = self.get_pricing_plan()
+                total, per_card_costs, meta = calc_digital_ear_cost(sentences, plan)
+                preview_cards = build_preview_cards(sentences)
+                self.pending_invoice = {
+                    "sentences": sentences,
+                    "per_card_costs": per_card_costs,
+                    "total": total,
+                    "plan": plan,
+                    "meta": meta,
+                    "preview_cards": preview_cards,
+                }
+                update_generate_button_state()
+                open_cards_preview(preview_cards)
+            except Exception as exc:
+                logging.exception("Digital ear preview failed")
+                messagebox.showerror("Ошибка", f"Не удалось подготовить предпросмотр: {exc}")
 
-            run_generation_thread()
-            tick()
+        def generate_cards():
+            invoice = self.pending_invoice
+            if not invoice:
+                messagebox.showwarning("Генерация", "Сначала подготовьте предпросмотр.")
+                return
+            total = int(invoice.get("total") or 0)
+            if total > 0 and not self.can_afford(total):
+                messagebox.showwarning("Недостаточно кредитов", "Недостаточно кредитов для генерации.")
+                return
+            try:
+                meta = {
+                    "plan": invoice.get("plan"),
+                    "total": total,
+                    "sentences_count": len(invoice.get("sentences") or []),
+                    "per_card_costs": invoice.get("per_card_costs"),
+                }
+                if total > 0 and not self.charge_credits(total, "digital_ear_generate", meta=meta):
+                    messagebox.showwarning("Оплата", "Не удалось списать кредиты.")
+                    return
+                created = 0
+                for sentence in invoice.get("sentences") or []:
+                    img_path = generate_sd_image_placeholder(sentence, None) or ""
+                    note_fields = {
+                        "word": sentence,
+                        "translation": "",
+                        "example": sentence,
+                        "level": 1,
+                        "image": img_path,
+                        "front_image_path": img_path,
+                        "back_image_path": "",
+                        "audio_path": None,
+                        "front": sentence,
+                        "back": "",
+                        "image_generated": False,
+                        "image_placeholder": bool(img_path),
+                    }
+                    _, cards_created = create_note_with_cards(
+                        self.selected_deck_id,
+                        note_fields,
+                        note_type_id=ensure_generated_note_type_id(),
+                    )
+                    created += cards_created
+                self.pending_invoice = None
+                update_generate_button_state()
+                messagebox.showinfo("Генерация", f"Создано карточек: {created}")
+                self.refresh_decks()
+                self.update_overdue_badge()
+                self.refresh_activation_progress_ui()
+            except Exception as exc:
+                logging.exception("Digital ear generation failed")
+                messagebox.showerror("Ошибка", f"Не удалось сгенерировать карточки: {exc}")
 
-        def cancel_generation():
-            if task_holder["task"]:
-                task_holder["task"].cancel()
-                status_var.set("Отмена запрошена…")
-                btn_cancel.config(state=tk.DISABLED)
+        record_btn.configure(command=start_record)
+        preview_btn.configure(command=prepare_preview)
+        generate_btn.configure(command=generate_cards)
 
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        btn_cancel = ttk.Button(btn_frame, text="Стоп", command=cancel_generation, state=tk.DISABLED)
-        btn_cancel.pack(side=tk.RIGHT, padx=5)
-        btn_rec = ttk.Button(btn_frame, text="Записать и сгенерировать", command=start_record)
-        btn_rec.pack(side=tk.RIGHT)
+        self.register_balance_observer(update_generate_button_state)
+        update_generate_button_state()
+
+        def on_close():
+            self.unregister_balance_observer(update_generate_button_state)
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
 
     # --------- режимы повторения / воспроизведения ---------
 
