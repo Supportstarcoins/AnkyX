@@ -4608,8 +4608,14 @@ def record_speech_to_text(
         progress_queue.put(("progress", duration_sec, max(duration_sec, 1), "Распознавание"))
     try:
         text = r.recognize_google(audio, language="de-DE")
-    except Exception as e:
-        raise RuntimeError(f"Не удалось распознать речь: {e}")
+    except sr.WaitTimeoutError as exc:
+        raise RuntimeError("Не слышу речь. Проверь микрофон и говори ближе.") from exc
+    except sr.UnknownValueError as exc:
+        raise RuntimeError("Речь не распознана (шум/тихо/слишком быстро). Попробуй ещё раз.") from exc
+    except sr.RequestError as exc:
+        raise RuntimeError(f"Ошибка сервиса распознавания: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось распознать речь: {exc}") from exc
     return text, audio_path
 
 
@@ -4654,8 +4660,14 @@ def auto_generate_cards_from_speech(deck_id: int,
 
     try:
         text = r.recognize_google(audio, language="de-DE")
-    except Exception as e:
-        raise RuntimeError(f"Не удалось распознать речь: {e}")
+    except sr.WaitTimeoutError as exc:
+        raise RuntimeError("Не слышу речь. Проверь микрофон и говори ближе.") from exc
+    except sr.UnknownValueError as exc:
+        raise RuntimeError("Речь не распознана (шум/тихо/слишком быстро). Попробуй ещё раз.") from exc
+    except sr.RequestError as exc:
+        raise RuntimeError(f"Ошибка сервиса распознавания: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось распознать речь: {exc}") from exc
 
     if cancel_check and cancel_check():
         return 0
