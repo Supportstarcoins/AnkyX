@@ -2938,18 +2938,35 @@ def init_db():
             description TEXT,
             front_template TEXT,
             back_template TEXT,
+            selected_gen_template_id INTEGER,
             icon_path TEXT,
             tts_lang TEXT
         );
     """)
 
     # миграция для старых БД: добавляем колонки шаблонов, если их нет
-    for col in ("front_template", "back_template", "icon_path", "tts_lang"):
+    for col in ("front_template", "back_template", "selected_gen_template_id", "icon_path", "tts_lang"):
         try:
-            cur.execute(f"ALTER TABLE decks ADD COLUMN {col} TEXT;")
+            if col == "selected_gen_template_id":
+                cur.execute(f"ALTER TABLE decks ADD COLUMN {col} INTEGER;")
+            else:
+                cur.execute(f"ALTER TABLE decks ADD COLUMN {col} TEXT;")
         except sqlite3.OperationalError:
             # колонка уже существует
             pass
+
+    # Шаблоны генерации
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS generation_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            question TEXT NOT NULL DEFAULT '',
+            front_template TEXT NOT NULL,
+            back_template TEXT NOT NULL,
+            created_at INTEGER,
+            updated_at INTEGER
+        );
+    """)
 
     # Карточки
     cur.execute("""
@@ -3098,6 +3115,158 @@ def save_deck_templates(deck_id: int, front_template: str, back_template: str):
         pass
     conn.commit()
     conn.close()
+
+
+def ensure_default_generation_template(deck_id: int | None = None) -> int | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM generation_templates ORDER BY id LIMIT 1;")
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return row["id"]
+
+    if deck_id is not None:
+        front_template, back_template = get_deck_templates(deck_id)
+    else:
+        front_template, back_template = DEFAULT_FRONT_TEMPLATE, DEFAULT_BACK_TEMPLATE
+    now = int(time.time())
+    cur.execute(
+        """
+        INSERT INTO generation_templates (name, question, front_template, back_template, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?);
+        """,
+        ("По умолчанию", "", front_template, back_template, now, now),
+    )
+    template_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return template_id
+
+
+def list_generation_templates() -> list[sqlite3.Row]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name, question, front_template, back_template FROM generation_templates ORDER BY name;"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_generation_template(template_id: int) -> sqlite3.Row | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name, question, front_template, back_template FROM generation_templates WHERE id = ?;",
+        (template_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def update_generation_template(template_id: int, name: str, question: str, front: str, back: str) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE generation_templates
+        SET name = ?, question = ?, front_template = ?, back_template = ?, updated_at = ?
+        WHERE id = ?;
+        """,
+        (name, question, front, back, int(time.time()), template_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def upsert_generation_template(name: str, question: str, front: str, back: str) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        """
+        INSERT INTO generation_templates (name, question, front_template, back_template, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            question = excluded.question,
+            front_template = excluded.front_template,
+            back_template = excluded.back_template,
+            updated_at = excluded.updated_at;
+        """,
+        (name, question, front, back, now, now),
+    )
+    cur.execute("SELECT id FROM generation_templates WHERE name = ?;", (name,))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+    return row["id"] if row else 0
+
+
+def delete_generation_template(template_id: int) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE decks SET selected_gen_template_id = NULL WHERE selected_gen_template_id = ?;",
+        (template_id,),
+    )
+    cur.execute("DELETE FROM generation_templates WHERE id = ?;", (template_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_deck_selected_template_id(deck_id: int) -> int | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT selected_gen_template_id FROM decks WHERE id = ?;", (deck_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row["selected_gen_template_id"]
+    return None
+
+
+def set_deck_selected_template_id(deck_id: int, template_id: int | None) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE decks SET selected_gen_template_id = ? WHERE id = ?;",
+        (template_id, deck_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_active_generation_template(deck_id: int | None) -> dict[str, str | int | None]:
+    if deck_id is None:
+        return {
+            "id": None,
+            "name": "По умолчанию",
+            "question": "",
+            "front_template": DEFAULT_FRONT_TEMPLATE,
+            "back_template": DEFAULT_BACK_TEMPLATE,
+        }
+    template_id = get_deck_selected_template_id(deck_id)
+    if template_id:
+        row = get_generation_template(template_id)
+        if row:
+            return {
+                "id": row["id"],
+                "name": row["name"],
+                "question": row["question"],
+                "front_template": row["front_template"],
+                "back_template": row["back_template"],
+            }
+    front, back = get_deck_templates(deck_id)
+    return {
+        "id": None,
+        "name": "По умолчанию",
+        "question": "",
+        "front_template": front,
+        "back_template": back,
+    }
 
 
 def get_deck_icon_path(deck_id: int):
@@ -3762,6 +3931,73 @@ def mask_text_by_repeated_words(text: str) -> tuple[str, list[str]]:
     return masked, unique_hidden
 
 
+def _apply_foreign_template_defaults(ctx: dict[str, str]) -> dict[str, str]:
+    sentence = ctx.get("sentence", "") or ""
+    if sentence:
+        masked_text, hidden_words = mask_text_by_repeated_words(sentence)
+        if not ctx.get("sentence_with_gap"):
+            ctx["sentence_with_gap"] = masked_text
+        if not ctx.get("translation"):
+            ctx["translation"] = ", ".join(hidden_words) if hidden_words else "—"
+        if not ctx.get("word"):
+            ctx["word"] = hidden_words[0] if hidden_words else "—"
+    for key in ("sentence_with_gap", "translation", "word"):
+        if not ctx.get(key):
+            ctx[key] = "—"
+    return ctx
+
+
+def _render_generation_template_faces(
+    template: dict[str, str | int | None],
+    ctx: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    base_ctx = dict(ctx or {})
+    template_name = str(template.get("name") or "").strip().lower()
+    question = str(template.get("question") or "")
+    front_template = str(template.get("front_template") or "")
+    back_template = str(template.get("back_template") or "")
+
+    front_ctx = dict(base_ctx)
+    back_ctx = dict(base_ctx)
+    for key in ("translation", "sentence_with_gap", "word", "ipa", "gender", "plural", "sentence"):
+        if f"front_{key}" in base_ctx:
+            front_ctx[key] = base_ctx.get(f"front_{key}", "") or ""
+        if f"back_{key}" in base_ctx:
+            back_ctx[key] = base_ctx.get(f"back_{key}", "") or ""
+
+    for key in ("translation", "sentence_with_gap", "word", "ipa", "gender", "plural", "sentence"):
+        front_ctx.setdefault(key, "")
+        back_ctx.setdefault(key, "")
+
+    if template_name == "иностранные слова":
+        front_ctx = _apply_foreign_template_defaults(front_ctx)
+        back_ctx = _apply_foreign_template_defaults(back_ctx)
+
+    front_formatter = collections.defaultdict(str, front_ctx)
+    back_formatter = collections.defaultdict(str, back_ctx)
+    front_formatter["question"] = question
+    back_formatter["question"] = question
+
+    formatted_front = front_template.format_map(front_formatter)
+    formatted_back = back_template.format_map(back_formatter)
+
+    if "{question}" in front_template:
+        front = formatted_front
+    else:
+        if question and formatted_front:
+            front = f"{question}\n{formatted_front}"
+        elif question:
+            front = question
+        else:
+            front = formatted_front
+    return front, formatted_back
+
+
+def render_generation_faces(deck_id: int, ctx: dict[str, str] | None = None) -> tuple[str, str]:
+    template = get_active_generation_template(deck_id)
+    return _render_generation_template_faces(template, ctx)
+
+
 # ==========================
 # Wiktionary
 # ==========================
@@ -4042,9 +4278,8 @@ def insert_card(
 # ==========================
 
 def build_local_cards_from_text(
+    deck_id: int,
     text: str,
-    front_template: str,
-    back_template: str,
     one_sentence_one_card: bool = False,
 ) -> tuple[list[dict], set[str]]:
     sentences = split_into_sentences(text)
@@ -4064,24 +4299,18 @@ def build_local_cards_from_text(
         translation = get_translation(target_word, use_openai=False) if target_word else ""
         sentence_translation = translate_sentence(sentence, use_openai=False)
 
-        front = front_template.format(
-            translation="",
-            sentence_with_gap=sentence_with_gap,
-            word=target_word,
-            ipa="",
-            gender="?",
-            plural="?",
-            sentence=sentence,
-        )
-
-        back = back_template.format(
-            translation=sentence_translation,
-            sentence_with_gap=sentence_with_gap,
-            word=target_word,
-            ipa="",
-            gender="?",
-            plural="?",
-            sentence=sentence,
+        front, back = render_generation_faces(
+            deck_id,
+            {
+                "translation": sentence_translation,
+                "front_translation": "",
+                "sentence_with_gap": sentence_with_gap,
+                "word": target_word or "",
+                "ipa": "",
+                "gender": "?",
+                "plural": "?",
+                "sentence": sentence,
+            },
         )
 
         cards.append(
@@ -4136,8 +4365,6 @@ def auto_generate_cards_from_text(deck_id: int,
                                   text: str,
                                   use_ai_images: bool,
                                   api_key: str | None,
-                                  front_template: str,
-                                  back_template: str,
                                   one_sentence_one_card: bool = False,
                                   audio_path: str | None = None,
                                   audio_source: str | None = None,
@@ -4206,24 +4433,18 @@ def auto_generate_cards_from_text(deck_id: int,
         # Получаем перевод всего предложения
         sentence_translation = translate_sentence(sentence, use_openai=True)
 
-        front = front_template.format(
-            translation="",  # Не показываем перевод на лицевой стороне
-            sentence_with_gap=sentence_with_gap,
-            word=target_word,
-            ipa=ipa_final,
-            gender=gender_final,
-            plural=plural_final,
-            sentence=sentence,
-        )
-
-        back = back_template.format(
-            translation=sentence_translation,
-            sentence_with_gap=sentence_with_gap,
-            word=target_word,
-            ipa=ipa_final,
-            gender=gender_final,
-            plural=plural_final,
-            sentence=sentence,
+        front, back = render_generation_faces(
+            deck_id,
+            {
+                "translation": sentence_translation,
+                "front_translation": "",
+                "sentence_with_gap": sentence_with_gap,
+                "word": target_word or "",
+                "ipa": ipa_final,
+                "gender": gender_final,
+                "plural": plural_final,
+                "sentence": sentence,
+            },
         )
 
         if max_sentences_per_card and target_word:
@@ -4447,8 +4668,6 @@ def split_ocr_text_into_sentences(text: str) -> list[str]:
 def auto_generate_cards_from_ocr_text(
     deck_id: int,
     text: str,
-    front_template: str,
-    back_template: str,
     language_mode: str,
     progress_queue: queue.Queue | None = None,
     cancel_check=None,
@@ -4497,23 +4716,19 @@ def auto_generate_cards_from_ocr_text(
         hidden_text = ", ".join(hidden_words)
         back_word = hidden_words[0] if hidden_words else ""
 
-        front = front_template.format(
-            translation="",
-            sentence_with_gap=masked_text,
-            word=primary_display,
-            ipa="",
-            gender="",
-            plural="",
-            sentence=combined_text,
-        )
-        back = back_template.format(
-            translation=hidden_text,
-            sentence_with_gap=masked_text,
-            word=back_word,
-            ipa="",
-            gender="",
-            plural="",
-            sentence=combined_text,
+        front, back = render_generation_faces(
+            deck_id,
+            {
+                "translation": hidden_text,
+                "front_translation": "",
+                "sentence_with_gap": masked_text,
+                "word": back_word,
+                "front_word": primary_display,
+                "ipa": "",
+                "gender": "",
+                "plural": "",
+                "sentence": combined_text,
+            },
         )
 
         note_fields = {
@@ -4554,8 +4769,6 @@ def auto_generate_cards_from_image(deck_id: int,
                                    image_path: str,
                                    use_ai_images: bool,
                                    api_key: str | None,
-                                   front_template: str,
-                                   back_template: str,
                                    one_sentence_one_card: bool = False,
                                    image_spend_cb=None) -> int:
     if not OCR_AVAILABLE or not is_tesseract_available():
@@ -4573,7 +4786,6 @@ def auto_generate_cards_from_image(deck_id: int,
 
     return auto_generate_cards_from_text(
         deck_id, text, use_ai_images, api_key,
-        front_template, back_template,
         one_sentence_one_card=one_sentence_one_card,
         audio_path=None,
         image_spend_cb=image_spend_cb,
@@ -4623,8 +4835,6 @@ def auto_generate_cards_from_speech(deck_id: int,
                                     duration_sec: int,
                                     use_ai_images: bool,
                                     api_key: str | None,
-                                    front_template: str,
-                                    back_template: str,
                                     mic_index: int | None,
                                     one_sentence_one_card: bool = False,
                                     progress_queue: queue.Queue | None = None,
@@ -4674,7 +4884,6 @@ def auto_generate_cards_from_speech(deck_id: int,
 
     return auto_generate_cards_from_text(
         deck_id, text, use_ai_images, api_key,
-        front_template, back_template,
         one_sentence_one_card=one_sentence_one_card,
         audio_path=audio_path,
         audio_source="digital_hearing",
@@ -4689,8 +4898,6 @@ def auto_generate_cards_from_video(deck_id: int,
                                    video_path: str,
                                    use_ai_images: bool,
                                    api_key: str | None,
-                                   front_template: str,
-                                   back_template: str,
                                    image_spend_cb=None) -> int:
     """
     Генерация карточек из видео: извлечение аудио, нарезка на предложения,
@@ -4737,7 +4944,6 @@ def auto_generate_cards_from_video(deck_id: int,
         # Генерировать карточки из текста
         return auto_generate_cards_from_text(
             deck_id, text, use_ai_images, api_key,
-            front_template, back_template,
             one_sentence_one_card=True,
             audio_path=audio_filename,
             audio_source="digital_hearing",
@@ -6304,6 +6510,8 @@ class AnkiApp(tk.Tk):
                                   command=self.open_translation_settings_window)
         settings_menu.add_command(label="Управление словарями",
                                   command=self.open_dictionary_manager_window)
+        settings_menu.add_command(label="Генерация шаблонов",
+                                  command=self.open_generation_templates_window)
         menubar.add_cascade(label="Настройки", menu=settings_menu)
 
         gen_menu = tk.Menu(menubar, tearoff=0)
@@ -8282,6 +8490,255 @@ class AnkiApp(tk.Tk):
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill=tk.X, padx=20, pady=20)
         ttk.Button(btn_frame, text="Сохранить", command=save_settings).pack(side=tk.RIGHT)
+
+    def open_generation_templates_window(
+        self,
+        selected_template_id: int | None = None,
+        on_close=None,
+    ) -> None:
+        win = tk.Toplevel(self)
+        win.title("Генерация шаблонов")
+        win.geometry("960x640")
+        win.grab_set()
+        apply_dark_theme_to_window(win, self.palette)
+
+        ensure_default_generation_template(self.selected_deck_id)
+
+        main_frame = ttk.Frame(win, style="Surface.TFrame")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        left_frame = ttk.Frame(main_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        ttk.Label(left_frame, text="Шаблоны").pack(anchor="w")
+        listbox = tk.Listbox(left_frame, width=28, height=18)
+        listbox.pack(side=tk.LEFT, fill=tk.Y, expand=False)
+        list_scroll = ttk.Scrollbar(left_frame, orient="vertical", command=listbox.yview)
+        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox.configure(yscrollcommand=list_scroll.set)
+
+        name_var = tk.StringVar()
+        question_var = tk.StringVar()
+        template_state = {"id": None, "rows": []}
+
+        ttk.Label(right_frame, text="Название:").pack(anchor="w")
+        entry_name = ttk.Entry(right_frame, textvariable=name_var)
+        entry_name.pack(fill=tk.X, pady=(0, 6))
+        create_context_menu(entry_name)
+
+        ttk.Label(right_frame, text="Вопрос на лицевой стороне:").pack(anchor="w")
+        entry_question = ttk.Entry(right_frame, textvariable=question_var)
+        entry_question.pack(fill=tk.X, pady=(0, 6))
+        create_context_menu(entry_question)
+
+        ttk.Label(right_frame, text="Шаблон FRONT:").pack(anchor="w")
+        text_front = tk.Text(right_frame, height=4)
+        style_text_widget(text_front, self.palette)
+        text_front.pack(fill=tk.BOTH, expand=False, pady=(0, 6))
+        create_context_menu(text_front)
+
+        ttk.Label(right_frame, text="Шаблон BACK:").pack(anchor="w")
+        text_back = tk.Text(right_frame, height=4)
+        style_text_widget(text_back, self.palette)
+        text_back.pack(fill=tk.BOTH, expand=False, pady=(0, 6))
+        create_context_menu(text_back)
+
+        ttk.Label(
+            right_frame,
+            text="Переменные: {question}, {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}",
+            style="Muted.TLabel",
+            wraplength=520,
+        ).pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(right_frame, text="Тестовый текст:").pack(anchor="w")
+        test_text = tk.Text(right_frame, height=3)
+        style_text_widget(test_text, self.palette)
+        test_text.pack(fill=tk.BOTH, expand=False, pady=(0, 4))
+        test_text.insert("1.0", "Das ist ein Haus.")
+        create_context_menu(test_text)
+
+        mask_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            right_frame,
+            text="Маскировать по повторенным словам",
+            variable=mask_var,
+        ).pack(anchor="w", pady=(0, 8))
+
+        def load_template_row(row: sqlite3.Row | None) -> None:
+            template_state["id"] = row["id"] if row else None
+            name_var.set(row["name"] if row else "")
+            question_var.set(row["question"] if row else "")
+            text_front.delete("1.0", tk.END)
+            text_back.delete("1.0", tk.END)
+            if row:
+                text_front.insert("1.0", row["front_template"])
+                text_back.insert("1.0", row["back_template"])
+
+        def refresh_list(select_id: int | None = None) -> None:
+            rows = list_generation_templates()
+            template_state["rows"] = rows
+            listbox.delete(0, tk.END)
+            selected_index = None
+            for idx, row in enumerate(rows):
+                listbox.insert(tk.END, row["name"])
+                if select_id and row["id"] == select_id:
+                    selected_index = idx
+            if selected_index is None and rows:
+                selected_index = 0
+            if selected_index is not None:
+                listbox.selection_set(selected_index)
+                listbox.activate(selected_index)
+                load_template_row(rows[selected_index])
+            else:
+                load_template_row(None)
+
+        def on_select(_event=None) -> None:
+            selection = listbox.curselection()
+            if not selection:
+                return
+            idx = selection[0]
+            rows = template_state["rows"]
+            if idx < len(rows):
+                load_template_row(rows[idx])
+
+        def collect_fields() -> tuple[str, str, str, str]:
+            name = name_var.get().strip()
+            question = question_var.get().strip()
+            front = text_front.get("1.0", tk.END).strip()
+            back = text_back.get("1.0", tk.END).strip()
+            return name, question, front, back
+
+        def ensure_valid_fields(name: str, front: str, back: str) -> bool:
+            if not name:
+                messagebox.showerror("Ошибка", "Название шаблона не может быть пустым.")
+                return False
+            if not front or not back:
+                messagebox.showerror("Ошибка", "Шаблон FRONT/BACK не может быть пустым.")
+                return False
+            return True
+
+        def save_template() -> None:
+            name, question, front, back = collect_fields()
+            if not ensure_valid_fields(name, front, back):
+                return
+            current_id = template_state["id"]
+            existing = {row["name"]: row["id"] for row in template_state["rows"]}
+            if current_id is not None:
+                if name in existing and existing[name] != current_id:
+                    messagebox.showerror("Ошибка", "Шаблон с таким названием уже существует.")
+                    return
+                update_generation_template(current_id, name, question, front, back)
+                refresh_list(select_id=current_id)
+            else:
+                template_id = upsert_generation_template(name, question, front, back)
+                refresh_list(select_id=template_id)
+
+        def save_as_new() -> None:
+            name, question, front, back = collect_fields()
+            base_name = name or "Новый шаблон"
+            existing = {row["name"] for row in template_state["rows"]}
+            new_name = base_name
+            idx = 2
+            while new_name in existing:
+                new_name = f"{base_name} ({idx})"
+                idx += 1
+            if not ensure_valid_fields(new_name, front, back):
+                return
+            name_var.set(new_name)
+            template_id = upsert_generation_template(new_name, question, front, back)
+            refresh_list(select_id=template_id)
+
+        def delete_template() -> None:
+            current_id = template_state["id"]
+            if current_id is None:
+                messagebox.showinfo("Удаление", "Выберите шаблон для удаления.")
+                return
+            if not messagebox.askyesno("Удаление", "Удалить выбранный шаблон?"):
+                return
+            delete_generation_template(current_id)
+            template_state["id"] = None
+            refresh_list()
+
+        def preview_template() -> None:
+            name, question, front_t, back_t = collect_fields()
+            if not name:
+                name = "Предпросмотр"
+            test_value = test_text.get("1.0", tk.END).strip()
+            if not test_value:
+                test_value = "Das ist ein Haus."
+            if mask_var.get():
+                masked_text, hidden_words = mask_text_by_repeated_words(test_value)
+                preview_ctx = {
+                    "sentence": test_value,
+                    "sentence_with_gap": masked_text,
+                    "word": hidden_words[0] if hidden_words else "—",
+                    "translation": ", ".join(hidden_words) if hidden_words else "—",
+                    "ipa": "",
+                    "gender": "",
+                    "plural": "",
+                }
+            else:
+                words = extract_words_from_text(test_value)
+                preview_ctx = {
+                    "sentence": test_value,
+                    "sentence_with_gap": test_value,
+                    "word": words[0] if words else "",
+                    "translation": "дом",
+                    "ipa": "",
+                    "gender": "",
+                    "plural": "",
+                }
+            template = {
+                "id": template_state["id"],
+                "name": name,
+                "question": question,
+                "front_template": front_t,
+                "back_template": back_t,
+            }
+            front, back = _render_generation_template_faces(template, preview_ctx)
+
+            preview_win = tk.Toplevel(win)
+            preview_win.title("Предпросмотр шаблона")
+            preview_win.geometry("700x420")
+            preview_win.grab_set()
+            apply_dark_theme_to_window(preview_win, self.palette)
+
+            preview_frame = ttk.Frame(preview_win, style="Surface.TFrame")
+            preview_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            ttk.Label(preview_frame, text="FRONT").pack(anchor="w")
+            front_box = tk.Text(preview_frame, height=6)
+            style_text_widget(front_box, self.palette)
+            front_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+            front_box.insert("1.0", front)
+            front_box.configure(state="disabled")
+
+            ttk.Label(preview_frame, text="BACK").pack(anchor="w")
+            back_box = tk.Text(preview_frame, height=6)
+            style_text_widget(back_box, self.palette)
+            back_box.pack(fill=tk.BOTH, expand=True)
+            back_box.insert("1.0", back)
+            back_box.configure(state="disabled")
+
+        btn_row = ttk.Frame(right_frame)
+        btn_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btn_row, text="Предпросмотр", command=preview_template).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Сохранить", command=save_template).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_row, text="Сохранить как новый", command=save_as_new).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_row, text="Удалить", command=delete_template).pack(side=tk.RIGHT)
+
+        listbox.bind("<<ListboxSelect>>", on_select)
+
+        refresh_list(select_id=selected_template_id)
+
+        def _on_close() -> None:
+            if callable(on_close):
+                on_close()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
 
     # --------- настройки ---------
 
@@ -10807,11 +11264,64 @@ class AnkiApp(tk.Tk):
             self.back_template = DEFAULT_BACK_TEMPLATE
             return
         try:
-            front, back = get_deck_templates(self.selected_deck_id)
+            active = get_active_generation_template(self.selected_deck_id)
+            front, back = active.get("front_template"), active.get("back_template")
         except Exception:
             front, back = DEFAULT_FRONT_TEMPLATE, DEFAULT_BACK_TEMPLATE
         self.front_template = front or DEFAULT_FRONT_TEMPLATE
         self.back_template = back or DEFAULT_BACK_TEMPLATE
+
+    def _build_generation_template_selector(
+        self,
+        parent: tk.Widget,
+        deck_id: int | None,
+        padx: int = 5,
+        pady: tuple[int, int] = (5, 5),
+    ) -> dict[str, object]:
+        container = ttk.Frame(parent)
+        container.pack(fill=tk.X, padx=padx, pady=pady)
+        ttk.Label(container, text="Выберите шаблон карточки").pack(anchor="w")
+        row = ttk.Frame(container)
+        row.pack(fill=tk.X, pady=(2, 0))
+
+        template_var = tk.StringVar()
+        combo = ttk.Combobox(row, textvariable=template_var, state="readonly")
+        combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        template_rows: list[sqlite3.Row] = []
+
+        def refresh() -> None:
+            nonlocal template_rows
+            ensure_default_generation_template(deck_id)
+            template_rows = list_generation_templates()
+            names = [row["name"] for row in template_rows]
+            combo.configure(values=names)
+            selected_id = get_deck_selected_template_id(deck_id) if deck_id else None
+            name_by_id = {row["id"]: row["name"] for row in template_rows}
+            if selected_id in name_by_id:
+                template_var.set(name_by_id[selected_id])
+            elif template_var.get() not in names:
+                template_var.set("")
+
+        def on_select(_event=None) -> None:
+            if deck_id is None:
+                return
+            name = template_var.get()
+            template_id = next((row["id"] for row in template_rows if row["name"] == name), None)
+            if template_id is not None:
+                set_deck_selected_template_id(deck_id, template_id)
+                self.load_templates_for_selected_deck()
+
+        def open_manager() -> None:
+            selected_id = next(
+                (row["id"] for row in template_rows if row["name"] == template_var.get()),
+                None,
+            )
+            self.open_generation_templates_window(selected_template_id=selected_id, on_close=refresh)
+
+        combo.bind("<<ComboboxSelected>>", on_select)
+        ttk.Button(row, text="Открыть менеджер шаблонов", command=open_manager).pack(side=tk.LEFT, padx=6)
+        refresh()
+        return {"frame": container, "combobox": combo, "refresh": refresh, "var": template_var}
 
     # --------- новая колода ---------
 
@@ -13498,6 +14008,8 @@ class AnkiApp(tk.Tk):
         frame_opts = ttk.LabelFrame(scroll_frame, text="Настройки")
         frame_opts.pack(fill=tk.X, padx=10, pady=10)
 
+        self._build_generation_template_selector(frame_opts, self.selected_deck_id, padx=5, pady=(5, 5))
+
         use_ai_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             frame_opts,
@@ -13610,23 +14122,11 @@ class AnkiApp(tk.Tk):
 
         frame_images.columnconfigure(1, weight=1)
 
-        ttk.Label(frame_opts, text="Шаблон FRONT:").pack(anchor="w", padx=5)
-        entry_front = tk.Text(frame_opts, height=2)
-        style_text_widget(entry_front, self.palette)
-        entry_front.pack(fill=tk.X, padx=5)
-        entry_front.insert("1.0", self.front_template)
-        create_context_menu(entry_front)  # Добавляем контекстное меню
-
-        ttk.Label(frame_opts, text="Шаблон BACK:").pack(anchor="w", padx=5, pady=(5, 0))
-        entry_back = tk.Text(frame_opts, height=2)
-        style_text_widget(entry_back, self.palette)
-        entry_back.pack(fill=tk.X, padx=5)
-        entry_back.insert("1.0", self.back_template)
-        create_context_menu(entry_back)  # Добавляем контекстное меню
+        self._build_generation_template_selector(frame_opts, self.selected_deck_id, padx=5, pady=(5, 0))
 
         ttk.Label(
             frame_opts,
-            text="Переменные: {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
+            text="Переменные: {question}, {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
         ).pack(anchor="w", padx=5, pady=(5, 0))
 
         progress_frame = ttk.LabelFrame(scroll_frame, text="Прогресс")
@@ -13655,30 +14155,36 @@ class AnkiApp(tk.Tk):
             if not front_value:
                 raise ValueError("Front text пустой.")
 
-            front_t = entry_front.get("1.0", tk.END).strip() or DEFAULT_FRONT_TEMPLATE
-            back_t = entry_back.get("1.0", tk.END).strip() or DEFAULT_BACK_TEMPLATE
-            self.front_template = front_t
-            self.back_template = back_t
-            if self.selected_deck_id is not None:
-                save_deck_templates(self.selected_deck_id, front_t, back_t)
-
             if back_value:
                 base_word = front_value.splitlines()[0].strip() or front_value
+                front, back = render_generation_faces(
+                    self.selected_deck_id,
+                    {
+                        "translation": back_value,
+                        "front_translation": "",
+                        "sentence_with_gap": front_value,
+                        "word": base_word,
+                        "ipa": "",
+                        "gender": "",
+                        "plural": "",
+                        "sentence": front_value,
+                    },
+                )
                 cards = [
                     {
-                        "front": front_value,
-                        "back": back_value,
+                        "front": front,
+                        "back": back,
                         "word": base_word,
                         "translation": back_value,
                         "sentence": front_value,
                         "sentence_with_gap": front_value,
                     }
                 ]
-                return cards, set(), front_t, back_t
+                return cards, set(), None, None
 
             one_sent = one_sent_var.get()
-            cards, new_words = build_local_cards_from_text(front_value, front_t, back_t, one_sent)
-            return cards, new_words, front_t, back_t
+            cards, new_words = build_local_cards_from_text(self.selected_deck_id, front_value, one_sent)
+            return cards, new_words, None, None
 
         def open_preview_window(cards, front_image_path: str, back_image_path: str):
             preview_win = tk.Toplevel(self)
@@ -13861,13 +14367,6 @@ class AnkiApp(tk.Tk):
                 return
 
             use_ai_images = use_ai_var.get()
-            front_t = entry_front.get("1.0", tk.END).strip() or DEFAULT_FRONT_TEMPLATE
-            back_t = entry_back.get("1.0", tk.END).strip() or DEFAULT_BACK_TEMPLATE
-            self.front_template = front_t
-            self.back_template = back_t
-            if self.selected_deck_id is not None:
-                save_deck_templates(self.selected_deck_id, front_t, back_t)
-
             api_key = OPENAI_API_KEY if OPENAI_API_KEY else None
             one_sent = one_sent_var.get()
 
@@ -13908,7 +14407,6 @@ class AnkiApp(tk.Tk):
                 return auto_generate_cards_from_text(
                     self.selected_deck_id, text,
                     use_ai_images, api_key,
-                    front_t, back_t,
                     one_sentence_one_card=one_sent,
                     audio_path=None,
                     progress_queue=task_obj.queue,
@@ -13970,6 +14468,8 @@ class AnkiApp(tk.Tk):
         style_text_widget(back_text, self.palette)
         back_text.pack(fill=tk.X, pady=(4, 10))
         create_context_menu(back_text)
+
+        self._build_generation_template_selector(form_frame, self.selected_deck_id, padx=0, pady=(0, 10))
 
         action_frame = ttk.LabelFrame(form_frame, text="Генерация")
         action_frame.pack(fill=tk.X, pady=6)
@@ -14062,6 +14562,20 @@ class AnkiApp(tk.Tk):
                 messagebox.showerror("Ошибка", "Front text пустой.")
                 return
 
+            rendered_front, rendered_back = render_generation_faces(
+                self.selected_deck_id,
+                {
+                    "translation": back,
+                    "front_translation": "",
+                    "sentence_with_gap": front,
+                    "word": front.splitlines()[0].strip() if front else "",
+                    "ipa": "",
+                    "gender": "",
+                    "plural": "",
+                    "sentence": front,
+                },
+            )
+
             note_fields = {
                 "word": front,
                 "translation": back,
@@ -14071,8 +14585,8 @@ class AnkiApp(tk.Tk):
                 "front_image_path": media_state["image_path"] or "",
                 "back_image_path": "",
                 "audio_path": None,
-                "front": front,
-                "back": back,
+                "front": rendered_front,
+                "back": rendered_back,
             }
             note_id, created = create_note_with_cards(
                 self.selected_deck_id,
@@ -14862,23 +15376,11 @@ class AnkiApp(tk.Tk):
             width=8,
         ).pack(anchor="w", padx=10, pady=(0, 5))
 
-        ttk.Label(settings_frame, text="Шаблон FRONT:").pack(anchor="w", padx=10, pady=(5, 0))
-        entry_front = tk.Text(settings_frame, height=2)
-        style_text_widget(entry_front, self.palette)
-        entry_front.pack(fill=tk.X, padx=10, pady=(0, 5))
-        entry_front.insert("1.0", self.front_template)
-        create_context_menu(entry_front)  # Добавляем контекстное меню
-
-        ttk.Label(settings_frame, text="Шаблон BACK:").pack(anchor="w", padx=10)
-        entry_back = tk.Text(settings_frame, height=2)
-        style_text_widget(entry_back, self.palette)
-        entry_back.pack(fill=tk.X, padx=10, pady=(0, 5))
-        entry_back.insert("1.0", self.back_template)
-        create_context_menu(entry_back)  # Добавляем контекстное меню
+        self._build_generation_template_selector(settings_frame, self.selected_deck_id, padx=10, pady=(5, 5))
 
         ttk.Label(
             settings_frame,
-            text="Переменные: {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
+            text="Переменные: {question}, {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}"
         ).pack(anchor="w", padx=10, pady=(0, 5))
 
         cards_lang_mode_var = tk.StringVar(value="foreign")
@@ -14999,13 +15501,6 @@ class AnkiApp(tk.Tk):
             ):
                 return
 
-            front_t = entry_front.get("1.0", tk.END).strip() or DEFAULT_FRONT_TEMPLATE
-            back_t = entry_back.get("1.0", tk.END).strip() or DEFAULT_BACK_TEMPLATE
-            self.front_template = front_t
-            self.back_template = back_t
-            if self.selected_deck_id is not None:
-                save_deck_templates(self.selected_deck_id, front_t, back_t)
-
             placeholder_path = self._ensure_generated_placeholder_image()
             if not placeholder_path:
                 messagebox.showerror("Ошибка", "Не удалось создать placeholder-картинку.")
@@ -15061,8 +15556,6 @@ class AnkiApp(tk.Tk):
                 return auto_generate_cards_from_ocr_text(
                     self.selected_deck_id,
                     text,
-                    front_t,
-                    back_t,
                     cards_lang_mode_var.get(),
                     progress_queue=task_obj.queue,
                     cancel_check=task_obj.cancelled,
@@ -15425,6 +15918,8 @@ class AnkiApp(tk.Tk):
             wraplength=760,
         ).pack(anchor="w", pady=(0, 8))
 
+        self._build_generation_template_selector(main_frame, self.selected_deck_id, padx=0, pady=(0, 10))
+
         record_frame = ttk.LabelFrame(main_frame, text="Запись", style="Card.TLabelframe")
         record_frame.pack(fill=tk.X, pady=(0, 10))
         style_card(record_frame, self.palette, padded=True)
@@ -15587,12 +16082,25 @@ class AnkiApp(tk.Tk):
             preview_cards: list[dict] = []
             for sentence in sentences:
                 placeholder_path = generate_sd_image_placeholder(sentence, None) or ""
+                front, back = render_generation_faces(
+                    self.selected_deck_id,
+                    {
+                        "translation": "",
+                        "front_translation": "",
+                        "sentence_with_gap": sentence,
+                        "word": sentence,
+                        "ipa": "",
+                        "gender": "",
+                        "plural": "",
+                        "sentence": sentence,
+                    },
+                )
                 preview_cards.append(
                     {
-                        "front": sentence,
-                        "back": "",
-                        "front_rich": {"text": sentence, "tags": []},
-                        "back_rich": {"text": "", "tags": []},
+                        "front": front,
+                        "back": back,
+                        "front_rich": {"text": front, "tags": []},
+                        "back_rich": {"text": back, "tags": []},
                         "front_image_path": placeholder_path,
                         "back_image_path": "",
                         "audio_path": None,
@@ -15731,6 +16239,19 @@ class AnkiApp(tk.Tk):
                 created = 0
                 for sentence in invoice.get("sentences") or []:
                     img_path = generate_sd_image_placeholder(sentence, None) or ""
+                    front, back = render_generation_faces(
+                        self.selected_deck_id,
+                        {
+                            "translation": "",
+                            "front_translation": "",
+                            "sentence_with_gap": sentence,
+                            "word": sentence,
+                            "ipa": "",
+                            "gender": "",
+                            "plural": "",
+                            "sentence": sentence,
+                        },
+                    )
                     note_fields = {
                         "word": sentence,
                         "translation": "",
@@ -15740,8 +16261,8 @@ class AnkiApp(tk.Tk):
                         "front_image_path": img_path,
                         "back_image_path": "",
                         "audio_path": None,
-                        "front": sentence,
-                        "back": "",
+                        "front": front,
+                        "back": back,
                         "image_generated": False,
                         "image_placeholder": bool(img_path),
                     }
