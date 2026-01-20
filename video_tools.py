@@ -131,6 +131,122 @@ def cut_video_clip(
         return False, f"Ошибка ffmpeg: {exc}"
 
 
+def _resolve_ffprobe(ffmpeg_path: Optional[str]) -> Optional[str]:
+    if ffmpeg_path:
+        ffprobe_candidate = os.path.join(os.path.dirname(ffmpeg_path), "ffprobe")
+        if sys.platform.startswith("win"):
+            ffprobe_candidate += ".exe"
+        if os.path.isfile(ffprobe_candidate):
+            return ffprobe_candidate
+    return shutil.which("ffprobe")
+
+
+def get_video_duration_seconds(video_path: str) -> Optional[float]:
+    ffmpeg_path = find_ffmpeg()
+    ffprobe_path = _resolve_ffprobe(ffmpeg_path)
+    if not ffprobe_path:
+        return None
+    cmd = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+        return float(value) if value else None
+    except Exception:
+        return None
+
+
+def cut_video_clip_with_poster(
+    video_path: str,
+    start_hms: str,
+    end_hms: str,
+    output_dir: str,
+) -> Tuple[bool, str | dict]:
+    ffmpeg_path = find_ffmpeg()
+    if not ffmpeg_path:
+        return False, "FFmpeg не найден. Положите ffmpeg.exe рядом с программой или добавьте его в PATH."
+
+    start_sec = parse_hms(start_hms)
+    end_sec = parse_hms(end_hms)
+    if start_sec is None or end_sec is None:
+        return False, "Неверный формат времени. Используйте HH:MM:SS."
+    if end_sec <= start_sec:
+        return False, "Время окончания должно быть больше времени начала."
+
+    os.makedirs(output_dir, exist_ok=True)
+    safe_start = start_hms.replace(":", "-")
+    safe_end = end_hms.replace(":", "-")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    clip_path = os.path.join(output_dir, f"clip_{ts}_{safe_start}_{safe_end}.mp4")
+    poster_path = os.path.join(output_dir, f"clip_{ts}_{safe_start}_{safe_end}.jpg")
+
+    base_cmd = [
+        ffmpeg_path,
+        "-y",
+        "-ss",
+        start_hms,
+        "-to",
+        end_hms,
+        "-i",
+        video_path,
+    ]
+    copy_cmd = base_cmd + ["-c", "copy", clip_path]
+    try:
+        result = subprocess.run(copy_cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            reencode_cmd = base_cmd + [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                clip_path,
+            ]
+            result = subprocess.run(reencode_cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() or "Неизвестная ошибка ffmpeg."
+                return False, f"Не удалось вырезать клип: {error_msg}"
+    except FileNotFoundError:
+        return False, "FFmpeg не найден."
+    except Exception as exc:
+        return False, f"Ошибка ffmpeg: {exc}"
+
+    poster_cmd = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        clip_path,
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        poster_path,
+    ]
+    try:
+        result = subprocess.run(poster_cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return False, (result.stderr.strip() or "Не удалось создать постер.")
+    except Exception as exc:
+        return False, f"Ошибка ffmpeg: {exc}"
+
+    return True, {"clip_path": clip_path, "poster_path": poster_path}
+
+
 def open_in_external_player(path: str) -> None:
     """Open *path* in the system video player."""
 

@@ -70,6 +70,7 @@ import gzip
 import pickle
 from datetime import date, datetime, timedelta
 import collections
+import html
 import math
 from csv_importer import (
     attach_image_if_exists,
@@ -263,9 +264,12 @@ from deck_timer import (
 )
 from video_tools import (
     VlcPlayerWidget,
-    cut_video_clip,
+    cut_video_clip_with_poster,
+    format_hms,
+    get_video_duration_seconds,
     is_vlc_available,
     open_in_external_player,
+    parse_hms,
 )
 from audio_player_widget import AudioPlayerWidget
 # ui_theme: в разных версиях проекта функции темы могут называться иначе.
@@ -2895,6 +2899,133 @@ def create_note_with_cards(
     ]
     attach_media_to_note(note_id, media_entries)
     return note_id, cards_created
+
+
+def _get_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table});")
+    return {row["name"] for row in cur.fetchall()}
+
+
+def spend_credits_in_transaction(
+    conn: sqlite3.Connection,
+    user_id: str,
+    amount: int,
+    reason: str,
+    meta: dict | None = None,
+) -> None:
+    if amount <= 0:
+        return
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO credits_balance (user_id, balance) VALUES (?, 0);",
+        (user_id,),
+    )
+    cur.execute("SELECT balance FROM credits_balance WHERE user_id = ?;", (user_id,))
+    row = cur.fetchone()
+    balance = int(row[0]) if row else 0
+    if balance < amount:
+        raise ValueError("insufficient credits")
+    cur.execute(
+        "UPDATE credits_balance SET balance = balance - ? WHERE user_id = ?;",
+        (amount, user_id),
+    )
+    columns = _get_table_columns(conn, "credits_ledger")
+    meta_column = "meta" if "meta" in columns else "meta_json"
+    cur.execute(
+        f"""
+        INSERT INTO credits_ledger (user_id, ts, delta, reason, {meta_column})
+        VALUES (?, ?, ?, ?, ?);
+        """,
+        (
+            user_id,
+            int(time.time()),
+            -abs(amount),
+            reason,
+            json.dumps(meta or {}, ensure_ascii=False),
+        ),
+    )
+
+
+def create_note_with_cards_in_transaction(
+    conn: sqlite3.Connection,
+    deck_id: int,
+    fields: dict,
+    note_type_id: int | None = None,
+    tags: str = "",
+    skip_template_ords: set[int] | None = None,
+    created_card_ids: list[int] | None = None,
+) -> tuple[int, int]:
+    skip_template_ords = skip_template_ords or set()
+    note_type = note_type_id or ensure_generated_note_type_id(conn)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO notes (deck_id, note_type_id, fields_json, tags, created_at)
+        VALUES (?, ?, ?, ?, ?);
+        """,
+        (
+            deck_id,
+            note_type,
+            json.dumps(fields, ensure_ascii=False),
+            tags,
+            int(time.time()),
+        ),
+    )
+    note_id = cur.lastrowid
+    note_type_row = _get_note_type(cur, note_type)
+    if not note_type_row:
+        raise RuntimeError("Тип заметки не найден")
+    templates = json.loads(note_type_row["card_templates_json"])
+    fields_default = collections.defaultdict(str, fields)
+    audio_value = fields_default.get("audio_path")
+    front_rich = fields_default.get("front_rich")
+    back_rich = fields_default.get("back_rich")
+
+    created = 0
+    for ord_idx, template in enumerate(templates):
+        if ord_idx in skip_template_ords:
+            continue
+        requires_image = bool(template.get("requires_image"))
+        image_value = fields_default.get("image") or fields_default.get("front_image_path")
+        if requires_image and not image_value:
+            continue
+        formatter = collections.defaultdict(str, fields_default)
+        front = str(template.get("front", "")).format_map(formatter)
+        back = str(template.get("back", "")).format_map(formatter)
+        front_image_path = fields_default.get("front_image_path") or (image_value if requires_image else None)
+        back_image_path = fields_default.get("back_image_path") or None
+        next_dt = get_next_review_for_level(1, deck_id).isoformat()
+        cur.execute(
+            """
+            INSERT INTO cards (
+                deck_id, front, back, next_review, leitner_level,
+                front_image_path, back_image_path, front_rich, back_rich, audio_path,
+                note_id, template_ord, translation_shown, overview_added
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1);
+            """,
+            (
+                deck_id,
+                front,
+                back,
+                next_dt,
+                1,
+                front_image_path,
+                back_image_path,
+                serialize_rich_doc(front_rich),
+                serialize_rich_doc(back_rich),
+                audio_value,
+                note_id,
+                ord_idx,
+            ),
+        )
+        card_id = cur.lastrowid
+        created += 1
+        if created_card_ids is not None:
+            created_card_ids.append(int(card_id))
+
+    return note_id, created
 
 
 def ensure_notes_for_cards(cards: list[sqlite3.Row]) -> list[dict]:
@@ -6046,6 +6177,299 @@ def render_rich_to_container(parent: tk.Widget, rich_doc: dict, card_bg: str, ca
     text_widget.configure(state=tk.DISABLED)
     return text_widget
 
+
+def _to_file_url(path: str) -> str:
+    try:
+        return Path(path).resolve().as_uri()
+    except Exception:
+        return path
+
+
+def build_video_embed_html(clip_path: str | None, poster_path: str | None) -> str:
+    if not clip_path:
+        return ""
+    clip_url = _to_file_url(clip_path)
+    poster_url = _to_file_url(poster_path) if poster_path else ""
+    poster_attr = f' poster="{html.escape(poster_url)}"' if poster_url else ""
+    return (
+        f'<video controls preload="metadata"{poster_attr}>'
+        f'<source src="{html.escape(clip_url)}" type="video/mp4"></video>'
+    )
+
+
+def build_rich_text_editor(
+    parent: tk.Widget,
+    palette: dict | None = None,
+    *,
+    height: int = 10,
+    on_change=None,
+) -> dict:
+    palette = palette or {}
+    toolbar_bg = palette.get("surface", "#111827")
+    toolbar_border = palette.get("card_border", "#1F2937")
+    toolbar_fg = palette.get("text", "#E5E7EB")
+    toolbar_hover = palette.get("accent", "#4F46E5")
+
+    container = tk.Frame(parent, bg=palette.get("background", "#0B0D12"))
+    format_wrap = tk.Frame(container, bg="white")
+    format_wrap.pack(fill=tk.X)
+    format_inner = tk.Frame(format_wrap, bg=palette.get("background", "#0B0D12"))
+    format_inner.pack(fill=tk.X, padx=1, pady=1)
+
+    toolbar = tk.Frame(format_inner, bg=toolbar_bg, highlightthickness=1, highlightbackground=toolbar_border)
+    toolbar.pack(fill=tk.X, padx=6, pady=4)
+
+    text_widget = tk.Text(container, height=height, wrap=tk.WORD)
+    style_card_surface_text(text_widget, palette)
+    text_widget.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+    create_context_menu(text_widget)
+
+    def _ensure_hidden_token_tag() -> str:
+        token_tag = "hidden_token"
+        if token_tag not in text_widget.tag_names():
+            try:
+                text_widget.tag_configure(token_tag, elide=True)
+            except tk.TclError:
+                bg = text_widget.cget("bg")
+                text_widget.tag_configure(token_tag, foreground=bg, background=bg)
+        return token_tag
+
+    def _insert_hidden_token(index: str, token: str) -> None:
+        token_tag = _ensure_hidden_token_tag()
+        text_widget.insert(index, token)
+        start = text_widget.index(index)
+        end = text_widget.index(f"{start} + {len(token)}c")
+        text_widget.tag_add(token_tag, start, end)
+
+    def _remove_underline_tokens(start: str, end: str) -> None:
+        range_start = text_widget.index(f"{start} - 12c")
+        range_end = text_widget.index(f"{end} + 12c")
+        segment = text_widget.get(range_start, range_end)
+        matches = list(_UNDERLINE_TOKEN_RE.finditer(segment))
+        for match in reversed(matches):
+            token_start = text_widget.index(f"{range_start} + {match.start()}c")
+            token_end = text_widget.index(f"{range_start} + {match.end()}c")
+            text_widget.delete(token_start, token_end)
+
+    def _btn(parent_btn, label, command):
+        btn = tk.Button(
+            parent_btn,
+            text=label,
+            command=command,
+            bg=toolbar_bg,
+            fg=toolbar_fg,
+            activebackground=toolbar_hover,
+            activeforeground=toolbar_fg,
+            relief=tk.FLAT,
+            bd=0,
+            padx=6,
+            pady=2,
+            font=("Segoe UI", 10, "bold"),
+        )
+
+        def _on_enter(_e):
+            btn.configure(bg=toolbar_hover)
+
+        def _on_leave(_e):
+            btn.configure(bg=toolbar_bg)
+
+        btn.bind("<Enter>", _on_enter)
+        btn.bind("<Leave>", _on_leave)
+        btn.pack(side=tk.LEFT, padx=2)
+        return btn
+
+    def _toggle_tag(tag: str, **cfg) -> None:
+        if tag not in text_widget.tag_names():
+            text_widget.tag_configure(tag, **cfg)
+        try:
+            has_tag = tag in text_widget.tag_names("sel.first")
+            if has_tag:
+                text_widget.tag_remove(tag, "sel.first", "sel.last")
+            else:
+                text_widget.tag_add(tag, "sel.first", "sel.last")
+        except tk.TclError:
+            pass
+
+    def _clear_formatting() -> None:
+        try:
+            start = text_widget.index("sel.first")
+            end = text_widget.index("sel.last")
+        except tk.TclError:
+            start = text_widget.index("insert linestart")
+            end = text_widget.index("insert lineend")
+        for tag in text_widget.tag_names():
+            if tag != "sel":
+                text_widget.tag_remove(tag, start, end)
+        _remove_underline_tokens(start, end)
+
+    def _choose_color(title: str):
+        try:
+            return colorchooser.askcolor(title=title, parent=container)
+        except tk.TclError:
+            return None
+
+    def _apply_color() -> None:
+        chosen = _choose_color("Цвет текста")
+        if not chosen or not chosen[1]:
+            return
+        color = chosen[1]
+        _toggle_tag(f"color_{color}", foreground=color)
+
+    def _apply_marker() -> None:
+        chosen = _choose_color("Цвет выделения")
+        if not chosen or not chosen[1]:
+            return
+        color = chosen[1]
+        _toggle_tag(f"marker_{color}", background=color)
+
+    def _apply_list(prefix: str) -> None:
+        try:
+            start = text_widget.index("sel.first linestart")
+            end = text_widget.index("sel.last linestart")
+        except tk.TclError:
+            start = text_widget.index("insert linestart")
+            end = start
+        line = start
+        counter = 1
+        while True:
+            insert_prefix = prefix.format(counter=counter)
+            text_widget.insert(line, insert_prefix)
+            if line == end:
+                break
+            line = text_widget.index(f"{line} +1 line")
+            counter += 1
+
+    def _line_range() -> tuple[str, str]:
+        try:
+            start = text_widget.index("sel.first linestart")
+            end = text_widget.index("sel.last linestart")
+        except tk.TclError:
+            start = text_widget.index("insert linestart")
+            end = start
+        return start, end
+
+    def _indent_lines() -> None:
+        start, end = _line_range()
+        line = start
+        while True:
+            text_widget.insert(line, "\t")
+            if line == end:
+                break
+            line = text_widget.index(f"{line} +1 line")
+
+    def _outdent_lines() -> None:
+        start, end = _line_range()
+        line = start
+        while True:
+            if text_widget.get(line, f"{line} +1c") == "\t":
+                text_widget.delete(line, f"{line} +1c")
+            elif text_widget.get(line, f"{line} +4c") == "    ":
+                text_widget.delete(line, f"{line} +4c")
+            elif text_widget.get(line, f"{line} +2c") == "  ":
+                text_widget.delete(line, f"{line} +2c")
+            if line == end:
+                break
+            line = text_widget.index(f"{line} +1 line")
+
+    def _apply_justify(align: str) -> None:
+        tag = f"align_{align}"
+        if tag not in text_widget.tag_names():
+            text_widget.tag_configure(tag, justify=align)
+        try:
+            text_widget.tag_add(tag, "sel.first", "sel.last")
+        except tk.TclError:
+            text_widget.tag_add(tag, "1.0", tk.END)
+
+    def _apply_script(tag: str, offset: int) -> None:
+        base_font = tkfont.Font(font=text_widget.cget("font"))
+        size = max(8, int(base_font.cget("size") or 12) - 3)
+        script_font = base_font.copy()
+        script_font.configure(size=size)
+        _toggle_tag(tag, font=script_font, offset=offset)
+
+    def _insert_link() -> None:
+        url = simpledialog.askstring("Ссылка", "Введите URL:", parent=container)
+        if not url:
+            return
+        text_widget.insert("insert", url)
+
+    def _apply_underline_style(style: str) -> None:
+        try:
+            start = text_widget.index("sel.first")
+            end = text_widget.index("sel.last")
+        except tk.TclError:
+            return
+        if style == "double":
+            tag_name = "underline_double"
+            tag_cfg = {"underline": 1, "foreground": palette.get("accent", "#4F46E5")}
+        else:
+            tag_name = "underline_wavy"
+            tag_cfg = {"underline": 1, "foreground": palette.get("muted", "#98A2B3")}
+        if tag_name not in text_widget.tag_names():
+            text_widget.tag_configure(tag_name, **tag_cfg)
+        text_widget.tag_add(tag_name, start, end)
+        _insert_hidden_token(end, "[[/u]]")
+        _insert_hidden_token(start, f"[[u:{style}]]")
+
+    def _insert_mathjax() -> None:
+        try:
+            start = text_widget.index("sel.first")
+            end = text_widget.index("sel.last")
+            content = text_widget.get(start, end)
+            text_widget.delete(start, end)
+            text_widget.insert(start, f"\\({content}\\)")
+        except tk.TclError:
+            insert_pos = text_widget.index("insert")
+            text_widget.insert(insert_pos, "\\(  \\)")
+            text_widget.mark_set("insert", f"{insert_pos} + 3c")
+
+    def _attach_media() -> None:
+        filename = filedialog.askopenfilename(
+            title="Прикрепить файл",
+            filetypes=[
+                ("Медиа", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.mp3 *.wav *.ogg *.m4a *.mp4 *.mov *.avi *.mkv *.webm"),
+                ("Все файлы", "*.*"),
+            ],
+            parent=container,
+        )
+        if not filename:
+            return
+        text_widget.insert("insert", filename)
+
+    def _fmt_not_ready() -> None:
+        pass
+
+    _btn(toolbar, "B", lambda: _toggle_tag("bold", font=("Segoe UI", 10, "bold")))
+    _btn(toolbar, "I", lambda: _toggle_tag("italic", font=("Segoe UI", 10, "italic")))
+    _btn(toolbar, "U", lambda: _toggle_tag("underline", underline=1))
+    _btn(toolbar, "U²", lambda: _apply_underline_style("double"))
+    _btn(toolbar, "U~", lambda: _apply_underline_style("wavy"))
+    _btn(toolbar, "x²", lambda: _apply_script("superscript", 6))
+    _btn(toolbar, "x₂", lambda: _apply_script("subscript", -4))
+    _btn(toolbar, "A", _apply_color)
+    _btn(toolbar, "🖍", _apply_marker)
+    _btn(toolbar, "🧹", _clear_formatting)
+    _btn(toolbar, "•", lambda: _apply_list("• "))
+    _btn(toolbar, "1.", lambda: _apply_list("{counter}. "))
+    _btn(toolbar, "L", lambda: _apply_justify("left"))
+    _btn(toolbar, "C", lambda: _apply_justify("center"))
+    _btn(toolbar, "R", lambda: _apply_justify("right"))
+    _btn(toolbar, "⇥", _indent_lines)
+    _btn(toolbar, "⇤", _outdent_lines)
+    _btn(toolbar, "🔗", _insert_link)
+    _btn(toolbar, "📎", _attach_media)
+    _btn(toolbar, "🎙", _fmt_not_ready)
+    _btn(toolbar, "Fx", _insert_mathjax)
+    _btn(toolbar, "</>", _fmt_not_ready)
+    _btn(toolbar, "⨯", _fmt_not_ready)
+
+    text_widget.bind("<Tab>", lambda _e: (_indent_lines() or "break"))
+    text_widget.bind("<Shift-Tab>", lambda _e: (_outdent_lines() or "break"))
+    if on_change is not None:
+        text_widget.bind("<KeyRelease>", lambda _e: on_change())
+
+    return {"frame": container, "text": text_widget, "toolbar": toolbar}
+
 def create_action_menubutton(parent, palette: dict | None = None) -> tuple[ttk.Menubutton, tk.Menu]:
     palette = palette or {}
     style = ttk.Style(parent)
@@ -6871,20 +7295,36 @@ class AnkiApp(tk.Tk):
             return
         win = tk.Toplevel(self)
         win.title("Видео → клипы → карточки")
-        win.geometry("520x260")
+        win.geometry("1180x860")
+        win.minsize(980, 760)
         win.grab_set()
         apply_dark_theme_to_window(win, self.palette)
+
+        deck_id = self.selected_deck_id
+        colors = getattr(self, "palette", None) or {}
+        state = {
+            "video_path": None,
+            "clip_path": None,
+            "poster_path": None,
+            "front_video": None,
+            "back_video": None,
+        }
 
         video_path_var = tk.StringVar()
         start_var = tk.StringVar(value="00:00:00")
         end_var = tk.StringVar(value="00:00:10")
+        start_sec_var = tk.DoubleVar(value=0)
+        end_sec_var = tk.DoubleVar(value=10)
+        duration_var = tk.StringVar(value="Длительность: —")
+        status_var = tk.StringVar(value="Клип сохраняется в папку media/clips/")
+        clip_info_var = tk.StringVar(value="Клип не создан")
 
-        ttk.Label(win, text="Видео файл:").pack(anchor="w", padx=10, pady=(10, 0))
-        video_frame = ttk.Frame(win)
-        video_frame.pack(fill=tk.X, padx=10)
-
-        entry_video = ttk.Entry(video_frame, textvariable=video_path_var)
-        entry_video.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        top_frame = ttk.Frame(win)
+        top_frame.pack(fill=tk.X, padx=12, pady=(10, 6))
+        ttk.Label(top_frame, text="Видео файл:").pack(anchor="w")
+        video_row = ttk.Frame(top_frame)
+        video_row.pack(fill=tk.X, pady=4)
+        ttk.Entry(video_row, textvariable=video_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         def browse_video():
             path = filedialog.askopenfilename(
@@ -6893,59 +7333,401 @@ class AnkiApp(tk.Tk):
             )
             if path:
                 video_path_var.set(path)
+                load_video(path)
 
-        ttk.Button(video_frame, text="…", width=4, command=browse_video).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(video_row, text="…", width=4, command=browse_video).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(top_frame, textvariable=duration_var).pack(anchor="w")
 
-        time_frame = ttk.Frame(win)
-        time_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Label(time_frame, text="Начало (HH:MM:SS):").grid(row=0, column=0, sticky="w")
-        ttk.Label(time_frame, text="Конец (HH:MM:SS):").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        player_frame = ttk.LabelFrame(win, text="Плеер")
+        player_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
+        player_holder = {"player": None}
 
-        ttk.Entry(time_frame, textvariable=start_var, width=12).grid(row=0, column=1, padx=5, sticky="w")
-        ttk.Entry(time_frame, textvariable=end_var, width=12).grid(row=1, column=1, padx=5, sticky="w", pady=(5, 0))
+        def _render_player(path: str) -> None:
+            for widget in player_frame.winfo_children():
+                widget.destroy()
+            if is_vlc_available():
+                try:
+                    player = VlcPlayerWidget(player_frame, path, width=520, height=280)
+                    if player.ensure_embedded():
+                        player.pack(anchor="w", padx=6, pady=6)
+                        player_holder["player"] = player
+                        return
+                except Exception:
+                    player_holder["player"] = None
+            ttk.Label(player_frame, text="Встроенный плеер недоступен").pack(anchor="w", padx=6, pady=6)
+            ttk.Button(
+                player_frame,
+                text="Открыть во внешнем плеере",
+                command=lambda: open_in_external_player(path),
+            ).pack(anchor="w", padx=6, pady=(0, 6))
 
-        status_var = tk.StringVar(value="Клип сохраняется в папку media/")
-        ttk.Label(win, textvariable=status_var, foreground="gray").pack(anchor="w", padx=10)
+        time_frame = ttk.LabelFrame(win, text="Нарезка")
+        time_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
+        time_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(time_frame, text="Начало:").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        start_entry = ttk.Entry(time_frame, textvariable=start_var, width=12)
+        start_entry.grid(row=0, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(time_frame, text="Конец:").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        end_entry = ttk.Entry(time_frame, textvariable=end_var, width=12)
+        end_entry.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+
+        start_scale = ttk.Scale(time_frame, from_=0, to=10, variable=start_sec_var)
+        end_scale = ttk.Scale(time_frame, from_=0, to=10, variable=end_sec_var)
+        start_scale.grid(row=0, column=2, sticky="ew", padx=6)
+        end_scale.grid(row=1, column=2, sticky="ew", padx=6)
+
+        def _sync_var_from_scale(var: tk.StringVar, value: float) -> None:
+            var.set(format_hms(int(value)))
+
+        def _apply_scale_bounds() -> None:
+            if end_sec_var.get() <= start_sec_var.get():
+                end_sec_var.set(start_sec_var.get() + 1)
+                _sync_var_from_scale(end_var, end_sec_var.get())
+
+        def _on_start_scale(value):
+            _sync_var_from_scale(start_var, float(value))
+            _apply_scale_bounds()
+
+        def _on_end_scale(value):
+            _sync_var_from_scale(end_var, float(value))
+            _apply_scale_bounds()
+
+        start_scale.configure(command=_on_start_scale)
+        end_scale.configure(command=_on_end_scale)
+
+        def _sync_entry_to_scale(var: tk.StringVar, scale_var: tk.DoubleVar) -> None:
+            parsed = parse_hms(var.get().strip())
+            if parsed is None:
+                messagebox.showwarning("Время", "Введите время в формате HH:MM:SS.", parent=win)
+                return
+            scale_var.set(parsed)
+            _apply_scale_bounds()
+
+        start_entry.bind("<Return>", lambda _e: _sync_entry_to_scale(start_var, start_sec_var))
+        end_entry.bind("<Return>", lambda _e: _sync_entry_to_scale(end_var, end_sec_var))
+        start_entry.bind("<FocusOut>", lambda _e: _sync_entry_to_scale(start_var, start_sec_var))
+        end_entry.bind("<FocusOut>", lambda _e: _sync_entry_to_scale(end_var, end_sec_var))
+
+        ttk.Label(time_frame, textvariable=status_var, foreground="gray").grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6)
+        )
+        ttk.Label(time_frame, textvariable=clip_info_var, foreground="gray").grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6)
+        )
+
+        def load_video(path: str) -> None:
+            if not path or not os.path.exists(path):
+                return
+            state["video_path"] = path
+            duration = get_video_duration_seconds(path)
+            if duration:
+                duration_var.set(f"Длительность: {format_hms(int(duration))}")
+                start_sec_var.set(0)
+                end_sec_var.set(max(1, int(duration)))
+                start_scale.configure(to=duration)
+                end_scale.configure(to=duration)
+                start_var.set("00:00:00")
+                end_var.set(format_hms(int(duration)))
+            _render_player(path)
 
         def cut_and_attach():
-            video_path = video_path_var.get().strip()
+            video_path = state.get("video_path") or video_path_var.get().strip()
             if not video_path:
-                messagebox.showerror("Ошибка", "Выберите видео файл.")
+                messagebox.showerror("Ошибка", "Выберите видео файл.", parent=win)
                 return
-
-            ok, result = cut_video_clip(video_path, start_var.get(), end_var.get(), MEDIA_FOLDER)
+            output_dir = os.path.join(MEDIA_FOLDER, "clips", str(deck_id))
+            ok, result = cut_video_clip_with_poster(
+                video_path,
+                start_var.get(),
+                end_var.get(),
+                output_dir,
+            )
             if not ok:
-                messagebox.showerror("FFmpeg", result)
+                messagebox.showerror("FFmpeg", str(result), parent=win)
                 return
-
-            clip_path = result
+            clip_path = result.get("clip_path") if isinstance(result, dict) else None
+            poster_path = result.get("poster_path") if isinstance(result, dict) else None
+            if not clip_path:
+                messagebox.showerror("FFmpeg", "Не удалось получить путь клипа.", parent=win)
+                return
+            state["clip_path"] = clip_path
+            state["poster_path"] = poster_path
             clip_name = os.path.basename(clip_path)
             clip_info = f"{start_var.get()} → {end_var.get()}"
+            status_var.set(f"Создан клип {clip_name}")
+            clip_info_var.set(f"Клип: {clip_name} ({clip_info})")
 
-            note_fields = {
-                "word": clip_name,
-                "translation": "",
-                "example": clip_info,
-                "level": 1,
-                "image": "",
-                "front": f"🎬 Клип {clip_info}\n{clip_name}",
-                "back": f"Смотри клип {clip_info}\n{clip_name}",
-                "front_image_path": None,
-                "back_image_path": None,
+        ttk.Button(time_frame, text="Нарезать", command=cut_and_attach).grid(
+            row=0, column=3, rowspan=2, padx=6, pady=6, sticky="ns"
+        )
+
+        template_frame = ttk.LabelFrame(win, text="Шаблон карточки")
+        template_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
+        ttk.Label(template_frame, text="Выберите шаблон карточки:").pack(anchor="w", padx=6, pady=(6, 0))
+        self._build_generation_template_selector(template_frame, deck_id, padx=6, pady=(0, 6))
+
+        editor_frame = ttk.LabelFrame(win, text="Редактор")
+        editor_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+
+        notebook = ttk.Notebook(editor_frame)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        front_tab = ttk.Frame(notebook)
+        back_tab = ttk.Frame(notebook)
+        notebook.add(front_tab, text="Front")
+        notebook.add(back_tab, text="Back")
+
+        front_editor = build_rich_text_editor(front_tab, colors)
+        back_editor = build_rich_text_editor(back_tab, colors)
+        front_editor["frame"].pack(fill=tk.BOTH, expand=True)
+        back_editor["frame"].pack(fill=tk.BOTH, expand=True)
+
+        front_video_label = tk.StringVar(value="Видео не добавлено")
+        back_video_label = tk.StringVar(value="Видео не добавлено")
+
+        def _require_clip() -> bool:
+            if not state.get("clip_path"):
+                messagebox.showinfo("Видео", "Сначала нарежьте клип.", parent=win)
+                return False
+            return True
+
+        def insert_front_video():
+            if not _require_clip():
+                return
+            state["front_video"] = state.get("clip_path")
+            front_video_label.set(f"🎬 {os.path.basename(state['front_video'])}")
+
+        def insert_back_video():
+            if not _require_clip():
+                return
+            state["back_video"] = state.get("clip_path")
+            back_video_label.set(f"🎬 {os.path.basename(state['back_video'])}")
+
+        def clear_front_video():
+            state["front_video"] = None
+            front_video_label.set("Видео не добавлено")
+
+        def clear_back_video():
+            state["back_video"] = None
+            back_video_label.set("Видео не добавлено")
+
+        insert_frame = ttk.Frame(win)
+        insert_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ttk.Button(insert_frame, text="Вставить видео на Front", command=insert_front_video).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Label(insert_frame, textvariable=front_video_label).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(insert_frame, text="Очистить", command=clear_front_video).pack(side=tk.LEFT)
+
+        ttk.Button(insert_frame, text="Вставить видео на Back", command=insert_back_video).pack(
+            side=tk.LEFT, padx=(16, 6)
+        )
+        ttk.Label(insert_frame, textvariable=back_video_label).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(insert_frame, text="Очистить", command=clear_back_video).pack(side=tk.LEFT)
+
+        preview_state = {"window": None, "renderer": None, "side": "front"}
+
+        def _build_ctx() -> dict:
+            front_text = front_editor["text"].get("1.0", tk.END).strip()
+            back_text = back_editor["text"].get("1.0", tk.END).strip()
+            front_html = html.escape(front_text).replace("\n", "<br>")
+            back_html = html.escape(back_text).replace("\n", "<br>")
+            front_video_html = build_video_embed_html(state.get("front_video"), state.get("poster_path"))
+            back_video_html = build_video_embed_html(state.get("back_video"), state.get("poster_path"))
+            template = get_active_generation_template(deck_id)
+            return {
+                "question": template.get("question") or "",
+                "front_html": front_html,
+                "back_html": back_html,
+                "front": front_text,
+                "back": back_text,
+                "front_video_html": front_video_html,
+                "back_video_html": back_video_html,
+            }
+
+        def _build_preview_card() -> dict:
+            ctx = _build_ctx()
+            front, back = render_generation_faces(deck_id, ctx)
+            poster_path = state.get("poster_path")
+            return {
+                "front": front,
+                "back": back,
+                "front_image_path": poster_path if state.get("front_video") else None,
+                "back_image_path": poster_path if state.get("back_video") else None,
+                "front_video_path": state.get("front_video"),
+                "back_video_path": state.get("back_video"),
                 "audio_path": None,
             }
 
-            note_id, _ = create_note_with_cards(
-                self.selected_deck_id,
-                note_fields,
-                note_type_id=ensure_generated_note_type_id(),
-                tags="video clip",
-            )
-            attach_media_to_note(note_id, [(clip_path, "video")])
-            status_var.set(f"Создан клип {clip_name}")
-            messagebox.showinfo("Готово", f"Клип сохранен в {clip_path}\nКарточка добавлена в колоду.")
+        def open_preview():
+            preview_win = tk.Toplevel(win)
+            preview_win.title("Предпросмотр карточки")
+            preview_win.geometry("900x620")
+            preview_win.grab_set()
+            apply_dark_theme_to_window(preview_win, colors)
 
-        ttk.Button(win, text="Нарезать клип", command=cut_and_attach).pack(anchor="e", padx=10, pady=10)
+            container = tk.Frame(preview_win, bg=DARK_BG)
+            container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+            controls = tk.Frame(container, bg=DARK_BG)
+            controls.pack(fill=tk.X, pady=(0, 8))
+
+            def _set_side(side: str) -> None:
+                preview_state["side"] = side
+                update_preview()
+
+            ttk.Button(controls, text="Лицевая", command=lambda: _set_side("front")).pack(
+                side=tk.LEFT, padx=4
+            )
+            ttk.Button(controls, text="Обратная", command=lambda: _set_side("back")).pack(
+                side=tk.LEFT, padx=4
+            )
+
+            card_wrap = tk.Frame(
+                container,
+                bg=DARK_BG,
+                highlightbackground=CARD_BORDER,
+                highlightthickness=1,
+                bd=0,
+                width=CARD_VIEW_WIDTH,
+                height=CARD_VIEW_HEIGHT,
+            )
+            card_wrap.pack(padx=10, pady=10)
+            card_wrap.pack_propagate(False)
+            renderer = CardRenderer(
+                card_wrap,
+                palette=colors,
+                editable=False,
+                show_image_toolbar=False,
+                image_layout="side",
+                show_media_placeholder=False,
+                fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
+                render_mode="preview",
+            )
+            renderer.image_container.config(width=REPEAT_MEDIA_SLOT_SIZE[0], height=REPEAT_MEDIA_SLOT_SIZE[1])
+            renderer.image_container.pack_propagate(False)
+            renderer.image_container.grid_propagate(False)
+
+            preview_state["window"] = preview_win
+            preview_state["renderer"] = renderer
+            preview_state["side"] = "front"
+
+            def update_preview() -> None:
+                card_data = _build_preview_card()
+                side = preview_state.get("side") or "front"
+                renderer.render(
+                    card_data,
+                    show_back=(side == "back"),
+                    prefer_audio_side=side,
+                    header_text="Предпросмотр",
+                )
+
+            def _on_close():
+                preview_state["window"] = None
+                preview_state["renderer"] = None
+                preview_win.destroy()
+
+            preview_win.protocol("WM_DELETE_WINDOW", _on_close)
+            update_preview()
+
+        cost = 2 if self.is_premium_active() else 6
+        cost_frame = ttk.Frame(win)
+        cost_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ttk.Button(cost_frame, text="Предпросмотр", command=open_preview).pack(side=tk.LEFT)
+
+        coin_icon, _ = self._load_credit_icon_pair()
+        cost_row = ttk.Frame(cost_frame)
+        cost_row.pack(side=tk.RIGHT)
+        ttk.Label(cost_row, text="Сохранить:").pack(side=tk.LEFT, padx=(0, 6))
+        if coin_icon:
+            coin_label = tk.Label(cost_row, image=coin_icon)
+            coin_label.image = coin_icon
+            coin_label.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(cost_row, text=str(cost)).pack(side=tk.LEFT)
+
+        def save_card():
+            if not deck_id:
+                messagebox.showerror("Ошибка", "Колода не выбрана.", parent=win)
+                return
+            if not state.get("clip_path"):
+                messagebox.showwarning("Клип", "Сначала нарежьте клип.", parent=win)
+                return
+            if not self.can_afford(cost):
+                messagebox.showwarning("Кредиты", "Недостаточно кредитов.", parent=win)
+                return
+            ctx = _build_ctx()
+            front, back = render_generation_faces(deck_id, ctx)
+            poster_path = state.get("poster_path")
+            note_fields = {
+                "word": os.path.basename(state["clip_path"]),
+                "translation": "",
+                "example": "",
+                "level": 1,
+                "image": poster_path or "",
+                "front": front,
+                "back": back,
+                "front_image_path": poster_path if state.get("front_video") else None,
+                "back_image_path": poster_path if state.get("back_video") else None,
+                "audio_path": None,
+                "front_html": ctx.get("front_html"),
+                "back_html": ctx.get("back_html"),
+                "front_video_html": ctx.get("front_video_html"),
+                "back_video_html": ctx.get("back_video_html"),
+            }
+            media_entries = []
+            if state.get("front_video"):
+                media_entries.append((state["front_video"], "video", "front", None))
+                if poster_path:
+                    media_entries.append((poster_path, "image", "front", None))
+            if state.get("back_video"):
+                media_entries.append((state["back_video"], "video", "back", None))
+                if poster_path:
+                    media_entries.append((poster_path, "image", "back", None))
+            conn = get_connection()
+
+            def _op():
+                spend_credits_in_transaction(
+                    conn,
+                    self.user_id,
+                    cost,
+                    "video_clip_card",
+                    meta={"deck_id": deck_id, "clip": os.path.basename(state["clip_path"])},
+                )
+                note_id, _ = create_note_with_cards_in_transaction(
+                    conn,
+                    deck_id,
+                    note_fields,
+                    note_type_id=ensure_generated_note_type_id(conn),
+                    tags="video clip",
+                )
+                for entry in media_entries:
+                    path, media_type, side, source = entry
+                    insert_media(
+                        conn,
+                        note_id=note_id,
+                        type=media_type,
+                        path=path,
+                        side=side or "back",
+                        source=source,
+                    )
+                return note_id
+
+            try:
+                commit_with_retry(conn, _op)
+            except Exception as exc:
+                conn.rollback()
+                messagebox.showerror("Ошибка", f"Не удалось сохранить карточку: {exc}", parent=win)
+                return
+            finally:
+                conn.close()
+
+            self.refresh_balance_display()
+            self.refresh_decks()
+            self.update_deck_preview()
+            self.update_overdue_badge()
+            messagebox.showinfo("Сохранено", "Карточка создана.", parent=win)
+            win.destroy()
+
+        ttk.Button(cost_frame, text="Сохранить", command=save_card).pack(side=tk.RIGHT, padx=(0, 12))
 
     def open_apkg_import_window(self):
         win = tk.Toplevel(self)
