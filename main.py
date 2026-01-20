@@ -264,12 +264,11 @@ from deck_timer import (
 )
 from video_tools import (
     VlcPlayerWidget,
-    cut_video_clip_with_poster,
+    cut_video_clip,
     format_hms,
     get_video_duration_seconds,
     is_vlc_available,
     open_in_external_player,
-    parse_hms,
 )
 from audio_player_widget import AudioPlayerWidget
 # ui_theme: в разных версиях проекта функции темы могут называться иначе.
@@ -6197,6 +6196,128 @@ def build_video_embed_html(clip_path: str | None, poster_path: str | None) -> st
     )
 
 
+def parse_timecode_to_seconds(value: str) -> float | None:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if not 1 <= len(parts) <= 3:
+        return None
+    try:
+        seconds = float(parts[-1].replace(",", "."))
+    except ValueError:
+        return None
+    if seconds < 0:
+        return None
+    hours = 0
+    minutes = 0
+    if len(parts) == 2:
+        try:
+            minutes = int(parts[0])
+        except ValueError:
+            return None
+        if seconds >= 60:
+            return None
+    elif len(parts) == 3:
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+        except ValueError:
+            return None
+        if seconds >= 60:
+            return None
+    if hours < 0 or minutes < 0 or minutes >= 60:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def ensure_premium_scrollbar_style(master: tk.Misc, palette: dict | None = None) -> None:
+    palette = palette or {}
+    style = ttk.Style(master)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure(
+        "Premium.Vertical.TScrollbar",
+        background=palette.get("surface", "#111827"),
+        troughcolor=palette.get("background", "#0B0D12"),
+        bordercolor=palette.get("card_border", "#1F2937"),
+        arrowcolor=palette.get("text_muted", "#9CA3AF"),
+        lightcolor=palette.get("surface", "#111827"),
+        darkcolor=palette.get("surface", "#111827"),
+    )
+
+
+def safe_cut_video_clip(
+    video_path: str,
+    start_tc: str,
+    end_tc: str,
+    media_root: str,
+) -> tuple[bool, str]:
+    if not video_path or not os.path.exists(video_path):
+        return False, "Видео файл не найден."
+
+    start_seconds = parse_timecode_to_seconds(start_tc)
+    end_seconds = parse_timecode_to_seconds(end_tc)
+    if start_seconds is None or end_seconds is None:
+        return False, "Неверный формат времени. Используйте SS, MM:SS или HH:MM:SS (дробные секунды допустимы)."
+    if end_seconds <= start_seconds:
+        return False, "Время окончания должно быть больше времени начала."
+
+    if os.path.basename(media_root) == "clips" or os.path.basename(os.path.dirname(media_root)) == "clips":
+        output_dir = media_root
+    else:
+        output_dir = os.path.join(media_root, "clips")
+    os.makedirs(output_dir, exist_ok=True)
+
+    safe_start = start_tc.strip().replace(":", "-").replace(".", "_").replace(",", "_")
+    safe_end = end_tc.strip().replace(":", "-").replace(".", "_").replace(",", "_")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(output_dir, f"clip_{ts}_{safe_start}_{safe_end}.mp4")
+
+    start_tc_norm = format_hms(int(start_seconds)) if float(start_seconds).is_integer() else start_tc
+    end_tc_norm = format_hms(int(end_seconds)) if float(end_seconds).is_integer() else end_tc
+    try:
+        ok, result = cut_video_clip(video_path, start_tc_norm, end_tc_norm, output_dir)
+    except Exception as exc:
+        ok, result = False, str(exc)
+
+    if ok:
+        return True, result
+
+    error_text = str(result)
+    lowered = error_text.lower()
+    if "ffmpeg" in lowered and ("не найден" in lowered or "not found" in lowered or "path" in lowered):
+        error_text = "FFmpeg не найден в PATH."
+
+    if MOVIEPY_AVAILABLE:
+        clip = None
+        subclip = None
+        try:
+            clip = mp.VideoFileClip(video_path)
+            subclip = clip.subclip(start_seconds, end_seconds)
+            subclip.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
+            return True, output_path
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            if subclip is not None:
+                try:
+                    subclip.close()
+                except Exception:
+                    pass
+            if clip is not None:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+
+    return False, error_text
+
+
 def build_rich_text_editor(
     parent: tk.Widget,
     palette: dict | None = None,
@@ -7299,6 +7420,7 @@ class AnkiApp(tk.Tk):
         win.minsize(980, 760)
         win.grab_set()
         apply_dark_theme_to_window(win, self.palette)
+        ensure_premium_scrollbar_style(win, self.palette)
 
         deck_id = self.selected_deck_id
         colors = getattr(self, "palette", None) or {}
@@ -7397,9 +7519,13 @@ class AnkiApp(tk.Tk):
         end_scale.configure(command=_on_end_scale)
 
         def _sync_entry_to_scale(var: tk.StringVar, scale_var: tk.DoubleVar) -> None:
-            parsed = parse_hms(var.get().strip())
+            parsed = parse_timecode_to_seconds(var.get().strip())
             if parsed is None:
-                messagebox.showwarning("Время", "Введите время в формате HH:MM:SS.", parent=win)
+                messagebox.showwarning(
+                    "Время",
+                    "Введите время в формате SS, MM:SS или HH:MM:SS (дробные секунды допустимы).",
+                    parent=win,
+                )
                 return
             scale_var.set(parsed)
             _apply_scale_bounds()
@@ -7436,31 +7562,85 @@ class AnkiApp(tk.Tk):
             if not video_path:
                 messagebox.showerror("Ошибка", "Выберите видео файл.", parent=win)
                 return
-            output_dir = os.path.join(MEDIA_FOLDER, "clips", str(deck_id))
-            ok, result = cut_video_clip_with_poster(
-                video_path,
-                start_var.get(),
-                end_var.get(),
-                output_dir,
-            )
-            if not ok:
-                messagebox.showerror("FFmpeg", str(result), parent=win)
-                return
-            clip_path = result.get("clip_path") if isinstance(result, dict) else None
-            poster_path = result.get("poster_path") if isinstance(result, dict) else None
-            if not clip_path:
-                messagebox.showerror("FFmpeg", "Не удалось получить путь клипа.", parent=win)
-                return
-            state["clip_path"] = clip_path
-            state["poster_path"] = poster_path
-            clip_name = os.path.basename(clip_path)
-            clip_info = f"{start_var.get()} → {end_var.get()}"
-            status_var.set(f"Создан клип {clip_name}")
-            clip_info_var.set(f"Клип: {clip_name} ({clip_info})")
+            cut_btn.configure(state=tk.DISABLED)
+            status_var.set("⏳ Нарезаю клип...")
 
-        ttk.Button(time_frame, text="Нарезать", command=cut_and_attach).grid(
-            row=0, column=3, rowspan=2, padx=6, pady=6, sticky="ns"
-        )
+            def _worker():
+                ok, result = safe_cut_video_clip(
+                    video_path,
+                    start_var.get(),
+                    end_var.get(),
+                    os.path.join(MEDIA_FOLDER, "clips", str(deck_id)),
+                )
+                if not ok:
+                    error_text = str(result)
+
+                    def _on_error():
+                        status_var.set("Ошибка нарезки")
+                        cut_btn.configure(state=tk.NORMAL)
+                        messagebox.showerror("Ошибка нарезки", error_text, parent=win)
+
+                    win.after(0, _on_error)
+                    return
+
+                clip_path = result
+                clip_name = os.path.basename(clip_path)
+                clip_info = f"{start_var.get()} → {end_var.get()}"
+                try:
+                    note_fields = {
+                        "word": clip_name,
+                        "translation": "",
+                        "example": "",
+                        "level": 1,
+                        "image": "",
+                        "front": "",
+                        "back": "",
+                        "front_image_path": None,
+                        "back_image_path": None,
+                        "audio_path": None,
+                        "front_html": "",
+                        "back_html": "",
+                        "front_video_html": build_video_embed_html(clip_path, None),
+                        "back_video_html": "",
+                    }
+                    note_id, _ = create_note_with_cards(
+                        deck_id,
+                        note_fields,
+                        note_type_id=ensure_generated_note_type_id(),
+                    )
+                    attach_media_to_note(note_id, [(clip_path, "video")])
+                except Exception as exc:
+
+                    def _on_card_error():
+                        status_var.set("Ошибка нарезки")
+                        cut_btn.configure(state=tk.NORMAL)
+                        messagebox.showerror(
+                            "Ошибка",
+                            f"Не удалось создать карточку: {exc}",
+                            parent=win,
+                        )
+
+                    win.after(0, _on_card_error)
+                    return
+
+                def _on_success():
+                    state["clip_path"] = clip_path
+                    state["poster_path"] = None
+                    status_var.set(f"Создан клип {clip_name}")
+                    clip_info_var.set(f"Клип: {clip_name} ({clip_info})")
+                    cut_btn.configure(state=tk.NORMAL)
+                    messagebox.showinfo(
+                        "Клип создан",
+                        f"Клип сохранен: {clip_path}",
+                        parent=win,
+                    )
+
+                win.after(0, _on_success)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        cut_btn = ttk.Button(time_frame, text="Нарезать", command=cut_and_attach)
+        cut_btn.grid(row=0, column=3, rowspan=2, padx=6, pady=6, sticky="ns")
 
         template_frame = ttk.LabelFrame(win, text="Шаблон карточки")
         template_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
@@ -18764,6 +18944,7 @@ class AudioEditorWindow:
     def create_widgets(self):
         """Создать интерфейс редактора"""
         # Основной фрейм
+        ensure_premium_scrollbar_style(self.win, getattr(self.master, "palette", None))
         main_frame = ttk.Frame(self.win)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
@@ -18825,7 +19006,12 @@ class AudioEditorWindow:
         self.sentences_tree.column("Действия", width=100)
         
         # Scrollbar для treeview
-        scrollbar = ttk.Scrollbar(sentences_frame, orient="vertical", command=self.sentences_tree.yview)
+        scrollbar = ttk.Scrollbar(
+            sentences_frame,
+            orient="vertical",
+            command=self.sentences_tree.yview,
+            style="Premium.Vertical.TScrollbar",
+        )
         self.sentences_tree.configure(yscrollcommand=scrollbar.set)
         
         self.sentences_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
