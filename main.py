@@ -72,6 +72,7 @@ from datetime import date, datetime, timedelta
 import collections
 import html
 import math
+from html.parser import HTMLParser
 from csv_importer import (
     attach_image_if_exists,
     detect_encoding,
@@ -2192,6 +2193,7 @@ def create_cards_from_note_templates(
 
     templates = json.loads(note_type_row["card_templates_json"])
     fields_default = collections.defaultdict(str, fields)
+    template_fields = prepare_template_fields(fields_default)
     audio_value = audio_path if audio_path is not None else fields_default.get("audio_path")
 
     created = 0
@@ -2203,7 +2205,7 @@ def create_cards_from_note_templates(
         if requires_image and not image_value:
             continue
 
-        formatter = collections.defaultdict(str, fields_default)
+        formatter = collections.defaultdict(str, template_fields)
         front = str(template.get("front", "")).format_map(formatter)
         back = str(template.get("back", "")).format_map(formatter)
         front_image_path = fields_default.get("front_image_path") or (image_value if requires_image else None)
@@ -2977,6 +2979,7 @@ def create_note_with_cards_in_transaction(
         raise RuntimeError("Тип заметки не найден")
     templates = json.loads(note_type_row["card_templates_json"])
     fields_default = collections.defaultdict(str, fields)
+    template_fields = prepare_template_fields(fields_default)
     audio_value = fields_default.get("audio_path")
     front_rich = fields_default.get("front_rich")
     back_rich = fields_default.get("back_rich")
@@ -2989,7 +2992,7 @@ def create_note_with_cards_in_transaction(
         image_value = fields_default.get("image") or fields_default.get("front_image_path")
         if requires_image and not image_value:
             continue
-        formatter = collections.defaultdict(str, fields_default)
+        formatter = collections.defaultdict(str, template_fields)
         front = str(template.get("front", "")).format_map(formatter)
         back = str(template.get("back", "")).format_map(formatter)
         front_image_path = fields_default.get("front_image_path") or (image_value if requires_image else None)
@@ -5798,10 +5801,27 @@ class CardRenderer:
         card_bg, card_text, _ = get_card_surface_colors(self.container)
         front_text = card.get("front") or ""
         back_text = card.get("back") or ""
+        front_html = card.get("front_html")
+        back_html = card.get("back_html")
+        if not front_html and _looks_like_html(front_text):
+            front_html = front_text
+        if not back_html and _looks_like_html(back_text):
+            back_html = back_text
         front_rich = deserialize_rich_doc(card.get("front_rich"))
         back_rich = deserialize_rich_doc(card.get("back_rich"))
         rich_doc = back_rich if show_back else front_rich
         use_rich = bool(rich_doc)
+        html_value = back_html if show_back else front_html
+        use_html = bool(html_value) and not use_rich
+        html_media = extract_media_from_html(html_value or "") if use_html else {}
+        if use_html and html_media.get("audio") and not card.get("audio_entries") and not card.get("audio_path"):
+            card = dict(card)
+            card["audio_path"] = html_media.get("audio")
+        if use_html:
+            if image_override is None and html_media.get("image"):
+                image_override = html_media.get("image")
+            if video_override is None and html_media.get("video"):
+                video_override = html_media.get("video")
         print(
             "[RENDER TEXT]",
             "mode=",
@@ -5816,6 +5836,9 @@ class CardRenderer:
         elif use_rich:
             self._use_custom_text = True
             render_rich_to_container(self.custom_text_frame, rich_doc, card_bg=card_bg, card_text_color=card_text)
+        elif use_html:
+            self._use_custom_text = True
+            show_card_html(self.custom_text_frame, html_value or "", card_bg=card_bg, card_text_color=card_text)
         else:
             self._use_custom_text = False
             if isinstance(self.front_text, tk.Text):
@@ -5849,6 +5872,10 @@ class CardRenderer:
             self.back_text.grid_remove()
             self.custom_text_frame.grid()
         elif use_rich:
+            self.front_text.grid_remove()
+            self.back_text.grid_remove()
+            self.custom_text_frame.grid()
+        elif use_html:
             self.front_text.grid_remove()
             self.back_text.grid_remove()
             self.custom_text_frame.grid()
@@ -6111,6 +6138,90 @@ def export_rich_from_editor(text_widget: tk.Text) -> dict:
     }
 
 
+def text_widget_to_html(text_widget: tk.Text) -> str:
+    dump = text_widget.dump("1.0", "end-1c", tag=True, text=True)
+    active_tags: set[str] = set()
+    html_parts: list[str] = []
+
+    def _style_from_tags(tags: set[str]) -> dict[str, str | bool | None]:
+        style: dict[str, str | bool | None] = {
+            "bold": False,
+            "italic": False,
+            "underline": False,
+            "underline_style": None,
+            "color": None,
+            "background": None,
+        }
+        for tag in tags:
+            if tag == "hidden_token":
+                continue
+            if tag == "bold":
+                style["bold"] = True
+            if tag == "italic":
+                style["italic"] = True
+            if tag == "underline":
+                style["underline"] = True
+            if tag == "underline_double":
+                style["underline"] = True
+                style["underline_style"] = "double"
+            if tag == "underline_wavy":
+                style["underline"] = True
+                style["underline_style"] = "wavy"
+            if tag.startswith("color_"):
+                style["color"] = tag.split("color_", 1)[1]
+            if tag.startswith("marker_"):
+                style["background"] = tag.split("marker_", 1)[1]
+            fg = text_widget.tag_cget(tag, "foreground")
+            bg = text_widget.tag_cget(tag, "background")
+            if fg:
+                style["color"] = fg
+            if bg:
+                style["background"] = bg
+        return style
+
+    def _wrap_html(text: str, style: dict[str, str | bool | None]) -> str:
+        if not text:
+            return ""
+        escaped = html.escape(text)
+        escaped = strip_custom_underline_tokens(escaped)
+        escaped = escaped.replace("\n", "<br>")
+        prefix = ""
+        suffix = ""
+        if style.get("bold"):
+            prefix += "<strong>"
+            suffix = "</strong>" + suffix
+        if style.get("italic"):
+            prefix += "<em>"
+            suffix = "</em>" + suffix
+        if style.get("underline") and not style.get("underline_style"):
+            prefix += "<u>"
+            suffix = "</u>" + suffix
+        span_styles: list[str] = []
+        if style.get("color"):
+            span_styles.append(f"color: {style['color']}")
+        if style.get("background"):
+            span_styles.append(f"background-color: {style['background']}")
+        if style.get("underline_style"):
+            span_styles.append(f"text-decoration: underline {style['underline_style']}")
+        if span_styles:
+            prefix += f"<span style=\"{' ; '.join(span_styles)}\">"
+            suffix = "</span>" + suffix
+        return f"{prefix}{escaped}{suffix}"
+
+    for kind, value, _index in dump:
+        if kind == "tagon":
+            active_tags.add(value)
+        elif kind == "tagoff":
+            active_tags.discard(value)
+        elif kind == "text":
+            if "hidden_token" in active_tags:
+                continue
+            style = _style_from_tags(active_tags)
+            html_parts.append(_wrap_html(value, style))
+
+    return "".join(html_parts).strip()
+
+
 def serialize_rich_doc(rich_doc: dict | None) -> str | None:
     if rich_doc is None:
         return None
@@ -6177,6 +6288,370 @@ def render_rich_to_container(parent: tk.Widget, rich_doc: dict, card_bg: str, ca
     return text_widget
 
 
+_HTML_TAG_RE = re.compile(r"<[a-zA-Z][^>]*>")
+
+
+def _looks_like_html(value: str) -> bool:
+    if not value:
+        return False
+    return bool(_HTML_TAG_RE.search(value))
+
+
+def _file_url_to_path(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "file":
+        return url
+    path = urllib.parse.unquote(parsed.path)
+    if os.name == "nt" and path.startswith("/") and len(path) > 2 and path[2] == ":":
+        path = path[1:]
+    return path or None
+
+
+class _HtmlTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self._list_stack: list[dict[str, int | str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"br"}:
+            self.parts.append("\n")
+        elif tag in {"p", "div"}:
+            self.parts.append("\n")
+        elif tag == "ul":
+            self._list_stack.append({"type": "ul", "index": 0})
+        elif tag == "ol":
+            self._list_stack.append({"type": "ol", "index": 0})
+        elif tag == "li":
+            prefix = "• "
+            if self._list_stack:
+                stack = self._list_stack[-1]
+                if stack["type"] == "ol":
+                    stack["index"] = int(stack.get("index", 0)) + 1
+                    prefix = f"{stack['index']}. "
+            self.parts.append("\n" + prefix)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"ul", "ol"} and self._list_stack:
+            self._list_stack.pop()
+        if tag in {"p", "div"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.parts.append(data)
+
+
+def plain_text_from_html(html_text: str) -> str:
+    if not html_text:
+        return ""
+    parser = _HtmlTextExtractor()
+    parser.feed(html_text)
+    return "".join(parser.parts).strip()
+
+
+def ensure_plain_text(text: str | None) -> str:
+    if not text:
+        return ""
+    if _looks_like_html(text):
+        return plain_text_from_html(text)
+    return text
+
+
+class _HtmlMediaExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.media: dict[str, str | None] = {"image": None, "video": None, "audio": None, "poster": None}
+        self._media_context: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = dict(attrs)
+        if tag == "img" and not self.media.get("image"):
+            src = attrs_dict.get("src")
+            self.media["image"] = _file_url_to_path(src) or src
+            return
+        if tag == "video":
+            self._media_context = "video"
+            if not self.media.get("poster"):
+                poster = attrs_dict.get("poster")
+                self.media["poster"] = _file_url_to_path(poster) or poster
+            src = attrs_dict.get("src")
+            if src and not self.media.get("video"):
+                self.media["video"] = _file_url_to_path(src) or src
+            return
+        if tag == "audio":
+            self._media_context = "audio"
+            src = attrs_dict.get("src")
+            if src and not self.media.get("audio"):
+                self.media["audio"] = _file_url_to_path(src) or src
+            return
+        if tag == "source" and self._media_context in {"video", "audio"}:
+            src = attrs_dict.get("src")
+            if not src:
+                return
+            key = self._media_context
+            if not self.media.get(key):
+                self.media[key] = _file_url_to_path(src) or src
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"video", "audio"}:
+            self._media_context = None
+
+
+def extract_media_from_html(html_text: str) -> dict[str, str | None]:
+    if not html_text:
+        return {"image": None, "video": None, "audio": None, "poster": None}
+    parser = _HtmlMediaExtractor()
+    parser.feed(html_text)
+    return parser.media
+
+
+def _parse_inline_style(style_text: str) -> dict[str, str]:
+    styles: dict[str, str] = {}
+    if not style_text:
+        return styles
+    for chunk in style_text.split(";"):
+        key, _, value = chunk.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+        if key and value:
+            styles[key] = value
+    return styles
+
+
+class _HtmlTextRenderer(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.segments: list[tuple[str, dict[str, str | bool | None]]] = []
+        self._style_stack: list[dict[str, str | bool | None]] = [
+            {
+                "bold": False,
+                "italic": False,
+                "underline": False,
+                "underline_style": None,
+                "color": None,
+                "background": None,
+                "link": None,
+            }
+        ]
+        self._list_stack: list[dict[str, int | str]] = []
+
+    def _current_style(self) -> dict[str, str | bool | None]:
+        return dict(self._style_stack[-1])
+
+    def _append_text(self, text: str, style: dict[str, str | bool | None]) -> None:
+        if text:
+            self.segments.append((text, style))
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = dict(attrs)
+        if tag == "br":
+            self._append_text("\n", self._current_style())
+            return
+        if tag in {"p", "div"}:
+            self._append_text("\n", self._current_style())
+            return
+        if tag == "ul":
+            self._list_stack.append({"type": "ul", "index": 0})
+            return
+        if tag == "ol":
+            self._list_stack.append({"type": "ol", "index": 0})
+            return
+        if tag == "li":
+            prefix = "• "
+            if self._list_stack:
+                stack = self._list_stack[-1]
+                if stack["type"] == "ol":
+                    stack["index"] = int(stack.get("index", 0)) + 1
+                    prefix = f"{stack['index']}. "
+            self._append_text("\n" + prefix, self._current_style())
+            return
+
+        style = self._current_style()
+        if tag in {"b", "strong"}:
+            style["bold"] = True
+        if tag in {"i", "em"}:
+            style["italic"] = True
+        if tag == "u":
+            style["underline"] = True
+        if tag == "span":
+            inline_style = _parse_inline_style(attrs_dict.get("style", "") or "")
+            color = inline_style.get("color")
+            background = inline_style.get("background-color") or inline_style.get("background")
+            decoration = inline_style.get("text-decoration") or ""
+            if color:
+                style["color"] = color
+            if background:
+                style["background"] = background
+            if "underline" in decoration:
+                style["underline"] = True
+                if "double" in decoration:
+                    style["underline_style"] = "double"
+                elif "wavy" in decoration:
+                    style["underline_style"] = "wavy"
+        if tag == "a":
+            href = attrs_dict.get("href")
+            if href:
+                style["link"] = href
+                style["underline"] = True
+        self._style_stack.append(style)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"ul", "ol"} and self._list_stack:
+            self._list_stack.pop()
+        if tag in {"b", "strong", "i", "em", "u", "span", "a"}:
+            if len(self._style_stack) > 1:
+                self._style_stack.pop()
+        if tag in {"p", "div"}:
+            self._append_text("\n", self._current_style())
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self._append_text(data, self._current_style())
+
+
+def show_card_html(parent: tk.Widget, html_text: str, card_bg: str, card_text_color: str) -> tk.Text:
+    for child in parent.winfo_children():
+        child.destroy()
+    text_widget = tk.Text(
+        parent,
+        wrap=tk.WORD,
+        bg="white",
+        fg=card_text_color,
+        relief=tk.FLAT,
+        bd=0,
+        height=10,
+    )
+    text_widget.pack(fill=tk.BOTH, expand=True)
+    base_font = tkfont.Font(font=text_widget.cget("font"))
+
+    renderer = _HtmlTextRenderer()
+    renderer.feed(html_text or "")
+    tag_cache: dict[tuple, str] = {}
+    link_cache: dict[str, str] = {}
+
+    def _tag_for_style(style: dict[str, str | bool | None]) -> str | None:
+        key = (
+            bool(style.get("bold")),
+            bool(style.get("italic")),
+            bool(style.get("underline")),
+            style.get("underline_style"),
+            style.get("color"),
+            style.get("background"),
+            style.get("link"),
+        )
+        if not any(key):
+            return None
+        if key in tag_cache:
+            return tag_cache[key]
+        tag_name = f"html_{len(tag_cache)}"
+        tag_cache[key] = tag_name
+        font = base_font.copy()
+        if style.get("bold"):
+            font.configure(weight="bold")
+        if style.get("italic"):
+            font.configure(slant="italic")
+        underline_flag = 1 if style.get("underline") else 0
+        text_widget.tag_configure(tag_name, font=font, underline=underline_flag)
+        if style.get("color"):
+            text_widget.tag_configure(tag_name, foreground=str(style["color"]))
+        if style.get("background"):
+            text_widget.tag_configure(tag_name, background=str(style["background"]))
+        link = style.get("link")
+        if link:
+            text_widget.tag_configure(tag_name, foreground="#2563EB", underline=1)
+            link_cache[tag_name] = str(link)
+        return tag_name
+
+    def _open_link(tag: str) -> None:
+        target = link_cache.get(tag)
+        if target:
+            webbrowser.open(target)
+
+    for text, style in renderer.segments:
+        if not text:
+            continue
+        tag_name = _tag_for_style(style)
+        if tag_name:
+            text_widget.insert(tk.END, text, tag_name)
+        else:
+            text_widget.insert(tk.END, text)
+
+    for tag_name in link_cache:
+        text_widget.tag_bind(tag_name, "<Button-1>", lambda _e, t=tag_name: _open_link(t))
+        text_widget.tag_bind(tag_name, "<Enter>", lambda _e: text_widget.config(cursor="hand2"))
+        text_widget.tag_bind(tag_name, "<Leave>", lambda _e: text_widget.config(cursor=""))
+
+    text_widget.configure(state=tk.DISABLED)
+    return text_widget
+
+
+def render_card_html(deck_id: int, ctx: dict[str, str] | None = None) -> tuple[str, str]:
+    ctx = dict(ctx or {})
+    for key in (
+        "front_html",
+        "back_html",
+        "front_image",
+        "back_image",
+        "front_video",
+        "back_video",
+        "front_audio",
+        "back_audio",
+        "image",
+        "video",
+        "audio",
+    ):
+        ctx.setdefault(key, "")
+    if not ctx.get("image"):
+        ctx["image"] = ctx.get("front_image") or ctx.get("back_image") or ""
+    if not ctx.get("video"):
+        ctx["video"] = ctx.get("front_video") or ctx.get("back_video") or ""
+    if not ctx.get("audio"):
+        ctx["audio"] = ctx.get("front_audio") or ctx.get("back_audio") or ""
+    return render_generation_faces(deck_id, ctx)
+
+
+def prepare_template_fields(fields: dict) -> dict:
+    fields = dict(fields or {})
+    front_text = fields.get("front") or ""
+    back_text = fields.get("back") or ""
+    fields.setdefault("front_html", html.escape(front_text).replace("\n", "<br>"))
+    fields.setdefault("back_html", html.escape(back_text).replace("\n", "<br>"))
+
+    front_image_path = fields.get("front_image_path") or fields.get("image")
+    back_image_path = fields.get("back_image_path")
+    video_path = fields.get("video_path")
+    front_video_path = fields.get("front_video_path") or video_path
+    back_video_path = fields.get("back_video_path")
+
+    audio_path = fields.get("audio_path")
+    audio_side = fields.get("audio_side") or "back"
+    front_audio_path = fields.get("front_audio_path") or (audio_path if audio_side == "front" else None)
+    back_audio_path = fields.get("back_audio_path") or (audio_path if audio_side == "back" else None)
+
+    front_image_html = build_image_html(front_image_path)
+    back_image_html = build_image_html(back_image_path)
+    front_video_html = build_video_html(front_video_path, fields.get("poster_path"))
+    back_video_html = build_video_html(back_video_path, fields.get("poster_path"))
+    front_audio_html = build_audio_html(front_audio_path)
+    back_audio_html = build_audio_html(back_audio_path)
+
+    fields.setdefault("front_image", front_image_html)
+    fields.setdefault("back_image", back_image_html)
+    fields.setdefault("image", front_image_html or back_image_html)
+    fields.setdefault("front_video", front_video_html)
+    fields.setdefault("back_video", back_video_html)
+    fields.setdefault("video", front_video_html or back_video_html)
+    fields.setdefault("front_audio", front_audio_html)
+    fields.setdefault("back_audio", back_audio_html)
+    fields.setdefault("audio", front_audio_html or back_audio_html)
+    fields.setdefault("front_video_html", front_video_html)
+    fields.setdefault("back_video_html", back_video_html)
+    return fields
+
+
 def _to_file_url(path: str) -> str:
     try:
         return Path(path).resolve().as_uri()
@@ -6184,16 +6659,34 @@ def _to_file_url(path: str) -> str:
         return path
 
 
-def build_video_embed_html(clip_path: str | None, poster_path: str | None) -> str:
-    if not clip_path:
+def build_image_html(path: str | None) -> str:
+    if not path:
         return ""
-    clip_url = _to_file_url(clip_path)
+    url = _to_file_url(path)
+    return f'<img src="{html.escape(url)}" alt="image">'
+
+
+def build_video_html(path: str | None, poster_path: str | None = None) -> str:
+    if not path:
+        return ""
+    clip_url = _to_file_url(path)
     poster_url = _to_file_url(poster_path) if poster_path else ""
     poster_attr = f' poster="{html.escape(poster_url)}"' if poster_url else ""
     return (
         f'<video controls preload="metadata"{poster_attr}>'
         f'<source src="{html.escape(clip_url)}" type="video/mp4"></video>'
     )
+
+
+def build_audio_html(path: str | None) -> str:
+    if not path:
+        return ""
+    url = _to_file_url(path)
+    return f'<audio controls preload="metadata"><source src="{html.escape(url)}"></audio>'
+
+
+def build_video_embed_html(clip_path: str | None, poster_path: str | None) -> str:
+    return build_video_html(clip_path, poster_path)
 
 
 def parse_timecode_to_seconds(value: str) -> float | None:
@@ -6644,7 +7137,24 @@ def build_rich_text_editor(
     if on_change is not None:
         text_widget.bind("<KeyRelease>", lambda _e: on_change())
 
-    return {"frame": container, "text": text_widget, "toolbar": toolbar}
+    def _get_plain_text() -> str:
+        return text_widget.get("1.0", tk.END).rstrip("\n")
+
+    def _get_html() -> str:
+        return text_widget_to_html(text_widget)
+
+    def _set_html(html_value: str) -> None:
+        text_widget.delete("1.0", tk.END)
+        text_widget.insert("1.0", plain_text_from_html(html_value or ""))
+
+    return {
+        "frame": container,
+        "text": text_widget,
+        "toolbar": toolbar,
+        "get_plain_text": _get_plain_text,
+        "get_html": _get_html,
+        "set_html": _set_html,
+    }
 
 def create_action_menubutton(parent, palette: dict | None = None) -> tuple[ttk.Menubutton, tk.Menu]:
     palette = palette or {}
@@ -7767,12 +8277,17 @@ class AnkiApp(tk.Tk):
         preview_state = {"window": None, "renderer": None, "side": "front"}
 
         def _build_ctx() -> dict:
-            front_text = front_editor["text"].get("1.0", tk.END).strip()
-            back_text = back_editor["text"].get("1.0", tk.END).strip()
-            front_html = html.escape(front_text).replace("\n", "<br>")
-            back_html = html.escape(back_text).replace("\n", "<br>")
-            front_video_html = build_video_embed_html(state.get("front_video"), state.get("poster_path"))
-            back_video_html = build_video_embed_html(state.get("back_video"), state.get("poster_path"))
+            front_text = front_editor["get_plain_text"]().strip()
+            back_text = back_editor["get_plain_text"]().strip()
+            front_html = front_editor["get_html"]()
+            back_html = back_editor["get_html"]()
+            front_video_html = build_video_html(state.get("front_video"), state.get("poster_path"))
+            back_video_html = build_video_html(state.get("back_video"), state.get("poster_path"))
+            poster_path = state.get("poster_path")
+            front_image_html = build_image_html(poster_path) if state.get("front_video") else ""
+            back_image_html = build_image_html(poster_path) if state.get("back_video") else ""
+            front_audio_html = ""
+            back_audio_html = ""
             template = get_active_generation_template(deck_id)
             return {
                 "question": template.get("question") or "",
@@ -7782,11 +8297,20 @@ class AnkiApp(tk.Tk):
                 "back": back_text,
                 "front_video_html": front_video_html,
                 "back_video_html": back_video_html,
+                "front_video": front_video_html,
+                "back_video": back_video_html,
+                "video": front_video_html or back_video_html,
+                "front_image": front_image_html,
+                "back_image": back_image_html,
+                "image": front_image_html or back_image_html,
+                "front_audio": front_audio_html,
+                "back_audio": back_audio_html,
+                "audio": front_audio_html or back_audio_html,
             }
 
         def _build_preview_card() -> dict:
             ctx = _build_ctx()
-            front, back = render_generation_faces(deck_id, ctx)
+            front, back = render_card_html(deck_id, ctx)
             poster_path = state.get("poster_path")
             return {
                 "front": front,
@@ -7894,7 +8418,7 @@ class AnkiApp(tk.Tk):
                 messagebox.showwarning("Кредиты", "Недостаточно кредитов.", parent=win)
                 return
             ctx = _build_ctx()
-            front, back = render_generation_faces(deck_id, ctx)
+            front, back = render_card_html(deck_id, ctx)
             poster_path = state.get("poster_path")
             note_fields = {
                 "word": os.path.basename(state["clip_path"]),
@@ -7911,6 +8435,8 @@ class AnkiApp(tk.Tk):
                 "back_html": ctx.get("back_html"),
                 "front_video_html": ctx.get("front_video_html"),
                 "back_video_html": ctx.get("back_video_html"),
+                "front_video": ctx.get("front_video"),
+                "back_video": ctx.get("back_video"),
             }
             media_entries = []
             if state.get("front_video"):
@@ -9566,12 +10092,56 @@ class AnkiApp(tk.Tk):
         text_back.pack(fill=tk.BOTH, expand=False, pady=(0, 6))
         create_context_menu(text_back)
 
+        active_template_widget = {"widget": text_front}
+        text_front.bind("<FocusIn>", lambda _e: active_template_widget.update(widget=text_front))
+        text_back.bind("<FocusIn>", lambda _e: active_template_widget.update(widget=text_back))
+
+        variables_frame = ttk.Frame(right_frame)
+        variables_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(variables_frame, text="Переменные:").pack(anchor="w")
+        available_vars = [
+            "{question}",
+            "{front_html}",
+            "{back_html}",
+            "{image}",
+            "{front_image}",
+            "{back_image}",
+            "{video}",
+            "{front_video}",
+            "{back_video}",
+            "{audio}",
+            "{front_audio}",
+            "{back_audio}",
+            "{translation}",
+            "{sentence_with_gap}",
+            "{word}",
+            "{ipa}",
+            "{gender}",
+            "{plural}",
+            "{sentence}",
+        ]
+        var_listbox = tk.Listbox(variables_frame, height=7)
+        for item in available_vars:
+            var_listbox.insert(tk.END, item)
+        var_listbox.pack(fill=tk.X, padx=(0, 6))
+
+        def _insert_variable() -> None:
+            selection = var_listbox.curselection()
+            if not selection:
+                return
+            variable = var_listbox.get(selection[0])
+            target = active_template_widget.get("widget") or text_front
+            target.insert(tk.INSERT, variable)
+            target.focus_set()
+
+        var_listbox.bind("<Double-Button-1>", lambda _e: _insert_variable())
+        ttk.Button(variables_frame, text="Вставить переменную", command=_insert_variable).pack(anchor="w", pady=(4, 0))
         ttk.Label(
-            right_frame,
-            text="Переменные: {question}, {translation}, {sentence_with_gap}, {word}, {ipa}, {gender}, {plural}, {sentence}",
+            variables_frame,
+            text="Медиа-переменные вставляют готовые HTML-теги <img>/<video>/<audio> и работают в preview/review.",
             style="Muted.TLabel",
             wraplength=520,
-        ).pack(anchor="w", pady=(0, 8))
+        ).pack(anchor="w", pady=(4, 0))
 
         ttk.Label(right_frame, text="Тестовый текст:").pack(anchor="w")
         test_text = tk.Text(right_frame, height=3)
@@ -9711,6 +10281,21 @@ class AnkiApp(tk.Tk):
                     "gender": "",
                     "plural": "",
                 }
+            preview_ctx.update(
+                {
+                    "front_html": html.escape(test_value).replace("\n", "<br>"),
+                    "back_html": html.escape(test_value).replace("\n", "<br>"),
+                    "image": "",
+                    "front_image": "",
+                    "back_image": "",
+                    "video": "",
+                    "front_video": "",
+                    "back_video": "",
+                    "audio": "",
+                    "front_audio": "",
+                    "back_audio": "",
+                }
+            )
             template = {
                 "id": template_state["id"],
                 "name": name,
@@ -9730,18 +10315,15 @@ class AnkiApp(tk.Tk):
             preview_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
             ttk.Label(preview_frame, text="FRONT").pack(anchor="w")
-            front_box = tk.Text(preview_frame, height=6)
-            style_text_widget(front_box, self.palette)
+            front_box = tk.Frame(preview_frame)
             front_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-            front_box.insert("1.0", front)
-            front_box.configure(state="disabled")
+            card_bg, card_text, _ = get_card_surface_colors(preview_frame)
+            show_card_html(front_box, front, card_bg=card_bg, card_text_color=card_text)
 
             ttk.Label(preview_frame, text="BACK").pack(anchor="w")
-            back_box = tk.Text(preview_frame, height=6)
-            style_text_widget(back_box, self.palette)
+            back_box = tk.Frame(preview_frame)
             back_box.pack(fill=tk.BOTH, expand=True)
-            back_box.insert("1.0", back)
-            back_box.configure(state="disabled")
+            show_card_html(back_box, back, card_bg=card_bg, card_text_color=card_text)
 
         btn_row = ttk.Frame(right_frame)
         btn_row.pack(fill=tk.X, pady=(6, 0))
@@ -17780,7 +18362,7 @@ class OverviewWindow(tk.Toplevel):
     def play_side_audio(self, side: str) -> None:
         if not self.current_card:
             return
-        text = self.current_card.get("front" if side == "front" else "back") or ""
+        text = ensure_plain_text(self.current_card.get("front" if side == "front" else "back") or "")
         if not text.strip():
             messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
             return
@@ -17796,7 +18378,7 @@ class OverviewWindow(tk.Toplevel):
             except Exception:
                 messagebox.showerror("Ошибка", "Не удалось воспроизвести аудио")
         elif TTS_AVAILABLE:
-            speak_text(self.current_card["front"])
+            speak_text(ensure_plain_text(self.current_card.get("front") or ""))
         else:
             messagebox.showinfo("Ошибка", "Аудио система недоступна")
     
@@ -17819,7 +18401,7 @@ class OverviewWindow(tk.Toplevel):
                 pass
         
         # Если нет аудио файла, озвучиваем текст
-        front_text = self.current_card["front"]
+        front_text = ensure_plain_text(self.current_card.get("front") or "")
         if front_text:
             speak_text(front_text)
     
@@ -18270,6 +18852,7 @@ class RepeatWindow(tk.Toplevel):
 
     def extract_words_with_translations(self, text):
         """Извлечь слова из текста и добавить переводы из словаря."""
+        text = ensure_plain_text(text)
         # Удаляем перевод в скобках если он есть
         text = re.sub(r'\([^)]*\)', '', text).strip()
         
@@ -18490,7 +19073,7 @@ class RepeatWindow(tk.Toplevel):
 
     def play_word(self):
         selection = get_selected_text_from_widget(self.focus_get())
-        back_text = self.current_card.get("back") or ""
+        back_text = ensure_plain_text(self.current_card.get("back") or "")
         text = selection or back_text
         if not text.strip():
             messagebox.showinfo("Озвучка", "Нет текста для озвучивания.")
@@ -18934,7 +19517,7 @@ class ReviewWindow(tk.Toplevel):
             except Exception:
                 pass
 
-        back = self.current_card["back"]
+        back = ensure_plain_text(self.current_card.get("back") or "")
         first_line = back.splitlines()[0] if back else ""
         word = first_line.split()[0] if first_line else ""
         if not word:
