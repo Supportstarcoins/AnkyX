@@ -6251,6 +6251,61 @@ def ensure_premium_scrollbar_style(master: tk.Misc, palette: dict | None = None)
     )
 
 
+def create_scrollable_content(
+    parent: tk.Misc,
+    bg: str | None = None,
+) -> tuple[ttk.Frame, tk.Canvas, ttk.Frame]:
+    outer_frame = ttk.Frame(parent)
+    canvas = tk.Canvas(outer_frame, highlightthickness=0, bd=0)
+    if bg is not None:
+        canvas.configure(bg=bg)
+    scrollbar = ttk.Scrollbar(
+        outer_frame,
+        orient="vertical",
+        command=canvas.yview,
+        style="Premium.Vertical.TScrollbar",
+    )
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    content_frame = ttk.Frame(canvas)
+    window_id = canvas.create_window((0, 0), window=content_frame, anchor="nw")
+
+    def _on_frame_configure(_event: tk.Event) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_configure(event: tk.Event) -> None:
+        canvas.itemconfigure(window_id, width=event.width)
+
+    content_frame.bind("<Configure>", _on_frame_configure)
+    canvas.bind("<Configure>", _on_canvas_configure)
+
+    def _on_mousewheel(event: tk.Event) -> None:
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_mousewheel_linux(event: tk.Event) -> None:
+        direction = -1 if event.num == 4 else 1
+        canvas.yview_scroll(direction, "units")
+
+    def _bind_to_mousewheel(_event: tk.Event) -> None:
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_mousewheel_linux)
+        canvas.bind_all("<Button-5>", _on_mousewheel_linux)
+
+    def _unbind_from_mousewheel(_event: tk.Event) -> None:
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    canvas.bind("<Enter>", _bind_to_mousewheel)
+    canvas.bind("<Leave>", _unbind_from_mousewheel)
+    content_frame.bind("<Enter>", _bind_to_mousewheel)
+    content_frame.bind("<Leave>", _unbind_from_mousewheel)
+
+    return outer_frame, canvas, content_frame
+
+
 def safe_cut_video_clip(
     video_path: str,
     start_tc: str,
@@ -7424,6 +7479,10 @@ class AnkiApp(tk.Tk):
 
         deck_id = self.selected_deck_id
         colors = getattr(self, "palette", None) or {}
+        scroll_bg = colors.get("background") if colors else None
+        outer_frame, canvas, content_frame = create_scrollable_content(win, bg=scroll_bg)
+        outer_frame.pack(fill=tk.BOTH, expand=True)
+
         state = {
             "video_path": None,
             "clip_path": None,
@@ -7441,7 +7500,7 @@ class AnkiApp(tk.Tk):
         status_var = tk.StringVar(value="Клип сохраняется в папку media/clips/")
         clip_info_var = tk.StringVar(value="Клип не создан")
 
-        top_frame = ttk.Frame(win)
+        top_frame = ttk.Frame(content_frame)
         top_frame.pack(fill=tk.X, padx=12, pady=(10, 6))
         ttk.Label(top_frame, text="Видео файл:").pack(anchor="w")
         video_row = ttk.Frame(top_frame)
@@ -7460,7 +7519,7 @@ class AnkiApp(tk.Tk):
         ttk.Button(video_row, text="…", width=4, command=browse_video).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(top_frame, textvariable=duration_var).pack(anchor="w")
 
-        player_frame = ttk.LabelFrame(win, text="Плеер")
+        player_frame = ttk.LabelFrame(content_frame, text="Плеер")
         player_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
         player_holder = {"player": None}
 
@@ -7483,7 +7542,7 @@ class AnkiApp(tk.Tk):
                 command=lambda: open_in_external_player(path),
             ).pack(anchor="w", padx=6, pady=(0, 6))
 
-        time_frame = ttk.LabelFrame(win, text="Нарезка")
+        time_frame = ttk.LabelFrame(content_frame, text="Нарезка")
         time_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
         time_frame.columnconfigure(1, weight=1)
 
@@ -7642,12 +7701,12 @@ class AnkiApp(tk.Tk):
         cut_btn = ttk.Button(time_frame, text="Нарезать", command=cut_and_attach)
         cut_btn.grid(row=0, column=3, rowspan=2, padx=6, pady=6, sticky="ns")
 
-        template_frame = ttk.LabelFrame(win, text="Шаблон карточки")
+        template_frame = ttk.LabelFrame(content_frame, text="Шаблон карточки")
         template_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
         ttk.Label(template_frame, text="Выберите шаблон карточки:").pack(anchor="w", padx=6, pady=(6, 0))
         self._build_generation_template_selector(template_frame, deck_id, padx=6, pady=(0, 6))
 
-        editor_frame = ttk.LabelFrame(win, text="Редактор")
+        editor_frame = ttk.LabelFrame(content_frame, text="Редактор")
         editor_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
 
         notebook = ttk.Notebook(editor_frame)
@@ -7691,7 +7750,7 @@ class AnkiApp(tk.Tk):
             state["back_video"] = None
             back_video_label.set("Видео не добавлено")
 
-        insert_frame = ttk.Frame(win)
+        insert_frame = ttk.Frame(content_frame)
         insert_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
         ttk.Button(insert_frame, text="Вставить видео на Front", command=insert_front_video).pack(
             side=tk.LEFT, padx=(0, 6)
@@ -7810,7 +7869,7 @@ class AnkiApp(tk.Tk):
             update_preview()
 
         cost = 2 if self.is_premium_active() else 6
-        cost_frame = ttk.Frame(win)
+        cost_frame = ttk.Frame(content_frame)
         cost_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
         ttk.Button(cost_frame, text="Предпросмотр", command=open_preview).pack(side=tk.LEFT)
 
