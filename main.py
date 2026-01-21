@@ -266,6 +266,7 @@ from deck_timer import (
 from video_tools import (
     VlcPlayerWidget,
     cut_video_clip,
+    find_ffmpeg,
     format_hms,
     get_video_duration_seconds,
     is_vlc_available,
@@ -4964,6 +4965,90 @@ def record_speech_to_text(
     return text, audio_path
 
 
+def transcribe_audio_to_text(
+    audio_path: str,
+    lang: str | None = None,
+    punctuate: bool = True,
+) -> str:
+    if not SR_AVAILABLE:
+        raise RuntimeError("SpeechRecognition не установлен.")
+    if not audio_path or not os.path.exists(audio_path):
+        raise FileNotFoundError(audio_path)
+    r = sr.Recognizer()
+    with sr.AudioFile(audio_path) as source:
+        audio_data = r.record(source)
+    try:
+        text = r.recognize_google(audio_data, language=lang or "de-DE")
+    except sr.WaitTimeoutError as exc:
+        raise RuntimeError("Не слышу речь. Проверь микрофон и говори ближе.") from exc
+    except sr.UnknownValueError as exc:
+        raise RuntimeError("Речь не распознана (шум/тихо/слишком быстро). Попробуй ещё раз.") from exc
+    except sr.RequestError as exc:
+        raise RuntimeError(f"Ошибка сервиса распознавания: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось распознать речь: {exc}") from exc
+    return auto_punctuate(text) if punctuate else text
+
+
+def extract_audio_from_video_for_stt(
+    video_path: str,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+) -> str:
+    if not video_path or not os.path.exists(video_path):
+        raise FileNotFoundError(video_path)
+    tmp_dir = ensure_dir(os.path.join("tmp", "media"))
+    output_path = os.path.join(tmp_dir, f"stt_{uuid4().hex}.wav")
+    ffmpeg_path = find_ffmpeg()
+    if ffmpeg_path:
+        cmd = [ffmpeg_path, "-y"]
+        if start_sec is not None:
+            cmd += ["-ss", str(start_sec)]
+        if end_sec is not None:
+            cmd += ["-to", str(end_sec)]
+        cmd += [
+            "-i",
+            video_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-acodec",
+            "pcm_s16le",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            error_text = result.stderr.strip() or "Не удалось извлечь аудио."
+            raise RuntimeError(error_text)
+        return output_path
+    if MOVIEPY_AVAILABLE:
+        clip = None
+        try:
+            clip = mp.VideoFileClip(video_path)
+            if start_sec is not None or end_sec is not None:
+                clip = clip.subclip(start_sec or 0, end_sec)
+            audio = clip.audio
+            if audio is None:
+                raise RuntimeError("В видео нет аудио дорожки.")
+            audio.write_audiofile(
+                output_path,
+                fps=16000,
+                nbytes=2,
+                codec="pcm_s16le",
+                ffmpeg_params=["-ac", "1"],
+            )
+            return output_path
+        finally:
+            if clip is not None:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+    raise RuntimeError("FFmpeg не найден, а moviepy не установлен.")
+
+
 def auto_generate_cards_from_speech(deck_id: int,
                                     duration_sec: int,
                                     use_ai_images: bool,
@@ -5036,32 +5121,17 @@ def auto_generate_cards_from_video(deck_id: int,
     Генерация карточек из видео: извлечение аудио, нарезка на предложения,
     распознавание речи, создание карточки с аудио.
     """
-    if not MOVIEPY_AVAILABLE:
-        raise RuntimeError("moviepy не установлен.")
     if not SR_AVAILABLE:
         raise RuntimeError("SpeechRecognition не установлен.")
-    
+
+    temp_audio = None
     try:
         # Извлечь аудио из видео
-        import tempfile
-        temp_dir = tempfile.mkdtemp()
-        temp_audio = os.path.join(temp_dir, "extracted_audio.wav")
-        
-        video = mp.VideoFileClip(video_path)
-        audio = video.audio
-        audio.write_audiofile(temp_audio)
-        video.close()
-        
+        temp_audio = extract_audio_from_video_for_stt(video_path)
+
         # Распознать речь из аудио
-        r = sr.Recognizer()
-        with sr.AudioFile(temp_audio) as source:
-            audio_data = r.record(source)
-            
-        try:
-            text = r.recognize_google(audio_data, language="de-DE")
-        except Exception as e:
-            raise RuntimeError(f"Не удалось распознать речь: {e}")
-        
+        text = transcribe_audio_to_text(temp_audio, lang="de-DE", punctuate=False)
+
         # Сохранить аудио файл
         os.makedirs("video_audio", exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -5070,9 +5140,6 @@ def auto_generate_cards_from_video(deck_id: int,
         # Копируем аудио файл
         import shutil
         shutil.copy(temp_audio, audio_filename)
-        
-        # Очистка временных файлов
-        shutil.rmtree(temp_dir)
         
         # Генерировать карточки из текста
         return auto_generate_cards_from_text(
@@ -5083,9 +5150,15 @@ def auto_generate_cards_from_video(deck_id: int,
             audio_side="back",
             image_spend_cb=image_spend_cb,
         )
-        
+
     except Exception as e:
         raise RuntimeError(f"Ошибка обработки видео: {e}")
+    finally:
+        if temp_audio and os.path.exists(temp_audio):
+            try:
+                os.remove(temp_audio)
+            except Exception:
+                pass
 
 
 # ==========================
@@ -8009,6 +8082,12 @@ class AnkiApp(tk.Tk):
         duration_var = tk.StringVar(value="Длительность: —")
         status_var = tk.StringVar(value="Клип сохраняется в папку media/clips/")
         clip_info_var = tk.StringVar(value="Клип не создан")
+        stt_status_var = tk.StringVar(value="")
+        stt_price_var = tk.StringVar(value="0")
+        stt_insufficient_var = tk.StringVar(value="")
+        stt_auto_punct_var = tk.BooleanVar(value=True)
+        stt_split_var = tk.BooleanVar(value=False)
+        stt_state = {"running": False, "poll_job": None}
 
         top_frame = ttk.Frame(content_frame)
         top_frame.pack(fill=tk.X, padx=12, pady=(10, 6))
@@ -8210,6 +8289,220 @@ class AnkiApp(tk.Tk):
 
         cut_btn = ttk.Button(time_frame, text="Нарезать", command=cut_and_attach)
         cut_btn.grid(row=0, column=3, rowspan=2, padx=6, pady=6, sticky="ns")
+
+        stt_frame = ttk.LabelFrame(content_frame, text="Цифровой слух")
+        stt_frame.pack(fill=tk.BOTH, padx=12, pady=(0, 10))
+
+        stt_top_row = ttk.Frame(stt_frame)
+        stt_top_row.pack(fill=tk.X, padx=6, pady=(6, 2))
+
+        coin_icon, coin_icon_disabled = self._load_credit_icon_pair()
+        stt_btn = tk.Button(
+            stt_top_row,
+            text="Сгенерировать текст из видео",
+            image=coin_icon,
+            compound=tk.RIGHT,
+            padx=10,
+            pady=6,
+        )
+        stt_btn.pack(side=tk.LEFT)
+        stt_btn.image = coin_icon
+
+        stt_price_row = ttk.Frame(stt_top_row)
+        stt_price_row.pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(stt_price_row, text="Цена:").pack(side=tk.LEFT, padx=(0, 6))
+        if coin_icon:
+            stt_price_icon = tk.Label(stt_price_row, image=coin_icon)
+            stt_price_icon.image = coin_icon
+            stt_price_icon.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(stt_price_row, textvariable=stt_price_var).pack(side=tk.LEFT)
+
+        ttk.Label(stt_frame, textvariable=stt_status_var, foreground="gray").pack(
+            anchor="w", padx=6, pady=(0, 4)
+        )
+
+        stt_option_row = ttk.Frame(stt_frame)
+        stt_option_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Checkbutton(
+            stt_option_row,
+            text="Автопунктуация",
+            variable=stt_auto_punct_var,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            stt_option_row,
+            text="Разбить на предложения",
+            variable=stt_split_var,
+        ).pack(side=tk.LEFT)
+
+        stt_text = scrolledtext.ScrolledText(stt_frame, height=6)
+        style_text_widget(stt_text, colors)
+        stt_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        create_context_menu(stt_text)
+
+        stt_action_row = ttk.Frame(stt_frame)
+        stt_action_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        def _get_stt_text() -> str:
+            return stt_text.get("1.0", tk.END).rstrip("\n")
+
+        ttk.Button(
+            stt_action_row,
+            text="Копировать",
+            command=lambda: win.clipboard_clear() or win.clipboard_append(_get_stt_text()),
+        ).pack(side=tk.LEFT)
+
+        def _insert_into_editor(editor: dict) -> None:
+            text = _get_stt_text()
+            if not text:
+                return
+            editor["text"].insert("insert", text)
+            editor["text"].focus_set()
+
+        ttk.Button(
+            stt_action_row,
+            text="Вставить в Front",
+            command=lambda: _insert_into_editor(front_editor),
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            stt_action_row,
+            text="Вставить в Back",
+            command=lambda: _insert_into_editor(back_editor),
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        ttk.Label(stt_frame, textvariable=stt_insufficient_var, foreground="red").pack(
+            anchor="e", padx=6, pady=(0, 4)
+        )
+
+        def _get_video_stt_price() -> int:
+            self.user_account = ensure_user_account(self.user_id)
+            self.user_profile = ensure_user_profile_row(self.user_id)
+            now_ts = int(time.time())
+            premium_active = int(self.user_account.get("premium_until") or 0) > now_ts
+            premium_plus = bool(self.user_profile.get("premium_plus")) or self.user_account.get("status") == "premium_plus"
+            return 10 if (premium_active and premium_plus) else 25
+
+        def _update_stt_pricing_ui() -> None:
+            price = _get_video_stt_price()
+            stt_price_var.set(str(price))
+            if stt_state["running"]:
+                stt_btn.configure(state=tk.DISABLED, image=coin_icon_disabled or coin_icon)
+                stt_btn.image = coin_icon_disabled or coin_icon
+                stt_insufficient_var.set("")
+                return
+            if self.can_afford(price):
+                stt_btn.configure(state=tk.NORMAL, image=coin_icon or coin_icon_disabled)
+                stt_btn.image = coin_icon or coin_icon_disabled
+                stt_insufficient_var.set("")
+            else:
+                stt_btn.configure(state=tk.DISABLED, image=coin_icon_disabled or coin_icon)
+                stt_btn.image = coin_icon_disabled or coin_icon
+                stt_insufficient_var.set("Недостаточно кредитов для распознавания")
+
+        def _poll_stt_pricing() -> None:
+            if not win.winfo_exists():
+                return
+            _update_stt_pricing_ui()
+            stt_state["poll_job"] = win.after(2000, _poll_stt_pricing)
+
+        def _run_stt():
+            if stt_state["running"]:
+                return
+            video_path = state.get("clip_path") or state.get("video_path") or video_path_var.get().strip()
+            if not video_path:
+                messagebox.showerror("Видео", "Выберите видео файл.", parent=win)
+                return
+            price = _get_video_stt_price()
+            if not self.can_afford(price):
+                messagebox.showwarning("Кредиты", "Недостаточно кредитов.", parent=win)
+                _update_stt_pricing_ui()
+                return
+            stt_state["running"] = True
+            stt_status_var.set("⏳ Распознаю…")
+            _update_stt_pricing_ui()
+
+            def _worker():
+                audio_path = None
+                try:
+                    if state.get("clip_path"):
+                        audio_path = extract_audio_from_video_for_stt(state["clip_path"])
+                    else:
+                        start_sec = parse_timecode_to_seconds(start_var.get().strip())
+                        end_sec = parse_timecode_to_seconds(end_var.get().strip())
+                        if start_sec is None or end_sec is None:
+                            raise RuntimeError(
+                                "Введите корректный диапазон Start/End (SS, MM:SS или HH:MM:SS)."
+                            )
+                        if end_sec <= start_sec:
+                            raise RuntimeError("Время окончания должно быть больше времени начала.")
+                        audio_path = extract_audio_from_video_for_stt(video_path, start_sec, end_sec)
+                    text = transcribe_audio_to_text(
+                        audio_path,
+                        lang="de-DE",
+                        punctuate=stt_auto_punct_var.get(),
+                    )
+                    if stt_split_var.get():
+                        text = "\n".join(split_into_sentences(text))
+                    return ("done", text)
+                except Exception as exc:
+                    return ("error", str(exc))
+                finally:
+                    if audio_path and os.path.exists(audio_path):
+                        try:
+                            os.remove(audio_path)
+                        except Exception:
+                            pass
+
+            def _on_finish(result):
+                stt_state["running"] = False
+                kind, payload = result
+                if kind == "error":
+                    stt_status_var.set("Ошибка")
+                    _update_stt_pricing_ui()
+                    messagebox.showerror("Ошибка распознавания", payload, parent=win)
+                    return
+                text = payload or ""
+                conn = None
+                try:
+                    if price > 0:
+                        conn = get_connection()
+
+                        def _op():
+                            spend_credits_in_transaction(
+                                conn,
+                                self.user_id,
+                                price,
+                                "video_stt",
+                                meta={"deck_id": deck_id, "video": os.path.basename(video_path)},
+                            )
+
+                        commit_with_retry(conn, _op)
+                except Exception as exc:
+                    stt_status_var.set("Ошибка оплаты")
+                    _update_stt_pricing_ui()
+                    messagebox.showerror("Оплата", f"Не удалось списать кредиты: {exc}", parent=win)
+                    return
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                self._after_balance_change()
+                stt_text.delete("1.0", tk.END)
+                stt_text.insert("1.0", text)
+                stt_status_var.set("Готово")
+                _update_stt_pricing_ui()
+
+            def _thread_runner():
+                result = _worker()
+                win.after(0, lambda: _on_finish(result))
+
+            threading.Thread(target=_thread_runner, daemon=True).start()
+
+        stt_btn.configure(command=_run_stt)
+        self.register_balance_observer(_update_stt_pricing_ui)
+        _update_stt_pricing_ui()
+        _poll_stt_pricing()
 
         template_frame = ttk.LabelFrame(content_frame, text="Шаблон карточки")
         template_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
@@ -8490,9 +8783,20 @@ class AnkiApp(tk.Tk):
             self.update_deck_preview()
             self.update_overdue_badge()
             messagebox.showinfo("Сохранено", "Карточка создана.", parent=win)
-            win.destroy()
+            _on_close()
 
         ttk.Button(cost_frame, text="Сохранить", command=save_card).pack(side=tk.RIGHT, padx=(0, 12))
+
+        def _on_close():
+            self.unregister_balance_observer(_update_stt_pricing_ui)
+            if stt_state.get("poll_job"):
+                try:
+                    win.after_cancel(stt_state["poll_job"])
+                except Exception:
+                    pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
 
     def open_apkg_import_window(self):
         win = tk.Toplevel(self)
