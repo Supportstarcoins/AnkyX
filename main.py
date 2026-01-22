@@ -777,6 +777,7 @@ except ImportError:
     SR_AVAILABLE = False
 
 FASTER_WHISPER_AVAILABLE = importlib.util.find_spec("faster_whisper") is not None
+WHISPER_AVAILABLE = importlib.util.find_spec("whisper") is not None
 VOSK_AVAILABLE = importlib.util.find_spec("vosk") is not None
 WEBRTCVAD_AVAILABLE = importlib.util.find_spec("webrtcvad") is not None
 
@@ -4969,6 +4970,7 @@ def auto_generate_cards_from_image(deck_id: int,
 
 
 STT_LOG_PATH = os.path.join("logs", "stt_last.log")
+STT_WHISPER_MODEL = os.environ.get("STT_WHISPER_MODEL", "small")
 
 
 class STTError(RuntimeError):
@@ -4995,22 +4997,25 @@ def _read_stt_log() -> str:
         return f"Не удалось прочитать лог: {exc}"
 
 
-def _normalize_lang(lang: str | None) -> str:
+def _normalize_lang(lang: str | None) -> str | None:
     if not lang:
-        return "de"
+        return None
     value = lang.replace("_", "-").strip().lower()
-    return value.split("-")[0] if value else "de"
+    if not value or value in {"auto", "autodetect", "detect"}:
+        return None
+    return value.split("-")[0]
 
 
 def _stt_user_message(reason: str, detail: str | None = None) -> str:
     if reason == "no_speech":
-        return "В выбранном фрагменте нет речи или слишком тихо."
+        return "Речь не обнаружена (тишина/очень тихо)."
     if reason == "wrong_language":
-        return "Похоже, выбран неверный язык распознавания."
+        label = detail or "Auto"
+        return f"Проверь язык распознавания (сейчас: {label})."
     if reason == "no_engine":
-        return "Движок распознавания недоступен. Установите ffmpeg/модель/локальные движки."
+        return "Нет движка STT: установите faster-whisper (предпочтительно)."
     if reason == "noisy":
-        return "Слишком шумно или низкая разборчивость речи."
+        return "Речь не обнаружена (тишина/очень тихо)."
     if reason == "network":
         return "Ошибка сети или квоты при обращении к сервису распознавания."
     return detail or "Не удалось распознать речь."
@@ -5101,12 +5106,10 @@ def _analyze_speech_presence(wav_path: str, log_lines: list[str]) -> tuple[float
     return duration, rms, voiced_ratio
 
 
-def extract_and_preprocess_audio(
+def extract_preprocessed_wav(
     video_path: str,
     start: float | None = None,
     end: float | None = None,
-    gain: float | None = None,
-    tempo: float | None = None,
     log_lines: list[str] | None = None,
 ) -> str:
     if not video_path or not os.path.exists(video_path):
@@ -5116,19 +5119,7 @@ def extract_and_preprocess_audio(
     ffmpeg_path = find_ffmpeg()
     log_lines = log_lines if log_lines is not None else []
     if ffmpeg_path:
-        filters = [
-            "highpass=f=80",
-            "lowpass=f=8000",
-        ]
-        if gain and gain != 1.0:
-            filters.append(f"volume={gain:.2f}")
-        if tempo and tempo != 1.0:
-            filters.append(f"atempo={tempo:.2f}")
-        filters += [
-            "afftdn",
-            "dynaudnorm",
-            "loudnorm=I=-16:TP=-1.5:LRA=11",
-        ]
+        filters = "highpass=f=80,lowpass=f=8000,afftdn,dynaudnorm,loudnorm=I=-16:TP=-1.5:LRA=11"
         cmd = [ffmpeg_path, "-y"]
         if start is not None:
             cmd += ["-ss", str(start)]
@@ -5145,47 +5136,10 @@ def extract_and_preprocess_audio(
             "-sample_fmt",
             "s16",
             "-af",
-            ",".join(filters),
+            filters,
             output_path,
         ]
         log_lines.append("ffmpeg_cmd=" + " ".join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            return output_path
-        log_lines.append("ffmpeg_error=" + (result.stderr.strip() or "unknown"))
-        filters = [
-            "highpass=f=80",
-            "lowpass=f=8000",
-        ]
-        if gain and gain != 1.0:
-            filters.append(f"volume={gain:.2f}")
-        if tempo and tempo != 1.0:
-            filters.append(f"atempo={tempo:.2f}")
-        filters += [
-            "anlmdn",
-            "dynaudnorm",
-            "loudnorm=I=-16:TP=-1.5:LRA=11",
-        ]
-        cmd = [ffmpeg_path, "-y"]
-        if start is not None:
-            cmd += ["-ss", str(start)]
-        if end is not None:
-            cmd += ["-to", str(end)]
-        cmd += [
-            "-i",
-            video_path,
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-sample_fmt",
-            "s16",
-            "-af",
-            ",".join(filters),
-            output_path,
-        ]
-        log_lines.append("ffmpeg_cmd_retry=" + " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             error_text = result.stderr.strip() or "Не удалось извлечь аудио."
@@ -5209,10 +5163,6 @@ def extract_and_preprocess_audio(
             audio = audio_clip.to_soundarray(fps=16000)
             if audio.ndim > 1:
                 audio = audio.mean(axis=1)
-            if gain and gain != 1.0:
-                audio = audio * float(gain)
-            if tempo and tempo != 1.0 and LIBROSA_AVAILABLE:
-                audio = librosa.effects.time_stretch(audio.astype(np.float32), rate=float(tempo))
             rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
             target_rms = 0.1
             if rms > 0:
@@ -5226,6 +5176,19 @@ def extract_and_preprocess_audio(
                 except Exception:
                     pass
     raise RuntimeError("FFmpeg не найден, а moviepy не установлен.")
+
+
+def extract_and_preprocess_audio(
+    video_path: str,
+    start: float | None = None,
+    end: float | None = None,
+    gain: float | None = None,
+    tempo: float | None = None,
+    log_lines: list[str] | None = None,
+) -> str:
+    _ = gain
+    _ = tempo
+    return extract_preprocessed_wav(video_path, start=start, end=end, log_lines=log_lines)
 
 
 def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 25.0) -> list[tuple[str, float, float]]:
@@ -5304,12 +5267,15 @@ def transcribe_audio_chunks(
     segments: list[dict] = []
     lang_short = _normalize_lang(lang)
     if FASTER_WHISPER_AVAILABLE:
-        try:
-            from faster_whisper import WhisperModel
+        from faster_whisper import WhisperModel
 
-            model = WhisperModel("small", device="cpu", compute_type="int8")
+        try:
+            model = WhisperModel(STT_WHISPER_MODEL, device="cpu", compute_type="int8")
             for chunk_path, t0, _ in chunks:
-                seg_iter, _info = model.transcribe(chunk_path, language=lang_short)
+                kwargs = {"vad_filter": True}
+                if lang_short:
+                    kwargs["language"] = lang_short
+                seg_iter, _info = model.transcribe(chunk_path, **kwargs)
                 for seg in seg_iter:
                     text = (seg.text or "").strip()
                     if not text:
@@ -5322,8 +5288,34 @@ def transcribe_audio_chunks(
             return text, segments, "faster-whisper"
         except Exception as exc:
             log_lines.append(f"engine_faster_whisper_error={exc}")
+    if WHISPER_AVAILABLE:
+        import whisper
+
+        try:
+            model = whisper.load_model(STT_WHISPER_MODEL)
+            for chunk_path, t0, _ in chunks:
+                kwargs = {"task": "transcribe"}
+                if lang_short:
+                    kwargs["language"] = lang_short
+                result = model.transcribe(chunk_path, **kwargs)
+                for seg in result.get("segments") or []:
+                    text = (seg.get("text") or "").strip()
+                    if not text:
+                        continue
+                    segments.append(
+                        {
+                            "start": float(seg.get("start", 0.0)) + t0,
+                            "end": float(seg.get("end", 0.0)) + t0,
+                            "text": text,
+                        }
+                    )
+            text = " ".join(seg["text"] for seg in segments).strip()
+            log_lines.append("engine=whisper")
+            return text, segments, "whisper"
+        except Exception as exc:
+            log_lines.append(f"engine_whisper_error={exc}")
     if VOSK_AVAILABLE:
-        model_path = _find_vosk_model(lang_short)
+        model_path = _find_vosk_model(lang_short or "en")
         if model_path:
             try:
                 from vosk import KaldiRecognizer, Model, SetLogLevel
@@ -5356,7 +5348,7 @@ def transcribe_audio_chunks(
             with sr.AudioFile(chunk_path) as source:
                 audio_data = r.record(source)
             try:
-                text = r.recognize_google(audio_data, language=lang or "de-DE")
+                text = r.recognize_google(audio_data, language=lang or "en-US")
             except sr.RequestError as exc:
                 raise STTError(_stt_user_message("network"), "network", str(exc)) from exc
             except sr.UnknownValueError:
@@ -5406,6 +5398,8 @@ def _is_language_mismatch(text: str, lang: str | None) -> bool:
     if not text:
         return False
     lang_short = _normalize_lang(lang)
+    if not lang_short:
+        return False
     letters = re.findall(r"[A-Za-zА-Яа-яЁё]", text)
     if not letters:
         return False
@@ -5426,86 +5420,77 @@ def run_stt_pipeline(
     punctuate: bool = True,
     preprocessed: bool = False,
 ) -> tuple[str, list[dict]]:
-    attempts = [
-        {"label": "base", "gain": None, "tempo": None},
-        {"label": "gain", "gain": 2.0, "tempo": None},
-        {"label": "slow", "gain": 1.2, "tempo": 0.9},
-    ]
+    lang_label = lang or "Auto"
     log_lines: list[str] = [
         f"source_path={source_path}",
-        f"lang={lang or 'auto'}",
+        f"lang={lang_label}",
         f"start={start}",
         f"end={end}",
         f"preprocessed={preprocessed}",
     ]
-    last_error: STTError | None = None
-    for attempt in attempts:
-        wav_path = None
-        delete_wav = True
-        chunk_paths: list[str] = []
-        try:
-            log_lines.append(f"attempt={attempt['label']}")
-            if preprocessed and attempt["label"] == "base":
-                wav_path = source_path
-                delete_wav = False
-            else:
-                wav_path = extract_and_preprocess_audio(
-                    source_path,
-                    start=start,
-                    end=end,
-                    gain=attempt["gain"],
-                    tempo=attempt["tempo"],
-                    log_lines=log_lines,
-                )
-            duration, rms, voiced_ratio = _analyze_speech_presence(wav_path, log_lines)
-            if duration < 0.3 or rms < 0.004 or voiced_ratio < 0.01:
-                raise STTError(_stt_user_message("no_speech"), "no_speech")
-            chunks = split_audio_into_chunks(wav_path)
-            for chunk_path, _, _ in chunks:
-                if chunk_path != wav_path:
-                    chunk_paths.append(chunk_path)
-            text, segments, engine = transcribe_audio_chunks(chunks, lang, log_lines)
-            log_lines.append(f"engine_used={engine}")
-            log_lines.append(f"text_length={len(text.strip())}")
-            if len(text.strip()) < 2:
-                last_error = STTError(_stt_user_message("noisy"), "noisy")
-                continue
-            if _is_language_mismatch(text, lang):
-                raise STTError(_stt_user_message("wrong_language"), "wrong_language")
-            final_text = _postprocess_transcript(text, segments) if punctuate else text.strip()
-            _write_stt_log(log_lines)
-            return final_text, segments
-        except STTError as exc:
-            last_error = exc
-            log_lines.append(f"stt_error_reason={exc.reason}")
-            log_lines.append(f"stt_error_detail={exc.detail}")
-        except RuntimeError as exc:
-            msg = str(exc)
-            reason = "no_engine" if "ffmpeg" in msg.lower() or "moviepy" in msg.lower() else "noisy"
-            last_error = STTError(_stt_user_message(reason, msg), reason, msg)
-            log_lines.append(f"stt_error_reason={reason}")
-            log_lines.append(f"stt_error_detail={msg}")
-        except Exception as exc:
-            msg = str(exc)
-            last_error = STTError(_stt_user_message("noisy", msg), "noisy", msg)
-            log_lines.append("stt_error_reason=unknown")
-            log_lines.append(f"stt_error_detail={msg}")
-        finally:
-            if delete_wav and wav_path and os.path.exists(wav_path):
+    wav_path = None
+    delete_wav = True
+    chunk_paths: list[str] = []
+    try:
+        if preprocessed:
+            wav_path = source_path
+            delete_wav = False
+        else:
+            wav_path = extract_preprocessed_wav(
+                source_path,
+                start=start,
+                end=end,
+                log_lines=log_lines,
+            )
+        duration, rms, voiced_ratio = _analyze_speech_presence(wav_path, log_lines)
+        if duration < 0.3 or rms < 0.004 or voiced_ratio < 0.01:
+            raise STTError(_stt_user_message("no_speech"), "no_speech")
+        chunks = split_audio_into_chunks(wav_path)
+        for chunk_path, _, _ in chunks:
+            if chunk_path != wav_path:
+                chunk_paths.append(chunk_path)
+        text, segments, engine = transcribe_audio_chunks(chunks, lang, log_lines)
+        log_lines.append(f"engine_used={engine}")
+        log_lines.append(f"segments_count={len(segments)}")
+        log_lines.append(f"text_preview={(text or '').strip()[:200]}")
+        log_lines.append(f"text_length={len(text.strip())}")
+        if len(text.strip()) < 2:
+            raise STTError(_stt_user_message("no_speech"), "no_speech")
+        if _is_language_mismatch(text, lang):
+            raise STTError(_stt_user_message("wrong_language", lang_label), "wrong_language", lang_label)
+        final_text = _postprocess_transcript(text, segments) if punctuate else text.strip()
+        _write_stt_log(log_lines)
+        return final_text, segments
+    except STTError as exc:
+        log_lines.append(f"stt_error_reason={exc.reason}")
+        log_lines.append(f"stt_error_detail={exc.detail}")
+        _write_stt_log(log_lines)
+        raise
+    except RuntimeError as exc:
+        msg = str(exc)
+        reason = "no_engine" if "ffmpeg" in msg.lower() or "moviepy" in msg.lower() else "noisy"
+        log_lines.append(f"stt_error_reason={reason}")
+        log_lines.append(f"stt_error_detail={msg}")
+        _write_stt_log(log_lines)
+        raise STTError(_stt_user_message(reason, msg), reason, msg) from exc
+    except Exception as exc:
+        msg = str(exc)
+        log_lines.append("stt_error_reason=unknown")
+        log_lines.append(f"stt_error_detail={msg}")
+        _write_stt_log(log_lines)
+        raise STTError(_stt_user_message("noisy", msg), "noisy", msg) from exc
+    finally:
+        if delete_wav and wav_path and os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+        for chunk_path in chunk_paths:
+            if os.path.exists(chunk_path):
                 try:
-                    os.remove(wav_path)
+                    os.remove(chunk_path)
                 except Exception:
                     pass
-            for chunk_path in chunk_paths:
-                if os.path.exists(chunk_path):
-                    try:
-                        os.remove(chunk_path)
-                    except Exception:
-                        pass
-    _write_stt_log(log_lines)
-    if last_error:
-        raise last_error
-    raise STTError(_stt_user_message("noisy"), "noisy")
 
 
 def show_stt_error_dialog(parent: tk.Misc | None, title: str, message: str) -> None:
@@ -21067,6 +21052,8 @@ class AudioEditorWindow:
 class VideoClipCardsWindow:
     """Видео → клипы → карточки (автозапуск + авто-STT + таймкоды)."""
 
+    STT_LANG_CHOICES = ["Auto", "ru-RU", "en-US", "de-DE"]
+
     def __init__(self, app: "AnkiApp", deck_id: int) -> None:
         self.app = app
         self.deck_id = deck_id
@@ -21167,6 +21154,23 @@ class VideoClipCardsWindow:
             variable=self.auto_stt_var,
         ).pack(side=tk.RIGHT)
 
+        options_row = ttk.Frame(frame)
+        options_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Label(options_row, text="Язык:").pack(side=tk.LEFT)
+        self.stt_lang_var = tk.StringVar(value=self._default_stt_language())
+        self.stt_lang_combo = ttk.Combobox(
+            options_row,
+            textvariable=self.stt_lang_var,
+            values=self.STT_LANG_CHOICES,
+            state="readonly",
+            width=10,
+        )
+        self.stt_lang_combo.pack(side=tk.LEFT, padx=(6, 6))
+        self.stt_lang_combo.bind("<<ComboboxSelected>>", lambda _e: self._maybe_auto_stt_language())
+        ttk.Button(options_row, text="Сменить язык", command=self._open_stt_lang_menu).pack(
+            side=tk.LEFT
+        )
+
         self.stt_text = scrolledtext.ScrolledText(frame, height=6)
         style_text_widget(self.stt_text, getattr(self.app, "palette", None) or {})
         self.stt_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
@@ -21175,7 +21179,7 @@ class VideoClipCardsWindow:
         action_row = ttk.Frame(frame)
         action_row.pack(fill=tk.X, padx=6, pady=(0, 6))
 
-        ttk.Button(action_row, text="Повторить распознавание", command=self._request_stt).pack(
+        ttk.Button(action_row, text="Повторить", command=self._request_stt).pack(
             side=tk.LEFT, padx=(0, 6)
         )
         ttk.Button(
@@ -21183,6 +21187,28 @@ class VideoClipCardsWindow:
             text="Копировать",
             command=lambda: self.win.clipboard_clear() or self.win.clipboard_append(self._get_stt_text()),
         ).pack(side=tk.LEFT)
+
+    def _default_stt_language(self) -> str:
+        mapping = {"ru": "ru-RU", "en": "en-US", "de": "de-DE"}
+        tts_lang = get_deck_tts_lang(self.deck_id, "").strip().lower()
+        return mapping.get(tts_lang, "Auto")
+
+    def _get_selected_stt_language(self) -> str | None:
+        value = (self.stt_lang_var.get() or "").strip()
+        if not value or value.lower() == "auto":
+            return None
+        return value
+
+    def _open_stt_lang_menu(self) -> None:
+        try:
+            self.stt_lang_combo.focus_set()
+            self.stt_lang_combo.event_generate("<Button-1>")
+        except Exception:
+            pass
+
+    def _maybe_auto_stt_language(self) -> None:
+        if self.auto_stt_var.get():
+            self._request_stt()
 
     def _build_sentences_block(self, parent: tk.Widget) -> None:
         frame = ttk.LabelFrame(parent, text="Предложения и таймкоды")
@@ -21304,9 +21330,13 @@ class VideoClipCardsWindow:
         def _worker() -> tuple[str, object]:
             try:
                 self.win.after(0, lambda: self.stt_status_var.set("⏳ распознавание"))
-                text, _segments = run_stt_pipeline(self.video_path, lang="de-DE", punctuate=True)
+                text, segments = run_stt_pipeline(
+                    self.video_path,
+                    lang=self._get_selected_stt_language(),
+                    punctuate=True,
+                )
                 duration = get_video_duration_seconds(self.video_path)
-                return ("done", {"text": text, "duration": duration})
+                return ("done", {"text": text, "duration": duration, "segments": segments})
             except Exception as exc:
                 return ("error", str(exc))
 
@@ -21322,10 +21352,11 @@ class VideoClipCardsWindow:
             payload = payload or {}
             text = str(payload.get("text") or "")
             duration = payload.get("duration")
+            segments = payload.get("segments") or []
             self.stt_text.delete("1.0", tk.END)
             self.stt_text.insert("1.0", text)
             self.stt_status_var.set("✅ готово")
-            self._build_sentences_from_text(text, duration)
+            self._build_sentences_from_text(text, duration, segments)
             self._update_save_pricing()
 
         def _thread_runner() -> None:
@@ -21334,13 +21365,18 @@ class VideoClipCardsWindow:
 
         threading.Thread(target=_thread_runner, daemon=True).start()
 
-    def _build_sentences_from_text(self, text: str, duration: float | None) -> None:
+    def _build_sentences_from_text(
+        self,
+        text: str,
+        duration: float | None,
+        segments: list[dict] | None,
+    ) -> None:
         self.sentences = []
         self.sentences_tree.delete(*self.sentences_tree.get_children())
         sentences = split_into_sentences(text or "")
         if not sentences and text.strip():
             sentences = [text.strip()]
-        timecodes = self._compute_sentence_timecodes(sentences, duration)
+        timecodes = self._compute_sentence_timecodes(sentences, duration, segments or [])
         for idx, sentence in enumerate(sentences):
             start, end = timecodes[idx]
             sentence_html = f"<div>{html.escape(sentence)}</div>"
@@ -21362,9 +21398,16 @@ class VideoClipCardsWindow:
             self.sentences_tree.selection_set("0")
             self._select_sentence(0)
 
-    def _compute_sentence_timecodes(self, sentences: list[str], duration: float | None) -> list[tuple[float, float]]:
+    def _compute_sentence_timecodes(
+        self,
+        sentences: list[str],
+        duration: float | None,
+        segments: list[dict],
+    ) -> list[tuple[float, float]]:
         if not sentences:
             return []
+        if segments:
+            return self._match_sentence_timecodes(sentences, segments)
         duration = float(duration or 0)
         if duration <= 0:
             duration = max(2.0 * len(sentences), 2.0)
@@ -21384,6 +21427,47 @@ class VideoClipCardsWindow:
                 end = cursor + max(0.2, duration / max(len(weights), 1))
             results.append((cursor, end))
             cursor = end
+        return results
+
+    def _match_sentence_timecodes(
+        self,
+        sentences: list[str],
+        segments: list[dict],
+    ) -> list[tuple[float, float]]:
+        def _normalize(text: str) -> str:
+            tokens = re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text.lower())
+            return "".join(tokens)
+
+        results: list[tuple[float, float]] = []
+        seg_idx = 0
+        last_end = 0.0
+        for sentence in sentences:
+            target = _normalize(sentence)
+            start = None
+            end = None
+            buffer = ""
+            while seg_idx < len(segments):
+                seg = segments[seg_idx]
+                seg_idx += 1
+                seg_text = _normalize(seg.get("text", ""))
+                if not seg_text:
+                    continue
+                if start is None:
+                    start = float(seg.get("start", 0.0))
+                end = float(seg.get("end", start))
+                buffer += seg_text
+                if target:
+                    if target in buffer or len(buffer) >= len(target):
+                        break
+                else:
+                    break
+            if start is None:
+                start = last_end
+                end = last_end
+            if end is None:
+                end = start
+            last_end = max(last_end, end)
+            results.append((start, end))
         return results
 
     def _on_sentence_select(self, _event=None) -> None:
