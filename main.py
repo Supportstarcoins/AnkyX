@@ -5373,44 +5373,30 @@ def stt_transcribe_wav(
     wav_path: str,
     lang: str | None,
     engine_pref: str = "auto",
+    progress_cb=None,
 ) -> tuple[str, list[dict], str]:
     segments: list[dict] = []
     chunk_paths: list[str] = []
     try:
         lang_whisper = _map_whisper_language(lang or "Auto")
+        duration = 0.0
+        try:
+            import wave
+
+            with wave.open(wav_path, "rb") as wf:
+                duration = wf.getnframes() / max(1, wf.getframerate())
+        except Exception:
+            duration = 0.0
         if FASTER_WHISPER_AVAILABLE and engine_pref in {"auto", "whisper"}:
             try:
                 model = WhisperModel(STT_WHISPER_MODEL, device="cpu", compute_type="int8")
-                duration = 0.0
-                try:
-                    import wave
-
-                    with wave.open(wav_path, "rb") as wf:
-                        duration = wf.getnframes() / max(1, wf.getframerate())
-                except Exception:
-                    duration = 0.0
-                if duration > 60.0:
-                    chunks = split_audio_into_chunks(wav_path, max_chunk_sec=30.0)
-                    for chunk_path, t0, _ in chunks:
-                        if chunk_path != wav_path:
-                            chunk_paths.append(chunk_path)
-                        seg_iter, _info = model.transcribe(
-                            chunk_path,
-                            language=lang_whisper,
-                            vad_filter=True,
-                            beam_size=5,
-                            condition_on_previous_text=False,
-                        )
-                        for seg in seg_iter:
-                            text = (seg.text or "").strip()
-                            if not text:
-                                continue
-                            segments.append(
-                                {"start": float(seg.start) + t0, "end": float(seg.end) + t0, "text": text}
-                            )
-                else:
+                chunks = split_audio_into_chunks(wav_path, max_chunk_sec=30.0)
+                total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
+                for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
+                    if chunk_path != wav_path:
+                        chunk_paths.append(chunk_path)
                     seg_iter, _info = model.transcribe(
-                        wav_path,
+                        chunk_path,
                         language=lang_whisper,
                         vad_filter=True,
                         beam_size=5,
@@ -5421,8 +5407,10 @@ def stt_transcribe_wav(
                         if not text:
                             continue
                         segments.append(
-                            {"start": float(seg.start), "end": float(seg.end), "text": text}
+                            {"start": float(seg.start) + t0, "end": float(seg.end) + t0, "text": text}
                         )
+                    if progress_cb is not None:
+                        progress_cb(t1, total_seconds, idx, len(chunks))
                 text = " ".join(seg["text"] for seg in segments).strip()
                 if text:
                     return text, segments, "whisper"
@@ -5431,7 +5419,8 @@ def stt_transcribe_wav(
         if SR_AVAILABLE and engine_pref in {"auto", "google"}:
             r = sr.Recognizer()
             chunks = split_audio_into_chunks(wav_path, max_chunk_sec=25.0)
-            for chunk_path, t0, t1 in chunks:
+            total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
+            for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
                 if chunk_path != wav_path:
                     chunk_paths.append(chunk_path)
                 with sr.AudioFile(chunk_path) as source:
@@ -5444,6 +5433,8 @@ def stt_transcribe_wav(
                     text = ""
                 if text:
                     segments.append({"start": t0, "end": t1, "text": text.strip()})
+                if progress_cb is not None:
+                    progress_cb(t1, total_seconds, idx, len(chunks))
             text = " ".join(seg["text"] for seg in segments).strip()
             return text, segments, "google"
         raise STTError(_stt_user_message("no_engine"), "no_engine")
@@ -5515,6 +5506,7 @@ def run_stt_pipeline(
     punctuate: bool = True,
     preprocessed: bool = False,
     log_context: list[str] | None = None,
+    progress_queue: queue.Queue | None = None,
 ) -> tuple[str, list[dict], str]:
     lang_label = lang or "Auto"
     log_lines: list[str] = [
@@ -5528,22 +5520,70 @@ def run_stt_pipeline(
         log_lines.extend(log_context)
     wav_path = None
     delete_wav = True
+
+    def _emit_progress(
+        *,
+        overall: float | None = None,
+        status: str | None = None,
+        mode: str | None = None,
+        stt_percent: float | None = None,
+    ) -> None:
+        if progress_queue is None:
+            return
+        progress_queue.put(
+            {
+                "overall": overall,
+                "status": status,
+                "mode": mode,
+                "stt_percent": stt_percent,
+            }
+        )
+
+    def _on_transcribe_progress(
+        processed_seconds: float,
+        total_seconds: float,
+        chunk_index: int,
+        total_chunks: int,
+    ) -> None:
+        if total_seconds > 0:
+            stt_percent = min(100.0, max(0.0, (processed_seconds / total_seconds) * 100.0))
+        elif total_chunks > 0:
+            stt_percent = min(100.0, max(0.0, (chunk_index / total_chunks) * 100.0))
+        else:
+            return
+        overall = 20.0 + (70.0 * (stt_percent / 100.0))
+        _emit_progress(
+            overall=overall,
+            status=f"Распознаю ({int(stt_percent)}%)…",
+            mode="determinate",
+            stt_percent=stt_percent,
+        )
+
     try:
         if preprocessed:
             wav_path = source_path
             delete_wav = False
         else:
+            _emit_progress(overall=0.0, status="Извлекаю аудио…", mode="indeterminate")
             wav_path = extract_preprocessed_wav(
                 source_path,
                 start=start,
                 end=end,
                 log_lines=log_lines,
             )
+        _emit_progress(overall=10.0, status="Подготавливаю…", mode="indeterminate")
         duration, rms, voiced_ratio = _analyze_speech_presence(wav_path, log_lines)
         rms = _apply_gain_if_needed(wav_path, rms, log_lines)
         if duration < 0.3 or rms < 0.004 or voiced_ratio < 0.01:
             raise STTError(_stt_user_message("no_speech"), "no_speech")
-        text, segments, engine = stt_transcribe_wav(wav_path, lang, engine_pref="auto")
+        _emit_progress(overall=20.0, status="Распознаю (0%)…", mode="determinate", stt_percent=0.0)
+        text, segments, engine = stt_transcribe_wav(
+            wav_path,
+            lang,
+            engine_pref="auto",
+            progress_cb=_on_transcribe_progress,
+        )
+        _emit_progress(overall=90.0, status="Пунктуация…", mode="indeterminate")
         log_lines.append(f"engine_used={engine}")
         if engine == "whisper":
             log_lines.append(f"model_name={STT_WHISPER_MODEL}")
@@ -5558,6 +5598,7 @@ def run_stt_pipeline(
             raise STTError(_stt_user_message("wrong_language", lang_label), "wrong_language", lang_label)
         final_text = _postprocess_transcript(text, segments) if punctuate else text.strip()
         _write_stt_log(log_lines)
+        _emit_progress(overall=100.0, status="Готово", mode="determinate")
         return final_text, segments, engine
     except STTError as exc:
         log_lines.append(f"stt_error_reason={exc.reason}")
@@ -9123,6 +9164,8 @@ class AnkiApp(tk.Tk):
         ttk.Label(stt_frame, textvariable=stt_status_var, foreground="gray").pack(
             anchor="w", padx=6, pady=(0, 4)
         )
+        stt_progress = ttk.Progressbar(stt_frame, mode="determinate", maximum=100)
+        stt_progress.pack(fill=tk.X, padx=6, pady=(0, 4))
 
         stt_option_row = ttk.Frame(stt_frame)
         stt_option_row.pack(fill=tk.X, padx=6, pady=(0, 4))
@@ -9131,11 +9174,12 @@ class AnkiApp(tk.Tk):
             text="Автопунктуация",
             variable=stt_auto_punct_var,
         ).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(
+        stt_auto_check = ttk.Checkbutton(
             stt_option_row,
             text="Авто-цифровой слух",
             variable=stt_auto_run_var,
-        ).pack(side=tk.LEFT)
+        )
+        stt_auto_check.pack(side=tk.LEFT)
 
         stt_text = scrolledtext.ScrolledText(stt_frame, height=6)
         style_text_widget(stt_text, colors)
@@ -9178,7 +9222,15 @@ class AnkiApp(tk.Tk):
             foreground="gray",
         ).pack(anchor="w", padx=6, pady=(0, 4))
 
-        action_buttons = [cut_btn, stt_btn]
+        action_buttons = [cut_btn, stt_btn, stt_auto_check]
+
+        def _set_progress_mode(mode: str) -> None:
+            if mode == "indeterminate":
+                stt_progress.configure(mode="indeterminate", maximum=100)
+                stt_progress.start(10)
+            else:
+                stt_progress.stop()
+                stt_progress.configure(mode="determinate", maximum=100)
 
         def _set_action_state(enabled: bool) -> None:
             for btn in action_buttons:
@@ -9198,6 +9250,10 @@ class AnkiApp(tk.Tk):
             job_id = stt_state["job_id"]
             _set_action_state(False)
             stt_status_var.set("⏳ Извлекаю аудио…")
+            stt_progress.configure(value=0)
+            _set_progress_mode("indeterminate")
+            progress_queue = queue.Queue()
+            stt_state["progress_queue"] = progress_queue
 
             def _worker():
                 try:
@@ -9215,17 +9271,40 @@ class AnkiApp(tk.Tk):
                         if end_sec <= start_sec:
                             raise RuntimeError("Время окончания должно быть больше времени начала.")
                         target_path = video_path
-                    win.after(0, lambda: stt_status_var.set("⏳ Распознаю…"))
                     text, _segments, _engine = run_stt_pipeline(
                         target_path,
                         start=start_sec,
                         end=end_sec,
                         lang="de-DE",
                         punctuate=stt_auto_punct_var.get(),
+                        progress_queue=progress_queue,
                     )
                     return ("done", text)
                 except Exception as exc:
                     return ("error", str(exc))
+
+            def _poll_progress(current_job_id: int) -> None:
+                if current_job_id != stt_state["job_id"]:
+                    return
+                local_queue = stt_state.get("progress_queue")
+                if local_queue is None:
+                    return
+                while True:
+                    try:
+                        event = local_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    status = event.get("status")
+                    mode = event.get("mode")
+                    overall = event.get("overall")
+                    if mode:
+                        _set_progress_mode(mode)
+                    if status:
+                        stt_status_var.set(f"⏳ {status}")
+                    if overall is not None:
+                        stt_progress.configure(value=max(0.0, min(100.0, overall)))
+                if stt_state["running"] and current_job_id == stt_state["job_id"]:
+                    win.after(100, lambda: _poll_progress(current_job_id))
 
             def _on_finish(result):
                 stt_state["running"] = False
@@ -9237,12 +9316,16 @@ class AnkiApp(tk.Tk):
                     return
                 kind, payload = result
                 if kind == "error":
-                    stt_status_var.set("❌ Ошибка")
+                    stt_status_var.set(f"❌ Ошибка: {payload}")
+                    _set_progress_mode("determinate")
+                    stt_progress.configure(value=0)
                     show_stt_error_dialog(win, "Ошибка распознавания", payload)
                     return
                 text = payload or ""
                 stt_text.delete("1.0", tk.END)
                 stt_text.insert("1.0", text)
+                _set_progress_mode("determinate")
+                stt_progress.configure(value=100)
                 stt_status_var.set("✅ Готово")
                 _auto_generate_drafts(text)
                 _update_save_pricing()
@@ -9251,6 +9334,7 @@ class AnkiApp(tk.Tk):
                 result = _worker()
                 win.after(0, lambda: _on_finish(result))
 
+            _poll_progress(job_id)
             threading.Thread(target=_thread_runner, daemon=True).start()
 
         def _request_stt(reason: str) -> None:
@@ -21173,6 +21257,8 @@ class VideoClipCardsWindow:
         self.player: VlcPlayerWidget | None = None
         self.stt_job_id = 0
         self.stt_running = False
+        self.stt_progress_queue: queue.Queue | None = None
+        self.stt_progress_mode = "determinate"
 
         self.win = tk.Toplevel(app.root)
         self.win.title("Видео → клипы → карточки")
@@ -21258,11 +21344,15 @@ class VideoClipCardsWindow:
         ttk.Label(top_row, textvariable=self.stt_status_var, foreground="gray").pack(side=tk.LEFT)
 
         self.auto_stt_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.auto_stt_check = ttk.Checkbutton(
             top_row,
             text="Авто-цифровой слух",
             variable=self.auto_stt_var,
-        ).pack(side=tk.RIGHT)
+        )
+        self.auto_stt_check.pack(side=tk.RIGHT)
+
+        self.stt_progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.stt_progress.pack(fill=tk.X, padx=6, pady=(0, 4))
 
         self.stt_source_var = tk.StringVar(value="Источник: audio track из файла (WAV 16k mono)")
         ttk.Label(frame, textvariable=self.stt_source_var, foreground="gray").pack(
@@ -21313,9 +21403,8 @@ class VideoClipCardsWindow:
         action_row = ttk.Frame(frame)
         action_row.pack(fill=tk.X, padx=6, pady=(0, 6))
 
-        ttk.Button(action_row, text="Повторить", command=self._request_stt).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
+        self.stt_repeat_btn = ttk.Button(action_row, text="Повторить", command=self._request_stt)
+        self.stt_repeat_btn.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(
             action_row,
             text="Копировать",
@@ -21475,6 +21564,51 @@ class VideoClipCardsWindow:
     def _get_stt_text(self) -> str:
         return self.stt_text.get("1.0", tk.END).rstrip("\n")
 
+    def _set_stt_controls_enabled(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        try:
+            self.stt_repeat_btn.configure(state=state)
+        except Exception:
+            pass
+        try:
+            self.auto_stt_check.configure(state=state)
+        except Exception:
+            pass
+
+    def _set_stt_progress_mode(self, mode: str) -> None:
+        if mode == self.stt_progress_mode:
+            return
+        self.stt_progress_mode = mode
+        if mode == "indeterminate":
+            self.stt_progress.configure(mode="indeterminate", maximum=100)
+            self.stt_progress.start(10)
+        else:
+            self.stt_progress.stop()
+            self.stt_progress.configure(mode="determinate", maximum=100)
+
+    def _poll_stt_progress(self, job_id: int) -> None:
+        if job_id != self.stt_job_id:
+            return
+        progress_queue = self.stt_progress_queue
+        if progress_queue is None:
+            return
+        while True:
+            try:
+                event = progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            status = event.get("status")
+            mode = event.get("mode")
+            overall = event.get("overall")
+            if mode:
+                self._set_stt_progress_mode(mode)
+            if status:
+                self.stt_status_var.set(f"⏳ {status}")
+            if overall is not None:
+                self.stt_progress.configure(value=max(0.0, min(100.0, overall)))
+        if self.stt_running and job_id == self.stt_job_id:
+            self.win.after(100, lambda: self._poll_stt_progress(job_id))
+
     def _request_stt(self) -> None:
         if self.stt_running:
             return
@@ -21484,10 +21618,13 @@ class VideoClipCardsWindow:
         self.stt_running = True
         self.stt_job_id += 1
         job_id = self.stt_job_id
-        self.stt_status_var.set("⏳ извлечение аудио")
+        self._set_stt_controls_enabled(False)
+        self.stt_status_var.set("⏳ Извлекаю аудио…")
+        self.stt_progress.configure(value=0)
+        self._set_stt_progress_mode("indeterminate")
+        self.stt_progress_queue = queue.Queue()
 
         def _worker() -> tuple[str, object]:
-            temp_wav = None
             try:
                 log_context = [
                     f"video_path={self.video_path}",
@@ -21496,13 +21633,12 @@ class VideoClipCardsWindow:
                     "end=None",
                     "source_type=file",
                 ]
-                temp_wav = extract_audio_from_video(self.video_path, log_lines=log_context)
-                self.win.after(0, lambda: self.stt_status_var.set("⏳ распознавание"))
-                text, segments, engine = transcribe_audio_file(
-                    temp_wav,
+                text, segments, engine = run_stt_pipeline(
+                    self.video_path,
                     lang=self._get_selected_stt_language(),
                     punctuate=True,
                     log_context=log_context,
+                    progress_queue=self.stt_progress_queue,
                 )
                 duration = get_video_duration_seconds(self.video_path)
                 return (
@@ -21511,20 +21647,17 @@ class VideoClipCardsWindow:
                 )
             except Exception as exc:
                 return ("error", str(exc))
-            finally:
-                if temp_wav and os.path.exists(temp_wav):
-                    try:
-                        os.remove(temp_wav)
-                    except Exception:
-                        pass
 
         def _finish(result: tuple[str, object]) -> None:
             self.stt_running = False
+            self._set_stt_controls_enabled(True)
             if job_id != self.stt_job_id:
                 return
             kind, payload = result
             if kind == "error":
-                self.stt_status_var.set("❌ ошибка")
+                self._set_stt_progress_mode("determinate")
+                self.stt_progress.configure(value=0)
+                self.stt_status_var.set(f"❌ Ошибка: {payload}")
                 show_stt_error_dialog(self.win, "Ошибка распознавания", str(payload))
                 return
             payload = payload or {}
@@ -21534,7 +21667,9 @@ class VideoClipCardsWindow:
             engine = str(payload.get("engine") or "")
             self.stt_text.delete("1.0", tk.END)
             self.stt_text.insert("1.0", text)
-            self.stt_status_var.set("✅ готово")
+            self._set_stt_progress_mode("determinate")
+            self.stt_progress.configure(value=100)
+            self.stt_status_var.set("✅ Готово")
             self._update_engine_label(engine)
             self._build_sentences_from_text(text, duration, segments)
             self._update_save_pricing()
@@ -21543,6 +21678,7 @@ class VideoClipCardsWindow:
             result = _worker()
             self.win.after(0, lambda: _finish(result))
 
+        self._poll_stt_progress(job_id)
         threading.Thread(target=_thread_runner, daemon=True).start()
 
     def _build_sentences_from_text(
