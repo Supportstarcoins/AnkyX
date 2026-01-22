@@ -5953,6 +5953,20 @@ class CardRenderer:
             "use_rich=",
             use_rich,
         )
+        if use_html:
+            try:
+                self.media_col.grid_remove()
+                self.audio_panel.grid_remove()
+                self.text_col.grid_configure(column=0, columnspan=2)
+            except Exception:
+                pass
+        else:
+            try:
+                self.media_col.grid()
+                self.audio_panel.grid()
+                self.text_col.grid_configure(column=1, columnspan=1)
+            except Exception:
+                pass
         if custom_items is not None:
             self._apply_custom_text(custom_items, card_bg=card_bg, card_text=card_text)
         elif use_rich:
@@ -6686,6 +6700,10 @@ class CardHtmlView:
                         )
                         if self.video_player.ensure_embedded():
                             self.video_player.pack(anchor="w", pady=(0, 6))
+                            try:
+                                self.video_player.play()
+                            except Exception:
+                                pass
                         else:
                             self.video_player.frame.destroy()
                             self.video_player = None
@@ -6886,7 +6904,7 @@ def build_video_html(path: str | None, poster_path: str | None = None) -> str:
     poster_url = _to_file_url(poster_path) if poster_path else ""
     poster_attr = f' poster="{html.escape(poster_url)}"' if poster_url else ""
     return (
-        f'<video controls preload="metadata"{poster_attr}>'
+        f'<video controls autoplay preload="metadata"{poster_attr}>'
         f'<source src="{html.escape(clip_url)}" type="video/mp4"></video>'
     )
 
@@ -7077,6 +7095,85 @@ def safe_cut_video_clip(
                     pass
 
     return False, error_text
+
+
+def cut_video_clip_with_poster_h264(
+    video_path: str,
+    start_sec: float,
+    end_sec: float,
+    output_dir: str,
+    base_name: str,
+) -> tuple[str, str]:
+    if not video_path or not os.path.exists(video_path):
+        raise FileNotFoundError(video_path)
+    if end_sec <= start_sec:
+        raise ValueError("end_sec must be > start_sec")
+    os.makedirs(output_dir, exist_ok=True)
+    clip_path = os.path.join(output_dir, f"{base_name}.mp4")
+    poster_path = os.path.join(output_dir, f"{base_name}.jpg")
+    ffmpeg_path = find_ffmpeg()
+    if ffmpeg_path:
+        clip_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-ss",
+            str(start_sec),
+            "-to",
+            str(end_sec),
+            "-i",
+            video_path,
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            clip_path,
+        ]
+        poster_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-ss",
+            str(start_sec),
+            "-i",
+            video_path,
+            "-frames:v",
+            "1",
+            poster_path,
+        ]
+        clip_result = subprocess.run(clip_cmd, capture_output=True, text=True, check=False)
+        if clip_result.returncode != 0:
+            error_text = clip_result.stderr.strip() or "Не удалось нарезать клип."
+            raise RuntimeError(error_text)
+        poster_result = subprocess.run(poster_cmd, capture_output=True, text=True, check=False)
+        if poster_result.returncode != 0:
+            error_text = poster_result.stderr.strip() or "Не удалось создать постер."
+            raise RuntimeError(error_text)
+        return clip_path, poster_path
+    if MOVIEPY_AVAILABLE:
+        clip = None
+        subclip = None
+        try:
+            clip = mp.VideoFileClip(video_path)
+            subclip = clip.subclip(start_sec, end_sec)
+            subclip.write_videofile(clip_path, codec="libx264", audio_codec="aac", logger=None)
+            try:
+                subclip.save_frame(poster_path, t=0)
+            except Exception:
+                clip.save_frame(poster_path, t=start_sec)
+            return clip_path, poster_path
+        finally:
+            if subclip is not None:
+                try:
+                    subclip.close()
+                except Exception:
+                    pass
+            if clip is not None:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+    raise RuntimeError("FFmpeg не найден, а moviepy не установлен.")
 
 
 def build_rich_text_editor(
@@ -8192,6 +8289,8 @@ class AnkiApp(tk.Tk):
         if self.selected_deck_id is None:
             messagebox.showwarning("Нет колоды", "Сначала выберите колоду.")
             return
+        VideoClipCardsWindow(self, self.selected_deck_id)
+        return
         win = tk.Toplevel(self)
         win.title("Видео → клипы → карточки")
         win.geometry("1180x860")
@@ -20451,6 +20550,589 @@ class AudioEditorWindow:
         """Остановить аудио"""
         if WINSOUND_AVAILABLE:
             winsound.PlaySound(None, winsound.SND_PURGE)
+
+
+class VideoClipCardsWindow:
+    """Видео → клипы → карточки (автозапуск + авто-STT + таймкоды)."""
+
+    def __init__(self, app: "AnkiApp", deck_id: int) -> None:
+        self.app = app
+        self.deck_id = deck_id
+        self.video_path: str | None = None
+        self.sentences: list[dict] = []
+        self.selected_index: int | None = None
+        self.player: VlcPlayerWidget | None = None
+        self.stt_job_id = 0
+        self.stt_running = False
+
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Видео → клипы → карточки")
+        self.win.geometry("1180x860")
+        self.win.minsize(980, 760)
+        self.win.grab_set()
+        apply_dark_theme_to_window(self.win, app.palette)
+        ensure_premium_scrollbar_style(self.win, app.palette)
+
+        colors = getattr(app, "palette", None) or {}
+        scroll_bg = colors.get("background") if colors else None
+        outer_frame, canvas, content_frame = create_scrollable_content(self.win, bg=scroll_bg)
+        outer_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._build_video_block(content_frame)
+        self._build_stt_block(content_frame)
+        self._build_sentences_block(content_frame)
+        self._build_editor_block(content_frame)
+        self._build_save_block(content_frame)
+
+        app.register_balance_observer(self._update_save_pricing)
+        self._update_save_pricing()
+
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_video_block(self, parent: tk.Widget) -> None:
+        frame = ttk.LabelFrame(parent, text="Видео")
+        frame.pack(fill=tk.X, padx=12, pady=(10, 8))
+
+        path_row = ttk.Frame(frame)
+        path_row.pack(fill=tk.X, padx=6, pady=(6, 4))
+        self.video_path_var = tk.StringVar()
+        ttk.Entry(path_row, textvariable=self.video_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def browse_video() -> None:
+            path = filedialog.askopenfilename(
+                title="Выберите видео файл",
+                filetypes=[("Видео", "*.mp4 *.mkv *.avi *.mov *.wmv *.flv"), ("Все файлы", "*.*")],
+            )
+            if path:
+                self.video_path_var.set(path)
+                self._load_video(path)
+
+        ttk.Button(path_row, text="…", width=4, command=browse_video).pack(side=tk.LEFT, padx=(6, 0))
+
+        self.video_status_var = tk.StringVar(value="Видео не выбрано")
+        ttk.Label(frame, textvariable=self.video_status_var, foreground="gray").pack(
+            anchor="w", padx=6, pady=(0, 6)
+        )
+
+        self.player_frame = ttk.Frame(frame)
+        self.player_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+    def _render_player(self, path: str) -> None:
+        for widget in self.player_frame.winfo_children():
+            widget.destroy()
+        self.player = None
+        if is_vlc_available():
+            try:
+                player = VlcPlayerWidget(self.player_frame, path, width=620, height=340)
+                if player.ensure_embedded():
+                    player.pack(anchor="w", padx=4, pady=4)
+                    self.player = player
+                    player.play()
+                    return
+            except Exception:
+                self.player = None
+        ttk.Label(self.player_frame, text="Встроенный плеер недоступен").pack(anchor="w", padx=6, pady=6)
+        ttk.Button(
+            self.player_frame,
+            text="Открыть во внешнем плеере",
+            command=lambda: open_in_external_player(path),
+        ).pack(anchor="w", padx=6, pady=(0, 6))
+
+    def _build_stt_block(self, parent: tk.Widget) -> None:
+        frame = ttk.LabelFrame(parent, text="Цифровой слух")
+        frame.pack(fill=tk.BOTH, padx=12, pady=(0, 8))
+
+        top_row = ttk.Frame(frame)
+        top_row.pack(fill=tk.X, padx=6, pady=(6, 2))
+
+        self.stt_status_var = tk.StringVar(value="Ожидание")
+        ttk.Label(top_row, textvariable=self.stt_status_var, foreground="gray").pack(side=tk.LEFT)
+
+        self.auto_stt_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            top_row,
+            text="Авто-цифровой слух",
+            variable=self.auto_stt_var,
+        ).pack(side=tk.RIGHT)
+
+        self.stt_text = scrolledtext.ScrolledText(frame, height=6)
+        style_text_widget(self.stt_text, getattr(self.app, "palette", None) or {})
+        self.stt_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        create_context_menu(self.stt_text)
+
+        action_row = ttk.Frame(frame)
+        action_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        ttk.Button(action_row, text="Повторить распознавание", command=self._request_stt).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(
+            action_row,
+            text="Копировать",
+            command=lambda: self.win.clipboard_clear() or self.win.clipboard_append(self._get_stt_text()),
+        ).pack(side=tk.LEFT)
+
+    def _build_sentences_block(self, parent: tk.Widget) -> None:
+        frame = ttk.LabelFrame(parent, text="Предложения и таймкоды")
+        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+
+        columns = ("№", "Предложение", "Start", "End")
+        self.sentences_tree = ttk.Treeview(frame, columns=columns, show="headings", height=8)
+        for col in columns:
+            self.sentences_tree.heading(col, text=col)
+            self.sentences_tree.column(col, width=90)
+        self.sentences_tree.column("Предложение", width=520)
+        self.sentences_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=6)
+
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.sentences_tree.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 6), pady=6)
+        self.sentences_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.sentences_tree.bind("<<TreeviewSelect>>", self._on_sentence_select)
+
+        action_row = ttk.Frame(parent)
+        action_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ttk.Button(action_row, text="Предпросмотр выбранного", command=self._open_preview).pack(side=tk.LEFT)
+
+    def _build_editor_block(self, parent: tk.Widget) -> None:
+        frame = ttk.LabelFrame(parent, text="Редактор предложения")
+        frame.pack(fill=tk.BOTH, padx=12, pady=(0, 8))
+        notebook = ttk.Notebook(frame)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        front_tab = ttk.Frame(notebook)
+        back_tab = ttk.Frame(notebook)
+        notebook.add(front_tab, text="Front")
+        notebook.add(back_tab, text="Back")
+        self.front_editor = build_rich_text_editor(front_tab, getattr(self.app, "palette", None) or {}, on_change=self._sync_editor_to_sentence)
+        self.back_editor = build_rich_text_editor(back_tab, getattr(self.app, "palette", None) or {}, on_change=self._sync_editor_to_sentence)
+        self.front_editor["frame"].pack(fill=tk.BOTH, expand=True)
+        self.back_editor["frame"].pack(fill=tk.BOTH, expand=True)
+
+    def _build_save_block(self, parent: tk.Widget) -> None:
+        frame = ttk.LabelFrame(parent, text="Сохранение")
+        frame.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+        toggle_row = ttk.Frame(frame)
+        toggle_row.pack(fill=tk.X, padx=6, pady=6)
+        self.video_on_front = tk.BooleanVar(value=True)
+        ttk.Radiobutton(
+            toggle_row,
+            text="Видео на Front",
+            variable=self.video_on_front,
+            value=True,
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            toggle_row,
+            text="Текст на Front (наоборот)",
+            variable=self.video_on_front,
+            value=False,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        cost_row = ttk.Frame(frame)
+        cost_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        self.save_total_var = tk.StringVar(value="0")
+        self.save_hint_var = tk.StringVar(value="")
+
+        coin_icon, coin_icon_disabled = self.app._load_credit_icon_pair(size=28)
+        self.coin_icon = coin_icon
+        self.coin_icon_disabled = coin_icon_disabled
+
+        cost_label = ttk.Frame(cost_row)
+        cost_label.pack(side=tk.LEFT)
+        ttk.Label(cost_label, text="Итого:").pack(side=tk.LEFT, padx=(0, 6))
+        if coin_icon:
+            coin_label = tk.Label(cost_label, image=coin_icon)
+            coin_label.image = coin_icon
+            coin_label.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(cost_label, textvariable=self.save_total_var).pack(side=tk.LEFT)
+
+        self.save_btn = tk.Button(
+            cost_row,
+            text="Сохранить — 0",
+            image=coin_icon,
+            compound=tk.LEFT,
+            padx=10,
+            pady=4,
+            command=self._save_cards,
+        )
+        self.save_btn.pack(side=tk.RIGHT)
+        if coin_icon:
+            self.save_btn.image = coin_icon
+
+        ttk.Label(frame, textvariable=self.save_hint_var, foreground="red").pack(anchor="e", padx=6, pady=(0, 6))
+
+    def _load_video(self, path: str) -> None:
+        if not path or not os.path.exists(path):
+            return
+        self.video_path = path
+        duration = get_video_duration_seconds(path)
+        if duration:
+            self.video_status_var.set(f"Длительность: {format_hms(int(duration))}")
+        else:
+            self.video_status_var.set("Видео загружено")
+        self._render_player(path)
+        if self.auto_stt_var.get():
+            self._request_stt()
+
+    def _get_stt_text(self) -> str:
+        return self.stt_text.get("1.0", tk.END).rstrip("\n")
+
+    def _request_stt(self) -> None:
+        if self.stt_running:
+            return
+        if not self.video_path:
+            messagebox.showwarning("Видео", "Сначала выберите видео файл.", parent=self.win)
+            return
+        self.stt_running = True
+        self.stt_job_id += 1
+        job_id = self.stt_job_id
+        self.stt_status_var.set("⏳ извлечение аудио")
+
+        def _worker() -> tuple[str, object]:
+            audio_path = None
+            try:
+                audio_path = extract_audio_from_video_for_stt(self.video_path)
+                self.win.after(0, lambda: self.stt_status_var.set("⏳ распознавание"))
+                text = transcribe_audio_to_text(audio_path, lang="de-DE", punctuate=True)
+                duration = None
+                try:
+                    import wave
+
+                    with wave.open(audio_path, "rb") as handle:
+                        frames = handle.getnframes()
+                        rate = handle.getframerate()
+                        duration = frames / float(rate or 1)
+                except Exception:
+                    duration = get_video_duration_seconds(self.video_path)
+                return ("done", {"text": text, "duration": duration})
+            except Exception as exc:
+                return ("error", str(exc))
+            finally:
+                if audio_path and os.path.exists(audio_path):
+                    try:
+                        os.remove(audio_path)
+                    except Exception:
+                        pass
+
+        def _finish(result: tuple[str, object]) -> None:
+            self.stt_running = False
+            if job_id != self.stt_job_id:
+                return
+            kind, payload = result
+            if kind == "error":
+                self.stt_status_var.set("❌ ошибка")
+                messagebox.showerror("Ошибка распознавания", str(payload), parent=self.win)
+                return
+            payload = payload or {}
+            text = str(payload.get("text") or "")
+            duration = payload.get("duration")
+            self.stt_text.delete("1.0", tk.END)
+            self.stt_text.insert("1.0", text)
+            self.stt_status_var.set("✅ готово")
+            self._build_sentences_from_text(text, duration)
+            self._update_save_pricing()
+
+        def _thread_runner() -> None:
+            result = _worker()
+            self.win.after(0, lambda: _finish(result))
+
+        threading.Thread(target=_thread_runner, daemon=True).start()
+
+    def _build_sentences_from_text(self, text: str, duration: float | None) -> None:
+        self.sentences = []
+        self.sentences_tree.delete(*self.sentences_tree.get_children())
+        sentences = split_into_sentences(text or "")
+        if not sentences and text.strip():
+            sentences = [text.strip()]
+        timecodes = self._compute_sentence_timecodes(sentences, duration)
+        for idx, sentence in enumerate(sentences):
+            start, end = timecodes[idx]
+            sentence_html = f"<div>{html.escape(sentence)}</div>"
+            entry = {
+                "index": idx + 1,
+                "sentence": sentence,
+                "start": float(start),
+                "end": float(end),
+                "text_html": sentence_html,
+            }
+            self.sentences.append(entry)
+            self.sentences_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(idx + 1, sentence, f"{start:.2f}", f"{end:.2f}"),
+            )
+        if self.sentences:
+            self.sentences_tree.selection_set("0")
+            self._select_sentence(0)
+
+    def _compute_sentence_timecodes(self, sentences: list[str], duration: float | None) -> list[tuple[float, float]]:
+        if not sentences:
+            return []
+        duration = float(duration or 0)
+        if duration <= 0:
+            duration = max(2.0 * len(sentences), 2.0)
+        weights = []
+        for sentence in sentences:
+            words = re.findall(r"[\\w']+", sentence, flags=re.UNICODE)
+            weights.append(max(len(words), 1))
+        total = float(sum(weights)) or 1.0
+        results: list[tuple[float, float]] = []
+        cursor = 0.0
+        for idx, weight in enumerate(weights):
+            if idx == len(weights) - 1:
+                end = duration
+            else:
+                end = cursor + duration * (weight / total)
+            if end <= cursor:
+                end = cursor + max(0.2, duration / max(len(weights), 1))
+            results.append((cursor, end))
+            cursor = end
+        return results
+
+    def _on_sentence_select(self, _event=None) -> None:
+        selection = self.sentences_tree.selection()
+        if not selection:
+            return
+        idx = int(selection[0])
+        self._select_sentence(idx)
+
+    def _select_sentence(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self.sentences):
+            return
+        self.selected_index = idx
+        sentence = self.sentences[idx]
+        start_sec = sentence.get("start", 0)
+        if self.player is not None:
+            try:
+                self.player.player.set_time(int(float(start_sec) * 1000))
+                self.player.seek_var.set(int(float(start_sec) * 1000))
+            except Exception:
+                pass
+        self.front_editor["set_html"](sentence.get("text_html") or "")
+        self.back_editor["set_html"](sentence.get("text_html") or "")
+
+    def _sync_editor_to_sentence(self) -> None:
+        if self.selected_index is None:
+            return
+        if self.selected_index >= len(self.sentences):
+            return
+        sentence_html = self.front_editor["get_html"]()
+        self.sentences[self.selected_index]["text_html"] = sentence_html
+
+    def _build_card_html(self, sentence: dict) -> tuple[str, str]:
+        text_html = sentence.get("text_html") or f"<div>{html.escape(sentence.get('sentence') or '')}</div>"
+        clip_html = build_video_html(sentence.get("clip_path"), sentence.get("poster_path"))
+        if self.video_on_front.get():
+            return clip_html, text_html
+        return text_html, clip_html
+
+    def _open_preview(self) -> None:
+        if self.selected_index is None or self.selected_index >= len(self.sentences):
+            messagebox.showinfo("Предпросмотр", "Сначала выберите предложение.", parent=self.win)
+            return
+        sentence = self.sentences[self.selected_index]
+        start = sentence.get("start", 0)
+        end = sentence.get("end", 0)
+        clip_html = build_video_html(self.video_path, None)
+        text_html = sentence.get("text_html") or f"<div>{html.escape(sentence.get('sentence') or '')}</div>"
+        if self.video_on_front.get():
+            front_html, back_html = clip_html, text_html
+        else:
+            front_html, back_html = text_html, clip_html
+
+        print("[PREVIEW SELECTED]", sentence.get("sentence"), start, end)
+        print("[PREVIEW FRONT HTML]", (front_html or "")[:200])
+        print("[PREVIEW BACK HTML]", (back_html or "")[:200])
+
+        preview_win = tk.Toplevel(self.win)
+        preview_win.title("Предпросмотр выбранного")
+        preview_win.geometry("900x620")
+        preview_win.grab_set()
+        apply_dark_theme_to_window(preview_win, getattr(self.app, "palette", None) or {})
+
+        container = tk.Frame(preview_win, bg=DARK_BG)
+        container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        controls = tk.Frame(container, bg=DARK_BG)
+        controls.pack(fill=tk.X, pady=(0, 8))
+
+        side_var = tk.StringVar(value="front")
+
+        card_wrap = tk.Frame(
+            container,
+            bg=DARK_BG,
+            highlightbackground=CARD_BORDER,
+            highlightthickness=1,
+            bd=0,
+            width=CARD_VIEW_WIDTH,
+            height=CARD_VIEW_HEIGHT,
+        )
+        card_wrap.pack(padx=10, pady=10)
+        card_wrap.pack_propagate(False)
+        html_view = CardHtmlView(card_wrap)
+
+        def update_view() -> None:
+            card_bg, card_text, _ = get_card_surface_colors(card_wrap)
+            html_value = back_html if side_var.get() == "back" else front_html
+            html_view.set_html(html_value or "", card_bg=card_bg, card_text_color=card_text)
+
+        def set_side(side: str) -> None:
+            side_var.set(side)
+            update_view()
+
+        ttk.Button(controls, text="Лицевая", command=lambda: set_side("front")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(controls, text="Обратная", command=lambda: set_side("back")).pack(side=tk.LEFT, padx=4)
+
+        card_bg, card_text, _ = get_card_surface_colors(card_wrap)
+        html_view.set_html("<b>TEST_BOLD</b> <span style=\"color:red\">TEST_RED</span>", card_bg=card_bg, card_text_color=card_text)
+        preview_win.after(200, update_view)
+
+    def _get_video_clip_card_price(self) -> int:
+        self.app.user_account = ensure_user_account(self.app.user_id)
+        self.app.user_profile = ensure_user_profile_row(self.app.user_id)
+        now_ts = int(time.time())
+        premium_plus = bool(self.app.user_profile.get("premium_plus")) or self.app.user_account.get("status") == "premium_plus"
+        if premium_plus:
+            return 5
+        if self.app.is_premium_active() or int(self.app.user_account.get("premium_until") or 0) > now_ts:
+            return 10
+        return 25
+
+    def _update_save_pricing(self) -> None:
+        count = len(self.sentences)
+        price = self._get_video_clip_card_price()
+        total = price * count
+        self.save_total_var.set(str(total))
+        self.save_btn.configure(text=f"Сохранить — {total}")
+        if self.stt_running:
+            self.save_btn.configure(state=tk.DISABLED, image=self.coin_icon_disabled or self.coin_icon)
+            self.save_hint_var.set("Идёт распознавание…")
+            return
+        if count == 0:
+            self.save_btn.configure(state=tk.DISABLED, image=self.coin_icon_disabled or self.coin_icon)
+            self.save_hint_var.set("Нет предложений")
+            return
+        if not self.app.can_afford(total):
+            self.save_btn.configure(state=tk.DISABLED, image=self.coin_icon_disabled or self.coin_icon)
+            self.save_hint_var.set("Не хватает кредитов")
+            return
+        self.save_btn.configure(state=tk.NORMAL, image=self.coin_icon or self.coin_icon_disabled)
+        self.save_hint_var.set("")
+
+    def _save_cards(self) -> None:
+        if not self.video_path:
+            messagebox.showwarning("Видео", "Сначала выберите видео файл.", parent=self.win)
+            return
+        if not self.sentences:
+            messagebox.showwarning("Сохранение", "Нет предложений для сохранения.", parent=self.win)
+            return
+        price = self._get_video_clip_card_price()
+        total_cost = price * len(self.sentences)
+        if not self.app.can_afford(total_cost):
+            self._update_save_pricing()
+            messagebox.showwarning("Кредиты", "Недостаточно кредитов.", parent=self.win)
+            return
+
+        self.save_btn.configure(state=tk.DISABLED)
+        output_dir = os.path.join(MEDIA_FOLDER, "clips", str(self.deck_id))
+
+        def _worker() -> tuple[bool, str]:
+            conn = get_connection()
+
+            def _op() -> int:
+                spend_credits_in_transaction(
+                    conn,
+                    self.app.user_id,
+                    total_cost,
+                    "video_clip_cards",
+                    meta={"deck_id": self.deck_id, "count": len(self.sentences)},
+                )
+                created = 0
+                for idx, sentence in enumerate(self.sentences, start=1):
+                    base_name = f"clip_{idx}"
+                    clip_path, poster_path = cut_video_clip_with_poster_h264(
+                        self.video_path,
+                        float(sentence.get("start", 0)),
+                        float(sentence.get("end", 0)),
+                        output_dir,
+                        base_name,
+                    )
+                    sentence["clip_path"] = clip_path
+                    sentence["poster_path"] = poster_path
+                    video_html = build_video_html(clip_path, poster_path)
+                    text_html = sentence.get("text_html") or f"<div>{html.escape(sentence.get('sentence') or '')}</div>"
+                    if self.video_on_front.get():
+                        front_html, back_html = video_html, text_html
+                    else:
+                        front_html, back_html = text_html, video_html
+
+                    note_fields = {
+                        "word": sentence.get("sentence") or "",
+                        "translation": "",
+                        "example": "",
+                        "level": 1,
+                        "image": poster_path or "",
+                        "front": front_html,
+                        "back": back_html,
+                        "front_image_path": poster_path if self.video_on_front.get() else None,
+                        "back_image_path": poster_path if not self.video_on_front.get() else None,
+                        "audio_path": None,
+                        "front_html": front_html,
+                        "back_html": back_html,
+                        "front_video_html": video_html if self.video_on_front.get() else "",
+                        "back_video_html": video_html if not self.video_on_front.get() else "",
+                        "front_video": video_html if self.video_on_front.get() else "",
+                        "back_video": video_html if not self.video_on_front.get() else "",
+                    }
+                    note_id, _ = create_note_with_cards_in_transaction(
+                        conn,
+                        self.deck_id,
+                        note_fields,
+                        note_type_id=ensure_generated_note_type_id(conn),
+                        tags="video clip",
+                    )
+                    insert_media(conn, note_id=note_id, type="video", path=clip_path, side="front" if self.video_on_front.get() else "back")
+                    insert_media(conn, note_id=note_id, type="image", path=poster_path, side="front" if self.video_on_front.get() else "back")
+                    created += 1
+                return created
+
+            try:
+                created = commit_with_retry(conn, _op)
+            except Exception as exc:
+                conn.rollback()
+                return False, str(exc)
+            finally:
+                conn.close()
+            return True, str(created)
+
+        def _finish(result: tuple[bool, str]) -> None:
+            ok, payload = result
+            if not ok:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить карточки: {payload}", parent=self.win)
+                self._update_save_pricing()
+                return
+            created = int(payload)
+            self.app.refresh_balance_display()
+            self.app.refresh_decks()
+            self.app.update_deck_preview()
+            self.app.update_overdue_badge()
+            messagebox.showinfo(
+                "Сохранено",
+                f"✅ Сохранено {created} карточек, списано {total_cost} кредитов",
+                parent=self.win,
+            )
+            self._on_close()
+
+        def _thread_runner() -> None:
+            result = _worker()
+            self.win.after(0, lambda: _finish(result))
+
+        threading.Thread(target=_thread_runner, daemon=True).start()
+
+    def _on_close(self) -> None:
+        self.app.unregister_balance_observer(self._update_save_pricing)
+        self.win.destroy()
 
 
 class VideoEditorWindow(AudioEditorWindow):
