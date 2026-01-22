@@ -776,6 +776,10 @@ except ImportError:
     sr = None
     SR_AVAILABLE = False
 
+FASTER_WHISPER_AVAILABLE = importlib.util.find_spec("faster_whisper") is not None
+VOSK_AVAILABLE = importlib.util.find_spec("vosk") is not None
+WEBRTCVAD_AVAILABLE = importlib.util.find_spec("webrtcvad") is not None
+
 # Deutsch Wiktionary
 try:
     import requests
@@ -4964,6 +4968,582 @@ def auto_generate_cards_from_image(deck_id: int,
     )
 
 
+STT_LOG_PATH = os.path.join("logs", "stt_last.log")
+
+
+class STTError(RuntimeError):
+    def __init__(self, user_message: str, reason: str, detail: str | None = None):
+        super().__init__(user_message)
+        self.user_message = user_message
+        self.reason = reason
+        self.detail = detail or ""
+
+
+def _write_stt_log(lines: list[str]) -> None:
+    os.makedirs(os.path.dirname(STT_LOG_PATH), exist_ok=True)
+    with open(STT_LOG_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).strip() + "\n")
+
+
+def _read_stt_log() -> str:
+    if not os.path.exists(STT_LOG_PATH):
+        return "Лог STT не найден."
+    try:
+        with open(STT_LOG_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as exc:
+        return f"Не удалось прочитать лог: {exc}"
+
+
+def _normalize_lang(lang: str | None) -> str:
+    if not lang:
+        return "de"
+    value = lang.replace("_", "-").strip().lower()
+    return value.split("-")[0] if value else "de"
+
+
+def _stt_user_message(reason: str, detail: str | None = None) -> str:
+    if reason == "no_speech":
+        return "В выбранном фрагменте нет речи или слишком тихо."
+    if reason == "wrong_language":
+        return "Похоже, выбран неверный язык распознавания."
+    if reason == "no_engine":
+        return "Движок распознавания недоступен. Установите ffmpeg/модель/локальные движки."
+    if reason == "noisy":
+        return "Слишком шумно или низкая разборчивость речи."
+    if reason == "network":
+        return "Ошибка сети или квоты при обращении к сервису распознавания."
+    return detail or "Не удалось распознать речь."
+
+
+def _load_wav_mono(wav_path: str) -> tuple["np.ndarray", int]:
+    import wave
+
+    if not NUMPY_AVAILABLE:
+        raise RuntimeError("NumPy не установлен, обработка аудио недоступна.")
+    with wave.open(wav_path, "rb") as wf:
+        sr = wf.getframerate()
+        channels = wf.getnchannels()
+        frames = wf.readframes(wf.getnframes())
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    audio = audio / 32768.0
+    return audio, sr
+
+
+def _write_wav_mono(wav_path: str, audio: "np.ndarray", sr: int = 16000) -> None:
+    import wave
+
+    os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+    clipped = np.clip(audio, -1.0, 1.0)
+    data = (clipped * 32767.0).astype(np.int16)
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(data.tobytes())
+
+
+def _compute_vad_segments(audio: "np.ndarray", sr: int) -> list[tuple[float, float]]:
+    if not WEBRTCVAD_AVAILABLE:
+        return []
+    import webrtcvad
+
+    vad = webrtcvad.Vad(2)
+    if sr != 16000 and LIBROSA_AVAILABLE:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        sr = 16000
+    if sr != 16000:
+        return []
+    frame_ms = 20
+    frame_len = int(sr * frame_ms / 1000)
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+    segments: list[tuple[float, float]] = []
+    in_speech = False
+    start = 0.0
+    idx = 0
+    total_frames = len(pcm) // 2 // frame_len
+    for i in range(total_frames):
+        frame = pcm[idx: idx + frame_len * 2]
+        idx += frame_len * 2
+        is_speech = vad.is_speech(frame, sr)
+        t = i * frame_ms / 1000.0
+        if is_speech and not in_speech:
+            start = t
+            in_speech = True
+        if not is_speech and in_speech:
+            end = t
+            if end - start > 0.1:
+                segments.append((start, end))
+            in_speech = False
+    if in_speech:
+        end = total_frames * frame_ms / 1000.0
+        segments.append((start, end))
+    return segments
+
+
+def _analyze_speech_presence(wav_path: str, log_lines: list[str]) -> tuple[float, float, float]:
+    audio, sr = _load_wav_mono(wav_path)
+    duration = len(audio) / max(sr, 1)
+    rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+    voiced_ratio = 0.0
+    if WEBRTCVAD_AVAILABLE:
+        segments = _compute_vad_segments(audio, sr)
+        voiced = sum((end - start) for start, end in segments)
+        voiced_ratio = voiced / duration if duration > 0 else 0.0
+    else:
+        threshold = max(0.01, rms * 0.6)
+        voiced_ratio = float(np.mean(np.abs(audio) > threshold)) if len(audio) else 0.0
+    log_lines.append(f"audio_duration_sec={duration:.3f}")
+    log_lines.append(f"audio_rms={rms:.6f}")
+    log_lines.append(f"audio_voiced_ratio={voiced_ratio:.4f}")
+    return duration, rms, voiced_ratio
+
+
+def extract_and_preprocess_audio(
+    video_path: str,
+    start: float | None = None,
+    end: float | None = None,
+    gain: float | None = None,
+    tempo: float | None = None,
+    log_lines: list[str] | None = None,
+) -> str:
+    if not video_path or not os.path.exists(video_path):
+        raise FileNotFoundError(video_path)
+    tmp_dir = ensure_dir(os.path.join("tmp", "media"))
+    output_path = os.path.join(tmp_dir, f"stt_pre_{uuid4().hex}.wav")
+    ffmpeg_path = find_ffmpeg()
+    log_lines = log_lines if log_lines is not None else []
+    if ffmpeg_path:
+        filters = [
+            "highpass=f=80",
+            "lowpass=f=8000",
+        ]
+        if gain and gain != 1.0:
+            filters.append(f"volume={gain:.2f}")
+        if tempo and tempo != 1.0:
+            filters.append(f"atempo={tempo:.2f}")
+        filters += [
+            "afftdn",
+            "dynaudnorm",
+            "loudnorm=I=-16:TP=-1.5:LRA=11",
+        ]
+        cmd = [ffmpeg_path, "-y"]
+        if start is not None:
+            cmd += ["-ss", str(start)]
+        if end is not None:
+            cmd += ["-to", str(end)]
+        cmd += [
+            "-i",
+            video_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-sample_fmt",
+            "s16",
+            "-af",
+            ",".join(filters),
+            output_path,
+        ]
+        log_lines.append("ffmpeg_cmd=" + " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            return output_path
+        log_lines.append("ffmpeg_error=" + (result.stderr.strip() or "unknown"))
+        filters = [
+            "highpass=f=80",
+            "lowpass=f=8000",
+        ]
+        if gain and gain != 1.0:
+            filters.append(f"volume={gain:.2f}")
+        if tempo and tempo != 1.0:
+            filters.append(f"atempo={tempo:.2f}")
+        filters += [
+            "anlmdn",
+            "dynaudnorm",
+            "loudnorm=I=-16:TP=-1.5:LRA=11",
+        ]
+        cmd = [ffmpeg_path, "-y"]
+        if start is not None:
+            cmd += ["-ss", str(start)]
+        if end is not None:
+            cmd += ["-to", str(end)]
+        cmd += [
+            "-i",
+            video_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-sample_fmt",
+            "s16",
+            "-af",
+            ",".join(filters),
+            output_path,
+        ]
+        log_lines.append("ffmpeg_cmd_retry=" + " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            error_text = result.stderr.strip() or "Не удалось извлечь аудио."
+            raise RuntimeError(error_text)
+        return output_path
+    if MOVIEPY_AVAILABLE:
+        if not NUMPY_AVAILABLE:
+            raise RuntimeError("NumPy не установлен, обработка аудио недоступна.")
+        clip = None
+        try:
+            if video_path.lower().endswith((".wav", ".mp3", ".m4a", ".aac", ".ogg")):
+                clip = mp.AudioFileClip(video_path)
+                audio_clip = clip
+            else:
+                clip = mp.VideoFileClip(video_path)
+                audio_clip = clip.audio
+            if audio_clip is None:
+                raise RuntimeError("В видео нет аудио дорожки.")
+            if start is not None or end is not None:
+                audio_clip = audio_clip.subclip(start or 0, end)
+            audio = audio_clip.to_soundarray(fps=16000)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            if gain and gain != 1.0:
+                audio = audio * float(gain)
+            if tempo and tempo != 1.0 and LIBROSA_AVAILABLE:
+                audio = librosa.effects.time_stretch(audio.astype(np.float32), rate=float(tempo))
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+            target_rms = 0.1
+            if rms > 0:
+                audio = audio * (target_rms / rms)
+            _write_wav_mono(output_path, audio, sr=16000)
+            return output_path
+        finally:
+            if clip is not None:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+    raise RuntimeError("FFmpeg не найден, а moviepy не установлен.")
+
+
+def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 25.0) -> list[tuple[str, float, float]]:
+    audio, sr = _load_wav_mono(wav_path)
+    duration = len(audio) / max(1, sr)
+    if duration <= max_chunk_sec:
+        return [(wav_path, 0.0, duration)]
+    tmp_dir = ensure_dir(os.path.join("tmp", "media"))
+    chunks: list[tuple[str, float, float]] = []
+    speech_segments: list[tuple[float, float]] = []
+    if WEBRTCVAD_AVAILABLE:
+        speech_segments = _compute_vad_segments(audio, sr)
+    if not speech_segments:
+        start = 0.0
+        idx = 0
+        while start < duration:
+            end = min(duration, start + 20.0)
+            start_idx = int(start * sr)
+            end_idx = int(end * sr)
+            chunk_audio = audio[start_idx:end_idx]
+            chunk_path = os.path.join(tmp_dir, f"stt_chunk_{uuid4().hex}_{idx}.wav")
+            _write_wav_mono(chunk_path, chunk_audio, sr=sr)
+            chunks.append((chunk_path, start, end))
+            idx += 1
+            start = end
+        return chunks
+    current_start = speech_segments[0][0]
+    current_end = speech_segments[0][1]
+    for start, end in speech_segments[1:]:
+        gap = start - current_end
+        if gap > 0.8 or (end - current_start) > max_chunk_sec:
+            start_idx = int(max(0, current_start) * sr)
+            end_idx = int(min(duration, current_end) * sr)
+            chunk_audio = audio[start_idx:end_idx]
+            chunk_path = os.path.join(tmp_dir, f"stt_chunk_{uuid4().hex}.wav")
+            _write_wav_mono(chunk_path, chunk_audio, sr=sr)
+            chunks.append((chunk_path, current_start, current_end))
+            current_start = start
+        current_end = max(current_end, end)
+    start_idx = int(max(0, current_start) * sr)
+    end_idx = int(min(duration, current_end) * sr)
+    chunk_audio = audio[start_idx:end_idx]
+    chunk_path = os.path.join(tmp_dir, f"stt_chunk_{uuid4().hex}.wav")
+    _write_wav_mono(chunk_path, chunk_audio, sr=sr)
+    chunks.append((chunk_path, current_start, current_end))
+    return chunks
+
+
+def _find_vosk_model(lang: str) -> str | None:
+    candidates = []
+    env_path = os.environ.get("VOSK_MODEL_PATH")
+    if env_path:
+        candidates.append(env_path)
+    base_candidates = [
+        "models",
+        "model",
+        "vosk-model",
+        "vosk-model-small",
+        f"vosk-model-small-{lang}",
+        f"vosk-model-{lang}",
+    ]
+    for base in base_candidates:
+        path = os.path.join(os.getcwd(), base)
+        candidates.append(path)
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def transcribe_audio_chunks(
+    chunks: list[tuple[str, float, float]],
+    lang: str | None,
+    log_lines: list[str],
+) -> tuple[str, list[dict], str]:
+    segments: list[dict] = []
+    lang_short = _normalize_lang(lang)
+    if FASTER_WHISPER_AVAILABLE:
+        try:
+            from faster_whisper import WhisperModel
+
+            model = WhisperModel("small", device="cpu", compute_type="int8")
+            for chunk_path, t0, _ in chunks:
+                seg_iter, _info = model.transcribe(chunk_path, language=lang_short)
+                for seg in seg_iter:
+                    text = (seg.text or "").strip()
+                    if not text:
+                        continue
+                    segments.append(
+                        {"start": float(seg.start) + t0, "end": float(seg.end) + t0, "text": text}
+                    )
+            text = " ".join(seg["text"] for seg in segments).strip()
+            log_lines.append("engine=faster-whisper")
+            return text, segments, "faster-whisper"
+        except Exception as exc:
+            log_lines.append(f"engine_faster_whisper_error={exc}")
+    if VOSK_AVAILABLE:
+        model_path = _find_vosk_model(lang_short)
+        if model_path:
+            try:
+                from vosk import KaldiRecognizer, Model, SetLogLevel
+
+                SetLogLevel(-1)
+                model = Model(model_path)
+                for chunk_path, t0, _ in chunks:
+                    with open(chunk_path, "rb") as f:
+                        data = f.read()
+                    rec = KaldiRecognizer(model, 16000)
+                    rec.SetWords(True)
+                    rec.AcceptWaveform(data)
+                    result = json.loads(rec.Result())
+                    text = (result.get("text") or "").strip()
+                    words = result.get("result") or []
+                    start_ts = float(words[0]["start"]) + t0 if words else t0
+                    end_ts = float(words[-1]["end"]) + t0 if words else t0
+                    if text:
+                        segments.append({"start": start_ts, "end": end_ts, "text": text})
+                text = " ".join(seg["text"] for seg in segments).strip()
+                log_lines.append("engine=vosk")
+                return text, segments, "vosk"
+            except Exception as exc:
+                log_lines.append(f"engine_vosk_error={exc}")
+        else:
+            log_lines.append("engine_vosk_error=missing_model")
+    if SR_AVAILABLE:
+        r = sr.Recognizer()
+        for chunk_path, t0, t1 in chunks:
+            with sr.AudioFile(chunk_path) as source:
+                audio_data = r.record(source)
+            try:
+                text = r.recognize_google(audio_data, language=lang or "de-DE")
+            except sr.RequestError as exc:
+                raise STTError(_stt_user_message("network"), "network", str(exc)) from exc
+            except sr.UnknownValueError:
+                text = ""
+            if text:
+                segments.append({"start": t0, "end": t1, "text": text.strip()})
+        text = " ".join(seg["text"] for seg in segments).strip()
+        log_lines.append("engine=google")
+        return text, segments, "google"
+    raise STTError(_stt_user_message("no_engine"), "no_engine")
+
+
+def _postprocess_transcript(text: str, segments: list[dict]) -> str:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return ""
+    punctuated = auto_punctuate(normalized) if "auto_punctuate" in globals() else normalized
+    if re.search(r"[.!?]", punctuated):
+        return punctuated
+    if segments:
+        sentences: list[str] = []
+        current: list[str] = []
+        last_end = None
+        for seg in segments:
+            seg_text = seg.get("text", "").strip()
+            if not seg_text:
+                continue
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start))
+            if last_end is not None and (start - last_end) > 1.0:
+                if current:
+                    sentences.append(" ".join(current))
+                    current = []
+            current.append(seg_text)
+            last_end = end
+        if current:
+            sentences.append(" ".join(current))
+        if sentences:
+            punctuated = ". ".join(s.strip() for s in sentences if s.strip()).strip()
+            if punctuated and not punctuated.endswith((".", "!", "?")):
+                punctuated += "."
+            return punctuated
+    return punctuated
+
+
+def _is_language_mismatch(text: str, lang: str | None) -> bool:
+    if not text:
+        return False
+    lang_short = _normalize_lang(lang)
+    letters = re.findall(r"[A-Za-zА-Яа-яЁё]", text)
+    if not letters:
+        return False
+    if lang_short.startswith("ru"):
+        cyrillic = re.findall(r"[А-Яа-яЁё]", text)
+        return (len(cyrillic) / max(1, len(letters))) < 0.2
+    if lang_short in {"de", "en", "fr", "es", "it"}:
+        latin = re.findall(r"[A-Za-z]", text)
+        return (len(latin) / max(1, len(letters))) < 0.2
+    return False
+
+
+def run_stt_pipeline(
+    source_path: str,
+    start: float | None = None,
+    end: float | None = None,
+    lang: str | None = None,
+    punctuate: bool = True,
+    preprocessed: bool = False,
+) -> tuple[str, list[dict]]:
+    attempts = [
+        {"label": "base", "gain": None, "tempo": None},
+        {"label": "gain", "gain": 2.0, "tempo": None},
+        {"label": "slow", "gain": 1.2, "tempo": 0.9},
+    ]
+    log_lines: list[str] = [
+        f"source_path={source_path}",
+        f"lang={lang or 'auto'}",
+        f"start={start}",
+        f"end={end}",
+        f"preprocessed={preprocessed}",
+    ]
+    last_error: STTError | None = None
+    for attempt in attempts:
+        wav_path = None
+        delete_wav = True
+        chunk_paths: list[str] = []
+        try:
+            log_lines.append(f"attempt={attempt['label']}")
+            if preprocessed and attempt["label"] == "base":
+                wav_path = source_path
+                delete_wav = False
+            else:
+                wav_path = extract_and_preprocess_audio(
+                    source_path,
+                    start=start,
+                    end=end,
+                    gain=attempt["gain"],
+                    tempo=attempt["tempo"],
+                    log_lines=log_lines,
+                )
+            duration, rms, voiced_ratio = _analyze_speech_presence(wav_path, log_lines)
+            if duration < 0.3 or rms < 0.004 or voiced_ratio < 0.01:
+                raise STTError(_stt_user_message("no_speech"), "no_speech")
+            chunks = split_audio_into_chunks(wav_path)
+            for chunk_path, _, _ in chunks:
+                if chunk_path != wav_path:
+                    chunk_paths.append(chunk_path)
+            text, segments, engine = transcribe_audio_chunks(chunks, lang, log_lines)
+            log_lines.append(f"engine_used={engine}")
+            log_lines.append(f"text_length={len(text.strip())}")
+            if len(text.strip()) < 2:
+                last_error = STTError(_stt_user_message("noisy"), "noisy")
+                continue
+            if _is_language_mismatch(text, lang):
+                raise STTError(_stt_user_message("wrong_language"), "wrong_language")
+            final_text = _postprocess_transcript(text, segments) if punctuate else text.strip()
+            _write_stt_log(log_lines)
+            return final_text, segments
+        except STTError as exc:
+            last_error = exc
+            log_lines.append(f"stt_error_reason={exc.reason}")
+            log_lines.append(f"stt_error_detail={exc.detail}")
+        except RuntimeError as exc:
+            msg = str(exc)
+            reason = "no_engine" if "ffmpeg" in msg.lower() or "moviepy" in msg.lower() else "noisy"
+            last_error = STTError(_stt_user_message(reason, msg), reason, msg)
+            log_lines.append(f"stt_error_reason={reason}")
+            log_lines.append(f"stt_error_detail={msg}")
+        except Exception as exc:
+            msg = str(exc)
+            last_error = STTError(_stt_user_message("noisy", msg), "noisy", msg)
+            log_lines.append("stt_error_reason=unknown")
+            log_lines.append(f"stt_error_detail={msg}")
+        finally:
+            if delete_wav and wav_path and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except Exception:
+                    pass
+            for chunk_path in chunk_paths:
+                if os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                    except Exception:
+                        pass
+    _write_stt_log(log_lines)
+    if last_error:
+        raise last_error
+    raise STTError(_stt_user_message("noisy"), "noisy")
+
+
+def show_stt_error_dialog(parent: tk.Misc | None, title: str, message: str) -> None:
+    win = tk.Toplevel(parent) if parent is not None else tk.Toplevel()
+    win.title(title)
+    win.geometry("560x320")
+    try:
+        apply_dark_theme_to_window(win, getattr(parent, "palette", None))
+    except Exception:
+        pass
+    container = ttk.Frame(win)
+    container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+    ttk.Label(container, text=message, wraplength=520, style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
+    btn_row = ttk.Frame(container)
+    btn_row.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _open_details():
+        details = _read_stt_log()
+        details_win = tk.Toplevel(win)
+        details_win.title("Детали распознавания")
+        details_win.geometry("700x460")
+        try:
+            apply_dark_theme_to_window(details_win, getattr(parent, "palette", None))
+        except Exception:
+            pass
+        text_box = scrolledtext.ScrolledText(details_win, height=18)
+        try:
+            style_text_widget(text_box, getattr(parent, "palette", None))
+        except Exception:
+            pass
+        text_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text_box.insert("1.0", details or "Лог пуст.")
+        text_box.configure(state=tk.DISABLED)
+
+    ttk.Button(btn_row, text="Показать детали", command=_open_details).pack(side=tk.LEFT)
+    ttk.Button(btn_row, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
+
 def record_speech_to_text(
     duration_sec: int,
     mic_index: int | None,
@@ -4991,13 +5571,9 @@ def record_speech_to_text(
     if progress_queue is not None:
         progress_queue.put(("progress", duration_sec, max(duration_sec, 1), "Распознавание"))
     try:
-        text = r.recognize_google(audio, language="de-DE")
-    except sr.WaitTimeoutError as exc:
-        raise RuntimeError("Не слышу речь. Проверь микрофон и говори ближе.") from exc
-    except sr.UnknownValueError as exc:
-        raise RuntimeError("Речь не распознана (шум/тихо/слишком быстро). Попробуй ещё раз.") from exc
-    except sr.RequestError as exc:
-        raise RuntimeError(f"Ошибка сервиса распознавания: {exc}") from exc
+        text, _segments = run_stt_pipeline(audio_path, lang="de-DE", punctuate=False)
+    except STTError as exc:
+        raise RuntimeError(exc.user_message) from exc
     except Exception as exc:
         raise RuntimeError(f"Не удалось распознать речь: {exc}") from exc
     return text, audio_path
@@ -5008,24 +5584,13 @@ def transcribe_audio_to_text(
     lang: str | None = None,
     punctuate: bool = True,
 ) -> str:
-    if not SR_AVAILABLE:
-        raise RuntimeError("SpeechRecognition не установлен.")
     if not audio_path or not os.path.exists(audio_path):
         raise FileNotFoundError(audio_path)
-    r = sr.Recognizer()
-    with sr.AudioFile(audio_path) as source:
-        audio_data = r.record(source)
     try:
-        text = r.recognize_google(audio_data, language=lang or "de-DE")
-    except sr.WaitTimeoutError as exc:
-        raise RuntimeError("Не слышу речь. Проверь микрофон и говори ближе.") from exc
-    except sr.UnknownValueError as exc:
-        raise RuntimeError("Речь не распознана (шум/тихо/слишком быстро). Попробуй ещё раз.") from exc
-    except sr.RequestError as exc:
-        raise RuntimeError(f"Ошибка сервиса распознавания: {exc}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"Не удалось распознать речь: {exc}") from exc
-    return auto_punctuate(text) if punctuate else text
+        text, _segments = run_stt_pipeline(audio_path, lang=lang or "de-DE", punctuate=punctuate)
+    except STTError as exc:
+        raise RuntimeError(exc.user_message) from exc
+    return text
 
 
 def extract_audio_from_video_for_stt(
@@ -5033,58 +5598,7 @@ def extract_audio_from_video_for_stt(
     start_sec: float | None = None,
     end_sec: float | None = None,
 ) -> str:
-    if not video_path or not os.path.exists(video_path):
-        raise FileNotFoundError(video_path)
-    tmp_dir = ensure_dir(os.path.join("tmp", "media"))
-    output_path = os.path.join(tmp_dir, f"stt_{uuid4().hex}.wav")
-    ffmpeg_path = find_ffmpeg()
-    if ffmpeg_path:
-        cmd = [ffmpeg_path, "-y"]
-        if start_sec is not None:
-            cmd += ["-ss", str(start_sec)]
-        if end_sec is not None:
-            cmd += ["-to", str(end_sec)]
-        cmd += [
-            "-i",
-            video_path,
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-acodec",
-            "pcm_s16le",
-            output_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            error_text = result.stderr.strip() or "Не удалось извлечь аудио."
-            raise RuntimeError(error_text)
-        return output_path
-    if MOVIEPY_AVAILABLE:
-        clip = None
-        try:
-            clip = mp.VideoFileClip(video_path)
-            if start_sec is not None or end_sec is not None:
-                clip = clip.subclip(start_sec or 0, end_sec)
-            audio = clip.audio
-            if audio is None:
-                raise RuntimeError("В видео нет аудио дорожки.")
-            audio.write_audiofile(
-                output_path,
-                fps=16000,
-                nbytes=2,
-                codec="pcm_s16le",
-                ffmpeg_params=["-ac", "1"],
-            )
-            return output_path
-        finally:
-            if clip is not None:
-                try:
-                    clip.close()
-                except Exception:
-                    pass
-    raise RuntimeError("FFmpeg не найден, а moviepy не установлен.")
+    return extract_and_preprocess_audio(video_path, start_sec, end_sec)
 
 
 def auto_generate_cards_from_speech(deck_id: int,
@@ -5125,13 +5639,9 @@ def auto_generate_cards_from_speech(deck_id: int,
         progress_queue.put(("progress", duration_sec, max(duration_sec, 1), "Распознавание"))
 
     try:
-        text = r.recognize_google(audio, language="de-DE")
-    except sr.WaitTimeoutError as exc:
-        raise RuntimeError("Не слышу речь. Проверь микрофон и говори ближе.") from exc
-    except sr.UnknownValueError as exc:
-        raise RuntimeError("Речь не распознана (шум/тихо/слишком быстро). Попробуй ещё раз.") from exc
-    except sr.RequestError as exc:
-        raise RuntimeError(f"Ошибка сервиса распознавания: {exc}") from exc
+        text, _segments = run_stt_pipeline(audio_path, lang="de-DE", punctuate=False)
+    except STTError as exc:
+        raise RuntimeError(exc.user_message) from exc
     except Exception as exc:
         raise RuntimeError(f"Не удалось распознать речь: {exc}") from exc
 
@@ -5164,11 +5674,16 @@ def auto_generate_cards_from_video(deck_id: int,
 
     temp_audio = None
     try:
-        # Извлечь аудио из видео
-        temp_audio = extract_audio_from_video_for_stt(video_path)
+        # Извлечь и предобработать аудио из видео
+        temp_audio = extract_and_preprocess_audio(video_path)
 
         # Распознать речь из аудио
-        text = transcribe_audio_to_text(temp_audio, lang="de-DE", punctuate=False)
+        text, _segments = run_stt_pipeline(
+            temp_audio,
+            lang="de-DE",
+            punctuate=False,
+            preprocessed=True,
+        )
 
         # Сохранить аудио файл
         os.makedirs("video_audio", exist_ok=True)
@@ -8591,10 +9106,11 @@ class AnkiApp(tk.Tk):
             stt_status_var.set("⏳ Извлекаю аудио…")
 
             def _worker():
-                audio_path = None
                 try:
                     if state.get("clip_path"):
-                        audio_path = extract_audio_from_video_for_stt(state["clip_path"])
+                        target_path = state["clip_path"]
+                        start_sec = None
+                        end_sec = None
                     else:
                         start_sec = parse_timecode_to_seconds(start_var.get().strip())
                         end_sec = parse_timecode_to_seconds(end_var.get().strip())
@@ -8604,22 +9120,18 @@ class AnkiApp(tk.Tk):
                             )
                         if end_sec <= start_sec:
                             raise RuntimeError("Время окончания должно быть больше времени начала.")
-                        audio_path = extract_audio_from_video_for_stt(video_path, start_sec, end_sec)
+                        target_path = video_path
                     win.after(0, lambda: stt_status_var.set("⏳ Распознаю…"))
-                    text = transcribe_audio_to_text(
-                        audio_path,
+                    text, _segments = run_stt_pipeline(
+                        target_path,
+                        start=start_sec,
+                        end=end_sec,
                         lang="de-DE",
                         punctuate=stt_auto_punct_var.get(),
                     )
                     return ("done", text)
                 except Exception as exc:
                     return ("error", str(exc))
-                finally:
-                    if audio_path and os.path.exists(audio_path):
-                        try:
-                            os.remove(audio_path)
-                        except Exception:
-                            pass
 
             def _on_finish(result):
                 stt_state["running"] = False
@@ -8632,7 +9144,7 @@ class AnkiApp(tk.Tk):
                 kind, payload = result
                 if kind == "error":
                     stt_status_var.set("❌ Ошибка")
-                    messagebox.showerror("Ошибка распознавания", payload, parent=win)
+                    show_stt_error_dialog(win, "Ошибка распознавания", payload)
                     return
                 text = payload or ""
                 stt_text.delete("1.0", tk.END)
@@ -18363,7 +18875,7 @@ class AnkiApp(tk.Tk):
                 record_task_holder["task"] = None
                 record_btn.config(state=tk.NORMAL)
                 record_status_var.set("")
-                messagebox.showerror("Ошибка записи", event[1])
+                show_stt_error_dialog(win, "Ошибка записи", event[1])
                 return
 
         def start_record():
@@ -20790,30 +21302,13 @@ class VideoClipCardsWindow:
         self.stt_status_var.set("⏳ извлечение аудио")
 
         def _worker() -> tuple[str, object]:
-            audio_path = None
             try:
-                audio_path = extract_audio_from_video_for_stt(self.video_path)
                 self.win.after(0, lambda: self.stt_status_var.set("⏳ распознавание"))
-                text = transcribe_audio_to_text(audio_path, lang="de-DE", punctuate=True)
-                duration = None
-                try:
-                    import wave
-
-                    with wave.open(audio_path, "rb") as handle:
-                        frames = handle.getnframes()
-                        rate = handle.getframerate()
-                        duration = frames / float(rate or 1)
-                except Exception:
-                    duration = get_video_duration_seconds(self.video_path)
+                text, _segments = run_stt_pipeline(self.video_path, lang="de-DE", punctuate=True)
+                duration = get_video_duration_seconds(self.video_path)
                 return ("done", {"text": text, "duration": duration})
             except Exception as exc:
                 return ("error", str(exc))
-            finally:
-                if audio_path and os.path.exists(audio_path):
-                    try:
-                        os.remove(audio_path)
-                    except Exception:
-                        pass
 
         def _finish(result: tuple[str, object]) -> None:
             self.stt_running = False
@@ -20822,7 +21317,7 @@ class VideoClipCardsWindow:
             kind, payload = result
             if kind == "error":
                 self.stt_status_var.set("❌ ошибка")
-                messagebox.showerror("Ошибка распознавания", str(payload), parent=self.win)
+                show_stt_error_dialog(self.win, "Ошибка распознавания", str(payload))
                 return
             payload = payload or {}
             text = str(payload.get("text") or "")
