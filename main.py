@@ -5178,6 +5178,79 @@ def extract_preprocessed_wav(
     raise RuntimeError("FFmpeg не найден, а moviepy не установлен.")
 
 
+def extract_audio_from_video(
+    video_path: str,
+    start: float | None = None,
+    end: float | None = None,
+    log_lines: list[str] | None = None,
+) -> str:
+    if not video_path or not os.path.exists(video_path):
+        raise FileNotFoundError(video_path)
+    tmp_dir = ensure_dir(os.path.join("tmp", "media"))
+    output_path = os.path.join(tmp_dir, f"stt_file_{uuid4().hex}.wav")
+    log_lines = log_lines if log_lines is not None else []
+    ffmpeg_path = find_ffmpeg()
+    if ffmpeg_path:
+        filters = "highpass=f=80,lowpass=f=8000,afftdn,dynaudnorm,loudnorm=I=-16:TP=-1.5:LRA=11"
+        cmd = [ffmpeg_path, "-y"]
+        if start is not None:
+            cmd += ["-ss", str(start)]
+        if end is not None:
+            cmd += ["-to", str(end)]
+        cmd += [
+            "-i",
+            video_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-sample_fmt",
+            "s16",
+            "-af",
+            filters,
+            output_path,
+        ]
+        log_lines.append("ffmpeg_cmd=" + " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            error_text = result.stderr.strip() or "Не удалось извлечь аудио."
+            raise RuntimeError(error_text)
+        log_lines.append(f"wav_path={output_path}")
+        return output_path
+    if MOVIEPY_AVAILABLE:
+        clip = None
+        try:
+            if video_path.lower().endswith((".wav", ".mp3", ".m4a", ".aac", ".ogg")):
+                clip = mp.AudioFileClip(video_path)
+                audio_clip = clip
+            else:
+                clip = mp.VideoFileClip(video_path)
+                audio_clip = clip.audio
+            if audio_clip is None:
+                raise RuntimeError("В видео нет аудио дорожки.")
+            if start is not None or end is not None:
+                audio_clip = audio_clip.subclip(start or 0, end)
+            audio_clip.write_audiofile(
+                output_path,
+                fps=16000,
+                nbytes=2,
+                codec="pcm_s16le",
+                ffmpeg_params=["-ac", "1"],
+                verbose=False,
+                logger=None,
+            )
+            log_lines.append(f"wav_path={output_path}")
+            return output_path
+        finally:
+            if clip is not None:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+    raise RuntimeError("FFmpeg не найден, а moviepy не установлен.")
+
+
 def extract_and_preprocess_audio(
     video_path: str,
     start: float | None = None,
@@ -5419,6 +5492,7 @@ def run_stt_pipeline(
     lang: str | None = None,
     punctuate: bool = True,
     preprocessed: bool = False,
+    log_context: list[str] | None = None,
 ) -> tuple[str, list[dict]]:
     lang_label = lang or "Auto"
     log_lines: list[str] = [
@@ -5428,6 +5502,8 @@ def run_stt_pipeline(
         f"end={end}",
         f"preprocessed={preprocessed}",
     ]
+    if log_context:
+        log_lines.extend(log_context)
     wav_path = None
     delete_wav = True
     chunk_paths: list[str] = []
@@ -5578,12 +5654,29 @@ def transcribe_audio_to_text(
     return text
 
 
+def transcribe_audio_file(
+    wav_path: str,
+    lang: str | None = None,
+    punctuate: bool = True,
+    log_context: list[str] | None = None,
+) -> tuple[str, list[dict]]:
+    if not wav_path or not os.path.exists(wav_path):
+        raise FileNotFoundError(wav_path)
+    return run_stt_pipeline(
+        wav_path,
+        lang=lang,
+        punctuate=punctuate,
+        preprocessed=True,
+        log_context=log_context,
+    )
+
+
 def extract_audio_from_video_for_stt(
     video_path: str,
     start_sec: float | None = None,
     end_sec: float | None = None,
 ) -> str:
-    return extract_and_preprocess_audio(video_path, start_sec, end_sec)
+    return extract_audio_from_video(video_path, start=start_sec, end=end_sec)
 
 
 def auto_generate_cards_from_speech(deck_id: int,
@@ -21154,6 +21247,11 @@ class VideoClipCardsWindow:
             variable=self.auto_stt_var,
         ).pack(side=tk.RIGHT)
 
+        self.stt_source_var = tk.StringVar(value="Источник: audio track из файла (WAV 16k mono)")
+        ttk.Label(frame, textvariable=self.stt_source_var, foreground="gray").pack(
+            anchor="w", padx=6, pady=(0, 4)
+        )
+
         options_row = ttk.Frame(frame)
         options_row.pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(options_row, text="Язык:").pack(side=tk.LEFT)
@@ -21328,17 +21426,33 @@ class VideoClipCardsWindow:
         self.stt_status_var.set("⏳ извлечение аудио")
 
         def _worker() -> tuple[str, object]:
+            temp_wav = None
             try:
+                log_context = [
+                    f"video_path={self.video_path}",
+                    "clip_path=None",
+                    "start=None",
+                    "end=None",
+                    "source_type=file",
+                ]
+                temp_wav = extract_audio_from_video(self.video_path, log_lines=log_context)
                 self.win.after(0, lambda: self.stt_status_var.set("⏳ распознавание"))
-                text, segments = run_stt_pipeline(
-                    self.video_path,
+                text, segments = transcribe_audio_file(
+                    temp_wav,
                     lang=self._get_selected_stt_language(),
                     punctuate=True,
+                    log_context=log_context,
                 )
                 duration = get_video_duration_seconds(self.video_path)
                 return ("done", {"text": text, "duration": duration, "segments": segments})
             except Exception as exc:
                 return ("error", str(exc))
+            finally:
+                if temp_wav and os.path.exists(temp_wav):
+                    try:
+                        os.remove(temp_wav)
+                    except Exception:
+                        pass
 
         def _finish(result: tuple[str, object]) -> None:
             self.stt_running = False
