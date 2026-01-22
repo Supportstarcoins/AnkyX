@@ -1080,6 +1080,15 @@ MIC_DEVICE_INDEX = None
 
 DEFAULT_FRONT_TEMPLATE = "{sentence_with_gap}"
 DEFAULT_BACK_TEMPLATE = "{word} [{ipa}] ({gender}; pl. {plural})\n\n{sentence}\n\n{translation}"
+VIDEO_TEXT_TEMPLATE_NAME = "Видео + текст"
+VIDEO_TEXT_FRONT_TEMPLATE = (
+    "{question}<div class=\"media\">{front_video}{front_image}{front_audio}</div>"
+    "<div class=\"txt\">{front_html}</div>"
+)
+VIDEO_TEXT_BACK_TEMPLATE = (
+    "<div class=\"media\">{back_video}{back_image}{back_audio}</div>"
+    "<div class=\"txt\">{back_html}</div>"
+)
 MEDIA_FOLDER = "media"
 MEDIA_IMPORT_SUBDIR = "anki_import"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
@@ -3271,6 +3280,35 @@ def ensure_default_generation_template(deck_id: int | None = None) -> int | None
         VALUES (?, ?, ?, ?, ?, ?);
         """,
         ("По умолчанию", "", front_template, back_template, now, now),
+    )
+    template_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return template_id
+
+
+def ensure_video_text_generation_template() -> int | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM generation_templates WHERE name = ? LIMIT 1;", (VIDEO_TEXT_TEMPLATE_NAME,))
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return row["id"]
+    now = int(time.time())
+    cur.execute(
+        """
+        INSERT INTO generation_templates (name, question, front_template, back_template, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?);
+        """,
+        (
+            VIDEO_TEXT_TEMPLATE_NAME,
+            "",
+            VIDEO_TEXT_FRONT_TEMPLATE,
+            VIDEO_TEXT_BACK_TEMPLATE,
+            now,
+            now,
+        ),
     )
     template_id = cur.lastrowid
     conn.commit()
@@ -5749,6 +5787,7 @@ class CardRenderer:
         self.custom_text_frame = tk.Frame(self.text_frame, bg="white")
         self.custom_text_frame.grid(row=0, column=0, sticky="nsew")
         self.custom_text_frame.grid_remove()
+        self.html_view = CardHtmlView(self.custom_text_frame)
 
         self.text_col.bind("<Configure>", self._update_wraplength)
 
@@ -5911,7 +5950,7 @@ class CardRenderer:
             render_rich_to_container(self.custom_text_frame, rich_doc, card_bg=card_bg, card_text_color=card_text)
         elif use_html:
             self._use_custom_text = True
-            show_card_html(self.custom_text_frame, html_value or "", card_bg=card_bg, card_text_color=card_text)
+            self.html_view.set_html(html_value or "", card_bg=card_bg, card_text_color=card_text)
         else:
             self._use_custom_text = False
             if isinstance(self.front_text, tk.Text):
@@ -5966,7 +6005,8 @@ class CardRenderer:
                 container_widget=self.image_container,
             )
         else:
-            self.image_label.config(image="", text="Нет изображения")
+            placeholder_text = "Нет изображения" if self.show_media_placeholder else ""
+            self.image_label.config(image="", text=placeholder_text)
 
     def _get_audio_entries(self, card: dict, prefer_side: str | None) -> list[dict]:
         if "audio_entries" in card:
@@ -6015,7 +6055,8 @@ class CardRenderer:
         else:
             for widget in self.audio_frame.winfo_children():
                 widget.destroy()
-            ttk.Label(self.audio_frame, text="Аудио не прикреплено").pack(anchor="center")
+            if self.show_media_placeholder:
+                ttk.Label(self.audio_frame, text="Аудио не прикреплено").pack(anchor="center")
 
         self._render_video(card)
 
@@ -6585,6 +6626,20 @@ class _HtmlTextRenderer(HTMLParser):
             self._append_text(data, self._current_style())
 
 
+class CardHtmlView:
+    def __init__(self, parent: tk.Widget) -> None:
+        self.parent = parent
+        self.text_widget: tk.Text | None = None
+
+    def clear(self) -> None:
+        for child in self.parent.winfo_children():
+            child.destroy()
+        self.text_widget = None
+
+    def set_html(self, html_text: str, card_bg: str, card_text_color: str) -> None:
+        self.text_widget = show_card_html(self.parent, html_text, card_bg=card_bg, card_text_color=card_text_color)
+
+
 def show_card_html(parent: tk.Widget, html_text: str, card_bg: str, card_text_color: str) -> tk.Text:
     for child in parent.winfo_children():
         child.destroy()
@@ -6725,11 +6780,15 @@ def prepare_template_fields(fields: dict) -> dict:
     return fields
 
 
-def _to_file_url(path: str) -> str:
+def to_file_url(path: str) -> str:
     try:
         return Path(path).resolve().as_uri()
     except Exception:
         return path
+
+
+def _to_file_url(path: str) -> str:
+    return to_file_url(path)
 
 
 def build_image_html(path: str | None) -> str:
@@ -8066,6 +8125,8 @@ class AnkiApp(tk.Tk):
         outer_frame, canvas, content_frame = create_scrollable_content(win, bg=scroll_bg)
         outer_frame.pack(fill=tk.BOTH, expand=True)
 
+        ensure_video_text_generation_template()
+
         state = {
             "video_path": None,
             "clip_path": None,
@@ -8567,7 +8628,27 @@ class AnkiApp(tk.Tk):
         ttk.Label(insert_frame, textvariable=back_video_label).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Button(insert_frame, text="Очистить", command=clear_back_video).pack(side=tk.LEFT)
 
-        preview_state = {"window": None, "renderer": None, "side": "front"}
+        preview_state = {"window": None, "view": None, "side": "front"}
+        template_warning_state = {"shown": False}
+
+        def _warn_missing_html_template() -> None:
+            if template_warning_state["shown"]:
+                return
+            template = get_active_generation_template(deck_id)
+            front_template = template.get("front_template") or ""
+            back_template = template.get("back_template") or ""
+            if "{front_html}" in front_template and "{back_html}" in back_template:
+                return
+            template_warning_state["shown"] = True
+            messagebox.showwarning(
+                "Шаблон карточки",
+                (
+                    "Выбранный шаблон не содержит {front_html}/{back_html}.\n"
+                    "Текст и форматирование редактора не будут отображаться.\n"
+                    f"Рекомендуется выбрать шаблон «{VIDEO_TEXT_TEMPLATE_NAME}»."
+                ),
+                parent=win,
+            )
 
         def _build_ctx() -> dict:
             front_text = front_editor["get_plain_text"]().strip()
@@ -8616,6 +8697,7 @@ class AnkiApp(tk.Tk):
             }
 
         def open_preview():
+            _warn_missing_html_template()
             preview_win = tk.Toplevel(win)
             preview_win.title("Предпросмотр карточки")
             preview_win.geometry("900x620")
@@ -8649,37 +8731,23 @@ class AnkiApp(tk.Tk):
             )
             card_wrap.pack(padx=10, pady=10)
             card_wrap.pack_propagate(False)
-            renderer = CardRenderer(
-                card_wrap,
-                palette=colors,
-                editable=False,
-                show_image_toolbar=False,
-                image_layout="side",
-                show_media_placeholder=False,
-                fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
-                render_mode="preview",
-            )
-            renderer.image_container.config(width=REPEAT_MEDIA_SLOT_SIZE[0], height=REPEAT_MEDIA_SLOT_SIZE[1])
-            renderer.image_container.pack_propagate(False)
-            renderer.image_container.grid_propagate(False)
+            html_view = CardHtmlView(card_wrap)
 
             preview_state["window"] = preview_win
-            preview_state["renderer"] = renderer
+            preview_state["view"] = html_view
             preview_state["side"] = "front"
 
             def update_preview() -> None:
-                card_data = _build_preview_card()
+                ctx = _build_ctx()
+                front_html, back_html = render_card_html(deck_id, ctx)
                 side = preview_state.get("side") or "front"
-                renderer.render(
-                    card_data,
-                    show_back=(side == "back"),
-                    prefer_audio_side=side,
-                    header_text="Предпросмотр",
-                )
+                html_value = back_html if side == "back" else front_html
+                card_bg, card_text, _ = get_card_surface_colors(card_wrap)
+                html_view.set_html(html_value or "", card_bg=card_bg, card_text_color=card_text)
 
             def _on_close():
                 preview_state["window"] = None
-                preview_state["renderer"] = None
+                preview_state["view"] = None
                 preview_win.destroy()
 
             preview_win.protocol("WM_DELETE_WINDOW", _on_close)
@@ -8710,6 +8778,7 @@ class AnkiApp(tk.Tk):
             if not self.can_afford(cost):
                 messagebox.showwarning("Кредиты", "Недостаточно кредитов.", parent=win)
                 return
+            _warn_missing_html_template()
             ctx = _build_ctx()
             front, back = render_card_html(deck_id, ctx)
             poster_path = state.get("poster_path")
@@ -10354,6 +10423,7 @@ class AnkiApp(tk.Tk):
         apply_dark_theme_to_window(win, self.palette)
 
         ensure_default_generation_template(self.selected_deck_id)
+        ensure_video_text_generation_template()
 
         main_frame = ttk.Frame(win, style="Surface.TFrame")
         main_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
@@ -10622,12 +10692,14 @@ class AnkiApp(tk.Tk):
             front_box = tk.Frame(preview_frame)
             front_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
             card_bg, card_text, _ = get_card_surface_colors(preview_frame)
-            show_card_html(front_box, front, card_bg=card_bg, card_text_color=card_text)
+            front_view = CardHtmlView(front_box)
+            front_view.set_html(front, card_bg=card_bg, card_text_color=card_text)
 
             ttk.Label(preview_frame, text="BACK").pack(anchor="w")
             back_box = tk.Frame(preview_frame)
             back_box.pack(fill=tk.BOTH, expand=True)
-            show_card_html(back_box, back, card_bg=card_bg, card_text_color=card_text)
+            back_view = CardHtmlView(back_box)
+            back_view.set_html(back, card_bg=card_bg, card_text_color=card_text)
 
         btn_row = ttk.Frame(right_frame)
         btn_row.pack(fill=tk.X, pady=(6, 0))
