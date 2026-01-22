@@ -6662,7 +6662,14 @@ class CardHtmlView:
         self.image_label = None
         self.audio_widget = None
 
-    def set_html(self, html_text: str, card_bg: str, card_text_color: str) -> None:
+    def set_html(
+        self,
+        html_text: str,
+        card_bg: str,
+        card_text_color: str,
+        *,
+        auto_play: bool = False,
+    ) -> None:
         self.clear()
         container = tk.Frame(self.parent, bg=card_bg)
         container.pack(fill=tk.BOTH, expand=True)
@@ -6686,6 +6693,8 @@ class CardHtmlView:
                         )
                         if self.video_player.ensure_embedded():
                             self.video_player.pack(anchor="w", pady=(0, 6))
+                            if auto_play:
+                                self.video_player.frame.after(150, self.video_player.play)
                         else:
                             self.video_player.frame.destroy()
                             self.video_player = None
@@ -6886,7 +6895,7 @@ def build_video_html(path: str | None, poster_path: str | None = None) -> str:
     poster_url = _to_file_url(poster_path) if poster_path else ""
     poster_attr = f' poster="{html.escape(poster_url)}"' if poster_url else ""
     return (
-        f'<video controls preload="metadata"{poster_attr}>'
+        f'<video controls autoplay preload="metadata"{poster_attr}>'
         f'<source src="{html.escape(clip_url)}" type="video/mp4"></video>'
     )
 
@@ -7077,6 +7086,99 @@ def safe_cut_video_clip(
                     pass
 
     return False, error_text
+
+
+def safe_cut_video_clip_with_poster(
+    video_path: str,
+    start_sec: float,
+    end_sec: float,
+    output_dir: str,
+    *,
+    clip_label: str | None = None,
+) -> tuple[bool, dict | str]:
+    if not video_path or not os.path.exists(video_path):
+        return False, "Видео файл не найден."
+    if end_sec <= start_sec:
+        return False, "Время окончания должно быть больше времени начала."
+    os.makedirs(output_dir, exist_ok=True)
+    label = clip_label or uuid4().hex
+    safe_label = re.sub(r"[^\w\-]+", "_", str(label))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    clip_path = os.path.join(output_dir, f"clip_{ts}_{safe_label}.mp4")
+    poster_path = os.path.join(output_dir, f"clip_{ts}_{safe_label}_poster.jpg")
+
+    ffmpeg_path = find_ffmpeg()
+    if ffmpeg_path:
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-ss",
+            str(start_sec),
+            "-to",
+            str(end_sec),
+            "-i",
+            video_path,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            clip_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return False, result.stderr.strip() or "Не удалось нарезать клип."
+        poster_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            clip_path,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            poster_path,
+        ]
+        poster_result = subprocess.run(poster_cmd, capture_output=True, text=True, check=False)
+        if poster_result.returncode != 0:
+            return False, poster_result.stderr.strip() or "Не удалось создать постер."
+        return True, {"clip_path": clip_path, "poster_path": poster_path}
+
+    if MOVIEPY_AVAILABLE:
+        clip = None
+        subclip = None
+        try:
+            clip = mp.VideoFileClip(video_path)
+            subclip = clip.subclip(start_sec, end_sec)
+            subclip.write_videofile(clip_path, codec="libx264", audio_codec="aac", logger=None)
+            try:
+                subclip.save_frame(poster_path, t=0)
+            except Exception:
+                try:
+                    subclip.save_frame(poster_path, t=0.1)
+                except Exception:
+                    return False, "Не удалось создать постер."
+            return True, {"clip_path": clip_path, "poster_path": poster_path}
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            if subclip is not None:
+                try:
+                    subclip.close()
+                except Exception:
+                    pass
+            if clip is not None:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+
+    return False, "FFmpeg не найден, а moviepy не установлен."
 
 
 def build_rich_text_editor(
@@ -8210,11 +8312,8 @@ class AnkiApp(tk.Tk):
 
         state = {
             "video_path": None,
-            "clip_path": None,
-            "poster_path": None,
-            "front_video": None,
-            "back_video": None,
             "drafts": [],
+            "selected_index": None,
         }
 
         video_path_var = tk.StringVar()
@@ -8223,8 +8322,10 @@ class AnkiApp(tk.Tk):
         start_sec_var = tk.DoubleVar(value=0)
         end_sec_var = tk.DoubleVar(value=10)
         duration_var = tk.StringVar(value="Длительность: —")
-        status_var = tk.StringVar(value="Клип сохраняется в папку media/clips/")
-        clip_info_var = tk.StringVar(value="Клип не создан")
+        status_var = tk.StringVar(
+            value=f"Клипы сохраняются в {os.path.join(MEDIA_FOLDER, 'clips', str(deck_id))}"
+        )
+        clip_info_var = tk.StringVar(value="Диапазон: —")
         stt_status_var = tk.StringVar(value="")
         stt_auto_punct_var = tk.BooleanVar(value=True)
         stt_auto_run_var = tk.BooleanVar(value=True)
@@ -8235,7 +8336,8 @@ class AnkiApp(tk.Tk):
         ttk.Label(top_frame, text="Видео файл:").pack(anchor="w")
         video_row = ttk.Frame(top_frame)
         video_row.pack(fill=tk.X, pady=4)
-        ttk.Entry(video_row, textvariable=video_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        video_entry = ttk.Entry(video_row, textvariable=video_path_var)
+        video_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         def browse_video():
             path = filedialog.askopenfilename(
@@ -8247,6 +8349,8 @@ class AnkiApp(tk.Tk):
                 load_video(path)
 
         ttk.Button(video_row, text="…", width=4, command=browse_video).pack(side=tk.LEFT, padx=(6, 0))
+        video_entry.bind("<Return>", lambda _e: load_video(video_path_var.get().strip()))
+        video_entry.bind("<FocusOut>", lambda _e: load_video(video_path_var.get().strip()))
         ttk.Label(top_frame, textvariable=duration_var).pack(anchor="w")
 
         player_frame = ttk.LabelFrame(content_frame, text="Плеер")
@@ -8262,6 +8366,7 @@ class AnkiApp(tk.Tk):
                     if player.ensure_embedded():
                         player.pack(anchor="w", padx=6, pady=6)
                         player_holder["player"] = player
+                        player.frame.after(150, player.play)
                         return
                 except Exception:
                     player_holder["player"] = None
@@ -8290,6 +8395,7 @@ class AnkiApp(tk.Tk):
 
         def _sync_var_from_scale(var: tk.StringVar, value: float) -> None:
             var.set(format_hms(int(value)))
+            _update_range_info()
 
         def _apply_scale_bounds() -> None:
             if end_sec_var.get() <= start_sec_var.get():
@@ -8299,10 +8405,12 @@ class AnkiApp(tk.Tk):
         def _on_start_scale(value):
             _sync_var_from_scale(start_var, float(value))
             _apply_scale_bounds()
+            _recompute_draft_timings()
 
         def _on_end_scale(value):
             _sync_var_from_scale(end_var, float(value))
             _apply_scale_bounds()
+            _recompute_draft_timings()
 
         start_scale.configure(command=_on_start_scale)
         end_scale.configure(command=_on_end_scale)
@@ -8321,6 +8429,8 @@ class AnkiApp(tk.Tk):
             scale_var.set(parsed)
             _apply_scale_bounds()
             _maybe_auto_stt("range")
+            _update_range_info()
+            _recompute_draft_timings()
 
         start_entry.bind("<Return>", lambda _e: _sync_entry_to_scale(start_var, start_sec_var))
         end_entry.bind("<Return>", lambda _e: _sync_entry_to_scale(end_var, end_sec_var))
@@ -8347,58 +8457,15 @@ class AnkiApp(tk.Tk):
                 end_scale.configure(to=duration)
                 start_var.set("00:00:00")
                 end_var.set(format_hms(int(duration)))
+                _update_range_info()
+                _recompute_draft_timings()
             _render_player(path)
             _maybe_auto_stt("video")
 
-        def cut_and_attach():
-            video_path = state.get("video_path") or video_path_var.get().strip()
-            if not video_path:
-                messagebox.showerror("Ошибка", "Выберите видео файл.", parent=win)
-                return
-            cut_btn.configure(state=tk.DISABLED)
-            status_var.set("⏳ Нарезаю клип...")
+        def _update_range_info() -> None:
+            clip_info_var.set(f"Диапазон: {start_var.get()} → {end_var.get()}")
 
-            def _worker():
-                ok, result = safe_cut_video_clip(
-                    video_path,
-                    start_var.get(),
-                    end_var.get(),
-                    os.path.join(MEDIA_FOLDER, "clips", str(deck_id)),
-                )
-                if not ok:
-                    error_text = str(result)
-
-                    def _on_error():
-                        status_var.set("Ошибка нарезки")
-                        cut_btn.configure(state=tk.NORMAL)
-                        messagebox.showerror("Ошибка нарезки", error_text, parent=win)
-
-                    win.after(0, _on_error)
-                    return
-
-                clip_path = result
-                clip_name = os.path.basename(clip_path)
-                clip_info = f"{start_var.get()} → {end_var.get()}"
-
-                def _on_success():
-                    state["clip_path"] = clip_path
-                    state["poster_path"] = None
-                    status_var.set(f"Создан клип {clip_name}")
-                    clip_info_var.set(f"Клип: {clip_name} ({clip_info})")
-                    cut_btn.configure(state=tk.NORMAL)
-                    _maybe_auto_stt("clip")
-                    messagebox.showinfo(
-                        "Клип создан",
-                        f"Клип сохранен: {clip_path}",
-                        parent=win,
-                    )
-
-                win.after(0, _on_success)
-
-            threading.Thread(target=_worker, daemon=True).start()
-
-        cut_btn = ttk.Button(time_frame, text="Нарезать", command=cut_and_attach)
-        cut_btn.grid(row=0, column=3, rowspan=2, padx=6, pady=6, sticky="ns")
+        _update_range_info()
 
         stt_frame = ttk.LabelFrame(content_frame, text="Цифровой слух")
         stt_frame.pack(fill=tk.BOTH, padx=12, pady=(0, 10))
@@ -8445,23 +8512,10 @@ class AnkiApp(tk.Tk):
             text="Копировать",
             command=lambda: win.clipboard_clear() or win.clipboard_append(_get_stt_text()),
         ).pack(side=tk.LEFT)
-
-        def _insert_into_editor(editor: dict) -> None:
-            text = _get_stt_text()
-            if not text:
-                return
-            editor["text"].insert("insert", text)
-            editor["text"].focus_set()
-
         ttk.Button(
             stt_action_row,
-            text="Вставить в Front",
-            command=lambda: _insert_into_editor(front_editor),
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            stt_action_row,
-            text="Вставить в Back",
-            command=lambda: _insert_into_editor(back_editor),
+            text="Разбить на предложения",
+            command=lambda: _build_drafts_from_text(),
         ).pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Label(
@@ -8470,7 +8524,7 @@ class AnkiApp(tk.Tk):
             foreground="gray",
         ).pack(anchor="w", padx=6, pady=(0, 4))
 
-        action_buttons = [cut_btn, stt_btn]
+        action_buttons = [stt_btn]
 
         def _set_action_state(enabled: bool) -> None:
             for btn in action_buttons:
@@ -8480,7 +8534,7 @@ class AnkiApp(tk.Tk):
                     continue
 
         def _start_stt(reason: str) -> None:
-            video_path = state.get("clip_path") or state.get("video_path") or video_path_var.get().strip()
+            video_path = state.get("video_path") or video_path_var.get().strip()
             if not video_path:
                 messagebox.showerror("Видео", "Выберите видео файл.", parent=win)
                 return
@@ -8489,29 +8543,28 @@ class AnkiApp(tk.Tk):
             stt_state["job_id"] += 1
             job_id = stt_state["job_id"]
             _set_action_state(False)
-            stt_status_var.set("⏳ Извлекаю аудио…")
+            stt_status_var.set("⏳ Извлечение аудио…")
 
             def _worker():
                 audio_path = None
                 try:
-                    if state.get("clip_path"):
-                        audio_path = extract_audio_from_video_for_stt(state["clip_path"])
-                    else:
-                        start_sec = parse_timecode_to_seconds(start_var.get().strip())
-                        end_sec = parse_timecode_to_seconds(end_var.get().strip())
-                        if start_sec is None or end_sec is None:
-                            raise RuntimeError(
-                                "Введите корректный диапазон Start/End (SS, MM:SS или HH:MM:SS)."
-                            )
-                        if end_sec <= start_sec:
-                            raise RuntimeError("Время окончания должно быть больше времени начала.")
-                        audio_path = extract_audio_from_video_for_stt(video_path, start_sec, end_sec)
-                    win.after(0, lambda: stt_status_var.set("⏳ Распознаю…"))
+                    start_sec = parse_timecode_to_seconds(start_var.get().strip())
+                    end_sec = parse_timecode_to_seconds(end_var.get().strip())
+                    if start_sec is None or end_sec is None:
+                        raise RuntimeError(
+                            "Введите корректный диапазон Start/End (SS, MM:SS или HH:MM:SS)."
+                        )
+                    if end_sec <= start_sec:
+                        raise RuntimeError("Время окончания должно быть больше времени начала.")
+                    audio_path = extract_audio_from_video_for_stt(video_path, start_sec, end_sec)
+                    win.after(0, lambda: stt_status_var.set("⏳ Распознавание…"))
                     text = transcribe_audio_to_text(
                         audio_path,
                         lang="de-DE",
-                        punctuate=stt_auto_punct_var.get(),
+                        punctuate=True,
                     )
+                    if not stt_auto_punct_var.get():
+                        text = auto_punctuate(text)
                     return ("done", text)
                 except Exception as exc:
                     return ("error", str(exc))
@@ -8567,220 +8620,116 @@ class AnkiApp(tk.Tk):
         ttk.Label(template_frame, text="Выберите шаблон карточки:").pack(anchor="w", padx=6, pady=(6, 0))
         self._build_generation_template_selector(template_frame, deck_id, padx=6, pady=(0, 6))
 
-        drafts_frame = ttk.LabelFrame(content_frame, text="Черновики карточек")
-        drafts_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+        reverse_var = tk.BooleanVar(value=False)
 
-        drafts_pane = ttk.Panedwindow(drafts_frame, orient=tk.HORIZONTAL)
-        drafts_pane.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        sentences_frame = ttk.LabelFrame(content_frame, text="Предложения")
+        sentences_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
 
-        drafts_left = ttk.Frame(drafts_pane)
-        drafts_right = ttk.Frame(drafts_pane)
-        drafts_pane.add(drafts_left, weight=1)
-        drafts_pane.add(drafts_right, weight=3)
+        sentences_top = ttk.Frame(sentences_frame)
+        sentences_top.pack(fill=tk.X, padx=6, pady=(6, 0))
+        ttk.Checkbutton(
+            sentences_top,
+            text="Наоборот (текст на Front)",
+            variable=reverse_var,
+            command=lambda: _update_preview(),
+        ).pack(side=tk.LEFT)
 
-        ttk.Label(drafts_left, text="Черновики").pack(anchor="w")
-        draft_listbox = tk.Listbox(drafts_left, selectmode=tk.EXTENDED, height=14)
-        draft_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        draft_scroll = ttk.Scrollbar(drafts_left, orient="vertical", command=draft_listbox.yview)
-        draft_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        draft_listbox.configure(yscrollcommand=draft_scroll.set)
-
-        draft_btn_row = ttk.Frame(drafts_left)
-        draft_btn_row.pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(draft_btn_row, text="Добавить карточку", command=lambda: _add_draft_from_editor()).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(draft_btn_row, text="Удалить", command=lambda: _delete_selected_drafts()).pack(
-            side=tk.LEFT, padx=6
-        )
-        ttk.Button(draft_btn_row, text="Очистить", command=lambda: _clear_drafts()).pack(side=tk.LEFT)
-
-        notebook = ttk.Notebook(drafts_right)
-        notebook.pack(fill=tk.BOTH, expand=True)
-        front_tab = ttk.Frame(notebook)
-        back_tab = ttk.Frame(notebook)
-        notebook.add(front_tab, text="Front")
-        notebook.add(back_tab, text="Back")
-
-        front_editor = build_rich_text_editor(front_tab, colors, on_change=lambda: _handle_editor_change())
-        back_editor = build_rich_text_editor(back_tab, colors, on_change=lambda: _handle_editor_change())
-        front_editor["frame"].pack(fill=tk.BOTH, expand=True)
-        back_editor["frame"].pack(fill=tk.BOTH, expand=True)
-
-        draft_state = {"active_index": None}
-
-        def _draft_title(idx: int, draft: dict) -> str:
-            base_text = draft.get("front_html") or draft.get("front_text") or ""
-            plain = plain_text_from_html(base_text)
-            preview = " ".join(plain.split())
-            if not preview:
-                preview = "Без названия"
-            if len(preview) > 42:
-                preview = preview[:39] + "..."
-            return f"{idx + 1}. {preview}"
-
-        def _refresh_draft_list(select_index: int | None = None) -> None:
-            draft_listbox.delete(0, tk.END)
-            for idx, draft in enumerate(state["drafts"]):
-                draft_listbox.insert(tk.END, _draft_title(idx, draft))
-            if select_index is not None and state["drafts"]:
-                idx = max(0, min(select_index, len(state["drafts"]) - 1))
-                draft_listbox.selection_set(idx)
-                draft_listbox.activate(idx)
-                _load_draft_into_editor(idx)
-            elif not state["drafts"]:
-                draft_state["active_index"] = None
-                front_editor["set_html"]("")
-                back_editor["set_html"]("")
-
-        def _sync_active_draft() -> None:
-            idx = draft_state.get("active_index")
-            if idx is None or idx >= len(state["drafts"]):
-                return
-            state["drafts"][idx]["front_html"] = front_editor["get_html"]()
-            state["drafts"][idx]["back_html"] = back_editor["get_html"]()
-            draft_listbox.delete(idx)
-            draft_listbox.insert(idx, _draft_title(idx, state["drafts"][idx]))
-            draft_listbox.selection_set(idx)
-            draft_listbox.activate(idx)
-
-        def _load_draft_into_editor(idx: int) -> None:
-            if idx < 0 or idx >= len(state["drafts"]):
-                return
-            draft_state["active_index"] = idx
-            draft = state["drafts"][idx]
-            front_editor["set_html"](draft.get("front_html") or "")
-            back_editor["set_html"](draft.get("back_html") or "")
-
-        def _on_draft_select(_event=None) -> None:
-            selection = draft_listbox.curselection()
-            _sync_active_draft()
-            if not selection:
-                draft_state["active_index"] = None
-                _update_save_pricing()
-                return
-            _load_draft_into_editor(selection[0])
-            _update_save_pricing()
-
-        def _add_draft_from_editor() -> None:
-            _sync_active_draft()
-            front_html = front_editor["get_html"]()
-            back_html = back_editor["get_html"]()
-            state["drafts"].append({"front_html": front_html, "back_html": back_html})
-            _refresh_draft_list(select_index=len(state["drafts"]) - 1)
-            _update_save_pricing()
-
-        def _delete_selected_drafts() -> None:
-            selection = list(draft_listbox.curselection())
-            if not selection:
-                return
-            for idx in sorted(selection, reverse=True):
-                if 0 <= idx < len(state["drafts"]):
-                    state["drafts"].pop(idx)
-            _refresh_draft_list(select_index=0 if state["drafts"] else None)
-            _update_save_pricing()
-
-        def _clear_drafts() -> None:
-            if state["drafts"] and not messagebox.askyesno(
-                "Очистить черновики",
-                "Удалить все черновики карточек?",
-                parent=win,
-            ):
-                return
-            state["drafts"] = []
-            _refresh_draft_list(select_index=None)
-            _update_save_pricing()
-
-        def _handle_editor_change() -> None:
-            if draft_state.get("active_index") is None:
-                return
-            _sync_active_draft()
-            _update_save_pricing()
-
-        draft_listbox.bind("<<ListboxSelect>>", _on_draft_select)
-
-        front_video_label = tk.StringVar(value="Видео не добавлено")
-        back_video_label = tk.StringVar(value="Видео не добавлено")
-
-        def _require_clip() -> bool:
-            if not state.get("clip_path"):
-                messagebox.showinfo("Видео", "Сначала нарежьте клип.", parent=win)
-                return False
-            return True
-
-        def insert_front_video():
-            if not _require_clip():
-                return
-            state["front_video"] = state.get("clip_path")
-            front_video_label.set(f"🎬 {os.path.basename(state['front_video'])}")
-
-        def insert_back_video():
-            if not _require_clip():
-                return
-            state["back_video"] = state.get("clip_path")
-            back_video_label.set(f"🎬 {os.path.basename(state['back_video'])}")
-
-        def clear_front_video():
-            state["front_video"] = None
-            front_video_label.set("Видео не добавлено")
-
-        def clear_back_video():
-            state["back_video"] = None
-            back_video_label.set("Видео не добавлено")
-
-        def _refresh_video_labels() -> None:
-            if state.get("front_video"):
-                front_video_label.set(f"🎬 {os.path.basename(state['front_video'])}")
-            else:
-                front_video_label.set("Видео не добавлено")
-            if state.get("back_video"):
-                back_video_label.set(f"🎬 {os.path.basename(state['back_video'])}")
-            else:
-                back_video_label.set("Видео не добавлено")
-
-        def _ensure_default_video_selection() -> None:
-            default_video = state.get("clip_path") or state.get("video_path")
-            if not default_video:
-                return
-            if state.get("front_video") is None:
-                state["front_video"] = default_video
-            if state.get("back_video") is None:
-                state["back_video"] = default_video
-            _refresh_video_labels()
-
-        insert_frame = ttk.Frame(content_frame)
-        insert_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
-        ttk.Button(insert_frame, text="Вставить видео на Front", command=insert_front_video).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-        ttk.Label(insert_frame, textvariable=front_video_label).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(insert_frame, text="Очистить", command=clear_front_video).pack(side=tk.LEFT)
-
-        ttk.Button(insert_frame, text="Вставить видео на Back", command=insert_back_video).pack(
-            side=tk.LEFT, padx=(16, 6)
-        )
-        ttk.Label(insert_frame, textvariable=back_video_label).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(insert_frame, text="Очистить", command=clear_back_video).pack(side=tk.LEFT)
-
-        def _auto_generate_drafts(text: str) -> None:
+        def _build_drafts_from_text() -> None:
+            text = _get_stt_text()
             sentences = split_into_sentences(text or "")
             if not sentences:
+                state["drafts"] = []
+                _refresh_draft_table()
+                _update_save_pricing()
                 return
-            _ensure_default_video_selection()
-            drafts = []
-            for sentence in sentences:
-                front_html = html.escape(sentence).replace("\n", "<br>")
-                drafts.append(
-                    {
-                        "front_html": front_html,
-                        "back_html": "",
-                    }
-                )
-            state["drafts"] = drafts
-            _refresh_draft_list(select_index=0)
+            _apply_sentence_timings(sentences)
+            _refresh_draft_table(select_index=0)
             _update_save_pricing()
 
-        preview_state = {"window": None, "view": None, "side": "front"}
+        refresh_btn = ttk.Button(sentences_top, text="Обновить предложения", command=_build_drafts_from_text)
+        refresh_btn.pack(side=tk.RIGHT)
+        action_buttons.append(refresh_btn)
+
+        sentences_body = ttk.Frame(sentences_frame)
+        sentences_body.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        sentences_body.columnconfigure(0, weight=2)
+        sentences_body.columnconfigure(1, weight=3)
+
+        table_frame = ttk.Frame(sentences_body)
+        table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        columns = ("idx", "sentence", "start", "end", "length")
+        draft_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            height=12,
+        )
+        draft_tree.heading("idx", text="№")
+        draft_tree.heading("sentence", text="Предложение")
+        draft_tree.heading("start", text="Start")
+        draft_tree.heading("end", text="End")
+        draft_tree.heading("length", text="Длина")
+        draft_tree.column("idx", width=50, anchor="center")
+        draft_tree.column("sentence", width=360, anchor="w")
+        draft_tree.column("start", width=80, anchor="center")
+        draft_tree.column("end", width=80, anchor="center")
+        draft_tree.column("length", width=80, anchor="center")
+        draft_tree.grid(row=0, column=0, sticky="nsew")
+        draft_scroll = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=draft_tree.yview,
+            style="Premium.Vertical.TScrollbar",
+        )
+        draft_scroll.grid(row=0, column=1, sticky="ns")
+        draft_tree.configure(yscrollcommand=draft_scroll.set)
+
+        preview_frame = ttk.LabelFrame(sentences_body, text="Предпросмотр")
+        preview_frame.grid(row=0, column=1, sticky="nsew")
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(0, weight=1)
+
+        preview_tabs = ttk.Notebook(preview_frame)
+        preview_tabs.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        preview_front = ttk.Frame(preview_tabs)
+        preview_back = ttk.Frame(preview_tabs)
+        preview_tabs.add(preview_front, text="Front")
+        preview_tabs.add(preview_back, text="Back")
+
+        preview_front_wrap = tk.Frame(
+            preview_front,
+            bg=DARK_BG,
+            highlightbackground=CARD_BORDER,
+            highlightthickness=1,
+            bd=0,
+            width=CARD_VIEW_WIDTH,
+            height=CARD_VIEW_HEIGHT,
+        )
+        preview_front_wrap.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        preview_front_wrap.pack_propagate(False)
+        preview_back_wrap = tk.Frame(
+            preview_back,
+            bg=DARK_BG,
+            highlightbackground=CARD_BORDER,
+            highlightthickness=1,
+            bd=0,
+            width=CARD_VIEW_WIDTH,
+            height=CARD_VIEW_HEIGHT,
+        )
+        preview_back_wrap.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        preview_back_wrap.pack_propagate(False)
+
+        front_preview_view = CardHtmlView(preview_front_wrap)
+        back_preview_view = CardHtmlView(preview_back_wrap)
+
+        preview_state = {
+            "front_view": front_preview_view,
+            "back_view": back_preview_view,
+        }
         template_warning_state = {"shown": False}
 
         def _warn_missing_html_template() -> None:
@@ -8802,112 +8751,200 @@ class AnkiApp(tk.Tk):
                 parent=win,
             )
 
-        def _build_ctx() -> dict:
-            front_text = front_editor["get_plain_text"]().strip()
-            back_text = back_editor["get_plain_text"]().strip()
-            front_html = front_editor["get_html"]()
-            back_html = back_editor["get_html"]()
-            front_video_html = build_video_html(state.get("front_video"), state.get("poster_path"))
-            back_video_html = build_video_html(state.get("back_video"), state.get("poster_path"))
-            poster_path = state.get("poster_path")
-            front_image_html = build_image_html(poster_path) if state.get("front_video") else ""
-            back_image_html = build_image_html(poster_path) if state.get("back_video") else ""
-            front_audio_html = ""
-            back_audio_html = ""
+        def _assign_sentence_timings(sentences: list[str], start_sec: float, end_sec: float) -> list[tuple[float, float]]:
+            if not sentences:
+                return []
+            total = max(end_sec - start_sec, 0.1)
+            weights = [max(len(sentence.strip()), 1) for sentence in sentences]
+            total_weight = sum(weights) or len(weights)
+            current = start_sec
+            timings: list[tuple[float, float]] = []
+            for idx, weight in enumerate(weights):
+                if idx == len(weights) - 1:
+                    end = end_sec
+                else:
+                    duration = total * (weight / total_weight)
+                    end = current + duration
+                timings.append((current, max(end, current)))
+                current = end
+            return timings
+
+        def _apply_sentence_timings(sentences: list[str]) -> None:
+            start_sec = float(start_sec_var.get())
+            end_sec = float(end_sec_var.get())
+            timings = _assign_sentence_timings(sentences, start_sec, end_sec)
+            drafts = []
+            for sentence, (start, end) in zip(sentences, timings):
+                drafts.append(
+                    {
+                        "text": sentence,
+                        "start": float(start),
+                        "end": float(end),
+                        "preview_key": None,
+                        "preview_clip_path": None,
+                        "preview_poster_path": None,
+                    }
+                )
+            state["drafts"] = drafts
+
+        def _refresh_draft_table(select_index: int | None = None) -> None:
+            draft_tree.delete(*draft_tree.get_children())
+            for idx, draft in enumerate(state["drafts"]):
+                length = max(0.0, float(draft.get("end", 0)) - float(draft.get("start", 0)))
+                draft_tree.insert(
+                    "",
+                    "end",
+                    iid=str(idx),
+                    values=(
+                        idx + 1,
+                        draft.get("text", ""),
+                        f"{draft.get('start', 0):.2f}",
+                        f"{draft.get('end', 0):.2f}",
+                        f"{length:.2f}",
+                    ),
+                )
+            if select_index is not None and state["drafts"]:
+                idx = max(0, min(select_index, len(state["drafts"]) - 1))
+                draft_tree.selection_set(str(idx))
+                draft_tree.focus(str(idx))
+                _select_draft(idx)
+            else:
+                state["selected_index"] = None
+
+        def _select_draft(idx: int) -> None:
+            if idx < 0 or idx >= len(state["drafts"]):
+                state["selected_index"] = None
+                return
+            state["selected_index"] = idx
+            _update_preview()
+            player = player_holder.get("player")
+            start_at = float(state["drafts"][idx].get("start", 0.0))
+            if player:
+                try:
+                    player.player.set_time(int(start_at * 1000))
+                    player.play()
+                except Exception:
+                    pass
+
+        def _on_draft_select(_event=None) -> None:
+            selection = draft_tree.selection()
+            if not selection:
+                state["selected_index"] = None
+                _update_preview()
+                return
+            try:
+                idx = int(selection[0])
+            except Exception:
+                return
+            _select_draft(idx)
+
+        def _ensure_preview_clip(draft: dict) -> tuple[str | None, str | None]:
+            video_path = state.get("video_path")
+            if not video_path:
+                return None, None
+            preview_key = (video_path, draft.get("start"), draft.get("end"))
+            cached_clip = draft.get("preview_clip_path")
+            cached_poster = draft.get("preview_poster_path")
+            if (
+                draft.get("preview_key") == preview_key
+                and cached_clip
+                and cached_poster
+                and os.path.exists(cached_clip)
+                and os.path.exists(cached_poster)
+            ):
+                return cached_clip, cached_poster
+            output_dir = ensure_dir(os.path.join("tmp", "video_clip_preview", str(deck_id)))
+            ok, result = safe_cut_video_clip_with_poster(
+                video_path,
+                float(draft.get("start", 0)),
+                float(draft.get("end", 0)),
+                output_dir,
+                clip_label=f"preview_{draft.get('start', 0):.2f}_{draft.get('end', 0):.2f}",
+            )
+            if not ok:
+                return None, None
+            clip_path = result.get("clip_path")
+            poster_path = result.get("poster_path")
+            draft["preview_key"] = preview_key
+            draft["preview_clip_path"] = clip_path
+            draft["preview_poster_path"] = poster_path
+            return clip_path, poster_path
+
+        def _build_ctx_for_sentence(sentence: str, clip_path: str | None, poster_path: str | None) -> dict:
             template = get_active_generation_template(deck_id)
+            text_html = html.escape(sentence).replace("\n", "<br>")
+            if reverse_var.get():
+                front_html = text_html
+                back_html = ""
+                front_video_html = ""
+                back_video_html = build_video_html(clip_path, poster_path)
+            else:
+                front_html = ""
+                back_html = text_html
+                front_video_html = build_video_html(clip_path, poster_path)
+                back_video_html = ""
             return {
                 "question": template.get("question") or "",
                 "front_html": front_html,
                 "back_html": back_html,
-                "front": front_text,
-                "back": back_text,
+                "front": plain_text_from_html(front_html),
+                "back": plain_text_from_html(back_html),
                 "front_video_html": front_video_html,
                 "back_video_html": back_video_html,
                 "front_video": front_video_html,
                 "back_video": back_video_html,
                 "video": front_video_html or back_video_html,
-                "front_image": front_image_html,
-                "back_image": back_image_html,
-                "image": front_image_html or back_image_html,
-                "front_audio": front_audio_html,
-                "back_audio": back_audio_html,
-                "audio": front_audio_html or back_audio_html,
+                "front_image": "",
+                "back_image": "",
+                "image": "",
+                "front_audio": "",
+                "back_audio": "",
+                "audio": "",
             }
 
-        def _build_preview_card() -> dict:
-            ctx = _build_ctx()
-            front, back = render_card_html(deck_id, ctx)
-            poster_path = state.get("poster_path")
-            return {
-                "front": front,
-                "back": back,
-                "front_image_path": poster_path if state.get("front_video") else None,
-                "back_image_path": poster_path if state.get("back_video") else None,
-                "front_video_path": state.get("front_video"),
-                "back_video_path": state.get("back_video"),
-                "audio_path": None,
-            }
+        def _update_preview() -> None:
+            for view in (preview_state.get("front_view"), preview_state.get("back_view")):
+                if view is None:
+                    continue
+                view.set_html("", card_bg=DARK_BG, card_text_color="white")
+            idx = state.get("selected_index")
+            if idx is None or idx >= len(state["drafts"]):
+                return
+            draft = state["drafts"][idx]
+            clip_path, poster_path = _ensure_preview_clip(draft)
+            ctx = _build_ctx_for_sentence(draft.get("text", ""), clip_path, poster_path)
+            front_html, back_html = render_card_html(deck_id, ctx)
+            card_bg, card_text, _ = get_card_surface_colors(preview_front_wrap)
+            front_preview_view.set_html(front_html, card_bg=card_bg, card_text_color=card_text, auto_play=True)
+            back_preview_view.set_html(back_html, card_bg=card_bg, card_text_color=card_text, auto_play=True)
 
-        def open_preview():
-            _warn_missing_html_template()
-            preview_win = tk.Toplevel(win)
-            preview_win.title("Предпросмотр карточки")
-            preview_win.geometry("900x620")
-            preview_win.grab_set()
-            apply_dark_theme_to_window(preview_win, colors)
+        draft_tree.bind("<<TreeviewSelect>>", _on_draft_select)
 
-            container = tk.Frame(preview_win, bg=DARK_BG)
-            container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
-            controls = tk.Frame(container, bg=DARK_BG)
-            controls.pack(fill=tk.X, pady=(0, 8))
+        def _auto_generate_drafts(text: str) -> None:
+            sentences = split_into_sentences(text or "")
+            if not sentences:
+                state["drafts"] = []
+                _refresh_draft_table()
+                _update_save_pricing()
+                return
+            _apply_sentence_timings(sentences)
+            _refresh_draft_table(select_index=0)
+            _update_save_pricing()
 
-            def _set_side(side: str) -> None:
-                preview_state["side"] = side
-                update_preview()
-
-            ttk.Button(controls, text="Лицевая", command=lambda: _set_side("front")).pack(
-                side=tk.LEFT, padx=4
-            )
-            ttk.Button(controls, text="Обратная", command=lambda: _set_side("back")).pack(
-                side=tk.LEFT, padx=4
-            )
-
-            card_wrap = tk.Frame(
-                container,
-                bg=DARK_BG,
-                highlightbackground=CARD_BORDER,
-                highlightthickness=1,
-                bd=0,
-                width=CARD_VIEW_WIDTH,
-                height=CARD_VIEW_HEIGHT,
-            )
-            card_wrap.pack(padx=10, pady=10)
-            card_wrap.pack_propagate(False)
-            html_view = CardHtmlView(card_wrap)
-
-            preview_state["window"] = preview_win
-            preview_state["view"] = html_view
-            preview_state["side"] = "front"
-
-            def update_preview() -> None:
-                ctx = _build_ctx()
-                front_html, back_html = render_card_html(deck_id, ctx)
-                side = preview_state.get("side") or "front"
-                html_value = back_html if side == "back" else front_html
-                card_bg, card_text, _ = get_card_surface_colors(card_wrap)
-                html_view.set_html(html_value or "", card_bg=card_bg, card_text_color=card_text)
-
-            def _on_close():
-                preview_state["window"] = None
-                preview_state["view"] = None
-                preview_win.destroy()
-
-            preview_win.protocol("WM_DELETE_WINDOW", _on_close)
-            update_preview()
+        def _recompute_draft_timings() -> None:
+            if not state["drafts"]:
+                return
+            sentences = [draft.get("text", "") for draft in state["drafts"]]
+            _apply_sentence_timings(sentences)
+            _refresh_draft_table(select_index=state.get("selected_index"))
 
         cost_frame = ttk.Frame(content_frame)
         cost_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
-        ttk.Button(cost_frame, text="Предпросмотр", command=open_preview).pack(side=tk.LEFT)
+        ttk.Button(
+            cost_frame,
+            text="Предпросмотр",
+            command=lambda: (_warn_missing_html_template(), _update_preview()),
+        ).pack(side=tk.LEFT)
 
         save_count_var = tk.StringVar(value="0")
         save_total_var = tk.StringVar(value="0")
@@ -8944,10 +8981,6 @@ class AnkiApp(tk.Tk):
             return 25
 
         def _get_drafts_to_save() -> list[dict]:
-            _sync_active_draft()
-            selection = draft_listbox.curselection()
-            if selection:
-                return [state["drafts"][idx] for idx in selection if idx < len(state["drafts"])]
             return list(state["drafts"])
 
         def _update_save_pricing() -> None:
@@ -8960,6 +8993,10 @@ class AnkiApp(tk.Tk):
             if stt_state.get("running"):
                 save_btn.configure(state=tk.DISABLED)
                 save_hint_var.set("Идёт распознавание…")
+                return
+            if not state.get("video_path"):
+                save_btn.configure(state=tk.DISABLED)
+                save_hint_var.set("Выберите видео")
                 return
             if count == 0:
                 save_btn.configure(state=tk.DISABLED)
@@ -8980,6 +9017,10 @@ class AnkiApp(tk.Tk):
             if not drafts_to_save:
                 messagebox.showwarning("Сохранение", "Нет карточек для сохранения.", parent=win)
                 return
+            video_path = state.get("video_path")
+            if not video_path:
+                messagebox.showwarning("Видео", "Сначала выберите видео файл.", parent=win)
+                return
             _warn_missing_html_template()
             price_per_card = _get_video_clip_card_price()
             total_cost = price_per_card * len(drafts_to_save)
@@ -8987,15 +9028,9 @@ class AnkiApp(tk.Tk):
                 _update_save_pricing()
                 messagebox.showwarning("Кредиты", "Недостаточно кредитов.", parent=win)
                 return
-            poster_path = state.get("poster_path")
-            front_video_path = state.get("front_video")
-            back_video_path = state.get("back_video")
-            front_video_html = build_video_html(front_video_path, poster_path)
-            back_video_html = build_video_html(back_video_path, poster_path)
-            front_image_html = build_image_html(poster_path) if front_video_path else ""
-            back_image_html = build_image_html(poster_path) if back_video_path else ""
             template = get_active_generation_template(deck_id)
             template_question = template.get("question") or ""
+            created_files: list[str] = []
 
             conn = get_connection()
 
@@ -9008,32 +9043,64 @@ class AnkiApp(tk.Tk):
                     meta={"deck_id": deck_id, "count": len(drafts_to_save)},
                 )
                 created = 0
-                for draft in drafts_to_save:
+                output_dir = ensure_dir(os.path.join(MEDIA_FOLDER, "clips", str(deck_id)))
+                for idx, draft in enumerate(drafts_to_save, start=1):
+                    sentence = draft.get("text") or ""
+                    if not sentence.strip():
+                        continue
+                    ok, result = safe_cut_video_clip_with_poster(
+                        video_path,
+                        float(draft.get("start", 0)),
+                        float(draft.get("end", 0)),
+                        output_dir,
+                        clip_label=f"{idx:03d}",
+                    )
+                    if not ok:
+                        raise RuntimeError(result)
+                    clip_path = result.get("clip_path")
+                    poster_path = result.get("poster_path")
+                    created_files.extend([clip_path, poster_path])
+
+                    if reverse_var.get():
+                        front_html = html.escape(sentence).replace("\n", "<br>")
+                        back_html = ""
+                        front_video_path = None
+                        back_video_path = clip_path
+                        front_video_html = ""
+                        back_video_html = build_video_html(clip_path, poster_path)
+                    else:
+                        front_html = ""
+                        back_html = html.escape(sentence).replace("\n", "<br>")
+                        front_video_path = clip_path
+                        back_video_path = None
+                        front_video_html = build_video_html(clip_path, poster_path)
+                        back_video_html = ""
+
                     ctx = {
                         "question": template_question,
-                        "front_html": draft.get("front_html") or "",
-                        "back_html": draft.get("back_html") or "",
-                        "front": plain_text_from_html(draft.get("front_html") or ""),
-                        "back": plain_text_from_html(draft.get("back_html") or ""),
+                        "front_html": front_html,
+                        "back_html": back_html,
+                        "front": plain_text_from_html(front_html),
+                        "back": plain_text_from_html(back_html),
                         "front_video_html": front_video_html,
                         "back_video_html": back_video_html,
                         "front_video": front_video_html,
                         "back_video": back_video_html,
                         "video": front_video_html or back_video_html,
-                        "front_image": front_image_html,
-                        "back_image": back_image_html,
-                        "image": front_image_html or back_image_html,
+                        "front_image": "",
+                        "back_image": "",
+                        "image": "",
                         "front_audio": "",
                         "back_audio": "",
                         "audio": "",
                     }
                     front, back = render_card_html(deck_id, ctx)
                     note_fields = {
-                        "word": os.path.basename(front_video_path or back_video_path or state.get("clip_path") or "clip"),
+                        "word": sentence.strip(),
                         "translation": "",
-                        "example": "",
+                        "example": sentence.strip(),
                         "level": 1,
-                        "image": poster_path or "",
+                        "image": "",
                         "front": front,
                         "back": back,
                         "front_image_path": poster_path if front_video_path else None,
@@ -9045,6 +9112,9 @@ class AnkiApp(tk.Tk):
                         "back_video_html": ctx.get("back_video_html"),
                         "front_video": ctx.get("front_video"),
                         "back_video": ctx.get("back_video"),
+                        "front_video_path": front_video_path,
+                        "back_video_path": back_video_path,
+                        "poster_path": poster_path,
                     }
                     note_id, _ = create_note_with_cards_in_transaction(
                         conn,
@@ -9068,6 +9138,12 @@ class AnkiApp(tk.Tk):
                 created = commit_with_retry(conn, _op)
             except Exception as exc:
                 conn.rollback()
+                for path in created_files:
+                    if path and os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
                 messagebox.showerror("Ошибка", f"Не удалось сохранить карточки: {exc}", parent=win)
                 return
             finally:
