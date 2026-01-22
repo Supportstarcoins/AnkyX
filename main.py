@@ -776,7 +776,12 @@ except ImportError:
     sr = None
     SR_AVAILABLE = False
 
-FASTER_WHISPER_AVAILABLE = importlib.util.find_spec("faster_whisper") is not None
+try:
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except Exception:
+    WhisperModel = None
+    FASTER_WHISPER_AVAILABLE = False
 WHISPER_AVAILABLE = importlib.util.find_spec("whisper") is not None
 VOSK_AVAILABLE = importlib.util.find_spec("vosk") is not None
 WEBRTCVAD_AVAILABLE = importlib.util.find_spec("webrtcvad") is not None
@@ -5006,6 +5011,21 @@ def _normalize_lang(lang: str | None) -> str | None:
     return value.split("-")[0]
 
 
+def _map_whisper_language(lang: str | None) -> str | None:
+    if not lang:
+        return None
+    value = lang.replace("_", "-").strip()
+    if not value or value.lower() == "auto":
+        return None
+    mapping = {
+        "de-de": "de",
+        "ru-ru": "ru",
+        "en-us": "en",
+    }
+    normalized = value.lower()
+    return mapping.get(normalized, _normalize_lang(value))
+
+
 def _stt_user_message(reason: str, detail: str | None = None) -> str:
     if reason == "no_speech":
         return "Речь не обнаружена (тишина/очень тихо)."
@@ -5104,6 +5124,22 @@ def _analyze_speech_presence(wav_path: str, log_lines: list[str]) -> tuple[float
     log_lines.append(f"audio_rms={rms:.6f}")
     log_lines.append(f"audio_voiced_ratio={voiced_ratio:.4f}")
     return duration, rms, voiced_ratio
+
+
+def _apply_gain_if_needed(wav_path: str, rms: float, log_lines: list[str]) -> float:
+    if not NUMPY_AVAILABLE:
+        return rms
+    if rms <= 0:
+        return rms
+    if rms >= 0.03:
+        return rms
+    audio, sr = _load_wav_mono(wav_path)
+    boosted = audio * 2.0
+    _write_wav_mono(wav_path, boosted, sr=sr)
+    new_rms = float(np.sqrt(np.mean(np.square(boosted)))) if len(boosted) else 0.0
+    log_lines.append("gain_db=6")
+    log_lines.append(f"audio_rms_after_gain={new_rms:.6f}")
+    return new_rms
 
 
 def extract_preprocessed_wav(
@@ -5264,7 +5300,7 @@ def extract_and_preprocess_audio(
     return extract_preprocessed_wav(video_path, start=start, end=end, log_lines=log_lines)
 
 
-def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 25.0) -> list[tuple[str, float, float]]:
+def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 30.0) -> list[tuple[str, float, float]]:
     audio, sr = _load_wav_mono(wav_path)
     duration = len(audio) / max(1, sr)
     if duration <= max_chunk_sec:
@@ -5277,8 +5313,9 @@ def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 25.0) -> list[
     if not speech_segments:
         start = 0.0
         idx = 0
+        chunk_size = min(25.0, max_chunk_sec)
         while start < duration:
-            end = min(duration, start + 20.0)
+            end = min(duration, start + chunk_size)
             start_idx = int(start * sr)
             end_idx = int(end * sr)
             chunk_audio = audio[start_idx:end_idx]
@@ -5332,106 +5369,91 @@ def _find_vosk_model(lang: str) -> str | None:
     return None
 
 
-def transcribe_audio_chunks(
-    chunks: list[tuple[str, float, float]],
+def stt_transcribe_wav(
+    wav_path: str,
     lang: str | None,
-    log_lines: list[str],
+    engine_pref: str = "auto",
 ) -> tuple[str, list[dict], str]:
     segments: list[dict] = []
-    lang_short = _normalize_lang(lang)
-    if FASTER_WHISPER_AVAILABLE:
-        from faster_whisper import WhisperModel
-
-        try:
-            model = WhisperModel(STT_WHISPER_MODEL, device="cpu", compute_type="int8")
-            for chunk_path, t0, _ in chunks:
-                kwargs = {"vad_filter": True}
-                if lang_short:
-                    kwargs["language"] = lang_short
-                seg_iter, _info = model.transcribe(chunk_path, **kwargs)
-                for seg in seg_iter:
-                    text = (seg.text or "").strip()
-                    if not text:
-                        continue
-                    segments.append(
-                        {"start": float(seg.start) + t0, "end": float(seg.end) + t0, "text": text}
-                    )
-            text = " ".join(seg["text"] for seg in segments).strip()
-            log_lines.append("engine=faster-whisper")
-            return text, segments, "faster-whisper"
-        except Exception as exc:
-            log_lines.append(f"engine_faster_whisper_error={exc}")
-    if WHISPER_AVAILABLE:
-        import whisper
-
-        try:
-            model = whisper.load_model(STT_WHISPER_MODEL)
-            for chunk_path, t0, _ in chunks:
-                kwargs = {"task": "transcribe"}
-                if lang_short:
-                    kwargs["language"] = lang_short
-                result = model.transcribe(chunk_path, **kwargs)
-                for seg in result.get("segments") or []:
-                    text = (seg.get("text") or "").strip()
-                    if not text:
-                        continue
-                    segments.append(
-                        {
-                            "start": float(seg.get("start", 0.0)) + t0,
-                            "end": float(seg.get("end", 0.0)) + t0,
-                            "text": text,
-                        }
-                    )
-            text = " ".join(seg["text"] for seg in segments).strip()
-            log_lines.append("engine=whisper")
-            return text, segments, "whisper"
-        except Exception as exc:
-            log_lines.append(f"engine_whisper_error={exc}")
-    if VOSK_AVAILABLE:
-        model_path = _find_vosk_model(lang_short or "en")
-        if model_path:
+    chunk_paths: list[str] = []
+    try:
+        lang_whisper = _map_whisper_language(lang or "Auto")
+        if FASTER_WHISPER_AVAILABLE and engine_pref in {"auto", "whisper"}:
             try:
-                from vosk import KaldiRecognizer, Model, SetLogLevel
+                model = WhisperModel(STT_WHISPER_MODEL, device="cpu", compute_type="int8")
+                duration = 0.0
+                try:
+                    import wave
 
-                SetLogLevel(-1)
-                model = Model(model_path)
-                for chunk_path, t0, _ in chunks:
-                    with open(chunk_path, "rb") as f:
-                        data = f.read()
-                    rec = KaldiRecognizer(model, 16000)
-                    rec.SetWords(True)
-                    rec.AcceptWaveform(data)
-                    result = json.loads(rec.Result())
-                    text = (result.get("text") or "").strip()
-                    words = result.get("result") or []
-                    start_ts = float(words[0]["start"]) + t0 if words else t0
-                    end_ts = float(words[-1]["end"]) + t0 if words else t0
-                    if text:
-                        segments.append({"start": start_ts, "end": end_ts, "text": text})
+                    with wave.open(wav_path, "rb") as wf:
+                        duration = wf.getnframes() / max(1, wf.getframerate())
+                except Exception:
+                    duration = 0.0
+                if duration > 60.0:
+                    chunks = split_audio_into_chunks(wav_path, max_chunk_sec=30.0)
+                    for chunk_path, t0, _ in chunks:
+                        if chunk_path != wav_path:
+                            chunk_paths.append(chunk_path)
+                        seg_iter, _info = model.transcribe(
+                            chunk_path,
+                            language=lang_whisper,
+                            vad_filter=True,
+                            beam_size=5,
+                            condition_on_previous_text=False,
+                        )
+                        for seg in seg_iter:
+                            text = (seg.text or "").strip()
+                            if not text:
+                                continue
+                            segments.append(
+                                {"start": float(seg.start) + t0, "end": float(seg.end) + t0, "text": text}
+                            )
+                else:
+                    seg_iter, _info = model.transcribe(
+                        wav_path,
+                        language=lang_whisper,
+                        vad_filter=True,
+                        beam_size=5,
+                        condition_on_previous_text=False,
+                    )
+                    for seg in seg_iter:
+                        text = (seg.text or "").strip()
+                        if not text:
+                            continue
+                        segments.append(
+                            {"start": float(seg.start), "end": float(seg.end), "text": text}
+                        )
                 text = " ".join(seg["text"] for seg in segments).strip()
-                log_lines.append("engine=vosk")
-                return text, segments, "vosk"
-            except Exception as exc:
-                log_lines.append(f"engine_vosk_error={exc}")
-        else:
-            log_lines.append("engine_vosk_error=missing_model")
-    if SR_AVAILABLE:
-        r = sr.Recognizer()
-        for chunk_path, t0, t1 in chunks:
-            with sr.AudioFile(chunk_path) as source:
-                audio_data = r.record(source)
-            try:
-                text = r.recognize_google(audio_data, language=lang or "en-US")
-            except sr.RequestError as exc:
-                raise STTError(_stt_user_message("network"), "network", str(exc)) from exc
-            except sr.UnknownValueError:
-                text = ""
-            if text:
-                segments.append({"start": t0, "end": t1, "text": text.strip()})
-        text = " ".join(seg["text"] for seg in segments).strip()
-        log_lines.append("engine=google")
-        return text, segments, "google"
-    raise STTError(_stt_user_message("no_engine"), "no_engine")
+                if text:
+                    return text, segments, "whisper"
+            except Exception:
+                segments = []
+        if SR_AVAILABLE and engine_pref in {"auto", "google"}:
+            r = sr.Recognizer()
+            chunks = split_audio_into_chunks(wav_path, max_chunk_sec=25.0)
+            for chunk_path, t0, t1 in chunks:
+                if chunk_path != wav_path:
+                    chunk_paths.append(chunk_path)
+                with sr.AudioFile(chunk_path) as source:
+                    audio_data = r.record(source)
+                try:
+                    text = r.recognize_google(audio_data, language=lang or "en-US")
+                except sr.RequestError as exc:
+                    raise STTError(_stt_user_message("network"), "network", str(exc)) from exc
+                except sr.UnknownValueError:
+                    text = ""
+                if text:
+                    segments.append({"start": t0, "end": t1, "text": text.strip()})
+            text = " ".join(seg["text"] for seg in segments).strip()
+            return text, segments, "google"
+        raise STTError(_stt_user_message("no_engine"), "no_engine")
+    finally:
+        for chunk_path in chunk_paths:
+            if os.path.exists(chunk_path):
+                try:
+                    os.remove(chunk_path)
+                except Exception:
+                    pass
 
 
 def _postprocess_transcript(text: str, segments: list[dict]) -> str:
@@ -5493,7 +5515,7 @@ def run_stt_pipeline(
     punctuate: bool = True,
     preprocessed: bool = False,
     log_context: list[str] | None = None,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], str]:
     lang_label = lang or "Auto"
     log_lines: list[str] = [
         f"source_path={source_path}",
@@ -5506,7 +5528,6 @@ def run_stt_pipeline(
         log_lines.extend(log_context)
     wav_path = None
     delete_wav = True
-    chunk_paths: list[str] = []
     try:
         if preprocessed:
             wav_path = source_path
@@ -5519,14 +5540,15 @@ def run_stt_pipeline(
                 log_lines=log_lines,
             )
         duration, rms, voiced_ratio = _analyze_speech_presence(wav_path, log_lines)
+        rms = _apply_gain_if_needed(wav_path, rms, log_lines)
         if duration < 0.3 or rms < 0.004 or voiced_ratio < 0.01:
             raise STTError(_stt_user_message("no_speech"), "no_speech")
-        chunks = split_audio_into_chunks(wav_path)
-        for chunk_path, _, _ in chunks:
-            if chunk_path != wav_path:
-                chunk_paths.append(chunk_path)
-        text, segments, engine = transcribe_audio_chunks(chunks, lang, log_lines)
+        text, segments, engine = stt_transcribe_wav(wav_path, lang, engine_pref="auto")
         log_lines.append(f"engine_used={engine}")
+        if engine == "whisper":
+            log_lines.append(f"model_name={STT_WHISPER_MODEL}")
+        else:
+            log_lines.append("model_name=google")
         log_lines.append(f"segments_count={len(segments)}")
         log_lines.append(f"text_preview={(text or '').strip()[:200]}")
         log_lines.append(f"text_length={len(text.strip())}")
@@ -5536,7 +5558,7 @@ def run_stt_pipeline(
             raise STTError(_stt_user_message("wrong_language", lang_label), "wrong_language", lang_label)
         final_text = _postprocess_transcript(text, segments) if punctuate else text.strip()
         _write_stt_log(log_lines)
-        return final_text, segments
+        return final_text, segments, engine
     except STTError as exc:
         log_lines.append(f"stt_error_reason={exc.reason}")
         log_lines.append(f"stt_error_detail={exc.detail}")
@@ -5561,12 +5583,6 @@ def run_stt_pipeline(
                 os.remove(wav_path)
             except Exception:
                 pass
-        for chunk_path in chunk_paths:
-            if os.path.exists(chunk_path):
-                try:
-                    os.remove(chunk_path)
-                except Exception:
-                    pass
 
 
 def show_stt_error_dialog(parent: tk.Misc | None, title: str, message: str) -> None:
@@ -5632,7 +5648,7 @@ def record_speech_to_text(
     if progress_queue is not None:
         progress_queue.put(("progress", duration_sec, max(duration_sec, 1), "Распознавание"))
     try:
-        text, _segments = run_stt_pipeline(audio_path, lang="de-DE", punctuate=False)
+        text, _segments, _engine = run_stt_pipeline(audio_path, lang="de-DE", punctuate=False)
     except STTError as exc:
         raise RuntimeError(exc.user_message) from exc
     except Exception as exc:
@@ -5648,7 +5664,7 @@ def transcribe_audio_to_text(
     if not audio_path or not os.path.exists(audio_path):
         raise FileNotFoundError(audio_path)
     try:
-        text, _segments = run_stt_pipeline(audio_path, lang=lang or "de-DE", punctuate=punctuate)
+        text, _segments, _engine = run_stt_pipeline(audio_path, lang=lang or "de-DE", punctuate=punctuate)
     except STTError as exc:
         raise RuntimeError(exc.user_message) from exc
     return text
@@ -5659,7 +5675,7 @@ def transcribe_audio_file(
     lang: str | None = None,
     punctuate: bool = True,
     log_context: list[str] | None = None,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], str]:
     if not wav_path or not os.path.exists(wav_path):
         raise FileNotFoundError(wav_path)
     return run_stt_pipeline(
@@ -5717,7 +5733,7 @@ def auto_generate_cards_from_speech(deck_id: int,
         progress_queue.put(("progress", duration_sec, max(duration_sec, 1), "Распознавание"))
 
     try:
-        text, _segments = run_stt_pipeline(audio_path, lang="de-DE", punctuate=False)
+        text, _segments, _engine = run_stt_pipeline(audio_path, lang="de-DE", punctuate=False)
     except STTError as exc:
         raise RuntimeError(exc.user_message) from exc
     except Exception as exc:
@@ -5756,7 +5772,7 @@ def auto_generate_cards_from_video(deck_id: int,
         temp_audio = extract_and_preprocess_audio(video_path)
 
         # Распознать речь из аудио
-        text, _segments = run_stt_pipeline(
+        text, _segments, _engine = run_stt_pipeline(
             temp_audio,
             lang="de-DE",
             punctuate=False,
@@ -9200,7 +9216,7 @@ class AnkiApp(tk.Tk):
                             raise RuntimeError("Время окончания должно быть больше времени начала.")
                         target_path = video_path
                     win.after(0, lambda: stt_status_var.set("⏳ Распознаю…"))
-                    text, _segments = run_stt_pipeline(
+                    text, _segments, _engine = run_stt_pipeline(
                         target_path,
                         start=start_sec,
                         end=end_sec,
@@ -21146,6 +21162,7 @@ class VideoClipCardsWindow:
     """Видео → клипы → карточки (автозапуск + авто-STT + таймкоды)."""
 
     STT_LANG_CHOICES = ["Auto", "ru-RU", "en-US", "de-DE"]
+    STT_MODEL_CHOICES = ["tiny", "base", "small", "medium"]
 
     def __init__(self, app: "AnkiApp", deck_id: int) -> None:
         self.app = app
@@ -21268,6 +21285,25 @@ class VideoClipCardsWindow:
         ttk.Button(options_row, text="Сменить язык", command=self._open_stt_lang_menu).pack(
             side=tk.LEFT
         )
+        ttk.Label(options_row, text="Модель:").pack(side=tk.LEFT, padx=(12, 0))
+        global STT_WHISPER_MODEL
+        default_model = STT_WHISPER_MODEL if STT_WHISPER_MODEL in self.STT_MODEL_CHOICES else "small"
+        STT_WHISPER_MODEL = default_model
+        self.stt_model_var = tk.StringVar(value=default_model)
+        self.stt_model_combo = ttk.Combobox(
+            options_row,
+            textvariable=self.stt_model_var,
+            values=self.STT_MODEL_CHOICES,
+            state="readonly",
+            width=7,
+        )
+        self.stt_model_combo.pack(side=tk.LEFT, padx=(6, 0))
+        self.stt_model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_stt_model_change())
+
+        self.stt_engine_var = tk.StringVar(value=self._default_engine_label())
+        ttk.Label(frame, textvariable=self.stt_engine_var, foreground="gray").pack(
+            anchor="w", padx=6, pady=(0, 4)
+        )
 
         self.stt_text = scrolledtext.ScrolledText(frame, height=6)
         style_text_widget(self.stt_text, getattr(self.app, "palette", None) or {})
@@ -21307,6 +21343,31 @@ class VideoClipCardsWindow:
     def _maybe_auto_stt_language(self) -> None:
         if self.auto_stt_var.get():
             self._request_stt()
+
+    def _on_stt_model_change(self) -> None:
+        global STT_WHISPER_MODEL
+        selected = (self.stt_model_var.get() or "").strip()
+        if selected:
+            STT_WHISPER_MODEL = selected
+        self.stt_engine_var.set(self._default_engine_label())
+        if self.auto_stt_var.get():
+            self._request_stt()
+
+    def _default_engine_label(self) -> str:
+        model_name = STT_WHISPER_MODEL if STT_WHISPER_MODEL else "small"
+        if FASTER_WHISPER_AVAILABLE:
+            return f"Движок: Whisper {model_name} (VAD)"
+        return "Движок: Google (fallback) — установите faster-whisper"
+
+    def _update_engine_label(self, engine: str) -> None:
+        model_name = STT_WHISPER_MODEL if STT_WHISPER_MODEL else "small"
+        if engine == "whisper":
+            label = f"Движок: Whisper {model_name} (VAD)"
+        else:
+            label = "Движок: Google (fallback)"
+            if not FASTER_WHISPER_AVAILABLE:
+                label += " — установите faster-whisper"
+        self.stt_engine_var.set(label)
 
     def _build_sentences_block(self, parent: tk.Widget) -> None:
         frame = ttk.LabelFrame(parent, text="Предложения и таймкоды")
@@ -21437,14 +21498,17 @@ class VideoClipCardsWindow:
                 ]
                 temp_wav = extract_audio_from_video(self.video_path, log_lines=log_context)
                 self.win.after(0, lambda: self.stt_status_var.set("⏳ распознавание"))
-                text, segments = transcribe_audio_file(
+                text, segments, engine = transcribe_audio_file(
                     temp_wav,
                     lang=self._get_selected_stt_language(),
                     punctuate=True,
                     log_context=log_context,
                 )
                 duration = get_video_duration_seconds(self.video_path)
-                return ("done", {"text": text, "duration": duration, "segments": segments})
+                return (
+                    "done",
+                    {"text": text, "duration": duration, "segments": segments, "engine": engine},
+                )
             except Exception as exc:
                 return ("error", str(exc))
             finally:
@@ -21467,9 +21531,11 @@ class VideoClipCardsWindow:
             text = str(payload.get("text") or "")
             duration = payload.get("duration")
             segments = payload.get("segments") or []
+            engine = str(payload.get("engine") or "")
             self.stt_text.delete("1.0", tk.END)
             self.stt_text.insert("1.0", text)
             self.stt_status_var.set("✅ готово")
+            self._update_engine_label(engine)
             self._build_sentences_from_text(text, duration, segments)
             self._update_save_pricing()
 
