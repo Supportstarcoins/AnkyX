@@ -5600,7 +5600,7 @@ def _split_wav_with_ffmpeg(
     return chunks, duration
 
 
-def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 30.0) -> list[tuple[str, float, float]]:
+def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 25.0) -> list[tuple[str, float, float]]:
     audio, sr = _load_wav_mono(wav_path)
     duration = len(audio) / max(1, sr)
     if duration <= max_chunk_sec:
@@ -5701,7 +5701,7 @@ def stt_transcribe_wav(
                     )
                     total_seconds = duration or chunk_duration
                 except Exception:
-                    chunks = split_audio_into_chunks(wav_path, max_chunk_sec=30.0)
+                    chunks = split_audio_into_chunks(wav_path, max_chunk_sec=25.0)
                     total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
                 write_log(f"chunks_count={len(chunks)}")
                 def _run_whisper(vad_filter: bool) -> tuple[str, list[dict], float]:
@@ -5726,13 +5726,29 @@ def stt_transcribe_wav(
                                 write_log(f"progress={progress_percent} chunk_t1={t1:.2f}")
                         if chunk_path != wav_path and chunk_path not in chunk_paths:
                             chunk_paths.append(chunk_path)
-                        seg_iter, _info = model.transcribe(
-                            chunk_path,
-                            language=lang_whisper,
-                            vad_filter=vad_filter,
-                            beam_size=3,
-                            condition_on_previous_text=True,
-                        )
+                        chunk_segments = 0
+                        try:
+                            seg_iter, _info = model.transcribe(
+                                chunk_path,
+                                language=lang_whisper,
+                                vad_filter=vad_filter,
+                                beam_size=1,
+                                condition_on_previous_text=True,
+                            )
+                        except Exception as exc:
+                            if vad_filter:
+                                write_log(
+                                    f"whisper_chunk_vad_retry idx={idx}/{len(chunks)} reason={type(exc).__name__}:{exc}"
+                                )
+                                seg_iter, _info = model.transcribe(
+                                    chunk_path,
+                                    language=lang_whisper,
+                                    vad_filter=False,
+                                    beam_size=1,
+                                    condition_on_previous_text=True,
+                                )
+                            else:
+                                raise
                         for seg in seg_iter:
                             if cancel_event is not None and cancel_event.is_set():
                                 raise STTCancelled()
@@ -5744,6 +5760,7 @@ def stt_transcribe_wav(
                             all_segments.append(
                                 {"start": seg_start, "end": seg_end, "text": text_part}
                             )
+                            chunk_segments += 1
                             last_processed = max(last_processed, seg_end)
                             if progress_cb is not None:
                                 progress_cb(last_processed, total_seconds, idx, len(chunks))
@@ -5755,6 +5772,9 @@ def stt_transcribe_wav(
                                 if decile > last_logged_decile:
                                     last_logged_decile = decile
                                     write_log(f"progress={progress_percent} seg_end={seg_end:.2f}")
+                        write_log(
+                            f"whisper_chunk_segments idx={idx}/{len(chunks)} count={chunk_segments} t0={t0:.2f} t1={t1:.2f}"
+                        )
                         if progress_cb is not None:
                             progress_cb(max(last_processed, t1), total_seconds, idx, len(chunks))
                     full_text = " ".join(all_text_parts).strip()
@@ -6024,14 +6044,25 @@ def run_stt_pipeline(
         heartbeat_stop = threading.Event()
 
         def _heartbeat_loop() -> None:
+            last_log_at = time.monotonic()
             while not heartbeat_stop.wait(STT_WHISPER_HEARTBEAT_SEC):
+                current_overall = progress_state.get("overall")
+                current_status = progress_state.get("status")
+                current_stt = progress_state.get("stt_percent")
                 _emit_progress(
-                    overall=progress_state.get("overall"),
-                    status=progress_state.get("status"),
+                    overall=current_overall,
+                    status=current_status,
                     mode=None,
-                    stt_percent=progress_state.get("stt_percent"),
+                    stt_percent=current_stt,
                     heartbeat=True,
                 )
+                now = time.monotonic()
+                if (now - last_log_at) >= 10.0:
+                    last_log_at = now
+                    _append_log_line(
+                        log_lines,
+                        f"heartbeat overall={current_overall} stt_percent={current_stt} status={current_status}",
+                    )
 
         heartbeat_thread = None
         if progress_queue is not None:
@@ -22037,6 +22068,7 @@ class VideoClipCardsWindow:
         ).pack(side=tk.LEFT)
         self.stt_cancel_btn = ttk.Button(action_row, text="Отмена", command=self._cancel_stt, state=tk.DISABLED)
         self.stt_cancel_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.win.after(100, lambda: self._poll_stt_progress(self.stt_job_id))
 
     def _default_stt_language(self) -> str:
         mapping = {"ru": "ru-RU", "en": "en-US", "de": "de-DE"}
@@ -22250,6 +22282,7 @@ class VideoClipCardsWindow:
             return
         progress_queue = self.stt_progress_queue
         if progress_queue is None:
+            self.win.after(100, lambda: self._poll_stt_progress(job_id))
             return
         now = time.time()
         while True:
@@ -22268,24 +22301,26 @@ class VideoClipCardsWindow:
                 self._set_stt_progress_mode(mode)
             if status:
                 self.stt_status_var.set(f"⏳ {status}")
-                if heartbeat:
-                    self.stt_last_progress_at = now
-                    self.stt_watchdog_warned = False
             if overall is not None:
                 self.stt_progress.configure(value=max(0.0, min(100.0, overall)))
                 if overall != self.stt_last_progress_value:
                     self.stt_last_progress_value = overall
                     self.stt_last_progress_at = now
                     self.stt_watchdog_warned = False
-            if heartbeat and overall is None and status is None:
+            if heartbeat:
                 self.stt_last_progress_at = now
                 self.stt_watchdog_warned = False
+        threshold = max(
+            90,
+            int((self.stt_total_duration_sec or 0.0) * 0.6),
+            STT_WATCHDOG_IDLE_SEC,
+        )
         if (
             self.stt_running
             and not self.stt_watchdog_warned
             and self.stt_last_progress_at
             and (time.time() - self.stt_last_progress_at)
-            > max(60, int((self.stt_total_duration_sec or 0.0) * 0.7) or STT_WATCHDOG_IDLE_SEC)
+            > threshold
         ):
             self.stt_watchdog_warned = True
             self.stt_status_var.set("⚠️ Похоже, процесс завис. См. лог.")
@@ -22297,7 +22332,7 @@ class VideoClipCardsWindow:
                 f"Лог: {get_log_path()}",
                 parent=self.win,
             )
-        if self.stt_running and job_id == self.stt_job_id:
+        if job_id == self.stt_job_id:
             self.win.after(100, lambda: self._poll_stt_progress(job_id))
 
     def _cancel_stt(self) -> None:
