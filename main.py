@@ -267,6 +267,8 @@ from deck_timer import (
 from video_tools import (
     VlcPlayerWidget,
     cut_video_clip,
+    cut_video_clip_with_fallback,
+    get_clip_log_path,
     find_ffmpeg,
     format_hms,
     get_video_duration_seconds,
@@ -5040,6 +5042,50 @@ def get_log_path() -> str:
     return os.path.join(get_log_dir(), "stt_last.log")
 
 
+def get_clip_log_path_ui() -> str:
+    return get_clip_log_path()
+
+
+def _append_clip_log_lines(lines: list[str]) -> None:
+    log_path = get_clip_log_path_ui()
+    with open(log_path, "a", encoding="utf-8") as handle:
+        for line in lines:
+            handle.write(f"{line}\n")
+            handle.flush()
+
+
+def _open_clip_log() -> None:
+    log_path = get_clip_log_path_ui()
+    if not os.path.exists(log_path):
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8"):
+            pass
+    if sys.platform.startswith("win"):
+        os.startfile(log_path)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", log_path])
+    else:
+        subprocess.Popen(["xdg-open", log_path])
+
+
+def show_clip_error_dialog(parent: tk.Misc | None, title: str, message: str) -> None:
+    win = tk.Toplevel(parent) if parent is not None else tk.Toplevel()
+    win.title(title)
+    win.geometry("560x260")
+    try:
+        apply_dark_theme_to_window(win, getattr(parent, "palette", None))
+    except Exception:
+        pass
+    container = ttk.Frame(win)
+    container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+    ttk.Label(container, text=message, wraplength=520, style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
+    log_hint = f"Лог: {get_clip_log_path_ui()}"
+    ttk.Label(container, text=log_hint, wraplength=520, style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
+    btn_row = ttk.Frame(container)
+    btn_row.pack(fill=tk.X, side=tk.BOTTOM)
+    ttk.Button(btn_row, text="Открыть лог", command=_open_clip_log).pack(side=tk.LEFT)
+    ttk.Button(btn_row, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
 def write_log(line: str) -> None:
     log_path = get_log_path()
     with open(log_path, "a", encoding="utf-8") as f:
@@ -8131,16 +8177,18 @@ def safe_cut_video_clip(
     start_tc: str,
     end_tc: str,
     media_root: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     if not video_path or not os.path.exists(video_path):
-        return False, "Видео файл не найден."
+        return False, "Видео файл не найден.", ""
 
     start_seconds = parse_timecode_to_seconds(start_tc)
     end_seconds = parse_timecode_to_seconds(end_tc)
     if start_seconds is None or end_seconds is None:
-        return False, "Неверный формат времени. Используйте SS, MM:SS или HH:MM:SS (дробные секунды допустимы)."
+        return False, "Неверный формат времени. Используйте SS, MM:SS или HH:MM:SS (дробные секунды допустимы).", ""
     if end_seconds <= start_seconds:
-        return False, "Время окончания должно быть больше времени начала."
+        return False, "Время окончания должно быть больше времени начала.", ""
+    if (end_seconds - start_seconds) <= 0.2:
+        return False, "Длительность клипа должна быть больше 0.2 секунды.", ""
 
     if os.path.basename(media_root) == "clips" or os.path.basename(os.path.dirname(media_root)) == "clips":
         output_dir = media_root
@@ -8156,12 +8204,12 @@ def safe_cut_video_clip(
     start_tc_norm = format_hms(int(start_seconds)) if float(start_seconds).is_integer() else start_tc
     end_tc_norm = format_hms(int(end_seconds)) if float(end_seconds).is_integer() else end_tc
     try:
-        ok, result = cut_video_clip(video_path, start_tc_norm, end_tc_norm, output_dir)
+        ok, result, mode = cut_video_clip(video_path, start_tc_norm, end_tc_norm, output_dir)
     except Exception as exc:
-        ok, result = False, str(exc)
+        ok, result, mode = False, str(exc), ""
 
     if ok:
-        return True, result
+        return True, result, mode
 
     error_text = str(result)
     lowered = error_text.lower()
@@ -8175,9 +8223,9 @@ def safe_cut_video_clip(
             clip = mp.VideoFileClip(video_path)
             subclip = clip.subclip(start_seconds, end_seconds)
             subclip.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
-            return True, output_path
+            return True, output_path, "libx264"
         except Exception as exc:
-            return False, str(exc)
+            return False, str(exc), ""
         finally:
             if subclip is not None:
                 try:
@@ -8190,7 +8238,7 @@ def safe_cut_video_clip(
                 except Exception:
                     pass
 
-    return False, error_text
+    return False, error_text, ""
 
 
 def cut_video_clip_with_poster_h264(
@@ -8199,35 +8247,32 @@ def cut_video_clip_with_poster_h264(
     end_sec: float,
     output_dir: str,
     base_name: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     if not video_path or not os.path.exists(video_path):
         raise FileNotFoundError(video_path)
     if end_sec <= start_sec:
         raise ValueError("end_sec must be > start_sec")
+    if (end_sec - start_sec) <= 0.2:
+        raise ValueError("clip duration must be > 0.2 seconds")
     os.makedirs(output_dir, exist_ok=True)
     clip_path = os.path.join(output_dir, f"{base_name}.mp4")
     poster_path = os.path.join(output_dir, f"{base_name}.jpg")
     ffmpeg_path = find_ffmpeg()
     if ffmpeg_path:
-        clip_cmd = [
-            ffmpeg_path,
-            "-y",
-            "-ss",
-            str(start_sec),
-            "-to",
-            str(end_sec),
-            "-i",
+        ok, mode, error = cut_video_clip_with_fallback(
             video_path,
-            "-c:v",
-            "libx264",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
+            str(start_sec),
+            str(end_sec),
             clip_path,
-        ]
+        )
+        if not ok:
+            raise RuntimeError(error)
         poster_cmd = [
             ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
             "-y",
             "-ss",
             str(start_sec),
@@ -8237,15 +8282,26 @@ def cut_video_clip_with_poster_h264(
             "1",
             poster_path,
         ]
-        clip_result = subprocess.run(clip_cmd, capture_output=True, text=True, check=False)
-        if clip_result.returncode != 0:
-            error_text = clip_result.stderr.strip() or "Не удалось нарезать клип."
-            raise RuntimeError(error_text)
-        poster_result = subprocess.run(poster_cmd, capture_output=True, text=True, check=False)
+        poster_result = subprocess.run(
+            poster_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
         if poster_result.returncode != 0:
             error_text = poster_result.stderr.strip() or "Не удалось создать постер."
+            _append_clip_log_lines(
+                [
+                    "attempt=poster",
+                    "cmd=" + " ".join(poster_cmd),
+                    f"returncode={poster_result.returncode}",
+                    f"stderr={error_text}",
+                ]
+            )
             raise RuntimeError(error_text)
-        return clip_path, poster_path
+        return clip_path, poster_path, mode
     if MOVIEPY_AVAILABLE:
         clip = None
         subclip = None
@@ -8257,7 +8313,7 @@ def cut_video_clip_with_poster_h264(
                 subclip.save_frame(poster_path, t=0)
             except Exception:
                 clip.save_frame(poster_path, t=start_sec)
-            return clip_path, poster_path
+            return clip_path, poster_path, "libx264"
         finally:
             if subclip is not None:
                 try:
@@ -9554,7 +9610,7 @@ class AnkiApp(tk.Tk):
             status_var.set("⏳ Нарезаю клип...")
 
             def _worker():
-                ok, result = safe_cut_video_clip(
+                ok, result, mode = safe_cut_video_clip(
                     video_path,
                     start_var.get(),
                     end_var.get(),
@@ -9566,7 +9622,7 @@ class AnkiApp(tk.Tk):
                     def _on_error():
                         status_var.set("Ошибка нарезки")
                         cut_btn.configure(state=tk.NORMAL)
-                        messagebox.showerror("Ошибка нарезки", error_text, parent=win)
+                        show_clip_error_dialog(win, "Ошибка нарезки", error_text)
 
                     win.after(0, _on_error)
                     return
@@ -9578,7 +9634,10 @@ class AnkiApp(tk.Tk):
                 def _on_success():
                     state["clip_path"] = clip_path
                     state["poster_path"] = None
-                    status_var.set(f"Создан клип {clip_name}")
+                    if mode == "copy":
+                        status_var.set("✅ Нарезано без перекодировки (быстро)")
+                    else:
+                        status_var.set("✅ Нарезано с перекодировкой (точно)")
                     clip_info_var.set(f"Клип: {clip_name} ({clip_info})")
                     cut_btn.configure(state=tk.NORMAL)
                     _maybe_auto_stt("clip")
@@ -22292,6 +22351,13 @@ class VideoClipCardsWindow:
                 parent=self.win,
             )
             return None
+        if (end_sec - start_sec) <= 0.2:
+            messagebox.showwarning(
+                "Диапазон",
+                "Длительность клипа должна быть больше 0.2 секунды.",
+                parent=self.win,
+            )
+            return None
         self.range_status_var.set(
             f"Диапазон: {format_hms(int(start_sec))} → {format_hms(int(end_sec))}"
         )
@@ -22310,26 +22376,30 @@ class VideoClipCardsWindow:
         base_name = f"clip_{ts}_{int(start_sec * 1000)}_{int(end_sec * 1000)}"
         self.range_status_var.set("⏳ Нарезаю клип…")
 
-        def _worker() -> tuple[bool, str, str]:
+        def _worker() -> tuple[bool, str, str, str]:
             try:
-                clip_path, poster_path = cut_video_clip_with_poster_h264(
+                clip_path, poster_path, mode = cut_video_clip_with_poster_h264(
                     self.video_path,
                     start_sec,
                     end_sec,
                     output_dir,
                     base_name,
                 )
-                return True, clip_path, poster_path
+                return True, clip_path, poster_path, mode
             except Exception as exc:
-                return False, str(exc), ""
+                return False, str(exc), "", ""
 
-        def _finish(result: tuple[bool, str, str]) -> None:
-            ok, clip_path, poster_path = result
+        def _finish(result: tuple[bool, str, str, str]) -> None:
+            ok, clip_path, poster_path, mode = result
             if not ok:
                 self.range_status_var.set("❌ Ошибка нарезки")
-                messagebox.showerror("Клип", f"Не удалось нарезать клип: {clip_path}", parent=self.win)
+                show_clip_error_dialog(self.win, "Клип", f"Не удалось нарезать клип: {clip_path}")
                 return
-            self.range_status_var.set(f"✅ Клип: {os.path.basename(clip_path)}")
+            if mode == "copy":
+                status_label = "✅ Нарезано без перекодировки (быстро)"
+            else:
+                status_label = "✅ Нарезано с перекодировкой (точно)"
+            self.range_status_var.set(status_label)
             messagebox.showinfo(
                 "Клип создан",
                 f"Клип сохранён: {clip_path}\nПостер: {poster_path}",
@@ -22824,7 +22894,7 @@ class VideoClipCardsWindow:
                 created = 0
                 for idx, sentence in enumerate(self.sentences, start=1):
                     base_name = f"clip_{idx}"
-                    clip_path, poster_path = cut_video_clip_with_poster_h264(
+                    clip_path, poster_path, _mode = cut_video_clip_with_poster_h264(
                         self.video_path,
                         float(sentence.get("start", 0)),
                         float(sentence.get("end", 0)),
@@ -22882,7 +22952,11 @@ class VideoClipCardsWindow:
         def _finish(result: tuple[bool, str]) -> None:
             ok, payload = result
             if not ok:
-                messagebox.showerror("Ошибка", f"Не удалось сохранить карточки: {payload}", parent=self.win)
+                lowered = payload.lower()
+                if "ffmpeg" in lowered or "клип" in lowered or "нарез" in lowered:
+                    show_clip_error_dialog(self.win, "Ошибка", f"Не удалось сохранить карточки: {payload}")
+                else:
+                    messagebox.showerror("Ошибка", f"Не удалось сохранить карточки: {payload}", parent=self.win)
                 self._update_save_pricing()
                 return
             created = int(payload)
