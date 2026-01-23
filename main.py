@@ -16,6 +16,7 @@ import base64
 import sqlite3
 import re
 import glob
+import multiprocessing
 import threading
 import queue
 import json
@@ -5031,6 +5032,151 @@ class STTCancelled(Exception):
     pass
 
 
+_STT_WORKER_MODEL = None
+_STT_WORKER_MODEL_KEY = None
+
+
+def _get_worker_whisper_model(model_name: str, device: str, compute_type: str):
+    global _STT_WORKER_MODEL, _STT_WORKER_MODEL_KEY
+    key = (model_name, device, compute_type)
+    if _STT_WORKER_MODEL is None or _STT_WORKER_MODEL_KEY != key:
+        from faster_whisper import WhisperModel
+
+        _STT_WORKER_MODEL = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=os.cpu_count() or 1,
+        )
+        _STT_WORKER_MODEL_KEY = key
+    return _STT_WORKER_MODEL
+
+
+def worker_process_stt(args: dict, out_queue) -> None:
+    import time as _time
+    import threading as _threading
+    import traceback as _traceback
+
+    heartbeat_sec = float(args.get("heartbeat_sec", 1.0))
+    stop_event = _threading.Event()
+
+    def _heartbeat_loop() -> None:
+        last_log_at = _time.monotonic()
+        while not stop_event.wait(heartbeat_sec):
+            out_queue.put({"type": "heartbeat", "ts": _time.time()})
+            now = _time.monotonic()
+            if (now - last_log_at) >= 10.0:
+                last_log_at = now
+                try:
+                    write_log(f"heartbeat ts={_time.time():.3f}")
+                except Exception:
+                    pass
+
+    heartbeat_thread = _threading.Thread(target=_heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
+
+    def _transcribe_chunks(vad_filter: bool):
+        model = _get_worker_whisper_model(
+            args["model_name"],
+            device=args.get("device", "cpu"),
+            compute_type=args.get("compute_type", "int8"),
+        )
+        lang = args.get("language")
+        chunks = args.get("chunks") or []
+        total_seconds = float(args.get("total_seconds") or 0.0)
+        all_text_parts: list[str] = []
+        all_segments: list[dict] = []
+        last_processed = 0.0
+        for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
+            out_queue.put(
+                {
+                    "type": "progress",
+                    "processed": last_processed,
+                    "total": total_seconds,
+                    "chunk_index": idx,
+                    "total_chunks": len(chunks),
+                    "msg": f"chunk {idx}/{len(chunks)}",
+                }
+            )
+            try:
+                seg_iter, _info = model.transcribe(
+                    chunk_path,
+                    language=lang,
+                    vad_filter=vad_filter,
+                    beam_size=1,
+                    condition_on_previous_text=True,
+                )
+            except Exception as exc:
+                if vad_filter:
+                    seg_iter, _info = model.transcribe(
+                        chunk_path,
+                        language=lang,
+                        vad_filter=False,
+                        beam_size=1,
+                        condition_on_previous_text=True,
+                    )
+                else:
+                    raise exc
+            for seg in seg_iter:
+                text_part = (getattr(seg, "text", "") or "").strip()
+                if text_part:
+                    all_text_parts.append(text_part)
+                seg_start = float(getattr(seg, "start", 0.0)) + float(t0)
+                seg_end = float(getattr(seg, "end", seg_start)) + float(t0)
+                all_segments.append({"start": seg_start, "end": seg_end, "text": text_part})
+                last_processed = max(last_processed, seg_end)
+                out_queue.put(
+                    {
+                        "type": "progress",
+                        "processed": last_processed,
+                        "total": total_seconds,
+                        "chunk_index": idx,
+                        "total_chunks": len(chunks),
+                        "msg": f"seg {idx}/{len(chunks)}",
+                    }
+                )
+            out_queue.put(
+                {
+                    "type": "progress",
+                    "processed": max(last_processed, float(t1)),
+                    "total": total_seconds,
+                    "chunk_index": idx,
+                    "total_chunks": len(chunks),
+                    "msg": f"chunk_done {idx}/{len(chunks)}",
+                }
+            )
+        full_text = " ".join(all_text_parts).strip()
+        voiced_duration = sum(
+            max(0.0, float(seg["end"]) - float(seg["start"]))
+            for seg in all_segments
+            if seg.get("text")
+        )
+        return full_text, all_segments, voiced_duration
+
+    try:
+        text, segments, voiced_duration = _transcribe_chunks(vad_filter=True)
+        if len(text) < 50 or len(segments) < 3:
+            text, segments, voiced_duration = _transcribe_chunks(vad_filter=False)
+        try:
+            write_log(
+                f"stage=whisper_done segments_count={len(segments)} text_len={len(text)}"
+            )
+        except Exception:
+            pass
+        out_queue.put(
+            {
+                "type": "result",
+                "text": text,
+                "segments": segments,
+                "voiced_duration": voiced_duration,
+            }
+        )
+    except Exception as exc:
+        out_queue.put({"type": "error", "err": str(exc), "tb": _traceback.format_exc()})
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=0.5)
+
 def get_log_dir() -> str:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     log_dir = os.path.join(base_dir, "logs")
@@ -5654,7 +5800,9 @@ def stt_transcribe_wav(
     total_seconds: float | None = None,
     log_lines: list[str] | None = None,
     cancel_event: threading.Event | None = None,
+    heartbeat_timeout_sec: float | None = None,
 ) -> tuple[str, list[dict], str, str | None]:
+    log_lines = log_lines if log_lines is not None else []
     segments: list[dict] = []
     chunk_paths: list[str] = []
     whisper_error: str | None = None
@@ -5675,21 +5823,9 @@ def stt_transcribe_wav(
             try:
                 if cancel_event is not None and cancel_event.is_set():
                     raise STTCancelled()
-                write_log("whisper_start")
-                try:
-                    model, cached = get_whisper_model(
-                        STT_WHISPER_MODEL, device="cpu", compute_type="int8"
-                    )
-                except Exception as exc:
-                    whisper_error = f"Whisper ошибка загрузки модели: {type(exc).__name__}: {exc}"
-                    raise
-                write_log(f"whisper_model_cached={'YES' if cached else 'NO'}")
-                write_log(f"whisper_model_cache_dir={_get_whisper_cache_dir()}")
+                _append_log_line(log_lines, "stage=whisper_start")
                 if stage_cb is not None:
-                    if cached:
-                        stage_cb("Модель: cached", "determinate")
-                    else:
-                        stage_cb("Модель: загружаю (первый запуск)", "indeterminate")
+                    stage_cb("Whisper: запуск процесса", "indeterminate")
                 chunk_sec = 25.0
                 write_log(f"whisper_chunking_start chunk_sec={chunk_sec}")
                 try:
@@ -5704,99 +5840,88 @@ def stt_transcribe_wav(
                     chunks = split_audio_into_chunks(wav_path, max_chunk_sec=25.0)
                     total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
                 write_log(f"chunks_count={len(chunks)}")
-                def _run_whisper(vad_filter: bool) -> tuple[str, list[dict], float]:
-                    all_text_parts: list[str] = []
-                    all_segments: list[dict] = []
-                    last_processed = 0.0
-                    last_logged_decile = -1
-                    for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise STTCancelled()
-                        write_log(
-                            f"chunk_progress engine=whisper idx={idx}/{len(chunks)} t0={t0:.2f} t1={t1:.2f}"
-                        )
-                        if progress_cb is not None and total_seconds > 0:
-                            progress_cb(t1, total_seconds, idx, len(chunks))
-                            progress_percent = int(
-                                min(100, max(0, (t1 / max(1.0, total_seconds)) * 100.0))
-                            )
-                            decile = progress_percent // 10
-                            if decile > last_logged_decile:
-                                last_logged_decile = decile
-                                write_log(f"progress={progress_percent} chunk_t1={t1:.2f}")
-                        if chunk_path != wav_path and chunk_path not in chunk_paths:
-                            chunk_paths.append(chunk_path)
-                        chunk_segments = 0
-                        try:
-                            seg_iter, _info = model.transcribe(
-                                chunk_path,
-                                language=lang_whisper,
-                                vad_filter=vad_filter,
-                                beam_size=1,
-                                condition_on_previous_text=True,
-                            )
-                        except Exception as exc:
-                            if vad_filter:
-                                write_log(
-                                    f"whisper_chunk_vad_retry idx={idx}/{len(chunks)} reason={type(exc).__name__}:{exc}"
-                                )
-                                seg_iter, _info = model.transcribe(
-                                    chunk_path,
-                                    language=lang_whisper,
-                                    vad_filter=False,
-                                    beam_size=1,
-                                    condition_on_previous_text=True,
-                                )
-                            else:
-                                raise
-                        for seg in seg_iter:
-                            if cancel_event is not None and cancel_event.is_set():
-                                raise STTCancelled()
-                            text_part = (seg.text or "").strip()
-                            if text_part:
-                                all_text_parts.append(text_part)
-                            seg_start = float(seg.start) + t0
-                            seg_end = float(seg.end) + t0
-                            all_segments.append(
-                                {"start": seg_start, "end": seg_end, "text": text_part}
-                            )
-                            chunk_segments += 1
-                            last_processed = max(last_processed, seg_end)
-                            if progress_cb is not None:
-                                progress_cb(last_processed, total_seconds, idx, len(chunks))
-                            if total_seconds > 0:
-                                progress_percent = int(
-                                    min(100, max(0, (last_processed / total_seconds) * 100.0))
-                                )
-                                decile = progress_percent // 10
-                                if decile > last_logged_decile:
-                                    last_logged_decile = decile
-                                    write_log(f"progress={progress_percent} seg_end={seg_end:.2f}")
-                        write_log(
-                            f"whisper_chunk_segments idx={idx}/{len(chunks)} count={chunk_segments} t0={t0:.2f} t1={t1:.2f}"
-                        )
-                        if progress_cb is not None:
-                            progress_cb(max(last_processed, t1), total_seconds, idx, len(chunks))
-                    full_text = " ".join(all_text_parts).strip()
-                    voiced_duration = sum(
-                        max(0.0, float(seg["end"]) - float(seg["start"]))
-                        for seg in all_segments
-                        if seg.get("text")
-                    )
-                    return full_text, all_segments, voiced_duration
+                for chunk_path, _t0, _t1 in chunks:
+                    if chunk_path != wav_path and chunk_path not in chunk_paths:
+                        chunk_paths.append(chunk_path)
 
-                text, segments, voiced_duration = _run_whisper(vad_filter=True)
+                def _terminate_process(proc: multiprocessing.Process) -> None:
+                    if proc.is_alive():
+                        proc.terminate()
+                    proc.join(timeout=2)
+                    if proc.is_alive() and hasattr(proc, "kill"):
+                        proc.kill()
+                        proc.join(timeout=1)
+
+                def _run_whisper_process() -> tuple[str, list[dict], float]:
+                    ctx = multiprocessing.get_context("spawn")
+                    out_queue = ctx.Queue()
+                    payload = {
+                        "wav_path": wav_path,
+                        "chunks": chunks,
+                        "language": lang_whisper,
+                        "total_seconds": total_seconds,
+                        "model_name": STT_WHISPER_MODEL,
+                        "device": "cpu",
+                        "compute_type": "int8",
+                        "heartbeat_sec": STT_WHISPER_HEARTBEAT_SEC,
+                    }
+                    proc = ctx.Process(target=worker_process_stt, args=(payload, out_queue))
+                    proc.start()
+                    last_heartbeat = time.time()
+                    last_logged_decile = -1
+                    try:
+                        while True:
+                            if cancel_event is not None and cancel_event.is_set():
+                                _terminate_process(proc)
+                                raise STTCancelled()
+                            try:
+                                event = out_queue.get(timeout=0.2)
+                            except queue.Empty:
+                                event = None
+                            if event:
+                                event_type = event.get("type")
+                                if event_type == "heartbeat":
+                                    last_heartbeat = time.time()
+                                elif event_type == "progress":
+                                    processed = float(event.get("processed") or 0.0)
+                                    total = float(event.get("total") or 0.0)
+                                    idx = int(event.get("chunk_index") or 0)
+                                    total_chunks = int(event.get("total_chunks") or 0)
+                                    if progress_cb is not None and total > 0:
+                                        progress_cb(processed, total, idx, total_chunks)
+                                        progress_percent = int(
+                                            min(100, max(0, (processed / max(1.0, total)) * 100.0))
+                                        )
+                                        decile = progress_percent // 10
+                                        if decile > last_logged_decile:
+                                            last_logged_decile = decile
+                                            write_log(
+                                                f"progress={progress_percent} processed={processed:.2f}"
+                                            )
+                                elif event_type == "result":
+                                    return (
+                                        str(event.get("text") or ""),
+                                        list(event.get("segments") or []),
+                                        float(event.get("voiced_duration") or 0.0),
+                                    )
+                                elif event_type == "error":
+                                    err = str(event.get("err") or "Whisper error")
+                                    tb = str(event.get("tb") or "")
+                                    if tb:
+                                        write_log(tb)
+                                    raise RuntimeError(err)
+                            timeout_limit = heartbeat_timeout_sec or 0.0
+                            if timeout_limit and (time.time() - last_heartbeat) > timeout_limit:
+                                _append_log_line(log_lines, "stage=whisper_timeout_terminate")
+                                _terminate_process(proc)
+                                raise RuntimeError("whisper_timeout")
+                    finally:
+                        _terminate_process(proc)
+
+                text, segments, voiced_duration = _run_whisper_process()
                 write_log(
                     f"whisper_vad_segments={len(segments)} voiced_seconds={voiced_duration:.2f}"
                 )
-                if len(text) < 50 or len(segments) < 3:
-                    write_log(
-                        f"whisper_vad_retry reason=short_text text_len={len(text)} segments={len(segments)}"
-                    )
-                    text, segments, voiced_duration = _run_whisper(vad_filter=False)
-                    write_log(
-                        f"whisper_no_vad_segments={len(segments)} voiced_seconds={voiced_duration:.2f}"
-                    )
                 if text:
                     return text, segments, "whisper", None
                 raise STTError(_stt_user_message("no_speech"), "no_speech")
@@ -5817,6 +5942,13 @@ def stt_transcribe_wav(
                     write_log("whisper_done")
                 except Exception:
                     pass
+        if whisper_error and (
+            engine_pref == "whisper"
+            or not SR_AVAILABLE
+            or engine_pref not in {"auto", "google"}
+        ):
+            reason = "timeout" if "timeout" in whisper_error.lower() else "noisy"
+            raise STTError(_stt_user_message(reason, whisper_error), reason, whisper_error)
         if engine_pref in {"auto", "whisper"} and not FASTER_WHISPER_AVAILABLE:
             detail = FASTER_WHISPER_IMPORT_ERROR or "faster-whisper не установлен"
             whisper_error = f"Whisper недоступен: {detail}"
@@ -6028,6 +6160,7 @@ def run_stt_pipeline(
                 log_lines=log_lines,
                 cancel_event=cancel_event,
             )
+        _append_log_line(log_lines, "stage=ffmpeg_done")
         _check_cancel()
         _emit_progress(overall=10.0, status="Подготавливаю…", mode="determinate")
         duration, rms, voiced_ratio = _analyze_speech_presence(wav_path, log_lines)
@@ -6069,6 +6202,8 @@ def run_stt_pipeline(
             heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
             heartbeat_thread.start()
         try:
+            is_range = start is not None or end is not None
+            heartbeat_timeout = 30.0 if is_range else 90.0
             text, segments, engine, engine_detail = stt_transcribe_wav(
                 wav_path,
                 lang,
@@ -6078,6 +6213,7 @@ def run_stt_pipeline(
                 total_seconds=duration,
                 log_lines=log_lines,
                 cancel_event=cancel_event,
+                heartbeat_timeout_sec=heartbeat_timeout,
             )
             if start is not None and segments:
                 offset = float(start)
