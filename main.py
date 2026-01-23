@@ -4974,7 +4974,6 @@ def auto_generate_cards_from_image(deck_id: int,
     )
 
 
-STT_LOG_PATH = os.path.join("logs", "stt_last.log")
 STT_WHISPER_MODEL = os.environ.get("STT_WHISPER_MODEL", "small")
 STT_FFMPEG_TIMEOUT_SEC = int(os.environ.get("STT_FFMPEG_TIMEOUT_SEC", "180"))
 STT_WATCHDOG_IDLE_SEC = int(os.environ.get("STT_WATCHDOG_IDLE_SEC", "25"))
@@ -4992,29 +4991,87 @@ class STTCancelled(Exception):
     pass
 
 
-def _write_stt_log(lines: list[str]) -> None:
-    os.makedirs(os.path.dirname(STT_LOG_PATH), exist_ok=True)
-    with open(STT_LOG_PATH, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines).strip() + "\n")
+def get_log_dir() -> str:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(base_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    return log_dir
+
+
+def get_log_path() -> str:
+    return os.path.join(get_log_dir(), "stt_last.log")
+
+
+def write_log(line: str) -> None:
+    log_path = get_log_path()
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"{line}\n")
+        f.flush()
+
+
+def _write_log_lines(lines: list[str], *, mode: str) -> None:
+    log_path = get_log_path()
+    with open(log_path, mode, encoding="utf-8") as f:
+        for line in lines:
+            f.write(f"{line}\n")
+            f.flush()
+
+
+def _append_log_line(log_lines: list[str], line: str) -> None:
+    log_lines.append(line)
+    write_log(line)
+
+
+def _append_log_lines(log_lines: list[str], lines: list[str]) -> None:
+    for line in lines:
+        _append_log_line(log_lines, line)
+
+
+def _init_stt_log(
+    *,
+    lang_label: str,
+    model_name: str,
+    video_path: str,
+    start: float | None,
+    end: float | None,
+) -> None:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    header_lines = [
+        f"timestamp={datetime.now().isoformat()}",
+        f"python_version={sys.version.replace(os.linesep, ' ')}",
+        f"cwd={os.getcwd()}",
+        f"base_dir={base_dir}",
+        f"lang={lang_label}",
+        f"model={model_name}",
+        f"video_path={video_path}",
+        f"start={start}",
+        f"end={end}",
+    ]
+    _write_log_lines(header_lines, mode="w")
 
 
 def _read_stt_log() -> str:
-    if not os.path.exists(STT_LOG_PATH):
+    log_path = get_log_path()
+    if not os.path.exists(log_path):
         return "Лог STT не найден."
     try:
-        with open(STT_LOG_PATH, "r", encoding="utf-8") as f:
+        with open(log_path, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception as exc:
         return f"Не удалось прочитать лог: {exc}"
 
 
 def _append_stt_log_line(line: str) -> None:
-    os.makedirs(os.path.dirname(STT_LOG_PATH), exist_ok=True)
     try:
-        with open(STT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{line}\n")
+        write_log(line)
     except Exception:
         pass
+
+
+def _log_stt_exception(exc: Exception, *, prefix: str) -> None:
+    write_log(f"exception={prefix}:{type(exc).__name__}")
+    for line in traceback.format_exc().splitlines():
+        write_log(line)
 
 
 def run_ffmpeg(
@@ -5027,8 +5084,7 @@ def run_ffmpeg(
     log_lines = log_lines if log_lines is not None else []
     cmd = list(cmd)
     cmd[1:1] = ["-hide_banner", "-loglevel", "error", "-nostdin"]
-    log_lines.append("ffmpeg_cmd=" + " ".join(cmd))
-    _write_stt_log(log_lines)
+    _append_log_line(log_lines, "ffmpeg_cmd=" + " ".join(cmd))
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -5049,6 +5105,7 @@ def run_ffmpeg(
             remaining = max(0.0, float(timeout_sec) - elapsed)
             if remaining <= 0:
                 proc.kill()
+                _append_log_line(log_lines, "TIMEOUT/DEADLOCK=ffmpeg_timeout")
                 raise RuntimeError("FFmpeg превысил лимит времени.")
             try:
                 stdout, stderr = proc.communicate(timeout=min(1.0, remaining))
@@ -5072,10 +5129,19 @@ def run_ffmpeg(
                 proc.stderr.close()
             except Exception:
                 pass
+    stdout = stdout or ""
     stderr = stderr or ""
-    log_lines.append("ffmpeg_stderr=" + (stderr.strip() or ""))
-    _write_stt_log(log_lines)
-    return proc.returncode or 0, stdout or "", stderr
+
+    def _trim_output(value: str, limit: int = 2000) -> str:
+        value = value.strip()
+        if len(value) > limit:
+            return value[-limit:]
+        return value
+
+    _append_log_line(log_lines, f"ffmpeg_returncode={proc.returncode or 0}")
+    _append_log_line(log_lines, "ffmpeg_stdout=" + _trim_output(stdout))
+    _append_log_line(log_lines, "ffmpeg_stderr=" + _trim_output(stderr))
+    return proc.returncode or 0, stdout, stderr
 
 
 def _normalize_lang(lang: str | None) -> str | None:
@@ -5196,9 +5262,9 @@ def _analyze_speech_presence(wav_path: str, log_lines: list[str]) -> tuple[float
     else:
         threshold = max(0.01, rms * 0.6)
         voiced_ratio = float(np.mean(np.abs(audio) > threshold)) if len(audio) else 0.0
-    log_lines.append(f"audio_duration_sec={duration:.3f}")
-    log_lines.append(f"audio_rms={rms:.6f}")
-    log_lines.append(f"audio_voiced_ratio={voiced_ratio:.4f}")
+    _append_log_line(log_lines, f"audio_duration_sec={duration:.3f}")
+    _append_log_line(log_lines, f"audio_rms={rms:.6f}")
+    _append_log_line(log_lines, f"audio_voiced_ratio={voiced_ratio:.4f}")
     return duration, rms, voiced_ratio
 
 
@@ -5213,8 +5279,8 @@ def _apply_gain_if_needed(wav_path: str, rms: float, log_lines: list[str]) -> fl
     boosted = audio * 2.0
     _write_wav_mono(wav_path, boosted, sr=sr)
     new_rms = float(np.sqrt(np.mean(np.square(boosted)))) if len(boosted) else 0.0
-    log_lines.append("gain_db=6")
-    log_lines.append(f"audio_rms_after_gain={new_rms:.6f}")
+    _append_log_line(log_lines, "gain_db=6")
+    _append_log_line(log_lines, f"audio_rms_after_gain={new_rms:.6f}")
     return new_rms
 
 
@@ -5338,7 +5404,7 @@ def extract_audio_from_video(
         if returncode != 0:
             error_text = stderr.strip() or "Не удалось извлечь аудио."
             raise RuntimeError(error_text)
-        log_lines.append(f"wav_path={output_path}")
+        _append_log_line(log_lines, f"wav_path={output_path}")
         return output_path
     if MOVIEPY_AVAILABLE:
         clip = None
@@ -5362,7 +5428,7 @@ def extract_audio_from_video(
                 verbose=False,
                 logger=None,
             )
-            log_lines.append(f"wav_path={output_path}")
+            _append_log_line(log_lines, f"wav_path={output_path}")
             return output_path
         finally:
             if clip is not None:
@@ -5496,6 +5562,9 @@ def stt_transcribe_wav(
                 for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
                     if cancel_event is not None and cancel_event.is_set():
                         raise STTCancelled()
+                    write_log(
+                        f"chunk_progress engine=whisper idx={idx}/{len(chunks)} t0={t0:.2f} t1={t1:.2f}"
+                    )
                     if chunk_path != wav_path:
                         chunk_paths.append(chunk_path)
                     seg_iter, _info = model.transcribe(
@@ -5530,6 +5599,9 @@ def stt_transcribe_wav(
             for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
                 if cancel_event is not None and cancel_event.is_set():
                     raise STTCancelled()
+                write_log(
+                    f"chunk_progress engine=google idx={idx}/{len(chunks)} t0={t0:.2f} t1={t1:.2f}"
+                )
                 if chunk_path != wav_path:
                     chunk_paths.append(chunk_path)
                 with sr.AudioFile(chunk_path) as source:
@@ -5619,16 +5691,26 @@ def run_stt_pipeline(
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, list[dict], str]:
     lang_label = lang or "Auto"
-    log_lines: list[str] = [
-        f"source_path={source_path}",
-        f"lang={lang_label}",
-        f"start={start}",
-        f"end={end}",
-        f"preprocessed={preprocessed}",
-    ]
+    log_lines: list[str] = []
+    _init_stt_log(
+        lang_label=lang_label,
+        model_name=STT_WHISPER_MODEL,
+        video_path=source_path,
+        start=start,
+        end=end,
+    )
+    _append_log_lines(
+        log_lines,
+        [
+            f"source_path={source_path}",
+            f"lang={lang_label}",
+            f"start={start}",
+            f"end={end}",
+            f"preprocessed={preprocessed}",
+        ],
+    )
     if log_context:
-        log_lines.extend(log_context)
-    _write_stt_log(log_lines)
+        _append_log_lines(log_lines, log_context)
     wav_path = None
     delete_wav = True
 
@@ -5706,43 +5788,48 @@ def run_stt_pipeline(
         )
         _check_cancel()
         _emit_progress(overall=90.0, status="Пунктуация/предложения/таймкоды…", mode="determinate")
-        log_lines.append(f"engine_used={engine}")
+        _append_log_line(log_lines, f"engine_used={engine}")
         if engine == "whisper":
-            log_lines.append(f"model_name={STT_WHISPER_MODEL}")
+            _append_log_line(log_lines, f"model_name={STT_WHISPER_MODEL}")
         else:
-            log_lines.append("model_name=google")
-        log_lines.append(f"segments_count={len(segments)}")
-        log_lines.append(f"text_preview={(text or '').strip()[:200]}")
-        log_lines.append(f"text_length={len(text.strip())}")
+            _append_log_line(log_lines, "model_name=google")
+        _append_log_line(log_lines, f"segments_count={len(segments)}")
+        _append_log_line(log_lines, f"text_preview={(text or '').strip()[:200]}")
+        _append_log_line(log_lines, f"text_length={len(text.strip())}")
         if len(text.strip()) < 2:
             raise STTError(_stt_user_message("no_speech"), "no_speech")
         if _is_language_mismatch(text, lang):
             raise STTError(_stt_user_message("wrong_language", lang_label), "wrong_language", lang_label)
         final_text = _postprocess_transcript(text, segments) if punctuate else text.strip()
-        _write_stt_log(log_lines)
         _emit_progress(overall=100.0, status="Готово", mode="determinate")
         return final_text, segments, engine
     except STTCancelled:
-        log_lines.append("stt_cancelled=true")
-        _write_stt_log(log_lines)
+        _append_log_line(log_lines, "stt_cancelled=true")
         raise
     except STTError as exc:
-        log_lines.append(f"stt_error_reason={exc.reason}")
-        log_lines.append(f"stt_error_detail={exc.detail}")
-        _write_stt_log(log_lines)
+        _append_log_line(log_lines, f"stt_error_reason={exc.reason}")
+        _append_log_line(log_lines, f"stt_error_detail={exc.detail}")
+        _log_stt_exception(exc, prefix="stt_error")
         raise
     except RuntimeError as exc:
         msg = str(exc)
-        reason = "no_engine" if "ffmpeg" in msg.lower() or "moviepy" in msg.lower() else "noisy"
-        log_lines.append(f"stt_error_reason={reason}")
-        log_lines.append(f"stt_error_detail={msg}")
-        _write_stt_log(log_lines)
+        msg_lower = msg.lower()
+        if "превысил лимит времени" in msg_lower or "timeout" in msg_lower:
+            reason = "timeout"
+            _append_log_line(log_lines, "TIMEOUT/DEADLOCK=ffmpeg_timeout")
+        elif "ffmpeg" in msg_lower or "moviepy" in msg_lower:
+            reason = "no_engine"
+        else:
+            reason = "noisy"
+        _append_log_line(log_lines, f"stt_error_reason={reason}")
+        _append_log_line(log_lines, f"stt_error_detail={msg}")
+        _log_stt_exception(exc, prefix="runtime_error")
         raise STTError(_stt_user_message(reason, msg), reason, msg) from exc
     except Exception as exc:
         msg = str(exc)
-        log_lines.append("stt_error_reason=unknown")
-        log_lines.append(f"stt_error_detail={msg}")
-        _write_stt_log(log_lines)
+        _append_log_line(log_lines, "stt_error_reason=unknown")
+        _append_log_line(log_lines, f"stt_error_detail={msg}")
+        _log_stt_exception(exc, prefix="unknown_error")
         raise STTError(_stt_user_message("noisy", msg), "noisy", msg) from exc
     finally:
         if delete_wav and wav_path and os.path.exists(wav_path):
@@ -21525,6 +21612,21 @@ class VideoClipCardsWindow:
             anchor="w", padx=6, pady=(0, 4)
         )
 
+        self.stt_log_path_var = tk.StringVar(value=f"Лог: {get_log_path()}")
+        log_row = ttk.Frame(frame)
+        log_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Label(log_row, textvariable=self.stt_log_path_var, foreground="gray").pack(side=tk.LEFT)
+        ttk.Button(
+            log_row,
+            text="Открыть лог",
+            command=self._open_stt_log,
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(
+            log_row,
+            text="Открыть папку логов",
+            command=self._open_stt_log_dir,
+        ).pack(side=tk.RIGHT)
+
         self.stt_text = scrolledtext.ScrolledText(frame, height=6)
         style_text_widget(self.stt_text, getattr(self.app, "palette", None) or {})
         self.stt_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
@@ -21759,6 +21861,13 @@ class VideoClipCardsWindow:
             self.stt_watchdog_warned = True
             self.stt_status_var.set("⚠️ Похоже, процесс завис. См. лог.")
             _append_stt_log_line("watchdog_warning=stt_progress_stalled")
+            _append_stt_log_line("TIMEOUT/DEADLOCK=stt_progress_stalled")
+            messagebox.showwarning(
+                "STT завис",
+                f"Похоже, процесс распознавания завис или не отвечает.\n"
+                f"Лог: {get_log_path()}",
+                parent=self.win,
+            )
         if self.stt_running and job_id == self.stt_job_id:
             self.win.after(100, lambda: self._poll_stt_progress(job_id))
 
@@ -21767,6 +21876,34 @@ class VideoClipCardsWindow:
             self.stt_cancel_event.set()
             self.stt_status_var.set("⏳ Отменяю…")
             _append_stt_log_line("stt_cancel_requested=true")
+
+    def _open_stt_log(self) -> None:
+        log_path = get_log_path()
+        try:
+            if not os.path.exists(log_path):
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with open(log_path, "a", encoding="utf-8"):
+                    pass
+            if hasattr(os, "startfile"):
+                os.startfile(log_path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", log_path])
+            else:
+                subprocess.Popen(["xdg-open", log_path])
+        except Exception as exc:
+            messagebox.showwarning("Лог", f"Не удалось открыть лог: {exc}", parent=self.win)
+
+    def _open_stt_log_dir(self) -> None:
+        log_dir = get_log_dir()
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(log_dir)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", log_dir])
+            else:
+                subprocess.Popen(["xdg-open", log_dir])
+        except Exception as exc:
+            messagebox.showwarning("Логи", f"Не удалось открыть папку логов: {exc}", parent=self.win)
 
     def _request_stt(self) -> None:
         if self.stt_running:
@@ -21811,8 +21948,10 @@ class VideoClipCardsWindow:
                 )
             except STTCancelled:
                 return ("cancelled", None)
+            except STTError as exc:
+                return ("error", {"message": exc.user_message, "reason": exc.reason})
             except Exception as exc:
-                return ("error", str(exc))
+                return ("error", {"message": str(exc), "reason": "unknown"})
 
         def _finish(result: tuple[str, object]) -> None:
             self.stt_running = False
@@ -21821,10 +21960,19 @@ class VideoClipCardsWindow:
                 return
             kind, payload = result
             if kind == "error":
+                error_info = payload if isinstance(payload, dict) else {"message": str(payload)}
+                message = str(error_info.get("message") or "Ошибка STT")
+                reason = str(error_info.get("reason") or "")
                 self._set_stt_progress_mode("determinate")
                 self.stt_progress.configure(value=0)
-                self.stt_status_var.set(f"❌ Ошибка: {payload}")
-                show_stt_error_dialog(self.win, "Ошибка распознавания", str(payload))
+                self.stt_status_var.set(f"❌ Ошибка: {message}")
+                show_stt_error_dialog(self.win, "Ошибка распознавания", message)
+                if reason in {"timeout", "deadlock"}:
+                    messagebox.showwarning(
+                        "STT завис/таймаут",
+                        f"Распознавание зависло или превысило лимит времени.\nЛог: {get_log_path()}",
+                        parent=self.win,
+                    )
                 return
             if kind == "cancelled":
                 self._set_stt_progress_mode("determinate")
