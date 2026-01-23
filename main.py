@@ -4976,7 +4976,8 @@ def auto_generate_cards_from_image(deck_id: int,
 
 STT_WHISPER_MODEL = os.environ.get("STT_WHISPER_MODEL", "small")
 STT_FFMPEG_TIMEOUT_SEC = int(os.environ.get("STT_FFMPEG_TIMEOUT_SEC", "180"))
-STT_WATCHDOG_IDLE_SEC = int(os.environ.get("STT_WATCHDOG_IDLE_SEC", "25"))
+STT_WATCHDOG_IDLE_SEC = int(os.environ.get("STT_WATCHDOG_IDLE_SEC", "180"))
+STT_WHISPER_HEARTBEAT_SEC = float(os.environ.get("STT_WHISPER_HEARTBEAT_SEC", "1.0"))
 
 
 class STTError(RuntimeError):
@@ -5534,6 +5535,7 @@ def stt_transcribe_wav(
     engine_pref: str = "auto",
     progress_cb=None,
     stage_cb=None,
+    total_seconds: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, list[dict], str]:
     segments: list[dict] = []
@@ -5542,23 +5544,33 @@ def stt_transcribe_wav(
         if cancel_event is not None and cancel_event.is_set():
             raise STTCancelled()
         lang_whisper = _map_whisper_language(lang or "Auto")
-        duration = 0.0
+        duration = float(total_seconds or 0.0)
         try:
             import wave
 
-            with wave.open(wav_path, "rb") as wf:
-                duration = wf.getnframes() / max(1, wf.getframerate())
+            if not duration:
+                with wave.open(wav_path, "rb") as wf:
+                    duration = wf.getnframes() / max(1, wf.getframerate())
         except Exception:
-            duration = 0.0
+            duration = duration or 0.0
         if FASTER_WHISPER_AVAILABLE and engine_pref in {"auto", "whisper"}:
             try:
                 if stage_cb is not None:
                     stage_cb("Загружаю модель Whisper…", "indeterminate")
                 if cancel_event is not None and cancel_event.is_set():
                     raise STTCancelled()
-                model = WhisperModel(STT_WHISPER_MODEL, device="cpu", compute_type="int8")
+                write_log("whisper_start")
+                model = WhisperModel(
+                    STT_WHISPER_MODEL,
+                    device="cpu",
+                    compute_type="int8",
+                    cpu_threads=os.cpu_count() or 1,
+                )
                 chunks = split_audio_into_chunks(wav_path, max_chunk_sec=30.0)
                 total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
+                last_ui_tick = time.monotonic()
+                last_processed = 0.0
+                last_logged_decile = -1
                 for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
                     if cancel_event is not None and cancel_event.is_set():
                         raise STTCancelled()
@@ -5571,7 +5583,7 @@ def stt_transcribe_wav(
                         chunk_path,
                         language=lang_whisper,
                         vad_filter=True,
-                        beam_size=5,
+                        beam_size=3,
                         condition_on_previous_text=False,
                     )
                     for seg in seg_iter:
@@ -5579,12 +5591,39 @@ def stt_transcribe_wav(
                             raise STTCancelled()
                         text = (seg.text or "").strip()
                         if not text:
+                            seg_end = float(seg.end) + t0
+                            last_processed = max(last_processed, seg_end)
+                            if progress_cb is not None:
+                                progress_cb(last_processed, total_seconds, idx, len(chunks))
+                                last_ui_tick = time.monotonic()
+                            now = time.monotonic()
+                            if now - last_ui_tick >= STT_WHISPER_HEARTBEAT_SEC and progress_cb is not None:
+                                progress_cb(last_processed, total_seconds, idx, len(chunks))
+                                last_ui_tick = now
                             continue
+                        seg_end = float(seg.end) + t0
+                        last_processed = max(last_processed, seg_end)
                         segments.append(
                             {"start": float(seg.start) + t0, "end": float(seg.end) + t0, "text": text}
                         )
+                        if progress_cb is not None:
+                            progress_cb(last_processed, total_seconds, idx, len(chunks))
+                            last_ui_tick = time.monotonic()
+                        if total_seconds > 0:
+                            progress_percent = int(
+                                min(100, max(0, (last_processed / total_seconds) * 100.0))
+                            )
+                            decile = progress_percent // 10
+                            if decile > last_logged_decile:
+                                last_logged_decile = decile
+                                write_log(f"progress={progress_percent} seg_end={seg_end:.2f}")
+                        now = time.monotonic()
+                        if now - last_ui_tick >= STT_WHISPER_HEARTBEAT_SEC and progress_cb is not None:
+                            progress_cb(last_processed, total_seconds, idx, len(chunks))
+                            last_ui_tick = now
                     if progress_cb is not None:
-                        progress_cb(t1, total_seconds, idx, len(chunks))
+                        progress_cb(max(last_processed, t1), total_seconds, idx, len(chunks))
+                        last_ui_tick = time.monotonic()
                 text = " ".join(seg["text"] for seg in segments).strip()
                 if text:
                     return text, segments, "whisper"
@@ -5592,6 +5631,11 @@ def stt_transcribe_wav(
                 raise
             except Exception:
                 segments = []
+            finally:
+                try:
+                    write_log("whisper_done")
+                except Exception:
+                    pass
         if SR_AVAILABLE and engine_pref in {"auto", "google"}:
             r = sr.Recognizer()
             chunks = split_audio_into_chunks(wav_path, max_chunk_sec=25.0)
@@ -5777,17 +5821,18 @@ def run_stt_pipeline(
         rms = _apply_gain_if_needed(wav_path, rms, log_lines)
         if duration < 0.3 or rms < 0.004 or voiced_ratio < 0.01:
             raise STTError(_stt_user_message("no_speech"), "no_speech")
-        _emit_progress(overall=20.0, status="Распознаю (0%)…", mode="determinate", stt_percent=0.0)
+        _emit_progress(overall=20.0, status="Распознаю…", mode="determinate", stt_percent=0.0)
         text, segments, engine = stt_transcribe_wav(
             wav_path,
             lang,
             engine_pref="auto",
             progress_cb=_on_transcribe_progress,
             stage_cb=lambda status, mode: _emit_progress(overall=20.0, status=status, mode=mode),
+            total_seconds=duration,
             cancel_event=cancel_event,
         )
         _check_cancel()
-        _emit_progress(overall=90.0, status="Пунктуация/предложения/таймкоды…", mode="determinate")
+        _emit_progress(overall=92.0, status="Постобработка…", mode="determinate")
         _append_log_line(log_lines, f"engine_used={engine}")
         if engine == "whisper":
             _append_log_line(log_lines, f"model_name={STT_WHISPER_MODEL}")
@@ -9190,7 +9235,7 @@ class AnkiApp(tk.Tk):
         stt_status_var = tk.StringVar(value="")
         stt_auto_punct_var = tk.BooleanVar(value=True)
         stt_auto_run_var = tk.BooleanVar(value=True)
-        stt_state = {"running": False, "job_id": 0, "pending": False}
+        stt_state = {"running": False, "job_id": 0, "pending": False, "cancel_event": None}
 
         top_frame = ttk.Frame(content_frame)
         top_frame.pack(fill=tk.X, padx=12, pady=(10, 6))
@@ -9373,6 +9418,12 @@ class AnkiApp(tk.Tk):
             text="Запустить цифровой слух",
         )
         stt_btn.pack(side=tk.LEFT)
+        stt_cancel_btn = ttk.Button(
+            stt_top_row,
+            text="Отмена",
+            state=tk.DISABLED,
+        )
+        stt_cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Label(stt_frame, textvariable=stt_status_var, foreground="gray").pack(
             anchor="w", padx=6, pady=(0, 4)
@@ -9451,6 +9502,17 @@ class AnkiApp(tk.Tk):
                     btn.configure(state=tk.NORMAL if enabled else tk.DISABLED)
                 except Exception:
                     continue
+            try:
+                stt_cancel_btn.configure(state=tk.DISABLED if enabled else tk.NORMAL)
+            except Exception:
+                pass
+
+        def _cancel_stt() -> None:
+            cancel_event = stt_state.get("cancel_event")
+            if stt_state["running"] and cancel_event is not None:
+                cancel_event.set()
+                stt_status_var.set("⏳ Отменяю…")
+                _append_stt_log_line("stt_cancel_requested=true")
 
         def _start_stt(reason: str) -> None:
             video_path = state.get("clip_path") or state.get("video_path") or video_path_var.get().strip()
@@ -9467,6 +9529,7 @@ class AnkiApp(tk.Tk):
             _set_progress_mode("indeterminate")
             progress_queue = queue.Queue()
             stt_state["progress_queue"] = progress_queue
+            stt_state["cancel_event"] = threading.Event()
 
             def _worker():
                 try:
@@ -9491,8 +9554,11 @@ class AnkiApp(tk.Tk):
                         lang="de-DE",
                         punctuate=stt_auto_punct_var.get(),
                         progress_queue=progress_queue,
+                        cancel_event=stt_state.get("cancel_event"),
                     )
                     return ("done", text)
+                except STTCancelled:
+                    return ("cancelled", None)
                 except Exception as exc:
                     return ("error", str(exc))
 
@@ -9534,6 +9600,11 @@ class AnkiApp(tk.Tk):
                     stt_progress.configure(value=0)
                     show_stt_error_dialog(win, "Ошибка распознавания", payload)
                     return
+                if kind == "cancelled":
+                    stt_status_var.set("⛔ Отменено")
+                    _set_progress_mode("determinate")
+                    stt_progress.configure(value=0)
+                    return
                 text = payload or ""
                 stt_text.delete("1.0", tk.END)
                 stt_text.insert("1.0", text)
@@ -9563,6 +9634,7 @@ class AnkiApp(tk.Tk):
             _request_stt(reason)
 
         stt_btn.configure(command=lambda: _request_stt("manual"))
+        stt_cancel_btn.configure(command=_cancel_stt)
 
         template_frame = ttk.LabelFrame(content_frame, text="Шаблон карточки")
         template_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
