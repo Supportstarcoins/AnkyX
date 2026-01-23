@@ -15,6 +15,7 @@ import traceback
 import base64
 import sqlite3
 import re
+import glob
 import threading
 import queue
 import json
@@ -785,6 +786,23 @@ except Exception:
 WHISPER_AVAILABLE = importlib.util.find_spec("whisper") is not None
 VOSK_AVAILABLE = importlib.util.find_spec("vosk") is not None
 WEBRTCVAD_AVAILABLE = importlib.util.find_spec("webrtcvad") is not None
+
+WHISPER_MODEL_CACHE: dict[str, "WhisperModel"] = {}
+WHISPER_MODEL_LOCK = threading.Lock()
+
+
+def get_whisper_model(model_name: str):
+    with WHISPER_MODEL_LOCK:
+        if model_name in WHISPER_MODEL_CACHE:
+            return WHISPER_MODEL_CACHE[model_name]
+        model = WhisperModel(
+            model_name,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=os.cpu_count() or 1,
+        )
+        WHISPER_MODEL_CACHE[model_name] = model
+        return model
 
 # Deutsch Wiktionary
 try:
@@ -5460,6 +5478,63 @@ def extract_and_preprocess_audio(
     )
 
 
+def _get_wav_duration(wav_path: str) -> float:
+    import wave
+
+    with wave.open(wav_path, "rb") as wf:
+        return wf.getnframes() / max(1, wf.getframerate())
+
+
+def _split_wav_with_ffmpeg(
+    wav_path: str,
+    *,
+    chunk_sec: float,
+    log_lines: list[str] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[tuple[str, float, float]], float]:
+    duration = _get_wav_duration(wav_path)
+    if duration <= chunk_sec:
+        return [(wav_path, 0.0, duration)], duration
+    ffmpeg_path = find_ffmpeg()
+    if not ffmpeg_path:
+        raise RuntimeError("FFmpeg не найден.")
+    tmp_dir = ensure_dir(os.path.join("tmp", "chunks"))
+    pattern = os.path.join(tmp_dir, f"chunk_{uuid4().hex}_%03d.wav")
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        wav_path,
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_sec),
+        "-c",
+        "copy",
+        "-reset_timestamps",
+        "1",
+        pattern,
+    ]
+    returncode, _stdout, stderr = run_ffmpeg(
+        cmd,
+        timeout_sec=STT_FFMPEG_TIMEOUT_SEC,
+        log_lines=log_lines,
+        cancel_event=cancel_event,
+    )
+    if returncode != 0:
+        error_text = stderr.strip() or "Не удалось разрезать WAV."
+        raise RuntimeError(error_text)
+    chunk_paths = sorted(glob.glob(pattern.replace("%03d", "*")))
+    if not chunk_paths:
+        return [(wav_path, 0.0, duration)], duration
+    chunks: list[tuple[str, float, float]] = []
+    for idx, chunk_path in enumerate(chunk_paths):
+        t0 = idx * chunk_sec
+        t1 = min(duration, t0 + chunk_sec)
+        chunks.append((chunk_path, t0, t1))
+    return chunks, duration
+
+
 def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 30.0) -> list[tuple[str, float, float]]:
     audio, sr = _load_wav_mono(wav_path)
     duration = len(audio) / max(1, sr)
@@ -5467,43 +5542,19 @@ def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 30.0) -> list[
         return [(wav_path, 0.0, duration)]
     tmp_dir = ensure_dir(os.path.join("tmp", "media"))
     chunks: list[tuple[str, float, float]] = []
-    speech_segments: list[tuple[float, float]] = []
-    if WEBRTCVAD_AVAILABLE:
-        speech_segments = _compute_vad_segments(audio, sr)
-    if not speech_segments:
-        start = 0.0
-        idx = 0
-        chunk_size = min(25.0, max_chunk_sec)
-        while start < duration:
-            end = min(duration, start + chunk_size)
-            start_idx = int(start * sr)
-            end_idx = int(end * sr)
-            chunk_audio = audio[start_idx:end_idx]
-            chunk_path = os.path.join(tmp_dir, f"stt_chunk_{uuid4().hex}_{idx}.wav")
-            _write_wav_mono(chunk_path, chunk_audio, sr=sr)
-            chunks.append((chunk_path, start, end))
-            idx += 1
-            start = end
-        return chunks
-    current_start = speech_segments[0][0]
-    current_end = speech_segments[0][1]
-    for start, end in speech_segments[1:]:
-        gap = start - current_end
-        if gap > 0.8 or (end - current_start) > max_chunk_sec:
-            start_idx = int(max(0, current_start) * sr)
-            end_idx = int(min(duration, current_end) * sr)
-            chunk_audio = audio[start_idx:end_idx]
-            chunk_path = os.path.join(tmp_dir, f"stt_chunk_{uuid4().hex}.wav")
-            _write_wav_mono(chunk_path, chunk_audio, sr=sr)
-            chunks.append((chunk_path, current_start, current_end))
-            current_start = start
-        current_end = max(current_end, end)
-    start_idx = int(max(0, current_start) * sr)
-    end_idx = int(min(duration, current_end) * sr)
-    chunk_audio = audio[start_idx:end_idx]
-    chunk_path = os.path.join(tmp_dir, f"stt_chunk_{uuid4().hex}.wav")
-    _write_wav_mono(chunk_path, chunk_audio, sr=sr)
-    chunks.append((chunk_path, current_start, current_end))
+    start = 0.0
+    idx = 0
+    chunk_size = min(25.0, max_chunk_sec)
+    while start < duration:
+        end = min(duration, start + chunk_size)
+        start_idx = int(start * sr)
+        end_idx = int(end * sr)
+        chunk_audio = audio[start_idx:end_idx]
+        chunk_path = os.path.join(tmp_dir, f"stt_chunk_{uuid4().hex}_{idx}.wav")
+        _write_wav_mono(chunk_path, chunk_audio, sr=sr)
+        chunks.append((chunk_path, start, end))
+        idx += 1
+        start = end
     return chunks
 
 
@@ -5536,6 +5587,7 @@ def stt_transcribe_wav(
     progress_cb=None,
     stage_cb=None,
     total_seconds: float | None = None,
+    log_lines: list[str] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, list[dict], str]:
     segments: list[dict] = []
@@ -5560,15 +5612,21 @@ def stt_transcribe_wav(
                 if cancel_event is not None and cancel_event.is_set():
                     raise STTCancelled()
                 write_log("whisper_start")
-                model = WhisperModel(
-                    STT_WHISPER_MODEL,
-                    device="cpu",
-                    compute_type="int8",
-                    cpu_threads=os.cpu_count() or 1,
-                )
-                chunks = split_audio_into_chunks(wav_path, max_chunk_sec=30.0)
-                total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
-                last_ui_tick = time.monotonic()
+                model = get_whisper_model(STT_WHISPER_MODEL)
+                chunk_sec = 25.0
+                write_log(f"whisper_chunking_start chunk_sec={chunk_sec}")
+                try:
+                    chunks, chunk_duration = _split_wav_with_ffmpeg(
+                        wav_path,
+                        chunk_sec=chunk_sec,
+                        log_lines=log_lines,
+                        cancel_event=cancel_event,
+                    )
+                    total_seconds = duration or chunk_duration
+                except Exception:
+                    chunks = split_audio_into_chunks(wav_path, max_chunk_sec=30.0)
+                    total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
+                write_log(f"chunks_count={len(chunks)}")
                 last_processed = 0.0
                 last_logged_decile = -1
                 for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
@@ -5577,6 +5635,15 @@ def stt_transcribe_wav(
                     write_log(
                         f"chunk_progress engine=whisper idx={idx}/{len(chunks)} t0={t0:.2f} t1={t1:.2f}"
                     )
+                    if progress_cb is not None and total_seconds > 0:
+                        progress_cb(t1, total_seconds, idx, len(chunks))
+                        progress_percent = int(
+                            min(100, max(0, (t1 / max(1.0, total_seconds)) * 100.0))
+                        )
+                        decile = progress_percent // 10
+                        if decile > last_logged_decile:
+                            last_logged_decile = decile
+                            write_log(f"progress={progress_percent} chunk_t1={t1:.2f}")
                     if chunk_path != wav_path:
                         chunk_paths.append(chunk_path)
                     seg_iter, _info = model.transcribe(
@@ -5595,11 +5662,6 @@ def stt_transcribe_wav(
                             last_processed = max(last_processed, seg_end)
                             if progress_cb is not None:
                                 progress_cb(last_processed, total_seconds, idx, len(chunks))
-                                last_ui_tick = time.monotonic()
-                            now = time.monotonic()
-                            if now - last_ui_tick >= STT_WHISPER_HEARTBEAT_SEC and progress_cb is not None:
-                                progress_cb(last_processed, total_seconds, idx, len(chunks))
-                                last_ui_tick = now
                             continue
                         seg_end = float(seg.end) + t0
                         last_processed = max(last_processed, seg_end)
@@ -5608,7 +5670,6 @@ def stt_transcribe_wav(
                         )
                         if progress_cb is not None:
                             progress_cb(last_processed, total_seconds, idx, len(chunks))
-                            last_ui_tick = time.monotonic()
                         if total_seconds > 0:
                             progress_percent = int(
                                 min(100, max(0, (last_processed / total_seconds) * 100.0))
@@ -5617,13 +5678,8 @@ def stt_transcribe_wav(
                             if decile > last_logged_decile:
                                 last_logged_decile = decile
                                 write_log(f"progress={progress_percent} seg_end={seg_end:.2f}")
-                        now = time.monotonic()
-                        if now - last_ui_tick >= STT_WHISPER_HEARTBEAT_SEC and progress_cb is not None:
-                            progress_cb(last_processed, total_seconds, idx, len(chunks))
-                            last_ui_tick = now
                     if progress_cb is not None:
                         progress_cb(max(last_processed, t1), total_seconds, idx, len(chunks))
-                        last_ui_tick = time.monotonic()
                 text = " ".join(seg["text"] for seg in segments).strip()
                 if text:
                     return text, segments, "whisper"
@@ -5768,6 +5824,8 @@ def run_stt_pipeline(
         status: str | None = None,
         mode: str | None = None,
         stt_percent: float | None = None,
+        heartbeat: bool | None = None,
+        total_duration: float | None = None,
     ) -> None:
         if progress_queue is None:
             return
@@ -5777,8 +5835,20 @@ def run_stt_pipeline(
                 "status": status,
                 "mode": mode,
                 "stt_percent": stt_percent,
+                "heartbeat": heartbeat,
+                "total_duration": total_duration,
             }
         )
+
+    progress_state = {
+        "overall": 20.0,
+        "status": "Распознаю…",
+        "stt_percent": 0.0,
+    }
+
+    def _on_stage(status: str, mode: str) -> None:
+        progress_state.update({"status": status})
+        _emit_progress(overall=20.0, status=status, mode=mode)
 
     def _on_transcribe_progress(
         processed_seconds: float,
@@ -5794,6 +5864,13 @@ def run_stt_pipeline(
         else:
             return
         overall = 20.0 + (70.0 * (stt_percent / 100.0))
+        progress_state.update(
+            {
+                "overall": overall,
+                "status": f"Распознаю ({int(stt_percent)}%)…",
+                "stt_percent": stt_percent,
+            }
+        )
         _emit_progress(
             overall=overall,
             status=f"Распознаю ({int(stt_percent)}%)…",
@@ -5821,16 +5898,44 @@ def run_stt_pipeline(
         rms = _apply_gain_if_needed(wav_path, rms, log_lines)
         if duration < 0.3 or rms < 0.004 or voiced_ratio < 0.01:
             raise STTError(_stt_user_message("no_speech"), "no_speech")
-        _emit_progress(overall=20.0, status="Распознаю…", mode="determinate", stt_percent=0.0)
-        text, segments, engine = stt_transcribe_wav(
-            wav_path,
-            lang,
-            engine_pref="auto",
-            progress_cb=_on_transcribe_progress,
-            stage_cb=lambda status, mode: _emit_progress(overall=20.0, status=status, mode=mode),
-            total_seconds=duration,
-            cancel_event=cancel_event,
+        _emit_progress(
+            overall=20.0,
+            status="Распознаю…",
+            mode="determinate",
+            stt_percent=0.0,
+            total_duration=duration,
         )
+        heartbeat_stop = threading.Event()
+
+        def _heartbeat_loop() -> None:
+            while not heartbeat_stop.wait(STT_WHISPER_HEARTBEAT_SEC):
+                _emit_progress(
+                    overall=progress_state.get("overall"),
+                    status=progress_state.get("status"),
+                    mode=None,
+                    stt_percent=progress_state.get("stt_percent"),
+                    heartbeat=True,
+                )
+
+        heartbeat_thread = None
+        if progress_queue is not None:
+            heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+            heartbeat_thread.start()
+        try:
+            text, segments, engine = stt_transcribe_wav(
+                wav_path,
+                lang,
+                engine_pref="auto",
+                progress_cb=_on_transcribe_progress,
+            stage_cb=_on_stage,
+                total_seconds=duration,
+                log_lines=log_lines,
+                cancel_event=cancel_event,
+            )
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=0.2)
         _check_cancel()
         _emit_progress(overall=92.0, status="Постобработка…", mode="determinate")
         _append_log_line(log_lines, f"engine_used={engine}")
@@ -21548,6 +21653,7 @@ class VideoClipCardsWindow:
         self.stt_last_progress_at = 0.0
         self.stt_last_progress_value: float | None = None
         self.stt_watchdog_warned = False
+        self.stt_total_duration_sec: float | None = None
 
         self.win = tk.Toplevel(app.root)
         self.win.title("Видео → клипы → карточки")
@@ -21912,23 +22018,32 @@ class VideoClipCardsWindow:
             status = event.get("status")
             mode = event.get("mode")
             overall = event.get("overall")
+            heartbeat = event.get("heartbeat")
+            total_duration = event.get("total_duration")
+            if total_duration is not None:
+                self.stt_total_duration_sec = float(total_duration)
             if mode:
                 self._set_stt_progress_mode(mode)
             if status:
                 self.stt_status_var.set(f"⏳ {status}")
-                self.stt_last_progress_at = now
-                self.stt_watchdog_warned = False
+                if heartbeat:
+                    self.stt_last_progress_at = now
+                    self.stt_watchdog_warned = False
             if overall is not None:
                 self.stt_progress.configure(value=max(0.0, min(100.0, overall)))
                 if overall != self.stt_last_progress_value:
                     self.stt_last_progress_value = overall
                     self.stt_last_progress_at = now
                     self.stt_watchdog_warned = False
+            if heartbeat and overall is None and status is None:
+                self.stt_last_progress_at = now
+                self.stt_watchdog_warned = False
         if (
             self.stt_running
             and not self.stt_watchdog_warned
             and self.stt_last_progress_at
-            and (time.time() - self.stt_last_progress_at) > STT_WATCHDOG_IDLE_SEC
+            and (time.time() - self.stt_last_progress_at)
+            > max(60, int((self.stt_total_duration_sec or 0.0) * 0.7) or STT_WATCHDOG_IDLE_SEC)
         ):
             self.stt_watchdog_warned = True
             self.stt_status_var.set("⚠️ Похоже, процесс завис. См. лог.")
@@ -21995,6 +22110,7 @@ class VideoClipCardsWindow:
         self.stt_last_progress_at = time.time()
         self.stt_last_progress_value = 0.0
         self.stt_watchdog_warned = False
+        self.stt_total_duration_sec = None
 
         def _worker() -> tuple[str, object]:
             try:
