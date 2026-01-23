@@ -4976,6 +4976,8 @@ def auto_generate_cards_from_image(deck_id: int,
 
 STT_LOG_PATH = os.path.join("logs", "stt_last.log")
 STT_WHISPER_MODEL = os.environ.get("STT_WHISPER_MODEL", "small")
+STT_FFMPEG_TIMEOUT_SEC = int(os.environ.get("STT_FFMPEG_TIMEOUT_SEC", "180"))
+STT_WATCHDOG_IDLE_SEC = int(os.environ.get("STT_WATCHDOG_IDLE_SEC", "25"))
 
 
 class STTError(RuntimeError):
@@ -4984,6 +4986,10 @@ class STTError(RuntimeError):
         self.user_message = user_message
         self.reason = reason
         self.detail = detail or ""
+
+
+class STTCancelled(Exception):
+    pass
 
 
 def _write_stt_log(lines: list[str]) -> None:
@@ -5000,6 +5006,76 @@ def _read_stt_log() -> str:
             return f.read().strip()
     except Exception as exc:
         return f"Не удалось прочитать лог: {exc}"
+
+
+def _append_stt_log_line(line: str) -> None:
+    os.makedirs(os.path.dirname(STT_LOG_PATH), exist_ok=True)
+    try:
+        with open(STT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{line}\n")
+    except Exception:
+        pass
+
+
+def run_ffmpeg(
+    cmd: list[str],
+    *,
+    timeout_sec: int = STT_FFMPEG_TIMEOUT_SEC,
+    log_lines: list[str] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, str, str]:
+    log_lines = log_lines if log_lines is not None else []
+    cmd = list(cmd)
+    cmd[1:1] = ["-hide_banner", "-loglevel", "error", "-nostdin"]
+    log_lines.append("ffmpeg_cmd=" + " ".join(cmd))
+    _write_stt_log(log_lines)
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout = ""
+    stderr = ""
+    completed = False
+    start_ts = time.time()
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                proc.kill()
+                raise STTCancelled()
+            elapsed = time.time() - start_ts
+            remaining = max(0.0, float(timeout_sec) - elapsed)
+            if remaining <= 0:
+                proc.kill()
+                raise RuntimeError("FFmpeg превысил лимит времени.")
+            try:
+                stdout, stderr = proc.communicate(timeout=min(1.0, remaining))
+                completed = True
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if not completed:
+            try:
+                stdout, stderr = proc.communicate(timeout=1)
+            except Exception:
+                pass
+        if proc.stdout:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        if proc.stderr:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+    stderr = stderr or ""
+    log_lines.append("ffmpeg_stderr=" + (stderr.strip() or ""))
+    _write_stt_log(log_lines)
+    return proc.returncode or 0, stdout or "", stderr
 
 
 def _normalize_lang(lang: str | None) -> str | None:
@@ -5147,6 +5223,7 @@ def extract_preprocessed_wav(
     start: float | None = None,
     end: float | None = None,
     log_lines: list[str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     if not video_path or not os.path.exists(video_path):
         raise FileNotFoundError(video_path)
@@ -5175,10 +5252,14 @@ def extract_preprocessed_wav(
             filters,
             output_path,
         ]
-        log_lines.append("ffmpeg_cmd=" + " ".join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            error_text = result.stderr.strip() or "Не удалось извлечь аудио."
+        returncode, _stdout, stderr = run_ffmpeg(
+            cmd,
+            timeout_sec=STT_FFMPEG_TIMEOUT_SEC,
+            log_lines=log_lines,
+            cancel_event=cancel_event,
+        )
+        if returncode != 0:
+            error_text = stderr.strip() or "Не удалось извлечь аудио."
             raise RuntimeError(error_text)
         return output_path
     if MOVIEPY_AVAILABLE:
@@ -5219,6 +5300,7 @@ def extract_audio_from_video(
     start: float | None = None,
     end: float | None = None,
     log_lines: list[str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     if not video_path or not os.path.exists(video_path):
         raise FileNotFoundError(video_path)
@@ -5247,10 +5329,14 @@ def extract_audio_from_video(
             filters,
             output_path,
         ]
-        log_lines.append("ffmpeg_cmd=" + " ".join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            error_text = result.stderr.strip() or "Не удалось извлечь аудио."
+        returncode, _stdout, stderr = run_ffmpeg(
+            cmd,
+            timeout_sec=STT_FFMPEG_TIMEOUT_SEC,
+            log_lines=log_lines,
+            cancel_event=cancel_event,
+        )
+        if returncode != 0:
+            error_text = stderr.strip() or "Не удалось извлечь аудио."
             raise RuntimeError(error_text)
         log_lines.append(f"wav_path={output_path}")
         return output_path
@@ -5294,10 +5380,17 @@ def extract_and_preprocess_audio(
     gain: float | None = None,
     tempo: float | None = None,
     log_lines: list[str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     _ = gain
     _ = tempo
-    return extract_preprocessed_wav(video_path, start=start, end=end, log_lines=log_lines)
+    return extract_preprocessed_wav(
+        video_path,
+        start=start,
+        end=end,
+        log_lines=log_lines,
+        cancel_event=cancel_event,
+    )
 
 
 def split_audio_into_chunks(wav_path: str, max_chunk_sec: float = 30.0) -> list[tuple[str, float, float]]:
@@ -5374,10 +5467,14 @@ def stt_transcribe_wav(
     lang: str | None,
     engine_pref: str = "auto",
     progress_cb=None,
+    stage_cb=None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, list[dict], str]:
     segments: list[dict] = []
     chunk_paths: list[str] = []
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise STTCancelled()
         lang_whisper = _map_whisper_language(lang or "Auto")
         duration = 0.0
         try:
@@ -5389,10 +5486,16 @@ def stt_transcribe_wav(
             duration = 0.0
         if FASTER_WHISPER_AVAILABLE and engine_pref in {"auto", "whisper"}:
             try:
+                if stage_cb is not None:
+                    stage_cb("Загружаю модель Whisper…", "indeterminate")
+                if cancel_event is not None and cancel_event.is_set():
+                    raise STTCancelled()
                 model = WhisperModel(STT_WHISPER_MODEL, device="cpu", compute_type="int8")
                 chunks = split_audio_into_chunks(wav_path, max_chunk_sec=30.0)
                 total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
                 for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise STTCancelled()
                     if chunk_path != wav_path:
                         chunk_paths.append(chunk_path)
                     seg_iter, _info = model.transcribe(
@@ -5403,6 +5506,8 @@ def stt_transcribe_wav(
                         condition_on_previous_text=False,
                     )
                     for seg in seg_iter:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise STTCancelled()
                         text = (seg.text or "").strip()
                         if not text:
                             continue
@@ -5414,6 +5519,8 @@ def stt_transcribe_wav(
                 text = " ".join(seg["text"] for seg in segments).strip()
                 if text:
                     return text, segments, "whisper"
+            except STTCancelled:
+                raise
             except Exception:
                 segments = []
         if SR_AVAILABLE and engine_pref in {"auto", "google"}:
@@ -5421,6 +5528,8 @@ def stt_transcribe_wav(
             chunks = split_audio_into_chunks(wav_path, max_chunk_sec=25.0)
             total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
             for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise STTCancelled()
                 if chunk_path != wav_path:
                     chunk_paths.append(chunk_path)
                 with sr.AudioFile(chunk_path) as source:
@@ -5507,6 +5616,7 @@ def run_stt_pipeline(
     preprocessed: bool = False,
     log_context: list[str] | None = None,
     progress_queue: queue.Queue | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, list[dict], str]:
     lang_label = lang or "Auto"
     log_lines: list[str] = [
@@ -5518,8 +5628,13 @@ def run_stt_pipeline(
     ]
     if log_context:
         log_lines.extend(log_context)
+    _write_stt_log(log_lines)
     wav_path = None
     delete_wav = True
+
+    def _check_cancel() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise STTCancelled()
 
     def _emit_progress(
         *,
@@ -5545,6 +5660,7 @@ def run_stt_pipeline(
         chunk_index: int,
         total_chunks: int,
     ) -> None:
+        _check_cancel()
         if total_seconds > 0:
             stt_percent = min(100.0, max(0.0, (processed_seconds / total_seconds) * 100.0))
         elif total_chunks > 0:
@@ -5560,18 +5676,21 @@ def run_stt_pipeline(
         )
 
     try:
+        _check_cancel()
         if preprocessed:
             wav_path = source_path
             delete_wav = False
         else:
-            _emit_progress(overall=0.0, status="Извлекаю аудио…", mode="indeterminate")
+            _emit_progress(overall=0.0, status="Извлекаю аудио…", mode="determinate")
             wav_path = extract_preprocessed_wav(
                 source_path,
                 start=start,
                 end=end,
                 log_lines=log_lines,
+                cancel_event=cancel_event,
             )
-        _emit_progress(overall=10.0, status="Подготавливаю…", mode="indeterminate")
+        _check_cancel()
+        _emit_progress(overall=10.0, status="Подготавливаю…", mode="determinate")
         duration, rms, voiced_ratio = _analyze_speech_presence(wav_path, log_lines)
         rms = _apply_gain_if_needed(wav_path, rms, log_lines)
         if duration < 0.3 or rms < 0.004 or voiced_ratio < 0.01:
@@ -5582,8 +5701,11 @@ def run_stt_pipeline(
             lang,
             engine_pref="auto",
             progress_cb=_on_transcribe_progress,
+            stage_cb=lambda status, mode: _emit_progress(overall=20.0, status=status, mode=mode),
+            cancel_event=cancel_event,
         )
-        _emit_progress(overall=90.0, status="Пунктуация…", mode="indeterminate")
+        _check_cancel()
+        _emit_progress(overall=90.0, status="Пунктуация/предложения/таймкоды…", mode="determinate")
         log_lines.append(f"engine_used={engine}")
         if engine == "whisper":
             log_lines.append(f"model_name={STT_WHISPER_MODEL}")
@@ -5600,6 +5722,10 @@ def run_stt_pipeline(
         _write_stt_log(log_lines)
         _emit_progress(overall=100.0, status="Готово", mode="determinate")
         return final_text, segments, engine
+    except STTCancelled:
+        log_lines.append("stt_cancelled=true")
+        _write_stt_log(log_lines)
+        raise
     except STTError as exc:
         log_lines.append(f"stt_error_reason={exc.reason}")
         log_lines.append(f"stt_error_detail={exc.detail}")
@@ -21259,6 +21385,10 @@ class VideoClipCardsWindow:
         self.stt_running = False
         self.stt_progress_queue: queue.Queue | None = None
         self.stt_progress_mode = "determinate"
+        self.stt_cancel_event: threading.Event | None = None
+        self.stt_last_progress_at = 0.0
+        self.stt_last_progress_value: float | None = None
+        self.stt_watchdog_warned = False
 
         self.win = tk.Toplevel(app.root)
         self.win.title("Видео → клипы → карточки")
@@ -21410,6 +21540,8 @@ class VideoClipCardsWindow:
             text="Копировать",
             command=lambda: self.win.clipboard_clear() or self.win.clipboard_append(self._get_stt_text()),
         ).pack(side=tk.LEFT)
+        self.stt_cancel_btn = ttk.Button(action_row, text="Отмена", command=self._cancel_stt, state=tk.DISABLED)
+        self.stt_cancel_btn.pack(side=tk.LEFT, padx=(6, 0))
 
     def _default_stt_language(self) -> str:
         mapping = {"ru": "ru-RU", "en": "en-US", "de": "de-DE"}
@@ -21574,6 +21706,11 @@ class VideoClipCardsWindow:
             self.auto_stt_check.configure(state=state)
         except Exception:
             pass
+        try:
+            cancel_state = tk.DISABLED if enabled else tk.NORMAL
+            self.stt_cancel_btn.configure(state=cancel_state)
+        except Exception:
+            pass
 
     def _set_stt_progress_mode(self, mode: str) -> None:
         if mode == self.stt_progress_mode:
@@ -21592,6 +21729,7 @@ class VideoClipCardsWindow:
         progress_queue = self.stt_progress_queue
         if progress_queue is None:
             return
+        now = time.time()
         while True:
             try:
                 event = progress_queue.get_nowait()
@@ -21604,10 +21742,31 @@ class VideoClipCardsWindow:
                 self._set_stt_progress_mode(mode)
             if status:
                 self.stt_status_var.set(f"⏳ {status}")
+                self.stt_last_progress_at = now
+                self.stt_watchdog_warned = False
             if overall is not None:
                 self.stt_progress.configure(value=max(0.0, min(100.0, overall)))
+                if overall != self.stt_last_progress_value:
+                    self.stt_last_progress_value = overall
+                    self.stt_last_progress_at = now
+                    self.stt_watchdog_warned = False
+        if (
+            self.stt_running
+            and not self.stt_watchdog_warned
+            and self.stt_last_progress_at
+            and (time.time() - self.stt_last_progress_at) > STT_WATCHDOG_IDLE_SEC
+        ):
+            self.stt_watchdog_warned = True
+            self.stt_status_var.set("⚠️ Похоже, процесс завис. См. лог.")
+            _append_stt_log_line("watchdog_warning=stt_progress_stalled")
         if self.stt_running and job_id == self.stt_job_id:
             self.win.after(100, lambda: self._poll_stt_progress(job_id))
+
+    def _cancel_stt(self) -> None:
+        if self.stt_running and self.stt_cancel_event is not None:
+            self.stt_cancel_event.set()
+            self.stt_status_var.set("⏳ Отменяю…")
+            _append_stt_log_line("stt_cancel_requested=true")
 
     def _request_stt(self) -> None:
         if self.stt_running:
@@ -21621,8 +21780,12 @@ class VideoClipCardsWindow:
         self._set_stt_controls_enabled(False)
         self.stt_status_var.set("⏳ Извлекаю аудио…")
         self.stt_progress.configure(value=0)
-        self._set_stt_progress_mode("indeterminate")
+        self._set_stt_progress_mode("determinate")
         self.stt_progress_queue = queue.Queue()
+        self.stt_cancel_event = threading.Event()
+        self.stt_last_progress_at = time.time()
+        self.stt_last_progress_value = 0.0
+        self.stt_watchdog_warned = False
 
         def _worker() -> tuple[str, object]:
             try:
@@ -21639,12 +21802,15 @@ class VideoClipCardsWindow:
                     punctuate=True,
                     log_context=log_context,
                     progress_queue=self.stt_progress_queue,
+                    cancel_event=self.stt_cancel_event,
                 )
                 duration = get_video_duration_seconds(self.video_path)
                 return (
                     "done",
                     {"text": text, "duration": duration, "segments": segments, "engine": engine},
                 )
+            except STTCancelled:
+                return ("cancelled", None)
             except Exception as exc:
                 return ("error", str(exc))
 
@@ -21659,6 +21825,11 @@ class VideoClipCardsWindow:
                 self.stt_progress.configure(value=0)
                 self.stt_status_var.set(f"❌ Ошибка: {payload}")
                 show_stt_error_dialog(self.win, "Ошибка распознавания", str(payload))
+                return
+            if kind == "cancelled":
+                self._set_stt_progress_mode("determinate")
+                self.stt_progress.configure(value=0)
+                self.stt_status_var.set("⛔ Отменено")
                 return
             payload = payload or {}
             text = str(payload.get("text") or "")
