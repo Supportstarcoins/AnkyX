@@ -777,12 +777,14 @@ except ImportError:
     sr = None
     SR_AVAILABLE = False
 
+FASTER_WHISPER_IMPORT_ERROR: str | None = None
 try:
     from faster_whisper import WhisperModel
     FASTER_WHISPER_AVAILABLE = True
-except Exception:
+except Exception as exc:
     WhisperModel = None
     FASTER_WHISPER_AVAILABLE = False
+    FASTER_WHISPER_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 WHISPER_AVAILABLE = importlib.util.find_spec("whisper") is not None
 VOSK_AVAILABLE = importlib.util.find_spec("vosk") is not None
 WEBRTCVAD_AVAILABLE = importlib.util.find_spec("webrtcvad") is not None
@@ -5606,9 +5608,10 @@ def stt_transcribe_wav(
     total_seconds: float | None = None,
     log_lines: list[str] | None = None,
     cancel_event: threading.Event | None = None,
-) -> tuple[str, list[dict], str]:
+) -> tuple[str, list[dict], str, str | None]:
     segments: list[dict] = []
     chunk_paths: list[str] = []
+    whisper_error: str | None = None
     try:
         if cancel_event is not None and cancel_event.is_set():
             raise STTCancelled()
@@ -5627,7 +5630,13 @@ def stt_transcribe_wav(
                 if cancel_event is not None and cancel_event.is_set():
                     raise STTCancelled()
                 write_log("whisper_start")
-                model, cached = get_whisper_model(STT_WHISPER_MODEL, device="cpu", compute_type="int8")
+                try:
+                    model, cached = get_whisper_model(
+                        STT_WHISPER_MODEL, device="cpu", compute_type="int8"
+                    )
+                except Exception as exc:
+                    whisper_error = f"Whisper ошибка загрузки модели: {type(exc).__name__}: {exc}"
+                    raise
                 write_log(f"whisper_model_cached={'YES' if cached else 'NO'}")
                 write_log(f"whisper_model_cache_dir={_get_whisper_cache_dir()}")
                 if stage_cb is not None:
@@ -5723,16 +5732,28 @@ def stt_transcribe_wav(
                         f"whisper_no_vad_segments={len(segments)} voiced_seconds={voiced_duration:.2f}"
                     )
                 if text:
-                    return text, segments, "whisper"
+                    return text, segments, "whisper", None
+                raise STTError(_stt_user_message("no_speech"), "no_speech")
             except STTCancelled:
                 raise
-            except Exception:
+            except STTError:
+                raise
+            except Exception as exc:
+                if whisper_error is None:
+                    detail = f"{type(exc).__name__}: {exc}"
+                    if "timeout" in detail.lower():
+                        whisper_error = f"Whisper timeout: {detail}"
+                    else:
+                        whisper_error = f"Whisper ошибка: {detail}"
                 segments = []
             finally:
                 try:
                     write_log("whisper_done")
                 except Exception:
                     pass
+        if engine_pref in {"auto", "whisper"} and not FASTER_WHISPER_AVAILABLE:
+            detail = FASTER_WHISPER_IMPORT_ERROR or "faster-whisper не установлен"
+            whisper_error = f"Whisper недоступен: {detail}"
         if SR_AVAILABLE and engine_pref in {"auto", "google"}:
             r = sr.Recognizer()
             chunks = split_audio_into_chunks(wav_path, max_chunk_sec=25.0)
@@ -5758,7 +5779,7 @@ def stt_transcribe_wav(
                 if progress_cb is not None:
                     progress_cb(t1, total_seconds, idx, len(chunks))
             text = " ".join(seg["text"] for seg in segments).strip()
-            return text, segments, "google"
+            return text, segments, "google", whisper_error
         raise STTError(_stt_user_message("no_engine"), "no_engine")
     finally:
         for chunk_path in chunk_paths:
@@ -5838,7 +5859,7 @@ def run_stt_pipeline(
     log_context: list[str] | None = None,
     progress_queue: queue.Queue | None = None,
     cancel_event: threading.Event | None = None,
-) -> tuple[str, list[dict], str]:
+) -> tuple[str, list[dict], str, str | None]:
     lang_label = lang or "Auto"
     log_lines: list[str] = []
     _init_stt_log(
@@ -5971,16 +5992,21 @@ def run_stt_pipeline(
             heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
             heartbeat_thread.start()
         try:
-            text, segments, engine = stt_transcribe_wav(
+            text, segments, engine, engine_detail = stt_transcribe_wav(
                 wav_path,
                 lang,
                 engine_pref="auto",
                 progress_cb=_on_transcribe_progress,
-            stage_cb=_on_stage,
+                stage_cb=_on_stage,
                 total_seconds=duration,
                 log_lines=log_lines,
                 cancel_event=cancel_event,
             )
+            if start is not None and segments:
+                offset = float(start)
+                for seg in segments:
+                    seg["start"] = float(seg.get("start", 0.0)) + offset
+                    seg["end"] = float(seg.get("end", seg.get("start", 0.0))) + offset
         finally:
             heartbeat_stop.set()
             if heartbeat_thread is not None:
@@ -5992,6 +6018,8 @@ def run_stt_pipeline(
             _append_log_line(log_lines, f"model_name={STT_WHISPER_MODEL}")
         else:
             _append_log_line(log_lines, "model_name=google")
+            if engine_detail:
+                _append_log_line(log_lines, f"whisper_fallback_reason={engine_detail}")
         _append_log_line(log_lines, f"segments_count={len(segments)}")
         _append_log_line(log_lines, f"text_preview={(text or '').strip()[:200]}")
         _append_log_line(log_lines, f"text_length={len(text.strip())}")
@@ -6001,7 +6029,7 @@ def run_stt_pipeline(
             raise STTError(_stt_user_message("wrong_language", lang_label), "wrong_language", lang_label)
         final_text = _postprocess_transcript(text, segments) if punctuate else text.strip()
         _emit_progress(overall=100.0, status="Готово", mode="determinate")
-        return final_text, segments, engine
+        return final_text, segments, engine, engine_detail
     except STTCancelled:
         _append_log_line(log_lines, "stt_cancelled=true")
         raise
@@ -6101,7 +6129,9 @@ def record_speech_to_text(
     if progress_queue is not None:
         progress_queue.put(("progress", duration_sec, max(duration_sec, 1), "Распознавание"))
     try:
-        text, _segments, _engine = run_stt_pipeline(audio_path, lang="de-DE", punctuate=False)
+        text, _segments, _engine, _engine_detail = run_stt_pipeline(
+            audio_path, lang="de-DE", punctuate=False
+        )
     except STTError as exc:
         raise RuntimeError(exc.user_message) from exc
     except Exception as exc:
@@ -6117,7 +6147,9 @@ def transcribe_audio_to_text(
     if not audio_path or not os.path.exists(audio_path):
         raise FileNotFoundError(audio_path)
     try:
-        text, _segments, _engine = run_stt_pipeline(audio_path, lang=lang or "de-DE", punctuate=punctuate)
+        text, _segments, _engine, _engine_detail = run_stt_pipeline(
+            audio_path, lang=lang or "de-DE", punctuate=punctuate
+        )
     except STTError as exc:
         raise RuntimeError(exc.user_message) from exc
     return text
@@ -6128,7 +6160,7 @@ def transcribe_audio_file(
     lang: str | None = None,
     punctuate: bool = True,
     log_context: list[str] | None = None,
-) -> tuple[str, list[dict], str]:
+) -> tuple[str, list[dict], str, str | None]:
     if not wav_path or not os.path.exists(wav_path):
         raise FileNotFoundError(wav_path)
     return run_stt_pipeline(
@@ -6186,7 +6218,9 @@ def auto_generate_cards_from_speech(deck_id: int,
         progress_queue.put(("progress", duration_sec, max(duration_sec, 1), "Распознавание"))
 
     try:
-        text, _segments, _engine = run_stt_pipeline(audio_path, lang="de-DE", punctuate=False)
+        text, _segments, _engine, _engine_detail = run_stt_pipeline(
+            audio_path, lang="de-DE", punctuate=False
+        )
     except STTError as exc:
         raise RuntimeError(exc.user_message) from exc
     except Exception as exc:
@@ -6225,7 +6259,7 @@ def auto_generate_cards_from_video(deck_id: int,
         temp_audio = extract_and_preprocess_audio(video_path)
 
         # Распознать речь из аудио
-        text, _segments, _engine = run_stt_pipeline(
+        text, _segments, _engine, _engine_detail = run_stt_pipeline(
             temp_audio,
             lang="de-DE",
             punctuate=False,
@@ -9701,7 +9735,7 @@ class AnkiApp(tk.Tk):
                         if end_sec <= start_sec:
                             raise RuntimeError("Время окончания должно быть больше времени начала.")
                         target_path = video_path
-                    text, _segments, _engine = run_stt_pipeline(
+                    text, _segments, _engine, _engine_detail = run_stt_pipeline(
                         target_path,
                         start=start_sec,
                         end=end_sec,
@@ -21703,6 +21737,8 @@ class VideoClipCardsWindow:
         self.stt_last_progress_value: float | None = None
         self.stt_watchdog_warned = False
         self.stt_total_duration_sec: float | None = None
+        self.stt_segments: list[dict] = []
+        self.video_duration_sec: float | None = None
 
         self.win = tk.Toplevel(app.root)
         self.win.title("Видео → клипы → карточки")
@@ -21716,6 +21752,8 @@ class VideoClipCardsWindow:
         scroll_bg = colors.get("background") if colors else None
         outer_frame, canvas, content_frame = create_scrollable_content(self.win, bg=scroll_bg)
         outer_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.processing_mode_var = tk.StringVar(value="auto")
 
         self._build_video_block(content_frame)
         self._build_stt_block(content_frame)
@@ -21755,6 +21793,33 @@ class VideoClipCardsWindow:
 
         self.player_frame = ttk.Frame(frame)
         self.player_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        range_frame = ttk.LabelFrame(frame, text="Диапазон (Start/End)")
+        range_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        self.range_start_var = tk.StringVar(value="00:00:00")
+        self.range_end_var = tk.StringVar(value="00:00:10")
+        ttk.Label(range_frame, text="Start:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(range_frame, textvariable=self.range_start_var, width=12).grid(
+            row=0, column=1, sticky="w", padx=6, pady=4
+        )
+        ttk.Label(range_frame, text="End:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(range_frame, textvariable=self.range_end_var, width=12).grid(
+            row=1, column=1, sticky="w", padx=6, pady=4
+        )
+        ttk.Button(
+            range_frame,
+            text="Распознать диапазон",
+            command=lambda: (self.processing_mode_var.set("range"), self._request_stt(mode_override="range")),
+        ).grid(row=0, column=2, padx=6, pady=4, rowspan=2, sticky="ns")
+        ttk.Button(
+            range_frame,
+            text="Нарезать клип",
+            command=self._cut_range_clip,
+        ).grid(row=0, column=3, padx=6, pady=4, rowspan=2, sticky="ns")
+        self.range_status_var = tk.StringVar(value="Диапазон не выбран")
+        ttk.Label(range_frame, textvariable=self.range_status_var, foreground="gray").grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4)
+        )
 
     def _render_player(self, path: str) -> None:
         for widget in self.player_frame.winfo_children():
@@ -21834,6 +21899,48 @@ class VideoClipCardsWindow:
         self.stt_model_combo.pack(side=tk.LEFT, padx=(6, 0))
         self.stt_model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_stt_model_change())
 
+        mode_row = ttk.Frame(frame)
+        mode_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Label(mode_row, text="Режим обработки:").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            mode_row,
+            text="Авто (рекомендуется)",
+            variable=self.processing_mode_var,
+            value="auto",
+            command=self._on_processing_mode_change,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Radiobutton(
+            mode_row,
+            text="Диапазон вручную",
+            variable=self.processing_mode_var,
+            value="range",
+            command=self._on_processing_mode_change,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Radiobutton(
+            mode_row,
+            text="По кликам",
+            variable=self.processing_mode_var,
+            value="selection",
+            command=self._on_processing_mode_change,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        limit_row = ttk.Frame(frame)
+        limit_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Label(limit_row, text="Лимиты:").pack(side=tk.LEFT)
+        self.stt_limit_minutes_var = tk.DoubleVar(value=4.0)
+        self.stt_limit_chunks_var = tk.IntVar(value=12)
+        ttk.Label(limit_row, text="не больше").pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Entry(limit_row, textvariable=self.stt_limit_minutes_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(limit_row, text="мин").pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Entry(limit_row, textvariable=self.stt_limit_chunks_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(limit_row, text="чанков").pack(side=tk.LEFT, padx=(2, 8))
+        self.stt_limit_disabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            limit_row,
+            text="Без ограничений",
+            variable=self.stt_limit_disabled_var,
+        ).pack(side=tk.LEFT)
+
         self.stt_engine_var = tk.StringVar(value=self._default_engine_label())
         ttk.Label(frame, textvariable=self.stt_engine_var, foreground="gray").pack(
             anchor="w", padx=6, pady=(0, 4)
@@ -21891,7 +21998,7 @@ class VideoClipCardsWindow:
             pass
 
     def _maybe_auto_stt_language(self) -> None:
-        if self.auto_stt_var.get():
+        if self._should_auto_stt():
             self._request_stt()
 
     def _on_stt_model_change(self) -> None:
@@ -21900,23 +22007,32 @@ class VideoClipCardsWindow:
         if selected:
             STT_WHISPER_MODEL = selected
         self.stt_engine_var.set(self._default_engine_label())
-        if self.auto_stt_var.get():
+        if self._should_auto_stt():
+            self._request_stt()
+
+    def _should_auto_stt(self) -> bool:
+        return bool(self.auto_stt_var.get() and self.processing_mode_var.get() == "auto")
+
+    def _on_processing_mode_change(self) -> None:
+        if self._should_auto_stt():
             self._request_stt()
 
     def _default_engine_label(self) -> str:
         model_name = STT_WHISPER_MODEL if STT_WHISPER_MODEL else "small"
         if FASTER_WHISPER_AVAILABLE:
             return f"Движок: Whisper {model_name} (VAD)"
-        return "Движок: Google (fallback) — установите faster-whisper"
+        detail = FASTER_WHISPER_IMPORT_ERROR or "установите faster-whisper"
+        return f"Движок: Google (fallback) — Whisper недоступен: {detail}"
 
-    def _update_engine_label(self, engine: str) -> None:
+    def _update_engine_label(self, engine: str, detail: str | None = None) -> None:
         model_name = STT_WHISPER_MODEL if STT_WHISPER_MODEL else "small"
         if engine == "whisper":
             label = f"Движок: Whisper {model_name} (VAD)"
         else:
             label = "Движок: Google (fallback)"
-            if not FASTER_WHISPER_AVAILABLE:
-                label += " — установите faster-whisper"
+            reason = detail or (FASTER_WHISPER_IMPORT_ERROR if not FASTER_WHISPER_AVAILABLE else None)
+            if reason:
+                label += f" — {reason}"
         self.stt_engine_var.set(label)
 
     def _build_sentences_block(self, parent: tk.Widget) -> None:
@@ -22013,13 +22129,31 @@ class VideoClipCardsWindow:
         if not path or not os.path.exists(path):
             return
         self.video_path = path
+        self.sentences = []
+        self.stt_segments = []
+        self.selected_index = None
+        try:
+            self.sentences_tree.delete(*self.sentences_tree.get_children())
+        except Exception:
+            pass
+        try:
+            self.stt_text.delete("1.0", tk.END)
+        except Exception:
+            pass
+        self.stt_engine_var.set(self._default_engine_label())
+        self.stt_source_var.set("Источник: audio track из файла (WAV 16k mono)")
         duration = get_video_duration_seconds(path)
+        self.video_duration_sec = float(duration) if duration else None
         if duration:
             self.video_status_var.set(f"Длительность: {format_hms(int(duration))}")
+            self.range_start_var.set("00:00:00")
+            self.range_end_var.set(format_hms(int(duration)))
+            self.range_status_var.set(f"Диапазон: 00:00:00 → {format_hms(int(duration))}")
         else:
             self.video_status_var.set("Видео загружено")
+            self.range_status_var.set("Диапазон: 00:00:00 → ?")
         self._render_player(path)
-        if self.auto_stt_var.get():
+        if self._should_auto_stt():
             self._request_stt()
 
     def _get_stt_text(self) -> str:
@@ -22141,12 +22275,145 @@ class VideoClipCardsWindow:
         except Exception as exc:
             messagebox.showwarning("Логи", f"Не удалось открыть папку логов: {exc}", parent=self.win)
 
-    def _request_stt(self) -> None:
+    def _get_manual_range(self) -> tuple[float, float] | None:
+        start_sec = parse_timecode_to_seconds((self.range_start_var.get() or "").strip())
+        end_sec = parse_timecode_to_seconds((self.range_end_var.get() or "").strip())
+        if start_sec is None or end_sec is None:
+            messagebox.showwarning(
+                "Диапазон",
+                "Введите корректные значения Start/End (SS, MM:SS или HH:MM:SS).",
+                parent=self.win,
+            )
+            return None
+        if end_sec <= start_sec:
+            messagebox.showwarning(
+                "Диапазон",
+                "Время окончания должно быть больше времени начала.",
+                parent=self.win,
+            )
+            return None
+        self.range_status_var.set(
+            f"Диапазон: {format_hms(int(start_sec))} → {format_hms(int(end_sec))}"
+        )
+        return float(start_sec), float(end_sec)
+
+    def _cut_range_clip(self) -> None:
+        if not self.video_path:
+            messagebox.showwarning("Клип", "Сначала выберите видео файл.", parent=self.win)
+            return
+        manual_range = self._get_manual_range()
+        if manual_range is None:
+            return
+        start_sec, end_sec = manual_range
+        output_dir = os.path.join(MEDIA_FOLDER, "clips", str(self.deck_id))
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"clip_{ts}_{int(start_sec * 1000)}_{int(end_sec * 1000)}"
+        self.range_status_var.set("⏳ Нарезаю клип…")
+
+        def _worker() -> tuple[bool, str, str]:
+            try:
+                clip_path, poster_path = cut_video_clip_with_poster_h264(
+                    self.video_path,
+                    start_sec,
+                    end_sec,
+                    output_dir,
+                    base_name,
+                )
+                return True, clip_path, poster_path
+            except Exception as exc:
+                return False, str(exc), ""
+
+        def _finish(result: tuple[bool, str, str]) -> None:
+            ok, clip_path, poster_path = result
+            if not ok:
+                self.range_status_var.set("❌ Ошибка нарезки")
+                messagebox.showerror("Клип", f"Не удалось нарезать клип: {clip_path}", parent=self.win)
+                return
+            self.range_status_var.set(f"✅ Клип: {os.path.basename(clip_path)}")
+            messagebox.showinfo(
+                "Клип создан",
+                f"Клип сохранён: {clip_path}\nПостер: {poster_path}",
+                parent=self.win,
+            )
+
+        def _thread_runner() -> None:
+            result = _worker()
+            self.win.after(0, lambda: _finish(result))
+
+        threading.Thread(target=_thread_runner, daemon=True).start()
+
+    def _get_auto_range(self) -> tuple[float | None, float | None, float | None]:
+        duration = self.video_duration_sec
+        if duration is None and self.video_path:
+            duration = get_video_duration_seconds(self.video_path) or None
+            self.video_duration_sec = duration
+        if self.stt_limit_disabled_var.get():
+            return None, None, duration
+        max_seconds: list[float] = []
+        try:
+            minutes = float(self.stt_limit_minutes_var.get())
+        except Exception:
+            minutes = 0.0
+        try:
+            chunks = int(self.stt_limit_chunks_var.get())
+        except Exception:
+            chunks = 0
+        if minutes > 0:
+            max_seconds.append(minutes * 60.0)
+        if chunks > 0:
+            max_seconds.append(chunks * 25.0)
+        if not max_seconds:
+            return None, None, duration
+        limit = min(max_seconds)
+        end_sec = min(duration, limit) if duration else limit
+        return 0.0, float(end_sec), duration
+
+    def _request_stt(self, mode_override: str | None = None) -> None:
         if self.stt_running:
             return
         if not self.video_path:
             messagebox.showwarning("Видео", "Сначала выберите видео файл.", parent=self.win)
             return
+        mode = mode_override or self.processing_mode_var.get()
+        start_sec: float | None = None
+        end_sec: float | None = None
+        duration = self.video_duration_sec
+        range_label = ""
+        if mode == "range":
+            manual_range = self._get_manual_range()
+            if manual_range is None:
+                return
+            start_sec, end_sec = manual_range
+            range_label = f"Диапазон: {format_hms(int(start_sec))} → {format_hms(int(end_sec))}"
+        elif mode == "selection":
+            if self.selected_index is None or self.selected_index >= len(self.sentences):
+                messagebox.showwarning(
+                    "Фрагмент",
+                    "Выберите предложение в таблице, чтобы распознать текущий фрагмент.",
+                    parent=self.win,
+                )
+                return
+            sentence = self.sentences[self.selected_index]
+            start_sec = float(sentence.get("start", 0.0))
+            end_sec = float(sentence.get("end", start_sec))
+            if end_sec <= start_sec:
+                messagebox.showwarning("Фрагмент", "Некорректный диапазон выбранного фрагмента.", parent=self.win)
+                return
+            range_label = f"Выбранное: {start_sec:.2f} → {end_sec:.2f}"
+        else:
+            start_sec, end_sec, duration = self._get_auto_range()
+            if start_sec is None:
+                start_sec = 0.0 if end_sec is not None else None
+            if end_sec is not None and duration:
+                range_label = (
+                    f"Авто-режим: {format_hms(int(end_sec))} из {format_hms(int(duration))}"
+                )
+            elif end_sec is not None:
+                range_label = f"Авто-режим: первые {format_hms(int(end_sec))}"
+            else:
+                range_label = "Авто-режим: весь файл"
+        if range_label:
+            self.stt_source_var.set(f"Источник: {range_label}")
         self.stt_running = True
         self.stt_job_id += 1
         job_id = self.stt_job_id
@@ -22166,12 +22433,15 @@ class VideoClipCardsWindow:
                 log_context = [
                     f"video_path={self.video_path}",
                     "clip_path=None",
-                    "start=None",
-                    "end=None",
+                    f"start={start_sec}",
+                    f"end={end_sec}",
                     "source_type=file",
+                    f"mode={mode}",
                 ]
-                text, segments, engine = run_stt_pipeline(
+                text, segments, engine, engine_detail = run_stt_pipeline(
                     self.video_path,
+                    start=start_sec,
+                    end=end_sec,
                     lang=self._get_selected_stt_language(),
                     punctuate=True,
                     log_context=log_context,
@@ -22181,7 +22451,16 @@ class VideoClipCardsWindow:
                 duration = get_video_duration_seconds(self.video_path)
                 return (
                     "done",
-                    {"text": text, "duration": duration, "segments": segments, "engine": engine},
+                    {
+                        "text": text,
+                        "duration": duration,
+                        "segments": segments,
+                        "engine": engine,
+                        "engine_detail": engine_detail,
+                        "start": start_sec,
+                        "end": end_sec,
+                        "range_label": range_label,
+                    },
                 )
             except STTCancelled:
                 return ("cancelled", None)
@@ -22221,13 +22500,17 @@ class VideoClipCardsWindow:
             duration = payload.get("duration")
             segments = payload.get("segments") or []
             engine = str(payload.get("engine") or "")
-            self.stt_text.delete("1.0", tk.END)
-            self.stt_text.insert("1.0", text)
+            engine_detail = str(payload.get("engine_detail") or "")
+            start_offset = payload.get("start")
+            range_label = str(payload.get("range_label") or "")
+            if range_label:
+                self.stt_source_var.set(f"Источник: {range_label}")
+            self._append_stt_text(text)
             self._set_stt_progress_mode("determinate")
             self.stt_progress.configure(value=100)
             self.stt_status_var.set("✅ Готово")
-            self._update_engine_label(engine)
-            self._build_sentences_from_text(text, duration, segments)
+            self._update_engine_label(engine, engine_detail or None)
+            self._append_sentences_from_text(text, duration, segments, base_offset=start_offset)
             self._update_save_pricing()
 
         def _thread_runner() -> None:
@@ -22244,16 +22527,47 @@ class VideoClipCardsWindow:
         segments: list[dict] | None,
     ) -> None:
         self.sentences = []
+        self.stt_segments = []
         self.sentences_tree.delete(*self.sentences_tree.get_children())
+        self._append_sentences_from_text(text, duration, segments or [])
+        if self.sentences:
+            self.sentences_tree.selection_set("0")
+            self._select_sentence(0)
+
+    def _append_stt_text(self, text: str) -> None:
+        new_text = (text or "").strip()
+        if not new_text:
+            return
+        existing = self._get_stt_text().strip()
+        combined = f"{existing}\n{new_text}".strip() if existing else new_text
+        self.stt_text.delete("1.0", tk.END)
+        self.stt_text.insert("1.0", combined)
+
+    def _append_sentences_from_text(
+        self,
+        text: str,
+        duration: float | None,
+        segments: list[dict],
+        *,
+        base_offset: float | None = None,
+    ) -> None:
         sentences = split_into_sentences(text or "")
         if not sentences and text.strip():
             sentences = [text.strip()]
+        if not sentences:
+            return
         timecodes = self._compute_sentence_timecodes(sentences, duration, segments or [])
+        if base_offset is not None and not segments:
+            timecodes = [
+                (start + float(base_offset), end + float(base_offset))
+                for start, end in timecodes
+            ]
+        start_index = len(self.sentences)
         for idx, sentence in enumerate(sentences):
             start, end = timecodes[idx]
             sentence_html = f"<div>{html.escape(sentence)}</div>"
             entry = {
-                "index": idx + 1,
+                "index": start_index + idx + 1,
                 "sentence": sentence,
                 "start": float(start),
                 "end": float(end),
@@ -22263,12 +22577,11 @@ class VideoClipCardsWindow:
             self.sentences_tree.insert(
                 "",
                 "end",
-                iid=str(idx),
-                values=(idx + 1, sentence, f"{start:.2f}", f"{end:.2f}"),
+                iid=str(start_index + idx),
+                values=(start_index + idx + 1, sentence, f"{start:.2f}", f"{end:.2f}"),
             )
-        if self.sentences:
-            self.sentences_tree.selection_set("0")
-            self._select_sentence(0)
+        if segments:
+            self.stt_segments.extend(segments)
 
     def _compute_sentence_timecodes(
         self,
@@ -22355,6 +22668,15 @@ class VideoClipCardsWindow:
         self.selected_index = idx
         sentence = self.sentences[idx]
         start_sec = sentence.get("start", 0)
+        end_sec = sentence.get("end", start_sec)
+        try:
+            self.range_start_var.set(format_hms(int(float(start_sec))))
+            self.range_end_var.set(format_hms(int(float(end_sec))))
+            self.range_status_var.set(
+                f"Диапазон: {format_hms(int(float(start_sec)))} → {format_hms(int(float(end_sec)))}"
+            )
+        except Exception:
+            pass
         if self.player is not None:
             try:
                 self.player.player.set_time(int(float(start_sec) * 1000))
