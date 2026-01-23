@@ -787,22 +787,39 @@ WHISPER_AVAILABLE = importlib.util.find_spec("whisper") is not None
 VOSK_AVAILABLE = importlib.util.find_spec("vosk") is not None
 WEBRTCVAD_AVAILABLE = importlib.util.find_spec("webrtcvad") is not None
 
-WHISPER_MODEL_CACHE: dict[str, "WhisperModel"] = {}
+WHISPER_MODEL_CACHE: dict[tuple[str, str, str], "WhisperModel"] = {}
 WHISPER_MODEL_LOCK = threading.Lock()
 
 
-def get_whisper_model(model_name: str):
+def get_whisper_model(
+    model_name: str,
+    device: str = "cpu",
+    compute_type: str = "int8",
+) -> tuple["WhisperModel", bool]:
+    key = (model_name, device, compute_type)
     with WHISPER_MODEL_LOCK:
-        if model_name in WHISPER_MODEL_CACHE:
-            return WHISPER_MODEL_CACHE[model_name]
+        if key in WHISPER_MODEL_CACHE:
+            return WHISPER_MODEL_CACHE[key], True
         model = WhisperModel(
             model_name,
-            device="cpu",
-            compute_type="int8",
+            device=device,
+            compute_type=compute_type,
             cpu_threads=os.cpu_count() or 1,
         )
-        WHISPER_MODEL_CACHE[model_name] = model
-        return model
+        WHISPER_MODEL_CACHE[key] = model
+        return model, False
+
+
+def _get_whisper_cache_dir() -> str:
+    env_paths = [
+        os.environ.get("HUGGINGFACE_HUB_CACHE"),
+        os.environ.get("HF_HUB_CACHE"),
+        os.environ.get("HF_HOME"),
+    ]
+    for candidate in env_paths:
+        if candidate:
+            return os.path.expanduser(candidate)
+    return os.path.expanduser("~/.cache/huggingface")
 
 # Deutsch Wiktionary
 try:
@@ -5607,12 +5624,17 @@ def stt_transcribe_wav(
             duration = duration or 0.0
         if FASTER_WHISPER_AVAILABLE and engine_pref in {"auto", "whisper"}:
             try:
-                if stage_cb is not None:
-                    stage_cb("Загружаю модель Whisper…", "indeterminate")
                 if cancel_event is not None and cancel_event.is_set():
                     raise STTCancelled()
                 write_log("whisper_start")
-                model = get_whisper_model(STT_WHISPER_MODEL)
+                model, cached = get_whisper_model(STT_WHISPER_MODEL, device="cpu", compute_type="int8")
+                write_log(f"whisper_model_cached={'YES' if cached else 'NO'}")
+                write_log(f"whisper_model_cache_dir={_get_whisper_cache_dir()}")
+                if stage_cb is not None:
+                    if cached:
+                        stage_cb("Модель: cached", "determinate")
+                    else:
+                        stage_cb("Модель: загружаю (первый запуск)", "indeterminate")
                 chunk_sec = 25.0
                 write_log(f"whisper_chunking_start chunk_sec={chunk_sec}")
                 try:
@@ -5627,60 +5649,79 @@ def stt_transcribe_wav(
                     chunks = split_audio_into_chunks(wav_path, max_chunk_sec=30.0)
                     total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
                 write_log(f"chunks_count={len(chunks)}")
-                last_processed = 0.0
-                last_logged_decile = -1
-                for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise STTCancelled()
-                    write_log(
-                        f"chunk_progress engine=whisper idx={idx}/{len(chunks)} t0={t0:.2f} t1={t1:.2f}"
-                    )
-                    if progress_cb is not None and total_seconds > 0:
-                        progress_cb(t1, total_seconds, idx, len(chunks))
-                        progress_percent = int(
-                            min(100, max(0, (t1 / max(1.0, total_seconds)) * 100.0))
-                        )
-                        decile = progress_percent // 10
-                        if decile > last_logged_decile:
-                            last_logged_decile = decile
-                            write_log(f"progress={progress_percent} chunk_t1={t1:.2f}")
-                    if chunk_path != wav_path:
-                        chunk_paths.append(chunk_path)
-                    seg_iter, _info = model.transcribe(
-                        chunk_path,
-                        language=lang_whisper,
-                        vad_filter=True,
-                        beam_size=3,
-                        condition_on_previous_text=False,
-                    )
-                    for seg in seg_iter:
+                def _run_whisper(vad_filter: bool) -> tuple[str, list[dict], float]:
+                    all_text_parts: list[str] = []
+                    all_segments: list[dict] = []
+                    last_processed = 0.0
+                    last_logged_decile = -1
+                    for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
                         if cancel_event is not None and cancel_event.is_set():
                             raise STTCancelled()
-                        text = (seg.text or "").strip()
-                        if not text:
-                            seg_end = float(seg.end) + t0
-                            last_processed = max(last_processed, seg_end)
-                            if progress_cb is not None:
-                                progress_cb(last_processed, total_seconds, idx, len(chunks))
-                            continue
-                        seg_end = float(seg.end) + t0
-                        last_processed = max(last_processed, seg_end)
-                        segments.append(
-                            {"start": float(seg.start) + t0, "end": float(seg.end) + t0, "text": text}
+                        write_log(
+                            f"chunk_progress engine=whisper idx={idx}/{len(chunks)} t0={t0:.2f} t1={t1:.2f}"
                         )
-                        if progress_cb is not None:
-                            progress_cb(last_processed, total_seconds, idx, len(chunks))
-                        if total_seconds > 0:
+                        if progress_cb is not None and total_seconds > 0:
+                            progress_cb(t1, total_seconds, idx, len(chunks))
                             progress_percent = int(
-                                min(100, max(0, (last_processed / total_seconds) * 100.0))
+                                min(100, max(0, (t1 / max(1.0, total_seconds)) * 100.0))
                             )
                             decile = progress_percent // 10
                             if decile > last_logged_decile:
                                 last_logged_decile = decile
-                                write_log(f"progress={progress_percent} seg_end={seg_end:.2f}")
-                    if progress_cb is not None:
-                        progress_cb(max(last_processed, t1), total_seconds, idx, len(chunks))
-                text = " ".join(seg["text"] for seg in segments).strip()
+                                write_log(f"progress={progress_percent} chunk_t1={t1:.2f}")
+                        if chunk_path != wav_path and chunk_path not in chunk_paths:
+                            chunk_paths.append(chunk_path)
+                        seg_iter, _info = model.transcribe(
+                            chunk_path,
+                            language=lang_whisper,
+                            vad_filter=vad_filter,
+                            beam_size=3,
+                            condition_on_previous_text=True,
+                        )
+                        for seg in seg_iter:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise STTCancelled()
+                            text_part = (seg.text or "").strip()
+                            if text_part:
+                                all_text_parts.append(text_part)
+                            seg_start = float(seg.start) + t0
+                            seg_end = float(seg.end) + t0
+                            all_segments.append(
+                                {"start": seg_start, "end": seg_end, "text": text_part}
+                            )
+                            last_processed = max(last_processed, seg_end)
+                            if progress_cb is not None:
+                                progress_cb(last_processed, total_seconds, idx, len(chunks))
+                            if total_seconds > 0:
+                                progress_percent = int(
+                                    min(100, max(0, (last_processed / total_seconds) * 100.0))
+                                )
+                                decile = progress_percent // 10
+                                if decile > last_logged_decile:
+                                    last_logged_decile = decile
+                                    write_log(f"progress={progress_percent} seg_end={seg_end:.2f}")
+                        if progress_cb is not None:
+                            progress_cb(max(last_processed, t1), total_seconds, idx, len(chunks))
+                    full_text = " ".join(all_text_parts).strip()
+                    voiced_duration = sum(
+                        max(0.0, float(seg["end"]) - float(seg["start"]))
+                        for seg in all_segments
+                        if seg.get("text")
+                    )
+                    return full_text, all_segments, voiced_duration
+
+                text, segments, voiced_duration = _run_whisper(vad_filter=True)
+                write_log(
+                    f"whisper_vad_segments={len(segments)} voiced_seconds={voiced_duration:.2f}"
+                )
+                if len(text) < 50 or len(segments) < 3:
+                    write_log(
+                        f"whisper_vad_retry reason=short_text text_len={len(text)} segments={len(segments)}"
+                    )
+                    text, segments, voiced_duration = _run_whisper(vad_filter=False)
+                    write_log(
+                        f"whisper_no_vad_segments={len(segments)} voiced_seconds={voiced_duration:.2f}"
+                    )
                 if text:
                     return text, segments, "whisper"
             except STTCancelled:
@@ -5733,11 +5774,13 @@ def _postprocess_transcript(text: str, segments: list[dict]) -> str:
     if not normalized:
         return ""
     punctuated = auto_punctuate(normalized) if "auto_punctuate" in globals() else normalized
-    if re.search(r"[.!?]", punctuated):
-        return punctuated
+    sentences = split_into_sentences(punctuated) if "split_into_sentences" in globals() else []
+    if sentences and len(sentences) > 1:
+        return "\n".join(sentences)
     if segments:
-        sentences: list[str] = []
-        current: list[str] = []
+        rebuilt: list[str] = []
+        buf: list[str] = []
+        buf_start = None
         last_end = None
         for seg in segments:
             seg_text = seg.get("text", "").strip()
@@ -5745,19 +5788,25 @@ def _postprocess_transcript(text: str, segments: list[dict]) -> str:
                 continue
             start = float(seg.get("start", 0.0))
             end = float(seg.get("end", start))
-            if last_end is not None and (start - last_end) > 1.0:
-                if current:
-                    sentences.append(" ".join(current))
-                    current = []
-            current.append(seg_text)
+            if buf_start is None:
+                buf_start = start
+            if last_end is not None and (start - last_end) > 0.8:
+                sentence = " ".join(buf).strip()
+                if sentence:
+                    rebuilt.append(sentence)
+                buf = []
+                buf_start = start
+            buf.append(seg_text)
             last_end = end
-        if current:
-            sentences.append(" ".join(current))
-        if sentences:
-            punctuated = ". ".join(s.strip() for s in sentences if s.strip()).strip()
+        if buf:
+            sentence = " ".join(buf).strip()
+            if sentence:
+                rebuilt.append(sentence)
+        if rebuilt:
+            punctuated = ". ".join(s.strip() for s in rebuilt if s.strip()).strip()
             if punctuated and not punctuated.endswith((".", "!", "?")):
                 punctuated += "."
-            return punctuated
+            return punctuated.replace(". ", ".\n")
     return punctuated
 
 
