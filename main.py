@@ -5033,15 +5033,22 @@ class STTCancelled(Exception):
     pass
 
 
-def get_log_dir() -> str:
+def get_stt_log_path() -> str:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     log_dir = os.path.join(base_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
-    return log_dir
+    return os.path.join(log_dir, "stt_last.log")
 
 
-def get_log_path() -> str:
-    return os.path.join(get_log_dir(), "stt_last.log")
+def log_write(path, line):
+    try:
+        if not path:
+            return
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line.rstrip("\n") + "\n")
+            f.flush()
+    except Exception:
+        pass
 
 
 def get_clip_log_path_ui() -> str:
@@ -5089,14 +5096,11 @@ def show_clip_error_dialog(parent: tk.Misc | None, title: str, message: str) -> 
     ttk.Button(btn_row, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
 
 def write_log(line: str) -> None:
-    log_path = get_log_path()
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"{line}\n")
-        f.flush()
+    log_write(get_stt_log_path(), line)
 
 
 def _write_log_lines(lines: list[str], *, mode: str) -> None:
-    log_path = get_log_path()
+    log_path = get_stt_log_path()
     with open(log_path, mode, encoding="utf-8") as f:
         for line in lines:
             f.write(f"{line}\n")
@@ -5120,6 +5124,7 @@ def _init_stt_log(
     video_path: str,
     start: float | None,
     end: float | None,
+    mode: str = "a",
 ) -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     header_lines = [
@@ -5133,11 +5138,11 @@ def _init_stt_log(
         f"start={start}",
         f"end={end}",
     ]
-    _write_log_lines(header_lines, mode="w")
+    _write_log_lines(header_lines, mode=mode)
 
 
 def _read_stt_log() -> str:
-    log_path = get_log_path()
+    log_path = get_stt_log_path()
     if not os.path.exists(log_path):
         return "Лог STT не найден."
     try:
@@ -5170,6 +5175,7 @@ def run_ffmpeg(
     log_lines = log_lines if log_lines is not None else []
     cmd = list(cmd)
     cmd[1:1] = ["-hide_banner", "-loglevel", "error", "-nostdin"]
+    _append_log_line(log_lines, "stage=ffmpeg_start")
     _append_log_line(log_lines, "ffmpeg_cmd=" + " ".join(cmd))
     proc = subprocess.Popen(
         cmd,
@@ -5659,6 +5665,7 @@ def stt_transcribe_wav(
     heartbeat_timeout_sec: float | None = None,
 ) -> tuple[str, list[dict], str, str | None]:
     log_lines = log_lines if log_lines is not None else []
+    log_path = get_stt_log_path()
     segments: list[dict] = []
     chunk_paths: list[str] = []
     whisper_error: str | None = None
@@ -5683,7 +5690,7 @@ def stt_transcribe_wav(
                 if stage_cb is not None:
                     stage_cb("Whisper: запуск процесса", "indeterminate")
                 chunk_sec = 25.0
-                write_log(f"whisper_chunking_start chunk_sec={chunk_sec}")
+                log_write(log_path, f"whisper_chunking_start chunk_sec={chunk_sec}")
                 try:
                     chunks, chunk_duration = _split_wav_with_ffmpeg(
                         wav_path,
@@ -5695,18 +5702,23 @@ def stt_transcribe_wav(
                 except Exception:
                     chunks = split_audio_into_chunks(wav_path, max_chunk_sec=25.0)
                     total_seconds = duration or max((t1 for _, _, t1 in chunks), default=0.0)
-                write_log(f"chunks_count={len(chunks)}")
+                log_write(log_path, f"chunks_count={len(chunks)}")
                 for chunk_path, _t0, _t1 in chunks:
                     if chunk_path != wav_path and chunk_path not in chunk_paths:
                         chunk_paths.append(chunk_path)
 
                 def _terminate_process(proc: multiprocessing.Process) -> None:
+                    terminated = False
                     if proc.is_alive():
                         proc.terminate()
+                        terminated = True
                     proc.join(timeout=0.2)
                     if proc.is_alive() and hasattr(proc, "kill"):
                         proc.kill()
+                        terminated = True
                         proc.join(timeout=0.2)
+                    if terminated:
+                        log_write(log_path, "stage=proc_terminated")
 
                 def _run_whisper_process() -> tuple[str, list[dict], float]:
                     ctx = multiprocessing.get_context("spawn")
@@ -5720,14 +5732,20 @@ def stt_transcribe_wav(
                         "device": "cpu",
                         "compute_type": "int8",
                         "heartbeat_sec": STT_WHISPER_HEARTBEAT_SEC,
+                        "log_path": log_path,
                     }
                     proc = ctx.Process(
                         target=whisper_worker,
                         args=(payload, out_queue),
                         daemon=True,
                     )
-                    write_log("mp_spawn_start")
-                    proc.start()
+                    log_write(log_path, "stage=mp_spawn_prepare")
+                    try:
+                        proc.start()
+                    except Exception as exc:
+                        log_write(log_path, f"ERROR=mp_failed_to_start: {exc}")
+                        raise RuntimeError(f"Не удалось запустить Whisper процесс: {exc}") from exc
+                    log_write(log_path, f"stage=mp_started pid={proc.pid}")
                     last_heartbeat = time.time()
                     started_at = time.time()
                     started_received = False
@@ -5747,7 +5765,7 @@ def stt_transcribe_wav(
                                 if event_type == "started":
                                     started_received = True
                                     last_heartbeat = time.time()
-                                    write_log("mp_worker_started")
+                                    log_write(log_path, "mp_worker_started")
                                 elif event_type == "heartbeat":
                                     last_heartbeat = time.time()
                                 elif event_type == "progress":
@@ -5764,8 +5782,9 @@ def stt_transcribe_wav(
                                         decile = progress_percent // 10
                                         if decile > last_logged_decile:
                                             last_logged_decile = decile
-                                            write_log(
-                                                f"progress={progress_percent} processed={processed:.2f}"
+                                            log_write(
+                                                log_path,
+                                                f"progress={progress_percent} processed={processed:.2f}",
                                             )
                                 elif event_type == "result":
                                     return (
@@ -5777,10 +5796,12 @@ def stt_transcribe_wav(
                                     err = str(event.get("err") or "Whisper error")
                                     tb = str(event.get("tb") or "")
                                     if tb:
-                                        write_log(tb)
+                                        log_write(log_path, tb)
+                                    log_write(log_path, f"EXCEPTION=worker_error err={err}")
                                     raise RuntimeError(err)
                             if not started_received and (time.time() - started_at) > 5.0:
                                 _append_log_line(log_lines, "spawn_error=no_started")
+                                log_write(log_path, "ERROR=mp_failed_to_start: no_started")
                                 raise RuntimeError(
                                     "Whisper не стартовал (нет started за 5 сек). "
                                     "Проверьте __main__ guard и multiprocessing.freeze_support()."
@@ -5788,6 +5809,7 @@ def stt_transcribe_wav(
                             timeout_limit = heartbeat_timeout_sec or 0.0
                             if timeout_limit and (time.time() - last_heartbeat) > timeout_limit:
                                 _append_log_line(log_lines, "stage=whisper_timeout_terminate")
+                                log_write(log_path, "stage=timeout_terminate")
                                 _terminate_process(proc)
                                 raise RuntimeError("whisper_timeout")
                             if event is None:
@@ -5796,8 +5818,9 @@ def stt_transcribe_wav(
                         _terminate_process(proc)
 
                 text, segments, voiced_duration = _run_whisper_process()
-                write_log(
-                    f"whisper_vad_segments={len(segments)} voiced_seconds={voiced_duration:.2f}"
+                log_write(
+                    log_path,
+                    f"whisper_vad_segments={len(segments)} voiced_seconds={voiced_duration:.2f}",
                 )
                 if text:
                     return text, segments, "whisper", None
@@ -5822,7 +5845,7 @@ def stt_transcribe_wav(
                 segments = []
             finally:
                 try:
-                    write_log("whisper_done")
+                    log_write(log_path, "whisper_done")
                 except Exception:
                     pass
         if whisper_error and (
@@ -5842,8 +5865,9 @@ def stt_transcribe_wav(
             for idx, (chunk_path, t0, t1) in enumerate(chunks, start=1):
                 if cancel_event is not None and cancel_event.is_set():
                     raise STTCancelled()
-                write_log(
-                    f"chunk_progress engine=google idx={idx}/{len(chunks)} t0={t0:.2f} t1={t1:.2f}"
+                log_write(
+                    log_path,
+                    f"chunk_progress engine=google idx={idx}/{len(chunks)} t0={t0:.2f} t1={t1:.2f}",
                 )
                 if chunk_path != wav_path:
                     chunk_paths.append(chunk_path)
@@ -6173,6 +6197,10 @@ def show_stt_error_dialog(parent: tk.Misc | None, title: str, message: str) -> N
     container = ttk.Frame(win)
     container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
     ttk.Label(container, text=message, wraplength=520, style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
+    log_path = get_stt_log_path()
+    ttk.Label(container, text=f"Лог: {log_path}", wraplength=520, style="Muted.TLabel").pack(
+        anchor="w", pady=(0, 12)
+    )
     btn_row = ttk.Frame(container)
     btn_row.pack(fill=tk.X, side=tk.BOTTOM)
 
@@ -6194,7 +6222,23 @@ def show_stt_error_dialog(parent: tk.Misc | None, title: str, message: str) -> N
         text_box.insert("1.0", details or "Лог пуст.")
         text_box.configure(state=tk.DISABLED)
 
+    def _open_log() -> None:
+        try:
+            if not os.path.exists(log_path):
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with open(log_path, "a", encoding="utf-8"):
+                    pass
+            if hasattr(os, "startfile"):
+                os.startfile(log_path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", log_path])
+            else:
+                subprocess.Popen(["xdg-open", log_path])
+        except Exception as exc:
+            messagebox.showwarning("Лог", f"Не удалось открыть лог: {exc}", parent=win)
+
     ttk.Button(btn_row, text="Показать детали", command=_open_details).pack(side=tk.LEFT)
+    ttk.Button(btn_row, text="Открыть лог", command=_open_log).pack(side=tk.LEFT, padx=(8, 0))
     ttk.Button(btn_row, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
 
 
@@ -22055,7 +22099,7 @@ class VideoClipCardsWindow:
             anchor="w", padx=6, pady=(0, 4)
         )
 
-        self.stt_log_path_var = tk.StringVar(value=f"Лог: {get_log_path()}")
+        self.stt_log_path_var = tk.StringVar(value=f"Лог: {get_stt_log_path()}")
         log_row = ttk.Frame(frame)
         log_row.pack(fill=tk.X, padx=6, pady=(0, 4))
         ttk.Label(log_row, textvariable=self.stt_log_path_var, foreground="gray").pack(side=tk.LEFT)
@@ -22345,10 +22389,11 @@ class VideoClipCardsWindow:
             self.stt_status_var.set("⚠️ Похоже, процесс завис. См. лог.")
             _append_stt_log_line("watchdog_warning=stt_progress_stalled")
             _append_stt_log_line("TIMEOUT/DEADLOCK=stt_progress_stalled")
+            log_write(get_stt_log_path(), "stage=timeout_terminate")
             messagebox.showwarning(
                 "STT завис",
                 f"Похоже, процесс распознавания завис или не отвечает.\n"
-                f"Лог: {get_log_path()}",
+                f"Лог: {get_stt_log_path()}",
                 parent=self.win,
             )
         if job_id == self.stt_job_id:
@@ -22361,7 +22406,7 @@ class VideoClipCardsWindow:
             _append_stt_log_line("stt_cancel_requested=true")
 
     def _open_stt_log(self) -> None:
-        log_path = get_log_path()
+        log_path = get_stt_log_path()
         try:
             if not os.path.exists(log_path):
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -22377,7 +22422,7 @@ class VideoClipCardsWindow:
             messagebox.showwarning("Лог", f"Не удалось открыть лог: {exc}", parent=self.win)
 
     def _open_stt_log_dir(self) -> None:
-        log_dir = get_log_dir()
+        log_dir = os.path.dirname(get_stt_log_path())
         try:
             if hasattr(os, "startfile"):
                 os.startfile(log_dir)
@@ -22493,9 +22538,22 @@ class VideoClipCardsWindow:
         return 0.0, float(end_sec), duration
 
     def _request_stt(self, mode_override: str | None = None) -> None:
+        log_path = get_stt_log_path()
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"timestamp={datetime.now().isoformat()}\n")
+                f.write(f"python_version={sys.version.replace(os.linesep, ' ')}\n")
+                f.write(f"cwd={os.getcwd()}\n")
+                f.flush()
+        except Exception:
+            pass
+        self.stt_log_path_var.set(f"Лог: {log_path}")
+        log_write(log_path, "stage=ui_click_recognize")
         if self.stt_running:
+            log_write(log_path, "stage=ui_click_ignored_running")
             return
         if not self.video_path:
+            log_write(log_path, "ERROR=no_video_path_selected")
             messagebox.showwarning("Видео", "Сначала выберите видео файл.", parent=self.win)
             return
         mode = mode_override or self.processing_mode_var.get()
@@ -22538,6 +22596,10 @@ class VideoClipCardsWindow:
                 range_label = "Авто-режим: весь файл"
         if range_label:
             self.stt_source_var.set(f"Источник: {range_label}")
+        log_write(
+            log_path,
+            f"video_path={self.video_path} start={start_sec} end={end_sec} mode={mode}",
+        )
         self.stt_running = True
         self.stt_job_id += 1
         job_id = self.stt_job_id
@@ -22610,7 +22672,7 @@ class VideoClipCardsWindow:
                 if reason in {"timeout", "deadlock"}:
                     messagebox.showwarning(
                         "STT завис/таймаут",
-                        f"Распознавание зависло или превысило лимит времени.\nЛог: {get_log_path()}",
+                        f"Распознавание зависло или превысило лимит времени.\nЛог: {get_stt_log_path()}",
                         parent=self.win,
                     )
                 return

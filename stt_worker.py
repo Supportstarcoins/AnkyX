@@ -8,6 +8,17 @@ _STT_WORKER_MODEL = None
 _STT_WORKER_MODEL_KEY = None
 
 
+def log_write(path, line):
+    try:
+        if not path:
+            return
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line.rstrip("\n") + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+
 def _get_worker_whisper_model(model_name: str, device: str, compute_type: str):
     global _STT_WORKER_MODEL, _STT_WORKER_MODEL_KEY
     key = (model_name, device, compute_type)
@@ -25,6 +36,8 @@ def _get_worker_whisper_model(model_name: str, device: str, compute_type: str):
 
 
 def whisper_worker(payload: dict, out_q) -> None:
+    log_path = payload.get("log_path")
+    log_write(log_path, "stage=worker_enter")
     out_q.put({"type": "started", "ts": time.time()})
 
     heartbeat_sec = float(payload.get("heartbeat_sec", 1.0))
@@ -43,6 +56,7 @@ def whisper_worker(payload: dict, out_q) -> None:
             device=payload.get("device", "cpu"),
             compute_type=payload.get("compute_type", "int8"),
         )
+        log_write(log_path, "stage=whisper_start")
         lang = payload.get("language")
         chunks = payload.get("chunks") or []
         total_seconds = float(payload.get("total_seconds") or 0.0)
@@ -128,6 +142,10 @@ def whisper_worker(payload: dict, out_q) -> None:
             }
         )
     except Exception as exc:
+        log_write(
+            log_path,
+            f"EXCEPTION={type(exc).__name__}: {exc} traceback={traceback.format_exc()}",
+        )
         out_q.put({"type": "error", "err": str(exc), "tb": traceback.format_exc()})
     finally:
         stop_event.set()
