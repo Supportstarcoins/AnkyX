@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -346,6 +347,74 @@ def cut_video_clip_with_poster(
         return False, error_msg
 
     return True, {"clip_path": clip_path, "poster_path": poster_path}
+
+
+def cut_video_clip_stream_copy_with_poster(
+    video_path: str,
+    start_sec: float,
+    end_sec: float,
+    output_dir: str,
+    base_name: str,
+) -> tuple[str, str]:
+    ffmpeg_path = find_ffmpeg()
+    if not ffmpeg_path:
+        raise RuntimeError("FFmpeg не найден. Положите ffmpeg.exe рядом с программой или добавьте его в PATH.")
+    if end_sec <= start_sec:
+        raise ValueError("Время окончания должно быть больше времени начала.")
+    if (end_sec - start_sec) <= 0.2:
+        raise ValueError("Длительность клипа должна быть больше 0.2 секунды.")
+    os.makedirs(output_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_base = re.sub(r"[^0-9A-Za-z_-]+", "_", base_name)
+    clip_path = os.path.join(output_dir, f"{safe_base}_{ts}.mp4")
+    poster_path = os.path.join(output_dir, f"{safe_base}_{ts}.jpg")
+    clip_cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-ss",
+        f"{start_sec:.3f}",
+        "-to",
+        f"{end_sec:.3f}",
+        "-i",
+        video_path,
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "1",
+        "-movflags",
+        "+faststart",
+        clip_path,
+    ]
+    result = _run_ffmpeg_attempt(clip_cmd, label="stream_copy")
+    if result is None or result.returncode != 0:
+        error_msg = result.stderr.strip() if result and result.stderr else "Не удалось нарезать клип (stream-copy)."
+        raise RuntimeError(error_msg)
+    poster_cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-i",
+        clip_path,
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        poster_path,
+    ]
+    result = _run_ffmpeg_attempt(poster_cmd, label="poster")
+    if result is None or result.returncode != 0:
+        error_msg = result.stderr.strip() if result and result.stderr else "Не удалось создать постер."
+        raise RuntimeError(error_msg)
+    return clip_path, poster_path
 
 
 def open_in_external_player(path: str) -> None:
