@@ -4495,6 +4495,33 @@ def insert_card(
 
     return card_id
 
+
+def update_card_text(card_id: int, front: str, back: str) -> bool:
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(cards);")
+        columns = {row[1] for row in cur.fetchall()}
+        set_parts = ["front = ?", "back = ?", "front_rich = NULL", "back_rich = NULL"]
+        if "front_html" in columns:
+            set_parts.append("front_html = NULL")
+        if "back_html" in columns:
+            set_parts.append("back_html = NULL")
+        cur.execute(
+            f"UPDATE cards SET {', '.join(set_parts)} WHERE id = ?;",
+            (front, back, card_id),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        messagebox.showerror("Ошибка БД", f"Не удалось сохранить карточку: {exc}")
+        return False
+
 # ==========================
 # Авто-генерация
 # ==========================
@@ -6972,6 +6999,7 @@ class CardRenderer:
         self._suppress_video = False
         self._suppress_image = False
         self._suppress_audio = False
+        self.inline_editing = bool(editable)
 
         card_bg, card_text, _ = get_card_surface_colors(parent)
         self.card_bg = card_bg
@@ -7083,28 +7111,28 @@ class CardRenderer:
         self.text_frame.grid_columnconfigure(0, weight=1)
         self.text_frame.grid_rowconfigure(0, weight=1)
 
-        if editable:
-            self.front_text = tk.Text(self.text_frame, wrap=tk.WORD, height=10, bg="white", fg=card_text)
-            self.back_text = tk.Text(self.text_frame, wrap=tk.WORD, height=10, bg="white", fg=card_text)
-        else:
-            self.front_text = tk.Label(
-                self.text_frame,
-                text="",
-                bg="white",
-                fg=card_text,
-                justify="left",
-                anchor="nw",
-                font=("Segoe UI", 12),
-            )
-            self.back_text = tk.Label(
-                self.text_frame,
-                text="",
-                bg="white",
-                fg=card_text,
-                justify="left",
-                anchor="nw",
-                font=("Segoe UI", 12),
-            )
+        self.front_text = tk.Text(
+            self.text_frame,
+            wrap=tk.WORD,
+            height=10,
+            bg="white",
+            fg=card_text,
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+            font=("Segoe UI", 12),
+        )
+        self.back_text = tk.Text(
+            self.text_frame,
+            wrap=tk.WORD,
+            height=10,
+            bg="white",
+            fg=card_text,
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+            font=("Segoe UI", 12),
+        )
 
         self.front_text.grid(row=0, column=0, sticky="nsew")
         self.back_text.grid(row=0, column=0, sticky="nsew")
@@ -7128,6 +7156,23 @@ class CardRenderer:
 
         self._bind_mousewheel(self.content_canvas)
         self._bind_mousewheel(self.content_inner)
+        self.set_inline_editing(self.inline_editing)
+
+    def set_inline_editing(self, editing: bool) -> None:
+        self.inline_editing = bool(editing)
+        desired_state = tk.NORMAL if self.inline_editing else tk.DISABLED
+        for widget in (self.front_text, self.back_text):
+            if isinstance(widget, tk.Text):
+                widget.configure(state=desired_state)
+
+    def _set_text_widget_content(self, widget: tk.Text, value: str) -> None:
+        if not isinstance(widget, tk.Text):
+            return
+        desired_state = tk.NORMAL if self.inline_editing else tk.DISABLED
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", value)
+        widget.configure(state=desired_state)
 
     def _bind_mousewheel(self, target: tk.Widget) -> None:
         def _on_mousewheel(event):
@@ -7251,6 +7296,10 @@ class CardRenderer:
         use_rich = bool(rich_doc)
         html_value = back_html if show_back else front_html
         use_html = bool(html_value) and not use_rich
+        if self.inline_editing:
+            use_rich = False
+            use_html = False
+            custom_items = None
         html_media = extract_media_from_html(html_value or "") if use_html else {}
         self._suppress_video = bool(use_html and html_media.get("video"))
         self._suppress_image = bool(use_html and html_media.get("image"))
@@ -7300,16 +7349,8 @@ class CardRenderer:
             self.html_view.set_html(html_value or "", card_bg=card_bg, card_text_color=card_text)
         else:
             self._use_custom_text = False
-            if isinstance(self.front_text, tk.Text):
-                self.front_text.delete("1.0", tk.END)
-                self.front_text.insert("1.0", front_text)
-            else:
-                self.front_text.configure(text=front_text)
-            if isinstance(self.back_text, tk.Text):
-                self.back_text.delete("1.0", tk.END)
-                self.back_text.insert("1.0", back_text)
-            else:
-                self.back_text.configure(text=back_text)
+            self._set_text_widget_content(self.front_text, front_text)
+            self._set_text_widget_content(self.back_text, back_text)
         self._current_show_back = show_back
         side_media = self._select_side_media(
             card,
@@ -20624,6 +20665,8 @@ class RepeatWindow(tk.Toplevel):
         self.timer_flash_job = None
         self.timer_label = None
         self._timer_fired = False
+        self._inline_editing = False
+        self._inline_edit_controls: list[tk.Widget] = []
         
         self.title("Режим повторения")
         self.geometry("1000x700")
@@ -20739,12 +20782,23 @@ class RepeatWindow(tk.Toplevel):
         self.actions_menu_button = self._build_actions_menu(self.controls_bar)
         self.actions_menu_button.pack(side=tk.RIGHT, padx=5)
 
+        self.btn_edit_save = ttk.Button(self.controls_bar, text="💾 Сохранить", command=self._save_inline_edit)
+        self.btn_edit_cancel = ttk.Button(self.controls_bar, text="✖ Отмена", command=self._cancel_inline_edit)
+
         # Кнопка звука
         self.btn_sound = ttk.Button(self.controls_bar, text="🔊 Слово", command=self.play_word)
         self.btn_sound.pack(side=tk.RIGHT, padx=5)
 
         # Инициализация аудио-плеера
         self.update_audio_player()
+        self._inline_edit_controls = [
+            self.btn_prev,
+            self.btn_next,
+            self.btn_show,
+            self.btn_forget,
+            self.btn_remember,
+            self.btn_translation,
+        ]
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
@@ -20792,6 +20846,7 @@ class RepeatWindow(tk.Toplevel):
             label="Отметить карточку",
             command=lambda: mark_card_for_overview(self.current_card["id"]) if self.current_card else None,
         )
+        menu.add_command(label="Редактировать карточку", command=self.toggle_inline_edit)
         menu.add_command(label="Отложить карточку", command=lambda: _placeholder("Отложить карточку"))
         menu.add_command(label="Сбросить карточку", command=_reset_card)
         menu.add_command(label="Задать срок", command=lambda: _placeholder("Задать срок"))
@@ -20800,6 +20855,75 @@ class RepeatWindow(tk.Toplevel):
         menu.add_command(label="Удалить карточку", command=_delete_card)
 
         return menu_button
+
+    def toggle_inline_edit(self) -> None:
+        if self._inline_editing:
+            return
+        self._start_inline_edit()
+
+    def _set_inline_edit_controls_state(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for widget in self._inline_edit_controls:
+            try:
+                widget.config(state=state)
+            except Exception:
+                pass
+
+    def _show_inline_edit_buttons(self) -> None:
+        if self.btn_edit_cancel.winfo_ismapped():
+            return
+        self.btn_edit_cancel.pack(side=tk.RIGHT, padx=5, before=self.actions_menu_button)
+        self.btn_edit_save.pack(side=tk.RIGHT, padx=5, before=self.btn_edit_cancel)
+
+    def _hide_inline_edit_buttons(self) -> None:
+        if self.btn_edit_save.winfo_ismapped():
+            self.btn_edit_save.pack_forget()
+        if self.btn_edit_cancel.winfo_ismapped():
+            self.btn_edit_cancel.pack_forget()
+
+    def _start_inline_edit(self) -> None:
+        if not self.current_card or not self.card_renderer:
+            return
+        self._inline_editing = True
+        self.stop_timer()
+        self._set_inline_edit_controls_state(False)
+        self.card_renderer.set_inline_editing(True)
+        self._show_inline_edit_buttons()
+        self.update_view()
+
+    def _stop_inline_edit(self) -> None:
+        if not self.card_renderer:
+            return
+        self._inline_editing = False
+        self.card_renderer.set_inline_editing(False)
+        self._set_inline_edit_controls_state(True)
+        self._hide_inline_edit_buttons()
+        if self.current_card:
+            self.reset_timer_for_card()
+
+    def _save_inline_edit(self) -> None:
+        if not self.current_card or not self.card_renderer:
+            return
+        card_id = self.current_card.get("id")
+        if card_id is None:
+            return
+        front_text = self.card_renderer.front_text.get("1.0", "end-1c")
+        back_text = self.card_renderer.back_text.get("1.0", "end-1c")
+        if not update_card_text(card_id, front_text, back_text):
+            return
+        self.current_card["front"] = front_text
+        self.current_card["back"] = back_text
+        for key in ("front_rich", "back_rich", "front_html", "back_html"):
+            if key in self.current_card:
+                self.current_card[key] = None
+        self._stop_inline_edit()
+        self.update_view()
+
+    def _cancel_inline_edit(self) -> None:
+        if not self.current_card:
+            return
+        self._stop_inline_edit()
+        self.update_view()
 
     def _apply_audio_state_from_selection(self):
         audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
@@ -20946,6 +21070,8 @@ class RepeatWindow(tk.Toplevel):
 
     def toggle_translations(self):
         """Переключить отображение переводов слов на лицевой стороне."""
+        if self._inline_editing:
+            return
         self.show_translations = not self.show_translations
         card_id = self.current_card["id"]
         self.translations_visible[card_id] = self.show_translations
@@ -21072,6 +21198,8 @@ class RepeatWindow(tk.Toplevel):
             btn.config(state=tk.DISABLED)
 
     def toggle_front_back(self):
+        if self._inline_editing:
+            return
         self.show_back = not self.show_back
         self.update_view()
 
@@ -21140,6 +21268,8 @@ class RepeatWindow(tk.Toplevel):
         self.timer_flash_job = self.after(1500, reset_bg)
 
     def mark_forgotten(self):
+        if self._inline_editing:
+            return
         self.session.mark_wrong()
         self.master.update_overdue_badge()
         if self.current_card:
@@ -21147,6 +21277,8 @@ class RepeatWindow(tk.Toplevel):
         self.goto_next_card()
 
     def mark_remembered(self):
+        if self._inline_editing:
+            return
         self.session.mark_correct()
         self.master.update_overdue_badge()
         if self.current_card:
@@ -21154,6 +21286,8 @@ class RepeatWindow(tk.Toplevel):
         self.goto_next_card()
 
     def goto_next_card(self):
+        if self._inline_editing:
+            return
         self.save_current_media_state()
         self.current_card = self.session.next_card()
         self.show_back = False
@@ -21165,9 +21299,13 @@ class RepeatWindow(tk.Toplevel):
         self.reset_timer_for_card()
 
     def next_card(self):
+        if self._inline_editing:
+            return
         self.goto_next_card()
 
     def prev_card(self):
+        if self._inline_editing:
+            return
         self.save_current_media_state()
         self.current_card = self.session.prev_card()
         self.show_back = False
@@ -21204,6 +21342,8 @@ class ReviewWindow(tk.Toplevel):
         self.timer_job = None
         self.timer_label = None
         self.timer_flash_job = None
+        self._inline_editing = False
+        self._inline_edit_controls: list[tk.Widget] = []
 
         # Прогресс
         self.progress_canvas = None
@@ -21302,6 +21442,9 @@ class ReviewWindow(tk.Toplevel):
         self.btn_audio_icon = ttk.Button(bottom_frame, text="🔊", width=3, command=self.play_word)
         self.btn_audio_icon.pack(side=tk.LEFT, padx=5)
 
+        self.actions_menu_button = self._build_actions_menu(bottom_frame)
+        self.actions_menu_button.pack(side=tk.RIGHT, padx=5)
+
         btn_frame = ttk.Frame(frame_main)
         btn_frame.pack(pady=10)
 
@@ -21318,7 +21461,22 @@ class ReviewWindow(tk.Toplevel):
         self.btn_sound = ttk.Button(btn_frame, text="🔊 Слово", command=self.play_word)
         self.btn_sound.grid(row=0, column=3, padx=5)
 
+        self.btn_edit_save = ttk.Button(btn_frame, text="💾 Сохранить", command=self._save_inline_edit)
+        self.btn_edit_cancel = ttk.Button(btn_frame, text="✖ Отмена", command=self._cancel_inline_edit)
+        self.btn_edit_save.grid(row=1, column=2, padx=5, pady=(6, 0))
+        self.btn_edit_cancel.grid(row=1, column=3, padx=5, pady=(6, 0))
+        self.btn_edit_save.grid_remove()
+        self.btn_edit_cancel.grid_remove()
+
         self.update_audio_player()
+        self._inline_edit_controls = [
+            self.btn_show,
+            self.btn_prev,
+            self.btn_next,
+            self.btn_sound,
+            self.btn_audio_icon,
+            self.btn_progress_plus,
+        ]
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
@@ -21327,6 +21485,11 @@ class ReviewWindow(tk.Toplevel):
         prefer_side = "back" if self.show_back else "front"
         self.card_renderer.update_media(self.current_card, prefer_audio_side=prefer_side)
         self.audio_widget = self.card_renderer.get_audio_widget()
+
+    def _build_actions_menu(self, parent) -> ttk.Menubutton:
+        menu_button, menu = create_action_menubutton(parent, getattr(self.master, "palette", None))
+        menu.add_command(label="Редактировать карточку", command=self.toggle_inline_edit)
+        return menu_button
 
     def _show_audio_error(self, title: str, message: str):
         try:
@@ -21345,6 +21508,71 @@ class ReviewWindow(tk.Toplevel):
             speak_text(self.current_card["front"])
         else:
             messagebox.showinfo("Ошибка", "Аудио система недоступна")
+
+    def toggle_inline_edit(self) -> None:
+        if self._inline_editing:
+            return
+        self._start_inline_edit()
+
+    def _set_inline_edit_controls_state(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for widget in self._inline_edit_controls:
+            try:
+                widget.config(state=state)
+            except Exception:
+                pass
+
+    def _show_inline_edit_buttons(self) -> None:
+        self.btn_edit_save.grid()
+        self.btn_edit_cancel.grid()
+
+    def _hide_inline_edit_buttons(self) -> None:
+        self.btn_edit_save.grid_remove()
+        self.btn_edit_cancel.grid_remove()
+
+    def _start_inline_edit(self) -> None:
+        if not self.current_card or not self.card_renderer:
+            return
+        self._inline_editing = True
+        self.cancel_timers()
+        self._set_inline_edit_controls_state(False)
+        self.card_renderer.set_inline_editing(True)
+        self._show_inline_edit_buttons()
+        self.update_view()
+
+    def _stop_inline_edit(self) -> None:
+        if not self.card_renderer:
+            return
+        self._inline_editing = False
+        self.card_renderer.set_inline_editing(False)
+        self._set_inline_edit_controls_state(True)
+        self._hide_inline_edit_buttons()
+        if self.current_card:
+            self.schedule_timers_for_card()
+
+    def _save_inline_edit(self) -> None:
+        if not self.current_card or not self.card_renderer:
+            return
+        card_id = self.current_card.get("id")
+        if card_id is None:
+            return
+        front_text = self.card_renderer.front_text.get("1.0", "end-1c")
+        back_text = self.card_renderer.back_text.get("1.0", "end-1c")
+        if not update_card_text(card_id, front_text, back_text):
+            return
+        self.current_card["front"] = front_text
+        self.current_card["back"] = back_text
+        for key in ("front_rich", "back_rich", "front_html", "back_html"):
+            if key in self.current_card:
+                self.current_card[key] = None
+        self._stop_inline_edit()
+        self.update_view()
+
+    def _cancel_inline_edit(self) -> None:
+        if not self.current_card:
+            return
+        self._stop_inline_edit()
+        self.update_view()
 
     def cancel_timers(self):
         if self.auto_flip_id is not None:
@@ -21441,11 +21669,15 @@ class ReviewWindow(tk.Toplevel):
         self.auto_next_id = self.after(total_time * 1000, self.auto_mark_and_next)
 
     def auto_show_answer(self):
+        if self._inline_editing:
+            return
         if not self.show_back:
             self.show_back = True
             self.update_view()
 
     def auto_mark_and_next(self):
+        if self._inline_editing:
+            return
         self.cancel_timers()
         card_id = self.current_card["id"]
         try:
@@ -21532,10 +21764,14 @@ class ReviewWindow(tk.Toplevel):
             self.update_audio_player()
 
     def toggle_front_back(self):
+        if self._inline_editing:
+            return
         self.show_back = not self.show_back
         self.update_view()
 
     def mark_forgotten(self):
+        if self._inline_editing:
+            return
         self.cancel_timers()
         card_id = self.current_card["id"]
         result = apply_srs_update(card_id, 0)
@@ -21551,6 +21787,8 @@ class ReviewWindow(tk.Toplevel):
         self.schedule_timers_for_card()
 
     def mark_remembered(self):
+        if self._inline_editing:
+            return
         self.cancel_timers()
         card_id = self.current_card["id"]
 
@@ -21567,6 +21805,8 @@ class ReviewWindow(tk.Toplevel):
         self.goto_next_card()
 
     def increment_progress(self):
+        if self._inline_editing:
+            return
         card_id = self.current_card["id"]
         current = int(self.current_card.get("progress") or 0)
         if current >= 100:
@@ -21578,6 +21818,8 @@ class ReviewWindow(tk.Toplevel):
 
     def goto_prev_card(self):
         """Перейти к предыдущей карточке (режим воспроизведения)."""
+        if self._inline_editing:
+            return
         try:
             self.cancel_timers()
         except Exception:
@@ -21597,6 +21839,8 @@ class ReviewWindow(tk.Toplevel):
         self.schedule_timers_for_card()
 
     def goto_next_card(self):
+        if self._inline_editing:
+            return
         self.cancel_timers()
         self.current_index += 1
         if self.current_index >= len(self.cards):
