@@ -4553,6 +4553,32 @@ def update_card_text(card_id: int, front: str, back: str) -> bool:
         return False
 
 
+def update_card_content(
+    card_id: int,
+    front: str,
+    back: str,
+    front_rich: str | None,
+    back_rich: str | None,
+) -> bool:
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE cards SET front = ?, back = ?, front_rich = ?, back_rich = ? WHERE id = ?;",
+            (front, back, front_rich, back_rich, card_id),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        messagebox.showerror("Ошибка БД", f"Не удалось сохранить карточку: {exc}")
+        return False
+
+
 def update_card_rich_text(
     card_id: int,
     front: str,
@@ -7907,9 +7933,9 @@ class CardRenderer:
             pass
         return front_value, back_value
 
-    def get_edited_rich_docs(self) -> tuple[dict, dict]:
-        front_doc = export_rich_from_editor(self.front_text)
-        back_doc = export_rich_from_editor(self.back_text)
+    def get_edited_rich_docs(self) -> tuple[str, str]:
+        _, front_doc = export_text_with_tags(self.front_text)
+        _, back_doc = export_text_with_tags(self.back_text)
         return front_doc, back_doc
 
     def revert_to_original(self) -> None:
@@ -7939,43 +7965,27 @@ class CardRenderer:
         widget.configure(state=desired_state)
         self._suppress_modified = False
 
-    def _apply_rich_doc_to_text(self, widget: tk.Text, rich_doc: dict | None) -> None:
-        value = ""
-        tags = []
-        if rich_doc:
-            value = rich_doc.get("text") or ""
-            tags = rich_doc.get("tags") or []
-        else:
-            try:
-                value = widget.get("1.0", "end-1c")
-            except Exception:
-                value = ""
+    def _apply_rich_doc_to_text(
+        self,
+        widget: tk.Text,
+        rich_doc: dict | str | None,
+        *,
+        fallback_text: str = "",
+    ) -> None:
         desired_state = tk.NORMAL if self.inline_editing else tk.DISABLED
         self._suppress_modified = True
-        widget.configure(state=tk.NORMAL)
-        widget.delete("1.0", tk.END)
-        widget.insert("1.0", value)
-        for tag_info in tags:
-            tag_name = tag_info.get("name")
-            if not tag_name:
-                continue
-            config = tag_info.get("config") or {}
-            safe_config: dict[str, object] = {}
-            for key, cfg_value in config.items():
-                if cfg_value in ("", None):
-                    continue
-                safe_config[key] = cfg_value
-            if safe_config:
-                try:
-                    widget.tag_configure(tag_name, **safe_config)
-                except tk.TclError:
-                    pass
-            ranges = tag_info.get("ranges") or []
-            for start, end in ranges:
-                try:
-                    widget.tag_add(tag_name, start, end)
-                except tk.TclError:
-                    pass
+        self._ensure_format_tags(widget)
+        plain_text = fallback_text
+        if isinstance(rich_doc, dict):
+            plain_text = rich_doc.get("text") or plain_text
+        elif isinstance(rich_doc, str):
+            try:
+                parsed = json.loads(rich_doc)
+                if isinstance(parsed, dict):
+                    plain_text = parsed.get("text") or plain_text
+            except Exception:
+                pass
+        import_text_with_tags(widget, plain_text, rich_doc)
         try:
             widget.edit_modified(False)
         except Exception:
@@ -8152,19 +8162,16 @@ class CardRenderer:
                 pass
         if custom_items is not None:
             self._apply_custom_text(custom_items, card_bg=card_bg, card_text=card_text)
-        elif use_rich:
-            self._use_custom_text = True
-            render_rich_to_container(self.custom_text_frame, rich_doc, card_bg=card_bg, card_text_color=card_text)
         elif use_html:
             self._use_custom_text = True
             self.html_view.set_html(html_value or "", card_bg=card_bg, card_text_color=card_text)
         else:
             self._use_custom_text = False
-            if self.inline_editing:
+            if self.inline_editing or use_rich:
                 front_doc = front_rich or {"text": front_text, "tags": []}
                 back_doc = back_rich or {"text": back_text, "tags": []}
-                self._apply_rich_doc_to_text(self.front_text, front_doc)
-                self._apply_rich_doc_to_text(self.back_text, back_doc)
+                self._apply_rich_doc_to_text(self.front_text, front_doc, fallback_text=front_text)
+                self._apply_rich_doc_to_text(self.back_text, back_doc, fallback_text=back_text)
             else:
                 self._set_text_widget_content(self.front_text, front_text)
                 self._set_text_widget_content(self.back_text, back_text)
@@ -8189,10 +8196,6 @@ class CardRenderer:
             self.back_text.grid_remove()
             self.front_text.grid()
         if custom_items is not None:
-            self.front_text.grid_remove()
-            self.back_text.grid_remove()
-            self.custom_text_frame.grid()
-        elif use_rich:
             self.front_text.grid_remove()
             self.back_text.grid_remove()
             self.custom_text_frame.grid()
@@ -8469,6 +8472,115 @@ def export_rich_from_editor(text_widget: tk.Text) -> dict:
     }
 
 
+def export_text_with_tags(
+    text_widget: tk.Text,
+    allowed_prefixes: tuple[str, ...] = ("fmt_",),
+) -> tuple[str, str]:
+    plain_text = text_widget.get("1.0", "end-1c")
+    tags_payload: list[dict[str, str]] = []
+    tag_configs: dict[str, dict[str, object]] = {}
+    for tag in text_widget.tag_names():
+        if tag == "sel":
+            continue
+        if not any(tag.startswith(prefix) for prefix in allowed_prefixes):
+            continue
+        ranges = text_widget.tag_ranges(tag)
+        if not ranges:
+            continue
+        for idx in range(0, len(ranges), 2):
+            start = str(ranges[idx])
+            end = str(ranges[idx + 1])
+            tags_payload.append({"name": tag, "start": start, "end": end})
+        config: dict[str, object] = {}
+        for key in ("foreground", "background", "font", "underline", "overstrike"):
+            value = text_widget.tag_cget(tag, key)
+            if value in ("", None):
+                continue
+            if key in ("underline", "overstrike"):
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    pass
+            config[key] = value
+        if config:
+            tag_configs[tag] = config
+    payload = {
+        "text": plain_text,
+        "tags": tags_payload,
+        "tag_configs": tag_configs,
+        "version": 1,
+    }
+    return plain_text, json.dumps(payload, ensure_ascii=False)
+
+
+def import_text_with_tags(
+    text_widget: tk.Text,
+    plain_text: str,
+    rich_json_str: str | dict | None,
+) -> None:
+    prev_state = text_widget.cget("state")
+    text_widget.configure(state=tk.NORMAL)
+    text_widget.delete("1.0", tk.END)
+    text_widget.insert("1.0", plain_text or "")
+    payload: dict | None = None
+    if rich_json_str:
+        if isinstance(rich_json_str, dict):
+            payload = rich_json_str
+        else:
+            try:
+                payload = json.loads(rich_json_str)
+            except Exception:
+                payload = None
+    if payload:
+        tags = payload.get("tags") or []
+        is_legacy = any("ranges" in tag for tag in tags if isinstance(tag, dict))
+        if is_legacy:
+            for tag_info in tags:
+                tag_name = tag_info.get("name")
+                if not tag_name:
+                    continue
+                config = tag_info.get("config") or {}
+                safe_config: dict[str, object] = {}
+                for key, value in config.items():
+                    if value in ("", None):
+                        continue
+                    safe_config[key] = value
+                if safe_config:
+                    try:
+                        text_widget.tag_configure(tag_name, **safe_config)
+                    except tk.TclError:
+                        pass
+                for start, end in tag_info.get("ranges") or []:
+                    try:
+                        text_widget.tag_add(tag_name, start, end)
+                    except tk.TclError:
+                        pass
+        else:
+            tag_configs = payload.get("tag_configs") or {}
+            for tag_name, config in tag_configs.items():
+                safe_config: dict[str, object] = {}
+                for key, value in (config or {}).items():
+                    if value in ("", None):
+                        continue
+                    safe_config[key] = value
+                if safe_config:
+                    try:
+                        text_widget.tag_configure(tag_name, **safe_config)
+                    except tk.TclError:
+                        pass
+            for tag_info in tags:
+                tag_name = tag_info.get("name")
+                start = tag_info.get("start")
+                end = tag_info.get("end")
+                if not tag_name or not start or not end:
+                    continue
+                try:
+                    text_widget.tag_add(tag_name, start, end)
+                except tk.TclError:
+                    pass
+    text_widget.configure(state=prev_state)
+
+
 def text_widget_to_html(text_widget: tk.Text) -> str:
     dump = text_widget.dump("1.0", "end-1c", tag=True, text=True)
     active_tags: set[str] = set()
@@ -8553,9 +8665,11 @@ def text_widget_to_html(text_widget: tk.Text) -> str:
     return "".join(html_parts).strip()
 
 
-def serialize_rich_doc(rich_doc: dict | None) -> str | None:
+def serialize_rich_doc(rich_doc: dict | str | None) -> str | None:
     if rich_doc is None:
         return None
+    if isinstance(rich_doc, str):
+        return rich_doc
     try:
         return json.dumps(rich_doc, ensure_ascii=False)
     except Exception:
@@ -22134,8 +22248,8 @@ class RepeatWindow(tk.Toplevel):
         card_id = self.current_card.get("id")
         if card_id is None:
             return False
-        front_text, back_text = self.card_renderer.get_edited_texts()
-        front_rich, back_rich = self.card_renderer.get_edited_rich_docs()
+        front_text, front_rich = export_text_with_tags(self.card_renderer.front_text)
+        back_text, back_rich = export_text_with_tags(self.card_renderer.back_text)
         now_ts = time.time()
         if silent:
             if (now_ts - self._last_autosave_version_ts) > 120:
@@ -22143,16 +22257,12 @@ class RepeatWindow(tk.Toplevel):
                 self._last_autosave_version_ts = now_ts
         else:
             insert_card_version_snapshot(self.current_card, reason="before_manual_save", window_name="repeat")
-        if not update_card_rich_text(card_id, front_text, back_text, front_rich, back_rich):
+        if not update_card_content(card_id, front_text, back_text, front_rich, back_rich):
             return False
         self.current_card["front"] = front_text
         self.current_card["back"] = back_text
         self.current_card["front_rich"] = front_rich
         self.current_card["back_rich"] = back_rich
-        for key in ("front_rich", "back_rich", "front_html", "back_html"):
-            if key in self.current_card:
-                if key in ("front_html", "back_html"):
-                    self.current_card[key] = None
         if self.card_renderer:
             self.card_renderer.clear_dirty()
         status_label = "Автосохранено" if silent else "Сохранено"
@@ -22914,8 +23024,8 @@ class ReviewWindow(tk.Toplevel):
         card_id = self.current_card.get("id")
         if card_id is None:
             return False
-        front_text, back_text = self.card_renderer.get_edited_texts()
-        front_rich, back_rich = self.card_renderer.get_edited_rich_docs()
+        front_text, front_rich = export_text_with_tags(self.card_renderer.front_text)
+        back_text, back_rich = export_text_with_tags(self.card_renderer.back_text)
         now_ts = time.time()
         if silent:
             if (now_ts - self._last_autosave_version_ts) > 120:
@@ -22923,16 +23033,12 @@ class ReviewWindow(tk.Toplevel):
                 self._last_autosave_version_ts = now_ts
         else:
             insert_card_version_snapshot(self.current_card, reason="before_manual_save", window_name="review")
-        if not update_card_rich_text(card_id, front_text, back_text, front_rich, back_rich):
+        if not update_card_content(card_id, front_text, back_text, front_rich, back_rich):
             return False
         self.current_card["front"] = front_text
         self.current_card["back"] = back_text
         self.current_card["front_rich"] = front_rich
         self.current_card["back_rich"] = back_rich
-        for key in ("front_rich", "back_rich", "front_html", "back_html"):
-            if key in self.current_card:
-                if key in ("front_html", "back_html"):
-                    self.current_card[key] = None
         if self.card_renderer:
             self.card_renderer.clear_dirty()
         status_label = "Автосохранено" if silent else "Сохранено"
