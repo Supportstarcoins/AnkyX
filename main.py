@@ -16,7 +16,6 @@ import base64
 import sqlite3
 import re
 import glob
-import multiprocessing as mp
 import threading
 import queue
 import json
@@ -29,7 +28,6 @@ import urllib.request
 from PIL import Image, ImageOps, ImageDraw, ImageEnhance
 from pathlib import Path
 from uuid import uuid4
-from stt_worker import whisper_worker
 csv.field_size_limit(10 * 1024 * 1024)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SYNC_CONFIG_PATH = os.path.join(BASE_DIR, "config_sync.json")
@@ -5040,6 +5038,13 @@ def get_stt_log_path() -> str:
     return os.path.join(log_dir, "stt_last.log")
 
 
+def get_stt_worker_stderr_log_path() -> str:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(base_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, "stt_worker_stderr.log")
+
+
 def log_write(path, line):
     try:
         if not path:
@@ -5707,22 +5712,33 @@ def stt_transcribe_wav(
                     if chunk_path != wav_path and chunk_path not in chunk_paths:
                         chunk_paths.append(chunk_path)
 
-                def _terminate_process(proc: mp.Process) -> None:
+                def _terminate_process(proc: subprocess.Popen[str]) -> None:
                     terminated = False
-                    if proc.is_alive():
-                        proc.terminate()
-                        terminated = True
-                    proc.join(timeout=0.2)
-                    if proc.is_alive() and hasattr(proc, "kill"):
-                        proc.kill()
-                        terminated = True
-                        proc.join(timeout=0.2)
+                    if proc.poll() is None:
+                        try:
+                            proc.terminate()
+                            terminated = True
+                        except Exception:
+                            pass
+                    try:
+                        proc.wait(timeout=0.2)
+                    except Exception:
+                        pass
+                    if proc.poll() is None:
+                        try:
+                            proc.kill()
+                            terminated = True
+                        except Exception:
+                            pass
+                        try:
+                            proc.wait(timeout=0.2)
+                        except Exception:
+                            pass
                     if terminated:
                         log_write(log_path, "stage=proc_terminated")
 
                 def _run_whisper_process() -> tuple[str, list[dict], float]:
-                    ctx = mp.get_context("spawn")
-                    out_queue = ctx.Queue()
+                    out_queue: queue.Queue[dict] = queue.Queue()
                     payload = {
                         "wav_path": str(wav_path),
                         "chunks": [(str(path), float(t0), float(t1)) for path, t0, t1 in chunks],
@@ -5733,15 +5749,66 @@ def stt_transcribe_wav(
                         "compute_type": "int8",
                         "heartbeat_sec": STT_WHISPER_HEARTBEAT_SEC,
                         "log_path": log_path,
+                        "chunk_sec": float(chunk_sec),
+                        "tmp_dir": ensure_dir(os.path.join("tmp", "media")),
                     }
-                    proc = ctx.Process(target=whisper_worker, args=(payload, out_queue), daemon=False)
-                    log_write(log_path, "stage=mp_spawn_prepare")
+                    tmp_dir = ensure_dir(os.path.join("tmp", "media"))
+                    payload_path = os.path.join(tmp_dir, "stt_payload.json")
+                    with open(payload_path, "w", encoding="utf-8") as handle:
+                        json.dump(payload, handle, ensure_ascii=False)
+                    base_dir = os.path.dirname(os.path.abspath(__file__))
+                    cmd = [
+                        sys.executable,
+                        "-u",
+                        os.path.join(base_dir, "stt_worker_cli.py"),
+                        "--payload",
+                        payload_path,
+                    ]
+                    log_write(log_path, "stage=worker_spawn_prepare")
+                    stderr_log_path = get_stt_worker_stderr_log_path()
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                        universal_newlines=True,
+                    )
                     try:
-                        proc.start()
+                        log_write(log_path, "stage=worker_spawned")
                     except Exception as exc:
-                        log_write(log_path, f"ERROR=mp_failed_to_start: {exc}")
+                        log_write(log_path, f"ERROR=worker_failed_to_start: {exc}")
                         raise RuntimeError(f"Не удалось запустить Whisper процесс: {exc}") from exc
-                    log_write(log_path, f"stage=mp_started pid={proc.pid}")
+                    log_write(log_path, f"stage=worker_started pid={proc.pid}")
+                    stdout_done = threading.Event()
+
+                    def _stdout_reader() -> None:
+                        if proc.stdout is None:
+                            stdout_done.set()
+                            return
+                        for line in proc.stdout:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                event = json.loads(line)
+                            except Exception:
+                                log_write(log_path, f"worker_stdout_unparsed={line}")
+                                continue
+                            out_queue.put(event)
+                        stdout_done.set()
+
+                    def _stderr_reader() -> None:
+                        if proc.stderr is None:
+                            return
+                        with open(stderr_log_path, "a", encoding="utf-8") as handle:
+                            for line in proc.stderr:
+                                handle.write(line)
+                                handle.flush()
+
+                    threading.Thread(target=_stdout_reader, daemon=True).start()
+                    threading.Thread(target=_stderr_reader, daemon=True).start()
                     last_heartbeat = time.time()
                     started_at = time.time()
                     started_received = False
@@ -5753,15 +5820,17 @@ def stt_transcribe_wav(
                                 raise STTCancelled()
                             event = None
                             try:
-                                event = out_queue.get_nowait()
+                                event = out_queue.get(timeout=0.2)
                             except queue.Empty:
-                                pass
+                                event = None
                             if event:
                                 event_type = event.get("type")
                                 if event_type == "started":
                                     started_received = True
                                     last_heartbeat = time.time()
-                                    log_write(log_path, "mp_worker_started")
+                                    log_write(log_path, "worker_started")
+                                    if stage_cb is not None:
+                                        stage_cb("Распознаю…", "determinate")
                                 elif event_type == "heartbeat":
                                     last_heartbeat = time.time()
                                 elif event_type == "progress":
@@ -5770,6 +5839,13 @@ def stt_transcribe_wav(
                                     total = float(event.get("total") or 0.0)
                                     idx = int(event.get("chunk_index") or 0)
                                     total_chunks = int(event.get("total_chunks") or 0)
+                                    percent = event.get("p")
+                                    if percent is not None and total_seconds:
+                                        try:
+                                            processed = float(total_seconds) * (float(percent) / 100.0)
+                                            total = float(total_seconds)
+                                        except Exception:
+                                            pass
                                     if progress_cb is not None and total > 0:
                                         progress_cb(processed, total, idx, total_chunks)
                                         progress_percent = int(
@@ -5788,6 +5864,8 @@ def stt_transcribe_wav(
                                         list(event.get("segments") or []),
                                         float(event.get("voiced_duration") or 0.0),
                                     )
+                                elif event_type == "done":
+                                    last_heartbeat = time.time()
                                 elif event_type == "error":
                                     err = str(event.get("err") or "Whisper error")
                                     tb = str(event.get("tb") or "")
@@ -5795,15 +5873,15 @@ def stt_transcribe_wav(
                                         log_write(log_path, tb)
                                     log_write(log_path, f"EXCEPTION=worker_error err={err}")
                                     raise RuntimeError(err)
-                            if not started_received and (time.time() - started_at) > 15.0:
+                            if not started_received and (time.time() - started_at) > 10.0:
                                 _append_log_line(log_lines, "spawn_error=no_started")
-                                log_write(log_path, f"child_exitcode={proc.exitcode}")
-                                log_write(log_path, "ERROR=mp_failed_to_start: no_started")
-                                if proc.exitcode is not None:
-                                    raise RuntimeError("worker crashed")
+                                log_write(log_path, f"child_exitcode={proc.poll()}")
+                                log_write(log_path, "ERROR=worker_failed_to_start: no_started")
+                                _terminate_process(proc)
+                                stderr_hint = get_stt_worker_stderr_log_path()
                                 raise RuntimeError(
-                                    "Whisper не стартовал (нет started за 15 сек). "
-                                    "Проверьте __main__ guard и multiprocessing.freeze_support()."
+                                    "worker не стартовал (нет started за 10 сек). "
+                                    f"Логи: {stderr_hint} и {log_path}."
                                 )
                             timeout_limit = heartbeat_timeout_sec or 0.0
                             if timeout_limit and (time.time() - last_heartbeat) > timeout_limit:
@@ -5811,8 +5889,9 @@ def stt_transcribe_wav(
                                 log_write(log_path, "stage=timeout_terminate")
                                 _terminate_process(proc)
                                 raise RuntimeError("whisper_timeout")
-                            if event is None:
-                                time.sleep(0.05)
+                            if proc.poll() is not None and stdout_done.is_set() and out_queue.empty():
+                                log_write(log_path, f"worker_exitcode={proc.returncode}")
+                                raise RuntimeError("worker exited unexpectedly")
                     finally:
                         _terminate_process(proc)
 
@@ -5835,9 +5914,9 @@ def stt_transcribe_wav(
                         "deadlock",
                         str(exc),
                     )
-                if "Whisper не стартовал" in str(exc):
+                if "worker не стартовал" in str(exc):
                     raise STTError(
-                        "Whisper не стартовал. Проверьте __main__ guard и multiprocessing.freeze_support().",
+                        str(exc),
                         "deadlock",
                         str(exc),
                     )
