@@ -22,14 +22,18 @@ def _find_ffmpeg() -> str:
     return path
 
 
-def _run_ffmpeg(cmd: list[str]) -> None:
-    proc = subprocess.run(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+def _run_ffmpeg(cmd: list[str], timeout_sec: int | None = None) -> None:
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("FFmpeg превысил лимит времени.")
     if proc.returncode != 0:
         msg = (proc.stderr or "").strip() or "ffmpeg failed"
         raise RuntimeError(msg)
@@ -44,11 +48,16 @@ def _extract_wav(
     ffmpeg_path = _find_ffmpeg()
     tmp_dir = tempfile.gettempdir()
     output_path = os.path.join(tmp_dir, f"stt_engine_{uuid.uuid4().hex}.wav")
-    cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error", "-nostdin"]
-    if start is not None:
-        cmd += ["-ss", str(start)]
+    start_sec = float(start or 0.0)
+    duration_sec = None
     if end is not None:
-        cmd += ["-to", str(end)]
+        duration_sec = max(0.1, float(end) - start_sec)
+    timeout_sec = 120
+    if duration_sec is not None:
+        timeout_sec = min(900, max(timeout_sec, int(duration_sec * 8 + 30)))
+    cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", str(start_sec)]
+    if duration_sec is not None:
+        cmd += ["-t", f"{duration_sec:.3f}"]
     cmd += [
         "-i",
         input_path,
@@ -61,7 +70,7 @@ def _extract_wav(
         "s16",
         output_path,
     ]
-    _run_ffmpeg(cmd)
+    _run_ffmpeg(cmd, timeout_sec=timeout_sec)
     return output_path
 
 
