@@ -3226,6 +3226,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             card_id INTEGER NOT NULL,
             created_at INTEGER NOT NULL,
+            reason TEXT,
             front TEXT,
             back TEXT,
             front_rich TEXT,
@@ -3239,6 +3240,10 @@ def init_db():
         );
         """
     )
+    try:
+        cur.execute("ALTER TABLE card_versions ADD COLUMN reason TEXT;")
+    except sqlite3.OperationalError:
+        pass
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_card_versions_card_id ON card_versions(card_id);"
     )
@@ -4548,6 +4553,46 @@ def update_card_text(card_id: int, front: str, back: str) -> bool:
         return False
 
 
+def update_card_rich_text(
+    card_id: int,
+    front: str,
+    back: str,
+    front_rich: dict | None,
+    back_rich: dict | None,
+) -> bool:
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(cards);")
+        columns = {row[1] for row in cur.fetchall()}
+        set_parts = ["front = ?", "back = ?", "front_rich = ?", "back_rich = ?"]
+        values = [
+            front,
+            back,
+            serialize_rich_doc(front_rich),
+            serialize_rich_doc(back_rich),
+        ]
+        if "front_html" in columns:
+            set_parts.append("front_html = NULL")
+        if "back_html" in columns:
+            set_parts.append("back_html = NULL")
+        values.append(card_id)
+        cur.execute(
+            f"UPDATE cards SET {', '.join(set_parts)} WHERE id = ?;",
+            values,
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        messagebox.showerror("Ошибка БД", f"Не удалось сохранить карточку: {exc}")
+        return False
+
+
 def insert_card_version_snapshot(card_dict: dict, reason: str, window_name: str | None = None) -> None:
     if not card_dict:
         return
@@ -4575,14 +4620,15 @@ def insert_card_version_snapshot(card_dict: dict, reason: str, window_name: str 
         cur.execute(
             """
             INSERT INTO card_versions (
-                card_id, created_at, front, back, front_rich, back_rich, front_html, back_html,
+                card_id, created_at, reason, front, back, front_rich, back_rich, front_html, back_html,
                 front_image_path, back_image_path, audio_path, meta_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 card_id,
                 int(time.time()),
+                reason,
                 snapshot["front"],
                 snapshot["back"],
                 snapshot["front_rich"],
@@ -7242,6 +7288,14 @@ class CardRenderer:
         self._on_status = None
         self._original_snapshot: dict | None = None
         self._suppress_modified = False
+        self._preview_after_id: str | None = None
+        self._preview_debounce_ms = 300
+        self._preview_enabled = False
+        self._preview_deck_id: int | None = None
+        self._preview_card_context: dict | None = None
+        self._preview_text_front: tk.Text | None = None
+        self._preview_text_back: tk.Text | None = None
+        self._editor_fonts: dict[str, tkfont.Font] = {}
 
         card_bg, card_text, _ = get_card_surface_colors(parent)
         self.card_bg = card_bg
@@ -7263,6 +7317,15 @@ class CardRenderer:
             anchor="w",
         )
         self.header_label.pack(fill=tk.X, padx=8, pady=(4, 2))
+        self.header_controls = tk.Frame(self.header_frame, bg=card_bg)
+        self.header_controls.pack(anchor="e", padx=8, pady=(0, 6))
+        self.preview_var = tk.BooleanVar(value=False)
+        self.preview_toggle = ttk.Checkbutton(
+            self.header_controls,
+            text="Показывать предпросмотр шаблона",
+            variable=self.preview_var,
+            command=self._on_preview_toggle,
+        )
 
         self.content_frame = tk.Frame(self.container, bg=card_bg)
         self.content_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(4, 4))
@@ -7393,11 +7456,33 @@ class CardRenderer:
             widget.bind("<Control-y>", self._on_redo)
             widget.bind("<Control-Y>", self._on_redo)
             widget.bind("<Control-Shift-Z>", self._on_redo)
+            widget.bind("<Control-b>", self._on_bold_shortcut)
+            widget.bind("<Control-B>", self._on_bold_shortcut)
+            widget.bind("<Control-i>", self._on_italic_shortcut)
+            widget.bind("<Control-I>", self._on_italic_shortcut)
+            widget.bind("<Control-u>", self._on_underline_shortcut)
+            widget.bind("<Control-U>", self._on_underline_shortcut)
+            widget.bind("<Control-h>", self._on_highlight_shortcut)
+            widget.bind("<Control-H>", self._on_highlight_shortcut)
+            self._install_rich_context_menu(widget)
+            self._ensure_format_tags(widget)
 
         self.custom_text_frame = tk.Frame(self.text_frame, bg="white")
         self.custom_text_frame.grid(row=0, column=0, sticky="nsew")
         self.custom_text_frame.grid_remove()
         self.html_view = CardHtmlView(self.custom_text_frame)
+
+        self.preview_frame = tk.LabelFrame(self.content_inner, text="Предпросмотр шаблона", bg="white")
+        self.preview_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(6, 6))
+        self.preview_frame.grid_remove()
+        self.preview_frame.grid_columnconfigure(0, weight=1)
+        self.preview_frame.grid_columnconfigure(1, weight=1)
+        self._preview_text_front = tk.Text(self.preview_frame, height=6, wrap=tk.WORD, bg="white", relief=tk.FLAT)
+        self._preview_text_back = tk.Text(self.preview_frame, height=6, wrap=tk.WORD, bg="white", relief=tk.FLAT)
+        self._preview_text_front.grid(row=0, column=0, sticky="nsew", padx=(6, 3), pady=6)
+        self._preview_text_back.grid(row=0, column=1, sticky="nsew", padx=(3, 6), pady=6)
+        for widget in (self._preview_text_front, self._preview_text_back):
+            widget.configure(state=tk.DISABLED)
 
         self.text_col.bind("<Configure>", self._update_wraplength)
 
@@ -7437,14 +7522,290 @@ class CardRenderer:
         for widget in (self.front_text, self.back_text):
             if isinstance(widget, tk.Text):
                 widget.configure(state=desired_state)
+        try:
+            self.preview_toggle.configure(state=tk.NORMAL if self.inline_editing else tk.DISABLED)
+        except Exception:
+            pass
         if not self.inline_editing:
             self._cancel_autosave()
+            self._hide_preview()
         self._notify_dirty(False)
         if self.inline_editing:
             try:
                 (self.back_text if self._current_show_back else self.front_text).focus_set()
             except Exception:
                 pass
+            self._on_preview_toggle()
+
+    def _on_preview_toggle(self) -> None:
+        self._preview_enabled = bool(self.preview_var.get())
+        if self._preview_enabled and self.inline_editing:
+            self._show_preview()
+            self._schedule_preview_update()
+        else:
+            self._hide_preview()
+
+    def _show_preview(self) -> None:
+        try:
+            self.preview_frame.grid()
+        except Exception:
+            pass
+
+    def _hide_preview(self) -> None:
+        try:
+            self.preview_frame.grid_remove()
+        except Exception:
+            pass
+
+    def _schedule_preview_update(self) -> None:
+        if not self._preview_enabled or not self.inline_editing:
+            return
+        if self._preview_after_id is not None:
+            try:
+                self.container.after_cancel(self._preview_after_id)
+            except Exception:
+                pass
+        self._preview_after_id = self.container.after(self._preview_debounce_ms, self._update_preview_now)
+
+    def _update_preview_now(self) -> None:
+        self._preview_after_id = None
+        if not self._preview_enabled or not self.inline_editing:
+            return
+        deck_id = self._preview_deck_id
+        front_value, back_value = self.get_edited_texts()
+        if not deck_id:
+            self._set_preview_text(front_value, back_value)
+            return
+        ctx = prepare_template_fields(
+            {
+                "front": front_value,
+                "back": back_value,
+            }
+        )
+        if self._preview_card_context:
+            ctx.update({k: v for k, v in self._preview_card_context.items() if v is not None})
+        try:
+            front_preview, back_preview = render_card_html(deck_id, ctx)
+        except Exception:
+            front_preview, back_preview = front_value, back_value
+        self._set_preview_text(front_preview, back_preview)
+
+    def _set_preview_text(self, front_text: str, back_text: str) -> None:
+        for widget, value in ((self._preview_text_front, front_text), (self._preview_text_back, back_text)):
+            if not widget:
+                continue
+            widget.configure(state=tk.NORMAL)
+            widget.delete("1.0", tk.END)
+            widget.insert("1.0", value or "")
+            widget.configure(state=tk.DISABLED)
+
+    def _ensure_format_tags(self, widget: tk.Text) -> None:
+        base_font = tkfont.Font(font=widget.cget("font"))
+        self._editor_fonts.setdefault("base", base_font)
+        bold_font = self._editor_fonts.get("bold")
+        if bold_font is None:
+            bold_font = tkfont.Font(font=base_font)
+            bold_font.configure(weight="bold")
+            self._editor_fonts["bold"] = bold_font
+        italic_font = self._editor_fonts.get("italic")
+        if italic_font is None:
+            italic_font = tkfont.Font(font=base_font)
+            italic_font.configure(slant="italic")
+            self._editor_fonts["italic"] = italic_font
+        widget.tag_configure("fmt_bold", font=bold_font)
+        widget.tag_configure("fmt_italic", font=italic_font)
+        widget.tag_configure("fmt_underline", underline=1)
+        widget.tag_configure("fmt_highlight", background="#FFF59D")
+
+    def _install_rich_context_menu(self, widget: tk.Text) -> None:
+        menu = tk.Menu(widget, tearoff=0)
+
+        menu.add_command(label="Жирный (Ctrl+B)", command=lambda: self._apply_tag_action(widget, "fmt_bold"))
+        menu.add_command(label="Курсив (Ctrl+I)", command=lambda: self._apply_tag_action(widget, "fmt_italic"))
+        menu.add_command(label="Подчёркивание (Ctrl+U)", command=lambda: self._apply_tag_action(widget, "fmt_underline"))
+        menu.add_command(label="Маркер/подсветка (Ctrl+H)", command=lambda: self._apply_tag_action(widget, "fmt_highlight"))
+        menu.add_command(label="Цвет текста…", command=lambda: self._apply_color_action(widget))
+        menu.add_command(label="Убрать форматирование", command=lambda: self._clear_formatting(widget))
+        menu.add_separator()
+        ai_menu = tk.Menu(menu, tearoff=0)
+        self._populate_ai_menu(ai_menu, widget)
+        menu.add_cascade(label="AI инструменты", menu=ai_menu)
+        menu.add_separator()
+        menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
+        menu.add_command(label="Выделить всё", command=lambda: widget.tag_add("sel", "1.0", "end-1c"))
+
+        def show_menu(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", show_menu)
+        widget.bind("<Button-2>", show_menu)
+
+    def _apply_tag_action(self, widget: tk.Text, tag: str) -> None:
+        if not self.inline_editing:
+            return
+        try:
+            self._ensure_format_tags(widget)
+            widget.tag_add(tag, "sel.first", "sel.last")
+            self.mark_dirty()
+        except tk.TclError:
+            pass
+
+    def _apply_color_action(self, widget: tk.Text) -> None:
+        if not self.inline_editing:
+            return
+        chosen = colorchooser.askcolor(title="Цвет текста", parent=self.container)
+        if not chosen or not chosen[1]:
+            return
+        color = chosen[1]
+        tag_name = f"fmt_color_{color}"
+        if tag_name not in widget.tag_names():
+            widget.tag_configure(tag_name, foreground=color)
+        try:
+            widget.tag_add(tag_name, "sel.first", "sel.last")
+            self.mark_dirty()
+        except tk.TclError:
+            pass
+
+    def _clear_formatting(self, widget: tk.Text) -> None:
+        if not self.inline_editing:
+            return
+        try:
+            start = widget.index("sel.first")
+            end = widget.index("sel.last")
+        except tk.TclError:
+            return
+        for tag in widget.tag_names():
+            if tag == "sel":
+                continue
+            if tag.startswith("fmt_") or tag.startswith("fmt_color_"):
+                widget.tag_remove(tag, start, end)
+        self.mark_dirty()
+
+    def _on_bold_shortcut(self, event) -> str:
+        self._apply_tag_action(event.widget, "fmt_bold")
+        return "break"
+
+    def _on_italic_shortcut(self, event) -> str:
+        self._apply_tag_action(event.widget, "fmt_italic")
+        return "break"
+
+    def _on_underline_shortcut(self, event) -> str:
+        self._apply_tag_action(event.widget, "fmt_underline")
+        return "break"
+
+    def _on_highlight_shortcut(self, event) -> str:
+        self._apply_tag_action(event.widget, "fmt_highlight")
+        return "break"
+
+    def _populate_ai_menu(self, menu: tk.Menu, widget: tk.Text) -> None:
+        menu.add_command(
+            label="Исправить пунктуацию",
+            command=lambda: self._run_ai_action("fix_punctuation", widget),
+        )
+        menu.add_command(
+            label="Сжать в 1 предложение",
+            command=lambda: self._run_ai_action("summarize", widget),
+        )
+        menu.add_command(
+            label="Выделить ключевое слово (жирным)",
+            command=lambda: self._run_ai_action("highlight_keyword", widget),
+        )
+        menu.add_command(
+            label="Сделать Cloze",
+            command=lambda: self._run_ai_action("cloze", widget),
+        )
+        menu.add_command(
+            label="Перевести",
+            command=lambda: self._run_ai_action("translate", widget),
+        )
+
+    def _run_ai_action(self, action: str, widget: tk.Text) -> None:
+        if not self.inline_editing:
+            return
+
+        def _worker() -> None:
+            try:
+                selection = ""
+                try:
+                    selection = widget.get("sel.first", "sel.last")
+                except tk.TclError:
+                    selection = ""
+                full_text = widget.get("1.0", "end-1c")
+                result = self._apply_ai_action(action, selection, full_text)
+                self.container.after(
+                    0,
+                    lambda: self._apply_ai_result(widget, action, selection, result),
+                )
+            except Exception as exc:
+                self.container.after(
+                    0,
+                    lambda: messagebox.showwarning("AI инструменты", f"Не удалось выполнить действие: {exc}"),
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_ai_action(self, action: str, selection: str, full_text: str) -> dict:
+        if action in ("fix_punctuation", "summarize"):
+            if not OPENAI_API_KEY or not OPENAI_LIB_AVAILABLE:
+                return {"error": "AI модуль не настроен"}
+            return {"error": "AI модуль не настроен"}
+        if action == "translate":
+            source = selection or full_text
+            if not source.strip():
+                return {"error": "Нет текста для перевода"}
+            translated = translate_sentence(source, use_openai=True)
+            return {"replace": translated}
+        if action == "highlight_keyword":
+            source = selection or full_text
+            words = re.findall(r"[\\w\\-]{3,}", source, flags=re.UNICODE)
+            if not words:
+                return {"error": "Нет подходящего слова"}
+            word = max(words, key=len)
+            return {"highlight": word, "scope": "selection" if selection else "full"}
+        if action == "cloze":
+            source = selection
+            if not source:
+                return {"error": "Выделите текст для Cloze"}
+            return {"replace": "{{c1::" + source + "}}"}
+        return {"error": "Неизвестное действие"}
+
+    def _apply_ai_result(self, widget: tk.Text, action: str, selection: str, result: dict) -> None:
+        if not self.inline_editing:
+            return
+        if result.get("error"):
+            messagebox.showinfo("AI инструменты", result["error"], parent=self.container)
+            return
+        if "replace" in result:
+            replacement = result.get("replace", "")
+            if selection:
+                try:
+                    widget.delete("sel.first", "sel.last")
+                    widget.insert("insert", replacement)
+                except tk.TclError:
+                    pass
+            else:
+                widget.delete("1.0", tk.END)
+                widget.insert("1.0", replacement)
+            self.mark_dirty()
+            return
+        if "highlight" in result:
+            word = result["highlight"]
+            start_index = "sel.first" if selection else "1.0"
+            end_index = "sel.last" if selection else "end"
+            try:
+                pos = widget.search(word, start_index, stopindex=end_index, nocase=True)
+            except tk.TclError:
+                pos = ""
+            if pos:
+                end_pos = f"{pos}+{len(word)}c"
+                self._ensure_format_tags(widget)
+                widget.tag_add("fmt_bold", pos, end_pos)
+                self.mark_dirty()
 
     def _notify_dirty(self, value: bool) -> None:
         if self._on_dirty_changed:
@@ -7502,6 +7863,7 @@ class CardRenderer:
             self._dirty = True
             self._notify_dirty(True)
         self._schedule_autosave()
+        self._schedule_preview_update()
 
     def _schedule_autosave(self) -> None:
         if not self._autosave_enabled or not self.inline_editing:
@@ -7545,19 +7907,19 @@ class CardRenderer:
             pass
         return front_value, back_value
 
+    def get_edited_rich_docs(self) -> tuple[dict, dict]:
+        front_doc = export_rich_from_editor(self.front_text)
+        back_doc = export_rich_from_editor(self.back_text)
+        return front_doc, back_doc
+
     def revert_to_original(self) -> None:
         if not self._original_snapshot:
             return
-        desired_state = tk.NORMAL if self.inline_editing else tk.DISABLED
         self._suppress_modified = True
-        for widget_name, widget in (("front", self.front_text), ("back", self.back_text)):
-            if not isinstance(widget, tk.Text):
-                continue
-            widget.configure(state=tk.NORMAL)
-            widget.delete("1.0", tk.END)
-            widget.insert("1.0", self._original_snapshot.get(widget_name, "") or "")
-            widget.edit_modified(False)
-            widget.configure(state=desired_state)
+        front_doc = self._original_snapshot.get("front_rich") or {"text": self._original_snapshot.get("front") or "", "tags": []}
+        back_doc = self._original_snapshot.get("back_rich") or {"text": self._original_snapshot.get("back") or "", "tags": []}
+        self._apply_rich_doc_to_text(self.front_text, front_doc)
+        self._apply_rich_doc_to_text(self.back_text, back_doc)
         self._suppress_modified = False
         self._dirty = False
         self._notify_dirty(False)
@@ -7570,6 +7932,50 @@ class CardRenderer:
         widget.configure(state=tk.NORMAL)
         widget.delete("1.0", tk.END)
         widget.insert("1.0", value)
+        try:
+            widget.edit_modified(False)
+        except Exception:
+            pass
+        widget.configure(state=desired_state)
+        self._suppress_modified = False
+
+    def _apply_rich_doc_to_text(self, widget: tk.Text, rich_doc: dict | None) -> None:
+        value = ""
+        tags = []
+        if rich_doc:
+            value = rich_doc.get("text") or ""
+            tags = rich_doc.get("tags") or []
+        else:
+            try:
+                value = widget.get("1.0", "end-1c")
+            except Exception:
+                value = ""
+        desired_state = tk.NORMAL if self.inline_editing else tk.DISABLED
+        self._suppress_modified = True
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", value)
+        for tag_info in tags:
+            tag_name = tag_info.get("name")
+            if not tag_name:
+                continue
+            config = tag_info.get("config") or {}
+            safe_config: dict[str, object] = {}
+            for key, cfg_value in config.items():
+                if cfg_value in ("", None):
+                    continue
+                safe_config[key] = cfg_value
+            if safe_config:
+                try:
+                    widget.tag_configure(tag_name, **safe_config)
+                except tk.TclError:
+                    pass
+            ranges = tag_info.get("ranges") or []
+            for start, end in ranges:
+                try:
+                    widget.tag_add(tag_name, start, end)
+                except tk.TclError:
+                    pass
         try:
             widget.edit_modified(False)
         except Exception:
@@ -7685,6 +8091,8 @@ class CardRenderer:
         custom_items: list | None = None,
     ) -> None:
         card_bg, card_text, _ = get_card_surface_colors(self.container)
+        self._preview_deck_id = card.get("deck_id") or self._preview_deck_id
+        self._preview_card_context = prepare_template_fields(card) if card else None
         front_text = card.get("front") or ""
         back_text = card.get("back") or ""
         front_html = card.get("front_html")
@@ -7752,8 +8160,14 @@ class CardRenderer:
             self.html_view.set_html(html_value or "", card_bg=card_bg, card_text_color=card_text)
         else:
             self._use_custom_text = False
-            self._set_text_widget_content(self.front_text, front_text)
-            self._set_text_widget_content(self.back_text, back_text)
+            if self.inline_editing:
+                front_doc = front_rich or {"text": front_text, "tags": []}
+                back_doc = back_rich or {"text": back_text, "tags": []}
+                self._apply_rich_doc_to_text(self.front_text, front_doc)
+                self._apply_rich_doc_to_text(self.back_text, back_doc)
+            else:
+                self._set_text_widget_content(self.front_text, front_text)
+                self._set_text_widget_content(self.back_text, back_text)
         self._current_show_back = show_back
         side_media = self._select_side_media(
             card,
@@ -7802,6 +8216,8 @@ class CardRenderer:
         else:
             placeholder_text = "Нет изображения" if self.show_media_placeholder else ""
             self.image_label.config(image="", text=placeholder_text)
+        if self.inline_editing and self._preview_enabled:
+            self._schedule_preview_update()
 
     def _get_audio_entries(self, card: dict, prefer_side: str | None) -> list[dict]:
         if "audio_entries" in card:
@@ -20900,7 +21316,15 @@ class OverviewWindow(tk.Toplevel):
         )
         menu.add_command(label="Редактировать карточку", command=self.toggle_inline_edit)
         menu.add_command(label="История версий…", command=self._open_versions_window)
-        menu.add_command(label="Восстановить последнюю сохранённую", command=self._restore_last_version)
+        menu.add_command(label="Откатить к последней сохранённой", command=self._restore_last_version)
+        ai_menu = tk.Menu(menu, tearoff=0)
+        ai_menu.add_command(label="Исправить пунктуацию", command=lambda: self._run_ai_tool("fix_punctuation"))
+        ai_menu.add_command(label="Сжать в 1 предложение", command=lambda: self._run_ai_tool("summarize"))
+        ai_menu.add_command(label="Выделить ключевое слово (жирным)", command=lambda: self._run_ai_tool("highlight_keyword"))
+        ai_menu.add_command(label="Сделать Cloze", command=lambda: self._run_ai_tool("cloze"))
+        ai_menu.add_command(label="Перевести", command=lambda: self._run_ai_tool("translate"))
+        menu.add_cascade(label="AI инструменты", menu=ai_menu)
+        menu.add_command(label="Массовая правка…", command=self._open_batch_edit_window)
         menu.add_command(label="Отложить карточку", command=lambda: _placeholder("Отложить карточку"))
         menu.add_command(label="Сбросить карточку", command=_reset_card)
         menu.add_command(label="Задать срок", command=lambda: _placeholder("Задать срок"))
@@ -21082,7 +21506,7 @@ def open_card_versions_window(
             meta = json.loads(row["meta_json"] or "{}")
         except Exception:
             meta = {}
-        reason = meta.get("reason") or "unknown"
+        reason = row["reason"] or meta.get("reason") or "unknown"
         window_name = meta.get("window")
         if window_name:
             reason = f"{reason} ({window_name})"
@@ -21146,6 +21570,281 @@ def open_card_versions_window(
 
     ttk.Button(button_row, text="Восстановить", command=_restore).pack(side=tk.LEFT)
     ttk.Button(button_row, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
+
+class BatchEditWindow(tk.Toplevel):
+    def __init__(self, master: tk.Misc):
+        super().__init__(master)
+        self.master = master
+        self.title("Массовая замена")
+        self.geometry("980x640")
+        self.grab_set()
+
+        self.deck_var = tk.StringVar(value="Все колоды")
+        self.tag_var = tk.StringVar()
+        self.search_var = tk.StringVar()
+        self.find_var = tk.StringVar()
+        self.replace_var = tk.StringVar()
+        self.regex_var = tk.BooleanVar(value=False)
+        self.front_var = tk.BooleanVar(value=True)
+        self.back_var = tk.BooleanVar(value=True)
+
+        self._preview_data: list[dict] = []
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        filter_frame = ttk.LabelFrame(container, text="Фильтры", padding=10)
+        filter_frame.pack(fill=tk.X)
+
+        decks = list_decks()
+        deck_names = ["Все колоды"] + [deck["name"] for deck in decks]
+        self._deck_map = {deck["name"]: deck["id"] for deck in decks}
+
+        ttk.Label(filter_frame, text="Колода").grid(row=0, column=0, sticky="w")
+        deck_combo = ttk.Combobox(filter_frame, textvariable=self.deck_var, values=deck_names, state="readonly")
+        deck_combo.grid(row=0, column=1, sticky="ew", padx=6)
+
+        ttk.Label(filter_frame, text="Тэг").grid(row=0, column=2, sticky="w")
+        ttk.Entry(filter_frame, textvariable=self.tag_var).grid(row=0, column=3, sticky="ew", padx=6)
+
+        ttk.Label(filter_frame, text="Поиск").grid(row=0, column=4, sticky="w")
+        ttk.Entry(filter_frame, textvariable=self.search_var).grid(row=0, column=5, sticky="ew", padx=6)
+
+        for col in range(6):
+            filter_frame.grid_columnconfigure(col, weight=1)
+
+        replace_frame = ttk.LabelFrame(container, text="Замена", padding=10)
+        replace_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Label(replace_frame, text="Найти").grid(row=0, column=0, sticky="w")
+        ttk.Entry(replace_frame, textvariable=self.find_var).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(replace_frame, text="Заменить на").grid(row=0, column=2, sticky="w")
+        ttk.Entry(replace_frame, textvariable=self.replace_var).grid(row=0, column=3, sticky="ew", padx=6)
+        ttk.Checkbutton(replace_frame, text="Regex", variable=self.regex_var).grid(row=0, column=4, padx=6)
+
+        side_frame = ttk.Frame(replace_frame)
+        side_frame.grid(row=0, column=5, sticky="e")
+        ttk.Checkbutton(side_frame, text="Front", variable=self.front_var).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(side_frame, text="Back", variable=self.back_var).pack(side=tk.LEFT, padx=4)
+
+        for col in range(6):
+            replace_frame.grid_columnconfigure(col, weight=1)
+
+        actions = ttk.Frame(container)
+        actions.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(actions, text="Предпросмотр изменений", command=self._preview).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Применить", command=self._apply).pack(side=tk.LEFT, padx=8)
+
+        preview_frame = ttk.LabelFrame(container, text="Предпросмотр (первые 20 карточек)", padding=10)
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.preview_text = tk.Text(preview_frame, wrap=tk.WORD, state=tk.DISABLED)
+        self.preview_text.pack(fill=tk.BOTH, expand=True)
+
+    def _fetch_cards(self) -> list[sqlite3.Row]:
+        deck_name = (self.deck_var.get() or "").strip()
+        deck_id = self._deck_map.get(deck_name)
+        tag = (self.tag_var.get() or "").strip()
+        search = (self.search_var.get() or "").strip()
+
+        where = []
+        params: list[object] = []
+        if deck_id:
+            where.append("cards.deck_id = ?")
+            params.append(deck_id)
+        if tag:
+            where.append("(notes.tags LIKE ?)")
+            params.append(f"%{tag}%")
+        if search:
+            where.append("(cards.front LIKE ? OR cards.back LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT cards.*, notes.tags
+            FROM cards
+            LEFT JOIN notes ON cards.note_id = notes.id
+            {where_sql}
+            ORDER BY cards.id DESC;
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def _preview(self) -> None:
+        find_text = self.find_var.get()
+        if not find_text:
+            messagebox.showwarning("Массовая замена", "Поле «Найти» не заполнено.", parent=self)
+            return
+        if not (self.front_var.get() or self.back_var.get()):
+            messagebox.showwarning("Массовая замена", "Выберите сторону Front и/или Back.", parent=self)
+            return
+
+        def _worker() -> None:
+            try:
+                cards = self._fetch_cards()
+                preview_items = self._build_preview(cards)
+                self.after(0, lambda: self._render_preview(preview_items))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Массовая замена", str(exc), parent=self))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _build_preview(self, cards: list[sqlite3.Row]) -> list[dict]:
+        find_text = self.find_var.get()
+        replace_text = self.replace_var.get()
+        use_regex = self.regex_var.get()
+
+        pattern = None
+        if use_regex:
+            try:
+                pattern = re.compile(find_text)
+            except re.error as exc:
+                raise ValueError(f"Некорректный regex: {exc}") from exc
+
+        def _apply(text: str) -> str:
+            if use_regex and pattern:
+                return pattern.sub(replace_text, text)
+            return text.replace(find_text, replace_text)
+
+        preview_items = []
+        for row in cards:
+            front_before = row["front"] or ""
+            back_before = row["back"] or ""
+            front_after = _apply(front_before) if self.front_var.get() else front_before
+            back_after = _apply(back_before) if self.back_var.get() else back_before
+            if front_after == front_before and back_after == back_before:
+                continue
+            preview_items.append(
+                {
+                    "id": row["id"],
+                    "front_before": front_before,
+                    "front_after": front_after,
+                    "back_before": back_before,
+                    "back_after": back_after,
+                }
+            )
+            if len(preview_items) >= 20:
+                break
+        return preview_items
+
+    def _render_preview(self, preview_items: list[dict]) -> None:
+        self.preview_text.configure(state=tk.NORMAL)
+        self.preview_text.delete("1.0", tk.END)
+        if not preview_items:
+            self.preview_text.insert("1.0", "Нет изменений для предпросмотра.")
+        else:
+            lines: list[str] = []
+            for item in preview_items:
+                lines.append(f"ID {item['id']}")
+                if self.front_var.get():
+                    lines.append(f"Front: {item['front_before']}")
+                    lines.append(f"  → {item['front_after']}")
+                if self.back_var.get():
+                    lines.append(f"Back: {item['back_before']}")
+                    lines.append(f"  → {item['back_after']}")
+                lines.append("")
+            self.preview_text.insert("1.0", "\n".join(lines).strip())
+        self.preview_text.configure(state=tk.DISABLED)
+
+    def _apply(self) -> None:
+        if not messagebox.askyesno("Массовая замена", "Применить изменения?", parent=self):
+            return
+        find_text = self.find_var.get()
+        if not find_text:
+            messagebox.showwarning("Массовая замена", "Поле «Найти» не заполнено.", parent=self)
+            return
+        if not (self.front_var.get() or self.back_var.get()):
+            messagebox.showwarning("Массовая замена", "Выберите сторону Front и/или Back.", parent=self)
+            return
+
+        def _worker() -> None:
+            try:
+                updated = self._apply_batch_changes()
+                self.after(0, lambda: messagebox.showinfo("Массовая замена", f"Обновлено карточек: {updated}", parent=self))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Массовая замена", str(exc), parent=self))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_batch_changes(self) -> int:
+        find_text = self.find_var.get()
+        replace_text = self.replace_var.get()
+        use_regex = self.regex_var.get()
+
+        pattern = None
+        if use_regex:
+            try:
+                pattern = re.compile(find_text)
+            except re.error as exc:
+                raise ValueError(f"Некорректный regex: {exc}") from exc
+
+        cards = self._fetch_cards()
+        if not cards:
+            return 0
+
+        updated = 0
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("PRAGMA table_info(cards);")
+            columns = {row[1] for row in cur.fetchall()}
+            has_front_html = "front_html" in columns
+            has_back_html = "back_html" in columns
+            for row in cards:
+                row_dict = dict(row)
+                row_dict["front_rich"] = deserialize_rich_doc(row_dict.get("front_rich"))
+                row_dict["back_rich"] = deserialize_rich_doc(row_dict.get("back_rich"))
+                front_before = row_dict.get("front") or ""
+                back_before = row_dict.get("back") or ""
+
+                if use_regex and pattern:
+                    front_after = pattern.sub(replace_text, front_before) if self.front_var.get() else front_before
+                    back_after = pattern.sub(replace_text, back_before) if self.back_var.get() else back_before
+                else:
+                    front_after = front_before.replace(find_text, replace_text) if self.front_var.get() else front_before
+                    back_after = back_before.replace(find_text, replace_text) if self.back_var.get() else back_before
+
+                if front_after == front_before and back_after == back_before:
+                    continue
+
+                insert_card_version_snapshot(row_dict, reason="before_batch_edit", window_name="batch")
+
+                set_parts = []
+                params: list[object] = []
+                if self.front_var.get():
+                    set_parts.append("front = REPLACE(front, ?, ?)" if not use_regex else "front = ?")
+                    params.extend([find_text, replace_text] if not use_regex else [front_after])
+                if self.back_var.get():
+                    set_parts.append("back = REPLACE(back, ?, ?)" if not use_regex else "back = ?")
+                    params.extend([find_text, replace_text] if not use_regex else [back_after])
+                set_parts.append("front_rich = NULL")
+                set_parts.append("back_rich = NULL")
+                if has_front_html:
+                    set_parts.append("front_html = NULL")
+                if has_back_html:
+                    set_parts.append("back_html = NULL")
+                params.append(row_dict["id"])
+                cur.execute(
+                    f"UPDATE cards SET {', '.join(set_parts)} WHERE id = ?;",
+                    params,
+                )
+                updated += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return updated
 
 
 class RepeatWindow(tk.Toplevel):
@@ -21367,7 +22066,7 @@ class RepeatWindow(tk.Toplevel):
         )
         menu.add_command(label="Редактировать карточку", command=self.toggle_inline_edit)
         menu.add_command(label="История версий…", command=self._open_versions_window)
-        menu.add_command(label="Восстановить последнюю сохранённую", command=self._restore_last_version)
+        menu.add_command(label="Откатить к последней сохранённой", command=self._restore_last_version)
         menu.add_command(label="Отложить карточку", command=lambda: _placeholder("Отложить карточку"))
         menu.add_command(label="Сбросить карточку", command=_reset_card)
         menu.add_command(label="Задать срок", command=lambda: _placeholder("Задать срок"))
@@ -21408,15 +22107,6 @@ class RepeatWindow(tk.Toplevel):
     def _start_inline_edit(self) -> None:
         if not self.current_card or not self.card_renderer:
             return
-        if any(
-            self.current_card.get(key)
-            for key in ("front_rich", "back_rich", "front_html", "back_html")
-        ):
-            messagebox.showwarning(
-                "Inline-редактор",
-                "Карточка содержит Rich/HTML. В режиме редактирования будет показан plain text.",
-                parent=self,
-            )
         self._inline_editing = True
         self.stop_timer()
         self._set_inline_edit_controls_state(False)
@@ -21445,19 +22135,24 @@ class RepeatWindow(tk.Toplevel):
         if card_id is None:
             return False
         front_text, back_text = self.card_renderer.get_edited_texts()
-        reason = "autosave" if silent else "manual_save"
+        front_rich, back_rich = self.card_renderer.get_edited_rich_docs()
         now_ts = time.time()
-        if not silent or (now_ts - self._last_autosave_version_ts) > 300:
-            insert_card_version_snapshot(self.current_card, reason=reason, window_name="repeat")
-            if silent:
+        if silent:
+            if (now_ts - self._last_autosave_version_ts) > 120:
+                insert_card_version_snapshot(self.current_card, reason="autosave", window_name="repeat")
                 self._last_autosave_version_ts = now_ts
-        if not update_card_text(card_id, front_text, back_text):
+        else:
+            insert_card_version_snapshot(self.current_card, reason="before_manual_save", window_name="repeat")
+        if not update_card_rich_text(card_id, front_text, back_text, front_rich, back_rich):
             return False
         self.current_card["front"] = front_text
         self.current_card["back"] = back_text
+        self.current_card["front_rich"] = front_rich
+        self.current_card["back_rich"] = back_rich
         for key in ("front_rich", "back_rich", "front_html", "back_html"):
             if key in self.current_card:
-                self.current_card[key] = None
+                if key in ("front_html", "back_html"):
+                    self.current_card[key] = None
         if self.card_renderer:
             self.card_renderer.clear_dirty()
         status_label = "Автосохранено" if silent else "Сохранено"
@@ -21495,7 +22190,7 @@ class RepeatWindow(tk.Toplevel):
         return True
 
     def _on_inline_dirty_changed(self, is_dirty: bool) -> None:
-        self.edit_dirty_var.set("● изменено" if is_dirty else "")
+        self.edit_dirty_var.set("● не сохранено" if is_dirty else "")
         if is_dirty:
             self.edit_status_var.set("")
 
@@ -21514,6 +22209,19 @@ class RepeatWindow(tk.Toplevel):
             on_restore=self._restore_card_version,
             title="История версий (повторение)",
         )
+
+    def _open_batch_edit_window(self) -> None:
+        guard = getattr(self.master, "guard_premium_and_spend", None)
+        if callable(guard) and not guard("batch_edit", 0, require_premium=True):
+            return
+        BatchEditWindow(self.master)
+
+    def _run_ai_tool(self, action: str) -> None:
+        if not self._inline_editing or not self.card_renderer:
+            messagebox.showinfo("AI инструменты", "Перейдите в режим редактирования карточки.")
+            return
+        widget = self.card_renderer.back_text if self.show_back else self.card_renderer.front_text
+        self.card_renderer._run_ai_action(action, widget)
 
     def _restore_last_version(self) -> None:
         if not self.current_card:
@@ -22124,7 +22832,15 @@ class ReviewWindow(tk.Toplevel):
         menu_button, menu = create_action_menubutton(parent, getattr(self.master, "palette", None))
         menu.add_command(label="Редактировать карточку", command=self.toggle_inline_edit)
         menu.add_command(label="История версий…", command=self._open_versions_window)
-        menu.add_command(label="Восстановить последнюю сохранённую", command=self._restore_last_version)
+        menu.add_command(label="Откатить к последней сохранённой", command=self._restore_last_version)
+        ai_menu = tk.Menu(menu, tearoff=0)
+        ai_menu.add_command(label="Исправить пунктуацию", command=lambda: self._run_ai_tool("fix_punctuation"))
+        ai_menu.add_command(label="Сжать в 1 предложение", command=lambda: self._run_ai_tool("summarize"))
+        ai_menu.add_command(label="Выделить ключевое слово (жирным)", command=lambda: self._run_ai_tool("highlight_keyword"))
+        ai_menu.add_command(label="Сделать Cloze", command=lambda: self._run_ai_tool("cloze"))
+        ai_menu.add_command(label="Перевести", command=lambda: self._run_ai_tool("translate"))
+        menu.add_cascade(label="AI инструменты", menu=ai_menu)
+        menu.add_command(label="Массовая правка…", command=self._open_batch_edit_window)
         return menu_button
 
     def _show_audio_error(self, title: str, message: str):
@@ -22171,15 +22887,6 @@ class ReviewWindow(tk.Toplevel):
     def _start_inline_edit(self) -> None:
         if not self.current_card or not self.card_renderer:
             return
-        if any(
-            self.current_card.get(key)
-            for key in ("front_rich", "back_rich", "front_html", "back_html")
-        ):
-            messagebox.showwarning(
-                "Inline-редактор",
-                "Карточка содержит Rich/HTML. В режиме редактирования будет показан plain text.",
-                parent=self,
-            )
         self._inline_editing = True
         self.cancel_timers()
         self._set_inline_edit_controls_state(False)
@@ -22208,19 +22915,24 @@ class ReviewWindow(tk.Toplevel):
         if card_id is None:
             return False
         front_text, back_text = self.card_renderer.get_edited_texts()
-        reason = "autosave" if silent else "manual_save"
+        front_rich, back_rich = self.card_renderer.get_edited_rich_docs()
         now_ts = time.time()
-        if not silent or (now_ts - self._last_autosave_version_ts) > 300:
-            insert_card_version_snapshot(self.current_card, reason=reason, window_name="review")
-            if silent:
+        if silent:
+            if (now_ts - self._last_autosave_version_ts) > 120:
+                insert_card_version_snapshot(self.current_card, reason="autosave", window_name="review")
                 self._last_autosave_version_ts = now_ts
-        if not update_card_text(card_id, front_text, back_text):
+        else:
+            insert_card_version_snapshot(self.current_card, reason="before_manual_save", window_name="review")
+        if not update_card_rich_text(card_id, front_text, back_text, front_rich, back_rich):
             return False
         self.current_card["front"] = front_text
         self.current_card["back"] = back_text
+        self.current_card["front_rich"] = front_rich
+        self.current_card["back_rich"] = back_rich
         for key in ("front_rich", "back_rich", "front_html", "back_html"):
             if key in self.current_card:
-                self.current_card[key] = None
+                if key in ("front_html", "back_html"):
+                    self.current_card[key] = None
         if self.card_renderer:
             self.card_renderer.clear_dirty()
         status_label = "Автосохранено" if silent else "Сохранено"
@@ -22258,7 +22970,7 @@ class ReviewWindow(tk.Toplevel):
         return True
 
     def _on_inline_dirty_changed(self, is_dirty: bool) -> None:
-        self.edit_dirty_var.set("● изменено" if is_dirty else "")
+        self.edit_dirty_var.set("● не сохранено" if is_dirty else "")
         if is_dirty:
             self.edit_status_var.set("")
 
@@ -22277,6 +22989,19 @@ class ReviewWindow(tk.Toplevel):
             on_restore=self._restore_card_version,
             title="История версий (воспроизведение)",
         )
+
+    def _open_batch_edit_window(self) -> None:
+        guard = getattr(self.master, "guard_premium_and_spend", None)
+        if callable(guard) and not guard("batch_edit", 0, require_premium=True):
+            return
+        BatchEditWindow(self.master)
+
+    def _run_ai_tool(self, action: str) -> None:
+        if not self._inline_editing or not self.card_renderer:
+            messagebox.showinfo("AI инструменты", "Перейдите в режим редактирования карточки.")
+            return
+        widget = self.card_renderer.back_text if self.show_back else self.card_renderer.front_text
+        self.card_renderer._run_ai_action(action, widget)
 
     def _restore_last_version(self) -> None:
         if not self.current_card:
