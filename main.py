@@ -6957,6 +6957,78 @@ def attach_simple_toolbar(parent_frame: ttk.Frame, text_widget: tk.Text):
 # Контекстное меню для текстовых полей
 # ==========================
 
+def attach_clipboard_context(widget, root=None):
+    import tkinter as tk
+    from tkinter import ttk
+
+    if root is None:
+        root = widget.winfo_toplevel()
+
+    menu = tk.Menu(root, tearoff=0)
+
+    def _event_generate(seq):
+        try:
+            widget.event_generate(seq)
+        except Exception:
+            pass
+
+    def cut():
+        _event_generate("<<Cut>>")
+
+    def copy():
+        _event_generate("<<Copy>>")
+
+    def paste():
+        _event_generate("<<Paste>>")
+
+    def select_all():
+        if isinstance(widget, tk.Entry) or isinstance(widget, ttk.Entry):
+            widget.selection_range(0, tk.END)
+            widget.icursor(tk.END)
+        else:
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "end-1c")
+        widget.focus_set()
+
+    menu.add_command(label="Вырезать", command=cut)
+    menu.add_command(label="Копировать", command=copy)
+    menu.add_command(label="Вставить", command=paste)
+    menu.add_separator()
+    menu.add_command(label="Выделить всё", command=select_all)
+
+    def show_menu(event):
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    widget.bind("<Button-3>", show_menu)
+    widget.bind("<Button-2>", show_menu)
+
+    widget.bind("<Control-a>", lambda e: (select_all(), "break"))
+    widget.bind("<Control-A>", lambda e: (select_all(), "break"))
+    widget.bind("<Control-c>", lambda e: (copy(), "break"))
+    widget.bind("<Control-C>", lambda e: (copy(), "break"))
+    widget.bind("<Control-x>", lambda e: (cut(), "break"))
+    widget.bind("<Control-X>", lambda e: (cut(), "break"))
+    widget.bind("<Control-v>", lambda e: (paste(), "break"))
+    widget.bind("<Control-V>", lambda e: (paste(), "break"))
+
+    widget.bind("<Command-a>", lambda e: (select_all(), "break"))
+    widget.bind("<Command-A>", lambda e: (select_all(), "break"))
+    widget.bind("<Command-c>", lambda e: (copy(), "break"))
+    widget.bind("<Command-C>", lambda e: (copy(), "break"))
+    widget.bind("<Command-x>", lambda e: (cut(), "break"))
+    widget.bind("<Command-X>", lambda e: (cut(), "break"))
+    widget.bind("<Command-v>", lambda e: (paste(), "break"))
+    widget.bind("<Command-V>", lambda e: (paste(), "break"))
+
+    widget.bind("<Shift-Insert>", lambda e: (paste(), "break"))
+    widget.bind("<Control-Insert>", lambda e: (copy(), "break"))
+    widget.bind("<Shift-Delete>", lambda e: (cut(), "break"))
+
+    return menu
+
 def create_context_menu(widget):
     """Создать контекстное меню для текстового виджета"""
     menu = tk.Menu(widget, tearoff=0)
@@ -23017,7 +23089,12 @@ class VideoClipCardsWindow:
         youtube_row.pack(fill=tk.X, padx=6, pady=(0, 4))
         self.youtube_url_var = tk.StringVar()
         self.youtube_url_entry = ttk.Entry(youtube_row, textvariable=self.youtube_url_var)
+        try:
+            self.youtube_url_entry.configure(exportselection=True)
+        except Exception:
+            pass
         self.youtube_url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        attach_clipboard_context(self.youtube_url_entry)
         self.youtube_load_btn = ttk.Button(
             youtube_row,
             text="Загрузить YouTube",
@@ -23136,6 +23213,8 @@ class VideoClipCardsWindow:
             self.youtube_subs_first_check.configure(state=youtube_state)
             self.youtube_download_video_check.configure(state=youtube_state)
             self.youtube_audio_only_check.configure(state=youtube_state)
+            if is_youtube:
+                self.youtube_url_entry.focus_set()
         except Exception:
             pass
         self._sync_youtube_options()
@@ -23620,7 +23699,7 @@ class VideoClipCardsWindow:
         self.stt_text = scrolledtext.ScrolledText(frame, height=6)
         style_text_widget(self.stt_text, getattr(self.app, "palette", None) or {})
         self.stt_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
-        create_context_menu(self.stt_text)
+        attach_clipboard_context(self.stt_text)
 
         action_row = ttk.Frame(frame)
         action_row.pack(fill=tk.X, padx=6, pady=(0, 6))
