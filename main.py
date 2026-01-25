@@ -16,7 +16,7 @@ import base64
 import sqlite3
 import re
 import glob
-import multiprocessing
+import multiprocessing as mp
 import threading
 import queue
 import json
@@ -5707,7 +5707,7 @@ def stt_transcribe_wav(
                     if chunk_path != wav_path and chunk_path not in chunk_paths:
                         chunk_paths.append(chunk_path)
 
-                def _terminate_process(proc: multiprocessing.Process) -> None:
+                def _terminate_process(proc: mp.Process) -> None:
                     terminated = False
                     if proc.is_alive():
                         proc.terminate()
@@ -5721,7 +5721,7 @@ def stt_transcribe_wav(
                         log_write(log_path, "stage=proc_terminated")
 
                 def _run_whisper_process() -> tuple[str, list[dict], float]:
-                    ctx = multiprocessing.get_context("spawn")
+                    ctx = mp.get_context("spawn")
                     out_queue = ctx.Queue()
                     payload = {
                         "wav_path": str(wav_path),
@@ -5734,11 +5734,7 @@ def stt_transcribe_wav(
                         "heartbeat_sec": STT_WHISPER_HEARTBEAT_SEC,
                         "log_path": log_path,
                     }
-                    proc = ctx.Process(
-                        target=whisper_worker,
-                        args=(payload, out_queue),
-                        daemon=True,
-                    )
+                    proc = ctx.Process(target=whisper_worker, args=(payload, out_queue), daemon=False)
                     log_write(log_path, "stage=mp_spawn_prepare")
                     try:
                         proc.start()
@@ -5799,11 +5795,14 @@ def stt_transcribe_wav(
                                         log_write(log_path, tb)
                                     log_write(log_path, f"EXCEPTION=worker_error err={err}")
                                     raise RuntimeError(err)
-                            if not started_received and (time.time() - started_at) > 5.0:
+                            if not started_received and (time.time() - started_at) > 15.0:
                                 _append_log_line(log_lines, "spawn_error=no_started")
+                                log_write(log_path, f"child_exitcode={proc.exitcode}")
                                 log_write(log_path, "ERROR=mp_failed_to_start: no_started")
+                                if proc.exitcode is not None:
+                                    raise RuntimeError("worker crashed")
                                 raise RuntimeError(
-                                    "Whisper не стартовал (нет started за 5 сек). "
+                                    "Whisper не стартовал (нет started за 15 сек). "
                                     "Проверьте __main__ guard и multiprocessing.freeze_support()."
                                 )
                             timeout_limit = heartbeat_timeout_sec or 0.0
@@ -5830,6 +5829,12 @@ def stt_transcribe_wav(
             except STTError:
                 raise
             except Exception as exc:
+                if "worker crashed" in str(exc):
+                    raise STTError(
+                        "worker crashed. Проверьте лог распознавания.",
+                        "deadlock",
+                        str(exc),
+                    )
                 if "Whisper не стартовал" in str(exc):
                     raise STTError(
                         "Whisper не стартовал. Проверьте __main__ guard и multiprocessing.freeze_support().",
@@ -6240,6 +6245,8 @@ def show_stt_error_dialog(parent: tk.Misc | None, title: str, message: str) -> N
     ttk.Button(btn_row, text="Показать детали", command=_open_details).pack(side=tk.LEFT)
     ttk.Button(btn_row, text="Открыть лог", command=_open_log).pack(side=tk.LEFT, padx=(8, 0))
     ttk.Button(btn_row, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+    if "worker crashed" in (message or "").lower():
+        win.after(100, _open_log)
 
 
 def record_speech_to_text(
@@ -23117,6 +23124,7 @@ if __name__ == "__main__":
     import multiprocessing as mp
 
     mp.freeze_support()
+    mp.set_start_method("spawn", force=True)
     main()
 # PATCH: tabs moved + dark scrollbar + video embed fixed + upload video in generator + unified card renderer
 # PATCH: unify card renderer sizes + white video background + image-over-video rule
