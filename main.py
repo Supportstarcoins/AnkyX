@@ -23044,12 +23044,18 @@ class VideoEditorWindow(AudioEditorWindow):
         self.win.title("Видео → клипы → карточки")
 
 
-if __name__ == "__main__":
-    multiprocessing.freeze_support()
+def main() -> None:
     init_db()
     init_dictionary()
     app = AnkiApp()
     app.mainloop()
+
+
+if __name__ == "__main__":
+    import multiprocessing as mp
+
+    mp.freeze_support()
+    main()
 # PATCH: tabs moved + dark scrollbar + video embed fixed + upload video in generator + unified card renderer
 # PATCH: unify card renderer sizes + white video background + image-over-video rule
 # PATCH: fix random image shrink (configure debounce + min size + orig cache) + fix preview image render (PhotoImage refs + shared renderer)
