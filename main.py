@@ -25,6 +25,7 @@ import shutil
 import webbrowser
 import urllib.parse
 import urllib.request
+import copy
 from PIL import Image, ImageOps, ImageDraw, ImageEnhance
 from pathlib import Path
 from uuid import uuid4
@@ -3218,6 +3219,30 @@ def init_db():
             # колонка уже существует
             pass
 
+    # История версий карточек (premium inline editor)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS card_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            front TEXT,
+            back TEXT,
+            front_rich TEXT,
+            back_rich TEXT,
+            front_html TEXT,
+            back_html TEXT,
+            front_image_path TEXT,
+            back_image_path TEXT,
+            audio_path TEXT,
+            meta_json TEXT
+        );
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_card_versions_card_id ON card_versions(card_id);"
+    )
+
     # Словарь уже известных слов
     cur.execute("""
         CREATE TABLE IF NOT EXISTS words (
@@ -4521,6 +4546,141 @@ def update_card_text(card_id: int, front: str, back: str) -> bool:
             pass
         messagebox.showerror("Ошибка БД", f"Не удалось сохранить карточку: {exc}")
         return False
+
+
+def insert_card_version_snapshot(card_dict: dict, reason: str, window_name: str | None = None) -> None:
+    if not card_dict:
+        return
+    card_id = card_dict.get("id")
+    if card_id is None:
+        return
+    meta = {"reason": reason}
+    window_value = window_name or card_dict.get("_version_window")
+    if window_value:
+        meta["window"] = window_value
+    snapshot = {
+        "front": card_dict.get("front"),
+        "back": card_dict.get("back"),
+        "front_rich": serialize_rich_doc(card_dict.get("front_rich")),
+        "back_rich": serialize_rich_doc(card_dict.get("back_rich")),
+        "front_html": card_dict.get("front_html"),
+        "back_html": card_dict.get("back_html"),
+        "front_image_path": card_dict.get("front_image_path"),
+        "back_image_path": card_dict.get("back_image_path"),
+        "audio_path": card_dict.get("audio_path"),
+    }
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO card_versions (
+                card_id, created_at, front, back, front_rich, back_rich, front_html, back_html,
+                front_image_path, back_image_path, audio_path, meta_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                card_id,
+                int(time.time()),
+                snapshot["front"],
+                snapshot["back"],
+                snapshot["front_rich"],
+                snapshot["back_rich"],
+                snapshot["front_html"],
+                snapshot["back_html"],
+                snapshot["front_image_path"],
+                snapshot["back_image_path"],
+                snapshot["audio_path"],
+                json.dumps(meta, ensure_ascii=False),
+            ),
+        )
+        cur.execute(
+            """
+            DELETE FROM card_versions
+            WHERE card_id = ?
+              AND id NOT IN (
+                SELECT id FROM card_versions WHERE card_id = ? ORDER BY id DESC LIMIT 20
+              );
+            """,
+            (card_id, card_id),
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"[card_versions] snapshot insert failed: {exc}")
+        messagebox.showwarning("Версии", f"Не удалось сохранить историю версии: {exc}")
+    finally:
+        conn.close()
+
+
+def list_card_versions(card_id: int, limit: int = 20) -> list[sqlite3.Row]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM card_versions
+        WHERE card_id = ?
+        ORDER BY id DESC
+        LIMIT ?;
+        """,
+        (card_id, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_card_version(version_id: int) -> sqlite3.Row | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM card_versions WHERE id = ?;", (version_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def restore_card_from_version(card_id: int, version_row: sqlite3.Row) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("PRAGMA table_info(cards);")
+        columns = {row[1] for row in cur.fetchall()}
+        set_parts = [
+            "front = ?",
+            "back = ?",
+            "front_rich = ?",
+            "back_rich = ?",
+            "front_image_path = ?",
+            "back_image_path = ?",
+            "audio_path = ?",
+        ]
+        values = [
+            version_row["front"],
+            version_row["back"],
+            version_row["front_rich"],
+            version_row["back_rich"],
+            version_row["front_image_path"],
+            version_row["back_image_path"],
+            version_row["audio_path"],
+        ]
+        if "front_html" in columns:
+            set_parts.append("front_html = ?")
+            values.append(version_row["front_html"])
+        if "back_html" in columns:
+            set_parts.append("back_html = ?")
+            values.append(version_row["back_html"])
+        values.append(card_id)
+        cur.execute(
+            f"UPDATE cards SET {', '.join(set_parts)} WHERE id = ?;",
+            values,
+        )
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        conn.rollback()
+        messagebox.showerror("Версии", f"Не удалось восстановить карточку: {exc}")
+    finally:
+        conn.close()
 
 # ==========================
 # Авто-генерация
@@ -7000,6 +7160,16 @@ class CardRenderer:
         self._suppress_image = False
         self._suppress_audio = False
         self.inline_editing = bool(editable)
+        self._dirty = False
+        self._autosave_after_id: str | None = None
+        self._autosave_last_ts = 0.0
+        self._autosave_debounce_ms = 1200
+        self._autosave_enabled = True
+        self._on_dirty_changed = None
+        self._on_request_save = None
+        self._on_status = None
+        self._original_snapshot: dict | None = None
+        self._suppress_modified = False
 
         card_bg, card_text, _ = get_card_surface_colors(parent)
         self.card_bg = card_bg
@@ -7121,6 +7291,9 @@ class CardRenderer:
             bd=0,
             highlightthickness=0,
             font=("Segoe UI", 12),
+            undo=True,
+            autoseparators=True,
+            maxundo=2000,
         )
         self.back_text = tk.Text(
             self.text_frame,
@@ -7132,11 +7305,22 @@ class CardRenderer:
             bd=0,
             highlightthickness=0,
             font=("Segoe UI", 12),
+            undo=True,
+            autoseparators=True,
+            maxundo=2000,
         )
 
         self.front_text.grid(row=0, column=0, sticky="nsew")
         self.back_text.grid(row=0, column=0, sticky="nsew")
         self.back_text.grid_remove()
+
+        for widget in (self.front_text, self.back_text):
+            widget.bind("<<Modified>>", self._on_text_modified)
+            widget.bind("<Control-z>", self._on_undo)
+            widget.bind("<Control-Z>", self._on_undo)
+            widget.bind("<Control-y>", self._on_redo)
+            widget.bind("<Control-Y>", self._on_redo)
+            widget.bind("<Control-Shift-Z>", self._on_redo)
 
         self.custom_text_frame = tk.Frame(self.text_frame, bg="white")
         self.custom_text_frame.grid(row=0, column=0, sticky="nsew")
@@ -7158,21 +7342,168 @@ class CardRenderer:
         self._bind_mousewheel(self.content_inner)
         self.set_inline_editing(self.inline_editing)
 
-    def set_inline_editing(self, editing: bool) -> None:
+    def set_inline_editing(self, editing: bool, card: dict | None = None) -> None:
         self.inline_editing = bool(editing)
+        if self.inline_editing and card is not None:
+            self._original_snapshot = copy.deepcopy(
+                {
+                    "front": card.get("front"),
+                    "back": card.get("back"),
+                    "front_rich": card.get("front_rich"),
+                    "back_rich": card.get("back_rich"),
+                    "front_html": card.get("front_html"),
+                    "back_html": card.get("back_html"),
+                    "front_image_path": card.get("front_image_path"),
+                    "back_image_path": card.get("back_image_path"),
+                    "audio_path": card.get("audio_path"),
+                }
+            )
+        elif not self.inline_editing:
+            self._original_snapshot = None
+        self._dirty = False
         desired_state = tk.NORMAL if self.inline_editing else tk.DISABLED
         for widget in (self.front_text, self.back_text):
             if isinstance(widget, tk.Text):
                 widget.configure(state=desired_state)
+        if not self.inline_editing:
+            self._cancel_autosave()
+        self._notify_dirty(False)
+        if self.inline_editing:
+            try:
+                (self.back_text if self._current_show_back else self.front_text).focus_set()
+            except Exception:
+                pass
+
+    def _notify_dirty(self, value: bool) -> None:
+        if self._on_dirty_changed:
+            try:
+                self._on_dirty_changed(value)
+            except Exception:
+                pass
+
+    def _set_status(self, text: str) -> None:
+        if self._on_status:
+            try:
+                self._on_status(text)
+            except Exception:
+                pass
+
+    def _cancel_autosave(self) -> None:
+        if self._autosave_after_id is None:
+            return
+        try:
+            self.container.after_cancel(self._autosave_after_id)
+        except Exception:
+            pass
+        self._autosave_after_id = None
+
+    def _on_text_modified(self, event) -> None:
+        widget = event.widget
+        try:
+            if self._suppress_modified:
+                widget.edit_modified(False)
+                return
+            if isinstance(widget, tk.Text) and widget.edit_modified():
+                widget.edit_modified(False)
+                self.mark_dirty()
+        except Exception:
+            pass
+
+    def _on_undo(self, event) -> str:
+        try:
+            event.widget.edit_undo()
+        except Exception:
+            pass
+        return "break"
+
+    def _on_redo(self, event) -> str:
+        try:
+            event.widget.edit_redo()
+        except Exception:
+            pass
+        return "break"
+
+    def mark_dirty(self) -> None:
+        if not self.inline_editing:
+            return
+        if not self._dirty:
+            self._dirty = True
+            self._notify_dirty(True)
+        self._schedule_autosave()
+
+    def _schedule_autosave(self) -> None:
+        if not self._autosave_enabled or not self.inline_editing:
+            return
+        self._cancel_autosave()
+        self._autosave_after_id = self.container.after(self._autosave_debounce_ms, self._run_autosave)
+
+    def _run_autosave(self) -> None:
+        self._autosave_after_id = None
+        if not self.inline_editing or not self._dirty or not self._autosave_enabled:
+            return
+        if not self._on_request_save:
+            return
+        ok = False
+        try:
+            ok = bool(self._on_request_save(silent=True, keep_editing=True))
+        except Exception:
+            ok = False
+        if ok:
+            self._dirty = False
+            self._autosave_last_ts = time.time()
+            self._notify_dirty(False)
+
+    def is_dirty(self) -> bool:
+        return bool(self._dirty)
+
+    def clear_dirty(self) -> None:
+        self._dirty = False
+        self._notify_dirty(False)
+
+    def get_edited_texts(self) -> tuple[str, str]:
+        front_value = ""
+        back_value = ""
+        try:
+            front_value = self.front_text.get("1.0", "end-1c")
+        except Exception:
+            pass
+        try:
+            back_value = self.back_text.get("1.0", "end-1c")
+        except Exception:
+            pass
+        return front_value, back_value
+
+    def revert_to_original(self) -> None:
+        if not self._original_snapshot:
+            return
+        desired_state = tk.NORMAL if self.inline_editing else tk.DISABLED
+        self._suppress_modified = True
+        for widget_name, widget in (("front", self.front_text), ("back", self.back_text)):
+            if not isinstance(widget, tk.Text):
+                continue
+            widget.configure(state=tk.NORMAL)
+            widget.delete("1.0", tk.END)
+            widget.insert("1.0", self._original_snapshot.get(widget_name, "") or "")
+            widget.edit_modified(False)
+            widget.configure(state=desired_state)
+        self._suppress_modified = False
+        self._dirty = False
+        self._notify_dirty(False)
 
     def _set_text_widget_content(self, widget: tk.Text, value: str) -> None:
         if not isinstance(widget, tk.Text):
             return
         desired_state = tk.NORMAL if self.inline_editing else tk.DISABLED
+        self._suppress_modified = True
         widget.configure(state=tk.NORMAL)
         widget.delete("1.0", tk.END)
         widget.insert("1.0", value)
+        try:
+            widget.edit_modified(False)
+        except Exception:
+            pass
         widget.configure(state=desired_state)
+        self._suppress_modified = False
 
     def _bind_mousewheel(self, target: tk.Widget) -> None:
         def _on_mousewheel(event):
@@ -20495,6 +20826,9 @@ class OverviewWindow(tk.Toplevel):
             label="Отметить карточку",
             command=lambda: mark_card_for_overview(self.current_card["id"]) if self.current_card else None,
         )
+        menu.add_command(label="Редактировать карточку", command=self.toggle_inline_edit)
+        menu.add_command(label="История версий…", command=self._open_versions_window)
+        menu.add_command(label="Восстановить последнюю сохранённую", command=self._restore_last_version)
         menu.add_command(label="Отложить карточку", command=lambda: _placeholder("Отложить карточку"))
         menu.add_command(label="Сбросить карточку", command=_reset_card)
         menu.add_command(label="Задать срок", command=lambda: _placeholder("Задать срок"))
@@ -20641,6 +20975,107 @@ class ReviewSession:
         return result
 
 
+def open_card_versions_window(
+    parent: tk.Misc,
+    card_id: int,
+    *,
+    on_restore,
+    title: str = "История версий",
+) -> None:
+    versions = list_card_versions(card_id, limit=20)
+    if not versions:
+        messagebox.showinfo("Версии", "История версий пуста.", parent=parent)
+        return
+
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.geometry("900x560")
+    win.grab_set()
+
+    container = ttk.Frame(win)
+    container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    columns = ("time", "reason")
+    tree = ttk.Treeview(container, columns=columns, show="headings", height=8)
+    tree.heading("time", text="Время")
+    tree.heading("reason", text="Причина")
+    tree.column("time", width=180)
+    tree.column("reason", width=400)
+    tree.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+    version_map: dict[str, sqlite3.Row] = {}
+    for row in versions:
+        meta = {}
+        try:
+            meta = json.loads(row["meta_json"] or "{}")
+        except Exception:
+            meta = {}
+        reason = meta.get("reason") or "unknown"
+        window_name = meta.get("window")
+        if window_name:
+            reason = f"{reason} ({window_name})"
+        ts = datetime.fromtimestamp(int(row["created_at"])).strftime("%Y-%m-%d %H:%M:%S")
+        iid = str(row["id"])
+        version_map[iid] = row
+        tree.insert("", "end", iid=iid, values=(ts, reason))
+
+    preview = ttk.Frame(container)
+    preview.pack(fill=tk.BOTH, expand=True, padx=6)
+    preview.columnconfigure(0, weight=1)
+    preview.columnconfigure(1, weight=1)
+
+    front_text = tk.Text(preview, height=8, wrap=tk.WORD)
+    back_text = tk.Text(preview, height=8, wrap=tk.WORD)
+    front_text.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+    back_text.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
+
+    for widget in (front_text, back_text):
+        widget.configure(state=tk.DISABLED)
+
+    def _render_preview(selected: sqlite3.Row) -> None:
+        for widget, key in ((front_text, "front"), (back_text, "back")):
+            widget.configure(state=tk.NORMAL)
+            widget.delete("1.0", tk.END)
+            widget.insert("1.0", selected[key] or "")
+            widget.configure(state=tk.DISABLED)
+
+    def _on_select(_event=None) -> None:
+        selection = tree.selection()
+        if not selection:
+            return
+        row = version_map.get(selection[0])
+        if row:
+            _render_preview(row)
+
+    tree.bind("<<TreeviewSelect>>", _on_select)
+    tree.selection_set(tree.get_children()[0])
+    _on_select()
+
+    button_row = ttk.Frame(container)
+    button_row.pack(fill=tk.X, padx=6, pady=(6, 0))
+
+    def _restore() -> None:
+        selection = tree.selection()
+        if not selection:
+            return
+        row = version_map.get(selection[0])
+        if not row:
+            return
+        if not messagebox.askyesno(
+            "Восстановление",
+            "Восстановить выбранную версию карточки?",
+            parent=win,
+        ):
+            return
+        try:
+            on_restore(row)
+        except Exception as exc:
+            messagebox.showerror("Версии", f"Не удалось восстановить версию: {exc}", parent=win)
+
+    ttk.Button(button_row, text="Восстановить", command=_restore).pack(side=tk.LEFT)
+    ttk.Button(button_row, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
+
 class RepeatWindow(tk.Toplevel):
     def __init__(self, master, session: ReviewSession):
         super().__init__(master)
@@ -20667,6 +21102,9 @@ class RepeatWindow(tk.Toplevel):
         self._timer_fired = False
         self._inline_editing = False
         self._inline_edit_controls: list[tk.Widget] = []
+        self._last_autosave_version_ts = 0.0
+        self.edit_status_var = tk.StringVar(value="")
+        self.edit_dirty_var = tk.StringVar(value="")
         
         self.title("Режим повторения")
         self.geometry("1000x700")
@@ -20677,6 +21115,7 @@ class RepeatWindow(tk.Toplevel):
         if self.current_card:
             self.load_checkpoint_state()
             self.reset_timer_for_card()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def create_widgets(self):
         frame_main = ttk.Frame(self, style="Surface.TFrame")
@@ -20727,6 +21166,9 @@ class RepeatWindow(tk.Toplevel):
             fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
             render_mode="repeat",
         )
+        self.card_renderer._on_dirty_changed = self._on_inline_dirty_changed
+        self.card_renderer._on_request_save = self._on_inline_autosave_request
+        self.card_renderer._on_status = self._on_inline_status
 
         # Фрейм для 6-клеточного чекпоинта (внизу карточки)
         self.checkpoint_frame = tk.Frame(cards_bg, bg=card_bg)
@@ -20789,6 +21231,11 @@ class RepeatWindow(tk.Toplevel):
         self.btn_sound = ttk.Button(self.controls_bar, text="🔊 Слово", command=self.play_word)
         self.btn_sound.pack(side=tk.RIGHT, padx=5)
 
+        self.edit_dirty_label = ttk.Label(self.controls_bar, textvariable=self.edit_dirty_var, foreground="#d9534f")
+        self.edit_dirty_label.pack(side=tk.RIGHT, padx=(0, 6))
+        self.edit_status_label = ttk.Label(self.controls_bar, textvariable=self.edit_status_var, foreground="gray")
+        self.edit_status_label.pack(side=tk.RIGHT, padx=(0, 6))
+
         # Инициализация аудио-плеера
         self.update_audio_player()
         self._inline_edit_controls = [
@@ -20847,6 +21294,8 @@ class RepeatWindow(tk.Toplevel):
             command=lambda: mark_card_for_overview(self.current_card["id"]) if self.current_card else None,
         )
         menu.add_command(label="Редактировать карточку", command=self.toggle_inline_edit)
+        menu.add_command(label="История версий…", command=self._open_versions_window)
+        menu.add_command(label="Восстановить последнюю сохранённую", command=self._restore_last_version)
         menu.add_command(label="Отложить карточку", command=lambda: _placeholder("Отложить карточку"))
         menu.add_command(label="Сбросить карточку", command=_reset_card)
         menu.add_command(label="Задать срок", command=lambda: _placeholder("Задать срок"))
@@ -20857,9 +21306,12 @@ class RepeatWindow(tk.Toplevel):
         return menu_button
 
     def toggle_inline_edit(self) -> None:
-        if self._inline_editing:
+        if not self._inline_editing:
+            self._start_inline_edit()
             return
-        self._start_inline_edit()
+        if self._confirm_inline_exit("выйти из режима редактирования"):
+            self._stop_inline_edit()
+            self.update_view()
 
     def _set_inline_edit_controls_state(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -20884,10 +21336,21 @@ class RepeatWindow(tk.Toplevel):
     def _start_inline_edit(self) -> None:
         if not self.current_card or not self.card_renderer:
             return
+        if any(
+            self.current_card.get(key)
+            for key in ("front_rich", "back_rich", "front_html", "back_html")
+        ):
+            messagebox.showwarning(
+                "Inline-редактор",
+                "Карточка содержит Rich/HTML. В режиме редактирования будет показан plain text.",
+                parent=self,
+            )
         self._inline_editing = True
         self.stop_timer()
         self._set_inline_edit_controls_state(False)
-        self.card_renderer.set_inline_editing(True)
+        self.card_renderer.set_inline_editing(True, card=self.current_card)
+        self.edit_status_var.set("")
+        self.edit_dirty_var.set("")
         self._show_inline_edit_buttons()
         self.update_view()
 
@@ -20895,35 +21358,124 @@ class RepeatWindow(tk.Toplevel):
         if not self.card_renderer:
             return
         self._inline_editing = False
-        self.card_renderer.set_inline_editing(False)
+        self.card_renderer.set_inline_editing(False, card=None)
         self._set_inline_edit_controls_state(True)
         self._hide_inline_edit_buttons()
+        self.edit_status_var.set("")
+        self.edit_dirty_var.set("")
         if self.current_card:
             self.reset_timer_for_card()
 
-    def _save_inline_edit(self) -> None:
+    def _save_inline_edit(self, *, silent: bool = False, keep_editing: bool = False) -> bool:
         if not self.current_card or not self.card_renderer:
-            return
+            return False
         card_id = self.current_card.get("id")
         if card_id is None:
-            return
-        front_text = self.card_renderer.front_text.get("1.0", "end-1c")
-        back_text = self.card_renderer.back_text.get("1.0", "end-1c")
+            return False
+        front_text, back_text = self.card_renderer.get_edited_texts()
+        reason = "autosave" if silent else "manual_save"
+        now_ts = time.time()
+        if not silent or (now_ts - self._last_autosave_version_ts) > 300:
+            insert_card_version_snapshot(self.current_card, reason=reason, window_name="repeat")
+            if silent:
+                self._last_autosave_version_ts = now_ts
         if not update_card_text(card_id, front_text, back_text):
-            return
+            return False
         self.current_card["front"] = front_text
         self.current_card["back"] = back_text
         for key in ("front_rich", "back_rich", "front_html", "back_html"):
             if key in self.current_card:
                 self.current_card[key] = None
+        if self.card_renderer:
+            self.card_renderer.clear_dirty()
+        status_label = "Автосохранено" if silent else "Сохранено"
+        self.edit_status_var.set(f"{status_label} {datetime.now().strftime('%H:%M:%S')}")
+        if keep_editing:
+            return True
         self._stop_inline_edit()
         self.update_view()
+        return True
 
     def _cancel_inline_edit(self) -> None:
         if not self.current_card:
             return
+        if self.card_renderer and self.card_renderer.is_dirty():
+            if not self._confirm_inline_exit("отменить изменения"):
+                return
+        if self.card_renderer:
+            self.card_renderer.revert_to_original()
         self._stop_inline_edit()
         self.update_view()
+
+    def _confirm_inline_exit(self, action: str) -> bool:
+        if not self.card_renderer or not self.card_renderer.is_dirty():
+            return True
+        result = messagebox.askyesnocancel(
+            "Несохранённые изменения",
+            f"Сохранить изменения перед тем как {action}?",
+            parent=self,
+        )
+        if result is None:
+            return False
+        if result:
+            return self._save_inline_edit(silent=False, keep_editing=False)
+        self.card_renderer.revert_to_original()
+        return True
+
+    def _on_inline_dirty_changed(self, is_dirty: bool) -> None:
+        self.edit_dirty_var.set("● изменено" if is_dirty else "")
+        if is_dirty:
+            self.edit_status_var.set("")
+
+    def _on_inline_status(self, text: str) -> None:
+        self.edit_status_var.set(text or "")
+
+    def _on_inline_autosave_request(self, *, silent: bool, keep_editing: bool) -> bool:
+        return self._save_inline_edit(silent=silent, keep_editing=keep_editing)
+
+    def _open_versions_window(self) -> None:
+        if not self.current_card:
+            return
+        open_card_versions_window(
+            self,
+            self.current_card["id"],
+            on_restore=self._restore_card_version,
+            title="История версий (повторение)",
+        )
+
+    def _restore_last_version(self) -> None:
+        if not self.current_card:
+            return
+        versions = list_card_versions(self.current_card["id"], limit=1)
+        if not versions:
+            messagebox.showinfo("Версии", "История версий пуста.", parent=self)
+            return
+        self._restore_card_version(versions[0])
+
+    def _restore_card_version(self, version_row: sqlite3.Row) -> None:
+        if not self.current_card:
+            return
+        insert_card_version_snapshot(self.current_card, reason="before_restore", window_name="repeat")
+        restore_card_from_version(self.current_card["id"], version_row)
+        refreshed = get_card_by_id(self.current_card["id"])
+        if refreshed:
+            self.current_card.update(refreshed)
+        self._stop_inline_edit()
+        self.update_view()
+
+    def _on_close(self) -> None:
+        if self._inline_editing and not self._confirm_inline_exit("закрыть окно"):
+            return
+        self.save_current_media_state()
+        self.destroy()
+
+    def _prepare_for_navigation(self, action: str) -> bool:
+        if not self._inline_editing:
+            return True
+        if not self._confirm_inline_exit(action):
+            return False
+        self._stop_inline_edit()
+        return True
 
     def _apply_audio_state_from_selection(self):
         audio_widget = getattr(self.audio_inline_frame, "audio_widget", None)
@@ -21286,7 +21838,7 @@ class RepeatWindow(tk.Toplevel):
         self.goto_next_card()
 
     def goto_next_card(self):
-        if self._inline_editing:
+        if not self._prepare_for_navigation("перейти к следующей карточке"):
             return
         self.save_current_media_state()
         self.current_card = self.session.next_card()
@@ -21299,12 +21851,10 @@ class RepeatWindow(tk.Toplevel):
         self.reset_timer_for_card()
 
     def next_card(self):
-        if self._inline_editing:
-            return
         self.goto_next_card()
 
     def prev_card(self):
-        if self._inline_editing:
+        if not self._prepare_for_navigation("вернуться к предыдущей карточке"):
             return
         self.save_current_media_state()
         self.current_card = self.session.prev_card()
@@ -21344,6 +21894,9 @@ class ReviewWindow(tk.Toplevel):
         self.timer_flash_job = None
         self._inline_editing = False
         self._inline_edit_controls: list[tk.Widget] = []
+        self._last_autosave_version_ts = 0.0
+        self.edit_status_var = tk.StringVar(value="")
+        self.edit_dirty_var = tk.StringVar(value="")
 
         # Прогресс
         self.progress_canvas = None
@@ -21356,6 +21909,7 @@ class ReviewWindow(tk.Toplevel):
         self.create_widgets()
         self.update_view()
         self.schedule_timers_for_card()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def create_widgets(self):
         frame_main = ttk.Frame(self, style="Surface.TFrame")
@@ -21409,6 +21963,9 @@ class ReviewWindow(tk.Toplevel):
             fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
             render_mode="playback",
         )
+        self.card_renderer._on_dirty_changed = self._on_inline_dirty_changed
+        self.card_renderer._on_request_save = self._on_inline_autosave_request
+        self.card_renderer._on_status = self._on_inline_status
 
         # Прогресс-бар
         progress_frame = tk.Frame(self.card_frame, bg=card_bg)
@@ -21468,6 +22025,11 @@ class ReviewWindow(tk.Toplevel):
         self.btn_edit_save.grid_remove()
         self.btn_edit_cancel.grid_remove()
 
+        self.edit_status_label = ttk.Label(btn_frame, textvariable=self.edit_status_var, foreground="gray")
+        self.edit_dirty_label = ttk.Label(btn_frame, textvariable=self.edit_dirty_var, foreground="#d9534f")
+        self.edit_status_label.grid(row=1, column=0, padx=5, pady=(6, 0), sticky="w")
+        self.edit_dirty_label.grid(row=1, column=1, padx=5, pady=(6, 0), sticky="w")
+
         self.update_audio_player()
         self._inline_edit_controls = [
             self.btn_show,
@@ -21489,6 +22051,8 @@ class ReviewWindow(tk.Toplevel):
     def _build_actions_menu(self, parent) -> ttk.Menubutton:
         menu_button, menu = create_action_menubutton(parent, getattr(self.master, "palette", None))
         menu.add_command(label="Редактировать карточку", command=self.toggle_inline_edit)
+        menu.add_command(label="История версий…", command=self._open_versions_window)
+        menu.add_command(label="Восстановить последнюю сохранённую", command=self._restore_last_version)
         return menu_button
 
     def _show_audio_error(self, title: str, message: str):
@@ -21510,9 +22074,11 @@ class ReviewWindow(tk.Toplevel):
             messagebox.showinfo("Ошибка", "Аудио система недоступна")
 
     def toggle_inline_edit(self) -> None:
-        if self._inline_editing:
+        if not self._inline_editing:
+            self._start_inline_edit()
             return
-        self._start_inline_edit()
+        if self._confirm_inline_exit("выйти из режима редактирования"):
+            self._stop_inline_edit()
 
     def _set_inline_edit_controls_state(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -21533,10 +22099,21 @@ class ReviewWindow(tk.Toplevel):
     def _start_inline_edit(self) -> None:
         if not self.current_card or not self.card_renderer:
             return
+        if any(
+            self.current_card.get(key)
+            for key in ("front_rich", "back_rich", "front_html", "back_html")
+        ):
+            messagebox.showwarning(
+                "Inline-редактор",
+                "Карточка содержит Rich/HTML. В режиме редактирования будет показан plain text.",
+                parent=self,
+            )
         self._inline_editing = True
         self.cancel_timers()
         self._set_inline_edit_controls_state(False)
-        self.card_renderer.set_inline_editing(True)
+        self.card_renderer.set_inline_editing(True, card=self.current_card)
+        self.edit_status_var.set("")
+        self.edit_dirty_var.set("")
         self._show_inline_edit_buttons()
         self.update_view()
 
@@ -21544,35 +22121,124 @@ class ReviewWindow(tk.Toplevel):
         if not self.card_renderer:
             return
         self._inline_editing = False
-        self.card_renderer.set_inline_editing(False)
+        self.card_renderer.set_inline_editing(False, card=None)
         self._set_inline_edit_controls_state(True)
         self._hide_inline_edit_buttons()
+        self.edit_status_var.set("")
+        self.edit_dirty_var.set("")
         if self.current_card:
             self.schedule_timers_for_card()
 
-    def _save_inline_edit(self) -> None:
+    def _save_inline_edit(self, *, silent: bool = False, keep_editing: bool = False) -> bool:
         if not self.current_card or not self.card_renderer:
-            return
+            return False
         card_id = self.current_card.get("id")
         if card_id is None:
-            return
-        front_text = self.card_renderer.front_text.get("1.0", "end-1c")
-        back_text = self.card_renderer.back_text.get("1.0", "end-1c")
+            return False
+        front_text, back_text = self.card_renderer.get_edited_texts()
+        reason = "autosave" if silent else "manual_save"
+        now_ts = time.time()
+        if not silent or (now_ts - self._last_autosave_version_ts) > 300:
+            insert_card_version_snapshot(self.current_card, reason=reason, window_name="review")
+            if silent:
+                self._last_autosave_version_ts = now_ts
         if not update_card_text(card_id, front_text, back_text):
-            return
+            return False
         self.current_card["front"] = front_text
         self.current_card["back"] = back_text
         for key in ("front_rich", "back_rich", "front_html", "back_html"):
             if key in self.current_card:
                 self.current_card[key] = None
+        if self.card_renderer:
+            self.card_renderer.clear_dirty()
+        status_label = "Автосохранено" if silent else "Сохранено"
+        self.edit_status_var.set(f"{status_label} {datetime.now().strftime('%H:%M:%S')}")
+        if keep_editing:
+            return True
         self._stop_inline_edit()
         self.update_view()
+        return True
 
     def _cancel_inline_edit(self) -> None:
         if not self.current_card:
             return
+        if self.card_renderer and self.card_renderer.is_dirty():
+            if not self._confirm_inline_exit("отменить изменения"):
+                return
+        if self.card_renderer:
+            self.card_renderer.revert_to_original()
         self._stop_inline_edit()
         self.update_view()
+
+    def _confirm_inline_exit(self, action: str) -> bool:
+        if not self.card_renderer or not self.card_renderer.is_dirty():
+            return True
+        result = messagebox.askyesnocancel(
+            "Несохранённые изменения",
+            f"Сохранить изменения перед тем как {action}?",
+            parent=self,
+        )
+        if result is None:
+            return False
+        if result:
+            return self._save_inline_edit(silent=False, keep_editing=False)
+        self.card_renderer.revert_to_original()
+        return True
+
+    def _on_inline_dirty_changed(self, is_dirty: bool) -> None:
+        self.edit_dirty_var.set("● изменено" if is_dirty else "")
+        if is_dirty:
+            self.edit_status_var.set("")
+
+    def _on_inline_status(self, text: str) -> None:
+        self.edit_status_var.set(text or "")
+
+    def _on_inline_autosave_request(self, *, silent: bool, keep_editing: bool) -> bool:
+        return self._save_inline_edit(silent=silent, keep_editing=keep_editing)
+
+    def _open_versions_window(self) -> None:
+        if not self.current_card:
+            return
+        open_card_versions_window(
+            self,
+            self.current_card["id"],
+            on_restore=self._restore_card_version,
+            title="История версий (воспроизведение)",
+        )
+
+    def _restore_last_version(self) -> None:
+        if not self.current_card:
+            return
+        versions = list_card_versions(self.current_card["id"], limit=1)
+        if not versions:
+            messagebox.showinfo("Версии", "История версий пуста.", parent=self)
+            return
+        self._restore_card_version(versions[0])
+
+    def _restore_card_version(self, version_row: sqlite3.Row) -> None:
+        if not self.current_card:
+            return
+        insert_card_version_snapshot(self.current_card, reason="before_restore", window_name="review")
+        restore_card_from_version(self.current_card["id"], version_row)
+        refreshed = get_card_by_id(self.current_card["id"])
+        if refreshed:
+            self.current_card.update(refreshed)
+        self._stop_inline_edit()
+        self.update_view()
+
+    def _on_close(self) -> None:
+        if self._inline_editing and not self._confirm_inline_exit("закрыть окно"):
+            return
+        self.cancel_timers()
+        self.destroy()
+
+    def _prepare_for_navigation(self, action: str) -> bool:
+        if not self._inline_editing:
+            return True
+        if not self._confirm_inline_exit(action):
+            return False
+        self._stop_inline_edit()
+        return True
 
     def cancel_timers(self):
         if self.auto_flip_id is not None:
@@ -21818,7 +22484,7 @@ class ReviewWindow(tk.Toplevel):
 
     def goto_prev_card(self):
         """Перейти к предыдущей карточке (режим воспроизведения)."""
-        if self._inline_editing:
+        if not self._prepare_for_navigation("вернуться к предыдущей карточке"):
             return
         try:
             self.cancel_timers()
@@ -21839,7 +22505,7 @@ class ReviewWindow(tk.Toplevel):
         self.schedule_timers_for_card()
 
     def goto_next_card(self):
-        if self._inline_editing:
+        if not self._prepare_for_navigation("перейти к следующей карточке"):
             return
         self.cancel_timers()
         self.current_index += 1
@@ -22199,6 +22865,54 @@ class AudioEditorWindow:
             winsound.PlaySound(None, winsound.SND_PURGE)
 
 
+_WEBVTT_TS_RE = re.compile(
+    r"(?:(\d{1,2}):)?(\d{2}):(\d{2})\.(\d{3})"
+)
+
+
+def _parse_webvtt_timestamp(value: str) -> float | None:
+    match = _WEBVTT_TS_RE.search(value.strip())
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    millis = int(match.group(4))
+    return hours * 3600 + minutes * 60 + seconds + (millis / 1000.0)
+
+
+def parse_webvtt(path: str) -> list[dict]:
+    segments: list[dict] = []
+    if not path or not os.path.exists(path):
+        return segments
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = [line.rstrip("\n") for line in handle]
+    except Exception as exc:
+        print(f"[VTT] Не удалось прочитать {path}: {exc}")
+        return segments
+
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx].strip()
+        if "-->" not in line:
+            idx += 1
+            continue
+        start_str, end_str = [part.strip() for part in line.split("-->")[:2]]
+        start = _parse_webvtt_timestamp(start_str)
+        end = _parse_webvtt_timestamp(end_str)
+        idx += 1
+        text_lines: list[str] = []
+        while idx < len(lines) and lines[idx].strip():
+            text_lines.append(lines[idx].strip())
+            idx += 1
+        text = " ".join(text_lines).strip()
+        if start is not None and end is not None and text:
+            segments.append({"start": float(start), "end": float(end), "text": text})
+        idx += 1
+    return segments
+
+
 class VideoClipCardsWindow:
     """Видео → клипы → карточки (автозапуск + авто-STT + таймкоды)."""
 
@@ -22212,6 +22926,13 @@ class VideoClipCardsWindow:
         self.sentences: list[dict] = []
         self.selected_index: int | None = None
         self.player: VlcPlayerWidget | None = None
+        self.youtube_url: str | None = None
+        self.youtube_video_id: str | None = None
+        self.youtube_cache_dir: str | None = None
+        self.youtube_download_running = False
+        self.youtube_cancel_event: threading.Event | None = None
+        self.youtube_video_path: str | None = None
+        self.youtube_audio_path: str | None = None
         self.stt_job_id = 0
         self.stt_running = False
         self.stt_progress_queue: queue.Queue | None = None
@@ -22255,10 +22976,30 @@ class VideoClipCardsWindow:
         frame = ttk.LabelFrame(parent, text="Видео")
         frame.pack(fill=tk.X, padx=12, pady=(10, 8))
 
+        source_row = ttk.Frame(frame)
+        source_row.pack(fill=tk.X, padx=6, pady=(6, 4))
+        ttk.Label(source_row, text="Источник:").pack(side=tk.LEFT)
+        self.source_var = tk.StringVar(value="file")
+        ttk.Radiobutton(
+            source_row,
+            text="Локальный файл",
+            variable=self.source_var,
+            value="file",
+            command=self._on_source_change,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Radiobutton(
+            source_row,
+            text="YouTube URL",
+            variable=self.source_var,
+            value="youtube",
+            command=self._on_source_change,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
         path_row = ttk.Frame(frame)
         path_row.pack(fill=tk.X, padx=6, pady=(6, 4))
         self.video_path_var = tk.StringVar()
-        ttk.Entry(path_row, textvariable=self.video_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.video_path_entry = ttk.Entry(path_row, textvariable=self.video_path_var)
+        self.video_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         def browse_video() -> None:
             path = filedialog.askopenfilename(
@@ -22269,10 +23010,60 @@ class VideoClipCardsWindow:
                 self.video_path_var.set(path)
                 self._load_video(path)
 
-        ttk.Button(path_row, text="…", width=4, command=browse_video).pack(side=tk.LEFT, padx=(6, 0))
+        self.browse_video_btn = ttk.Button(path_row, text="…", width=4, command=browse_video)
+        self.browse_video_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        youtube_row = ttk.Frame(frame)
+        youtube_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+        self.youtube_url_var = tk.StringVar()
+        self.youtube_url_entry = ttk.Entry(youtube_row, textvariable=self.youtube_url_var)
+        self.youtube_url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.youtube_load_btn = ttk.Button(
+            youtube_row,
+            text="Загрузить YouTube",
+            command=lambda: self._load_youtube(self.youtube_url_var.get().strip()),
+        )
+        self.youtube_load_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.youtube_cancel_btn = ttk.Button(
+            youtube_row,
+            text="Отменить",
+            command=self._cancel_youtube_download,
+            state=tk.DISABLED,
+        )
+        self.youtube_cancel_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        youtube_opts = ttk.Frame(frame)
+        youtube_opts.pack(fill=tk.X, padx=6, pady=(0, 4))
+        self.youtube_subs_first_var = tk.BooleanVar(value=True)
+        self.youtube_download_video_var = tk.BooleanVar(value=False)
+        self.youtube_audio_only_var = tk.BooleanVar(value=True)
+        self.youtube_subs_first_check = ttk.Checkbutton(
+            youtube_opts,
+            text="Сначала пробовать субтитры (быстро)",
+            variable=self.youtube_subs_first_var,
+        )
+        self.youtube_subs_first_check.pack(side=tk.LEFT)
+        self.youtube_download_video_check = ttk.Checkbutton(
+            youtube_opts,
+            text="Скачивать видео (для нарезки клипов)",
+            variable=self.youtube_download_video_var,
+            command=self._sync_youtube_options,
+        )
+        self.youtube_download_video_check.pack(side=tk.LEFT, padx=(10, 0))
+        self.youtube_audio_only_check = ttk.Checkbutton(
+            youtube_opts,
+            text="Только аудио (быстрее)",
+            variable=self.youtube_audio_only_var,
+            command=self._sync_youtube_options,
+        )
+        self.youtube_audio_only_check.pack(side=tk.LEFT, padx=(10, 0))
 
         self.video_status_var = tk.StringVar(value="Видео не выбрано")
         ttk.Label(frame, textvariable=self.video_status_var, foreground="gray").pack(
+            anchor="w", padx=6, pady=(0, 6)
+        )
+        self.youtube_status_var = tk.StringVar(value="YouTube не выбран")
+        ttk.Label(frame, textvariable=self.youtube_status_var, foreground="gray").pack(
             anchor="w", padx=6, pady=(0, 6)
         )
 
@@ -22305,6 +23096,7 @@ class VideoClipCardsWindow:
         ttk.Label(range_frame, textvariable=self.range_status_var, foreground="gray").grid(
             row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4)
         )
+        self._on_source_change()
 
     def _render_player(self, path: str) -> None:
         for widget in self.player_frame.winfo_children():
@@ -22326,6 +23118,385 @@ class VideoClipCardsWindow:
             text="Открыть во внешнем плеере",
             command=lambda: open_in_external_player(path),
         ).pack(anchor="w", padx=6, pady=(0, 6))
+
+    def _on_source_change(self) -> None:
+        is_youtube = self.source_var.get() == "youtube"
+        file_state = tk.DISABLED if is_youtube else tk.NORMAL
+        youtube_state = tk.NORMAL if is_youtube else tk.DISABLED
+        try:
+            self.video_path_entry.configure(state=file_state)
+            self.browse_video_btn.configure(state=file_state)
+        except Exception:
+            pass
+        try:
+            self.youtube_url_entry.configure(state=youtube_state)
+            self.youtube_load_btn.configure(state=youtube_state)
+            cancel_state = tk.NORMAL if (is_youtube and self.youtube_download_running) else tk.DISABLED
+            self.youtube_cancel_btn.configure(state=cancel_state)
+            self.youtube_subs_first_check.configure(state=youtube_state)
+            self.youtube_download_video_check.configure(state=youtube_state)
+            self.youtube_audio_only_check.configure(state=youtube_state)
+        except Exception:
+            pass
+        self._sync_youtube_options()
+
+    def _sync_youtube_options(self) -> None:
+        if self.source_var.get() != "youtube":
+            try:
+                self.youtube_audio_only_check.configure(state=tk.DISABLED)
+            except Exception:
+                pass
+            return
+        if self.youtube_download_video_var.get():
+            self.youtube_audio_only_var.set(False)
+            try:
+                self.youtube_audio_only_check.configure(state=tk.DISABLED)
+            except Exception:
+                pass
+        else:
+            try:
+                self.youtube_audio_only_check.configure(state=tk.NORMAL)
+            except Exception:
+                pass
+
+    def _set_youtube_controls_enabled(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        try:
+            self.youtube_url_entry.configure(state=state)
+            self.youtube_load_btn.configure(state=state)
+            self.youtube_subs_first_check.configure(state=state)
+            self.youtube_download_video_check.configure(state=state)
+            self.youtube_audio_only_check.configure(state=state)
+        except Exception:
+            pass
+        cancel_state = tk.NORMAL if not enabled else tk.DISABLED
+        try:
+            self.youtube_cancel_btn.configure(state=cancel_state)
+        except Exception:
+            pass
+
+    def _cancel_youtube_download(self) -> None:
+        if self.youtube_download_running and self.youtube_cancel_event is not None:
+            self.youtube_cancel_event.set()
+            self.youtube_status_var.set("⏳ Отменяю загрузку…")
+
+    def _get_preferred_youtube_lang(self) -> str | None:
+        value = (self.stt_lang_var.get() or "").strip()
+        if not value or value.lower() == "auto":
+            return None
+        return value.split("-")[0].lower()
+
+    def _find_subtitle_file(self, cache_dir: str, video_id: str, prefer_lang: str | None) -> str | None:
+        candidates = glob.glob(os.path.join(cache_dir, f"{video_id}*.vtt"))
+        if not candidates:
+            return None
+        if prefer_lang:
+            for path in candidates:
+                if f".{prefer_lang}." in path or f".{prefer_lang}_" in path or f".{prefer_lang}.vtt" in path:
+                    return path
+        return candidates[0]
+
+    def _normalize_vtt_segments(self, segments: list[dict]) -> list[dict]:
+        merged: list[dict] = []
+        buffer_text = ""
+        buffer_start: float | None = None
+        buffer_end: float | None = None
+        for segment in segments:
+            text = " ".join(str(segment.get("text") or "").split())
+            if not text:
+                continue
+            if buffer_start is None:
+                buffer_start = float(segment.get("start", 0.0))
+            buffer_end = float(segment.get("end", buffer_start or 0.0))
+            if buffer_text:
+                buffer_text = f"{buffer_text} {text}"
+            else:
+                buffer_text = text
+            if text.endswith((".", "!", "?")) or len(buffer_text) > 160:
+                if buffer_text and buffer_text[-1] not in ".!?":
+                    buffer_text += "."
+                merged.append({"text": buffer_text.strip(), "start": buffer_start or 0.0, "end": buffer_end or 0.0})
+                buffer_text = ""
+                buffer_start = None
+                buffer_end = None
+        if buffer_text:
+            if buffer_text[-1] not in ".!?":
+                buffer_text += "."
+            merged.append({"text": buffer_text.strip(), "start": buffer_start or 0.0, "end": buffer_end or 0.0})
+        return merged
+
+    def _apply_youtube_sentences(self, phrases: list[dict], status: str) -> None:
+        self.stt_status_var.set(status)
+        self.stt_source_var.set("Источник: субтитры YouTube (VTT)")
+        self._set_stt_text_from_phrases(phrases)
+        self._set_sentences_from_phrases(phrases)
+        self._update_save_pricing()
+
+    def _download_youtube_subtitles(
+        self,
+        url: str,
+        cache_dir: str,
+        video_id: str,
+        prefer_lang: str | None,
+    ) -> str | None:
+        try:
+            import yt_dlp
+        except Exception:
+            return None
+        ydl_opts = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitlesformat": "vtt",
+            "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
+            "quiet": True,
+        }
+        if prefer_lang:
+            ydl_opts["subtitleslangs"] = [prefer_lang]
+        if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
+            return None
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=True)
+        return self._find_subtitle_file(cache_dir, video_id, prefer_lang)
+
+    def _start_stt_from_audio(self, audio_path: str, source_label: str) -> None:
+        if not audio_path or not os.path.exists(audio_path):
+            messagebox.showwarning("YouTube", "Аудиофайл не найден для распознавания.", parent=self.win)
+            return
+        if self.stt_running:
+            return
+        self.stt_running = True
+        self.stt_job_id += 1
+        job_id = self.stt_job_id
+        self._set_stt_controls_enabled(False)
+        self.stt_status_var.set("⏳ Распознаю…")
+        self.stt_progress.configure(value=0)
+        self._set_stt_progress_mode("indeterminate")
+        self.stt_progress_queue = queue.Queue()
+        self.stt_cancel_event = threading.Event()
+        self.stt_last_progress_at = time.time()
+        self.stt_last_progress_value = 0.0
+        self.stt_watchdog_warned = False
+        self.stt_total_duration_sec = None
+        self.stt_source_var.set(source_label)
+        selected_lang = self._get_selected_stt_language()
+
+        def _worker() -> tuple[str, list[dict], str, str | None] | tuple[str, str]:
+            try:
+                return run_stt_pipeline(
+                    audio_path,
+                    lang=selected_lang,
+                    punctuate=True,
+                    preprocessed=False,
+                    progress_queue=self.stt_progress_queue,
+                    cancel_event=self.stt_cancel_event,
+                )
+            except STTCancelled:
+                return ("cancelled", "cancelled")
+            except STTError as exc:
+                return ("error", exc.user_message)
+            except Exception as exc:
+                return ("error", str(exc))
+
+        def _finish(result) -> None:
+            self.stt_running = False
+            self._set_stt_controls_enabled(True)
+            if job_id != self.stt_job_id:
+                return
+            if isinstance(result, tuple) and len(result) == 2 and result[0] in {"error", "cancelled"}:
+                status, payload = result
+                if status == "cancelled":
+                    self._set_stt_progress_mode("determinate")
+                    self.stt_progress.configure(value=0)
+                    self.stt_status_var.set("⛔ Отменено")
+                    return
+                self._set_stt_progress_mode("determinate")
+                self.stt_progress.configure(value=0)
+                self.stt_status_var.set(f"❌ Ошибка: {payload}")
+                show_stt_error_dialog(self.win, "Ошибка распознавания", payload)
+                return
+            text, segments, engine, detail = result
+            self._update_engine_label(engine, detail)
+            self._set_stt_text_from_phrases(segments)
+            self._set_sentences_from_phrases(segments)
+            self._set_stt_progress_mode("determinate")
+            self.stt_progress.configure(value=100)
+            self.stt_status_var.set("✅ Готово")
+
+        def _runner() -> None:
+            result = _worker()
+            self.win.after(0, lambda: _finish(result))
+
+        threading.Thread(target=_runner, daemon=True).start()
+        self._poll_stt_progress(job_id)
+
+    def _load_youtube(self, url: str) -> None:
+        if not url:
+            messagebox.showwarning("YouTube", "Введите ссылку на YouTube.", parent=self.win)
+            return
+        try:
+            import yt_dlp
+        except Exception:
+            messagebox.showerror(
+                "YouTube",
+                "Модуль yt-dlp не установлен. Установите его командой:\n\npip install yt-dlp",
+                parent=self.win,
+            )
+            return
+        if self.youtube_download_running:
+            messagebox.showwarning("YouTube", "Загрузка уже выполняется.", parent=self.win)
+            return
+        try:
+            self.source_var.set("youtube")
+            self._on_source_change()
+        except Exception:
+            pass
+        self.youtube_download_running = True
+        self.youtube_cancel_event = threading.Event()
+        self._set_youtube_controls_enabled(False)
+        self.youtube_status_var.set("⏳ Подключаюсь к YouTube…")
+
+        def _worker() -> tuple[str, dict | None]:
+            try:
+                with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                if not info:
+                    return ("error", {"message": "Не удалось получить данные видео."})
+                video_id = info.get("id")
+                if not video_id:
+                    return ("error", {"message": "Не удалось определить ID видео."})
+                cache_dir = os.path.join(MEDIA_FOLDER, "youtube", str(video_id))
+                os.makedirs(cache_dir, exist_ok=True)
+                meta_path = os.path.join(cache_dir, "meta.json")
+                meta_payload = {
+                    "url": url,
+                    "id": video_id,
+                    "title": info.get("title"),
+                }
+                with open(meta_path, "w", encoding="utf-8") as handle:
+                    json.dump(meta_payload, handle, ensure_ascii=False, indent=2)
+                if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
+                    return ("cancelled", None)
+                prefer_lang = self._get_preferred_youtube_lang()
+                if self.youtube_subs_first_var.get():
+                    sub_path = self._download_youtube_subtitles(url, cache_dir, video_id, prefer_lang)
+                    if sub_path and os.path.exists(sub_path):
+                        segments = parse_webvtt(sub_path)
+                        phrases = self._normalize_vtt_segments(segments)
+                        if phrases:
+                            return ("subs", {"phrases": phrases, "video_id": video_id, "cache_dir": cache_dir})
+                if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
+                    return ("cancelled", None)
+                download_video = bool(self.youtube_download_video_var.get())
+                output_template = os.path.join(cache_dir, "video.%(ext)s" if download_video else "audio.%(ext)s")
+
+                def _progress_hook(data):
+                    if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
+                        raise RuntimeError("cancelled")
+
+                ydl_opts = {
+                    "quiet": True,
+                    "outtmpl": output_template,
+                    "progress_hooks": [_progress_hook],
+                }
+                if download_video:
+                    ydl_opts.update(
+                        {
+                            "format": "bv*+ba/b",
+                            "merge_output_format": "mp4",
+                        }
+                    )
+                else:
+                    ydl_opts.update({"format": "bestaudio/best"})
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
+                    return ("cancelled", None)
+                if download_video:
+                    files = glob.glob(os.path.join(cache_dir, "video.*"))
+                    video_path = files[0] if files else None
+                    audio_path = None
+                else:
+                    files = glob.glob(os.path.join(cache_dir, "audio.*"))
+                    audio_path = files[0] if files else None
+                    video_path = None
+                payload = {
+                    "video_id": video_id,
+                    "cache_dir": cache_dir,
+                    "video_path": video_path,
+                    "audio_path": audio_path,
+                }
+                return ("media", payload)
+            except RuntimeError as exc:
+                if "cancelled" in str(exc).lower():
+                    return ("cancelled", None)
+                return ("error", {"message": str(exc)})
+            except Exception as exc:
+                return ("error", {"message": str(exc)})
+
+        def _finish(result: tuple[str, dict | None]) -> None:
+            status, payload = result
+            self.youtube_download_running = False
+            self._set_youtube_controls_enabled(True)
+            if status == "cancelled":
+                self.youtube_status_var.set("⛔ Отменено")
+                return
+            if status == "error":
+                message = payload.get("message") if payload else "Ошибка загрузки."
+                self.youtube_status_var.set("❌ Ошибка загрузки")
+                messagebox.showerror("YouTube", message, parent=self.win)
+                return
+            self.youtube_url = url
+            if payload:
+                self.youtube_video_id = payload.get("video_id")
+                self.youtube_cache_dir = payload.get("cache_dir")
+            if status == "subs":
+                phrases = payload.get("phrases") if payload else []
+                if not phrases:
+                    self.youtube_status_var.set("⚠️ Субтитры пустые, запускаю STT…")
+                else:
+                    self.youtube_status_var.set("✅ Субтитры загружены")
+                    self._apply_youtube_sentences(phrases, "✅ Субтитры YouTube")
+                    return
+            if status == "media":
+                video_path = payload.get("video_path") if payload else None
+                audio_path = payload.get("audio_path") if payload else None
+                self.youtube_video_path = video_path
+                self.youtube_audio_path = audio_path
+                if video_path:
+                    self.video_path = video_path
+                    self._render_player(video_path)
+                    duration = get_video_duration_seconds(video_path)
+                    self.video_duration_sec = float(duration) if duration else None
+                    if duration:
+                        self.video_status_var.set(f"Длительность: {format_hms(int(duration))}")
+                        self.range_start_var.set("00:00:00")
+                        self.range_end_var.set(format_hms(int(duration)))
+                        self.range_status_var.set(f"Диапазон: 00:00:00 → {format_hms(int(duration))}")
+                    else:
+                        self.video_status_var.set("Видео загружено")
+                else:
+                    self.video_path = None
+                    self.video_status_var.set("Видео не загружено (только аудио)")
+                    for widget in self.player_frame.winfo_children():
+                        widget.destroy()
+                    ttk.Label(self.player_frame, text="Воспроизведение только аудио").pack(
+                        anchor="w", padx=6, pady=6
+                    )
+                if audio_path:
+                    self.youtube_status_var.set("⏳ Распознаю аудио…")
+                    self._start_stt_from_audio(audio_path, "Источник: YouTube audio")
+                elif video_path:
+                    self.youtube_status_var.set("⏳ Распознаю видео…")
+                    self._request_stt()
+                else:
+                    self.youtube_status_var.set("⚠️ Аудио не найдено для распознавания")
+
+        def _runner() -> None:
+            result = _worker()
+            self.win.after(0, lambda: _finish(result))
+
+        threading.Thread(target=_runner, daemon=True).start()
 
     def _build_stt_block(self, parent: tk.Widget) -> None:
         frame = ttk.LabelFrame(parent, text="Цифровой слух")
@@ -22622,7 +23793,14 @@ class VideoClipCardsWindow:
     def _load_video(self, path: str) -> None:
         if not path or not os.path.exists(path):
             return
+        try:
+            self.source_var.set("file")
+            self._on_source_change()
+        except Exception:
+            pass
         self.video_path = path
+        self.youtube_video_path = None
+        self.youtube_audio_path = None
         self.sentences = []
         self.stt_segments = []
         self.selected_index = None
@@ -22861,6 +24039,45 @@ class VideoClipCardsWindow:
 
         threading.Thread(target=_thread_runner, daemon=True).start()
 
+    def _cut_audio_segment(
+        self,
+        source_path: str,
+        start_sec: float,
+        end_sec: float,
+        output_dir: str,
+        base_name: str,
+    ) -> str:
+        ffmpeg_path = find_ffmpeg()
+        if not ffmpeg_path:
+            raise RuntimeError("FFmpeg не найден для нарезки аудио.")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{base_name}.wav")
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-ss",
+            f"{start_sec:.3f}",
+            "-to",
+            f"{end_sec:.3f}",
+            "-i",
+            source_path,
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.exists(output_path):
+            raise RuntimeError(result.stderr or "FFmpeg error")
+        return output_path
+
     def _get_auto_range(self) -> tuple[float | None, float | None, float | None]:
         duration = self.video_duration_sec
         if duration is None and self.video_path:
@@ -22903,6 +24120,10 @@ class VideoClipCardsWindow:
             log_write(log_path, "stage=ui_click_ignored_running")
             return
         if not self.video_path:
+            if self.youtube_audio_path:
+                log_write(log_path, "stage=use_youtube_audio_fallback")
+                self._start_stt_from_audio(self.youtube_audio_path, "Источник: YouTube audio")
+                return
             log_write(log_path, "ERROR=no_video_path_selected")
             messagebox.showwarning("Видео", "Сначала выберите видео файл.", parent=self.win)
             return
@@ -23200,8 +24421,10 @@ class VideoClipCardsWindow:
         if self.selected_index is None or self.selected_index >= len(self.sentences):
             messagebox.showwarning("Карточка", "Сначала выберите строку с фразой.", parent=self.win)
             return
-        if not self.video_path:
-            messagebox.showwarning("Карточка", "Сначала выберите видео файл.", parent=self.win)
+        video_source = self.video_path or self.youtube_video_path
+        audio_source = self.youtube_audio_path
+        if not video_source and not audio_source:
+            messagebox.showwarning("Карточка", "Сначала выберите видео файл или YouTube-источник.", parent=self.win)
             return
         sentence = self.sentences[self.selected_index]
         start_sec = float(sentence.get("start", 0.0))
@@ -23214,7 +24437,11 @@ class VideoClipCardsWindow:
             self._update_save_pricing()
             messagebox.showwarning("Кредиты", "Недостаточно кредитов.", parent=self.win)
             return
-        output_dir = os.path.join(MEDIA_FOLDER, "clips", str(self.deck_id))
+        output_dir = (
+            os.path.join(self.youtube_cache_dir, "clips")
+            if self.youtube_cache_dir
+            else os.path.join(MEDIA_FOLDER, "clips", str(self.deck_id))
+        )
         base_name = f"phrase_{self.selected_index + 1}_{int(start_sec * 1000)}_{int(end_sec * 1000)}"
         self.create_card_btn.configure(state=tk.DISABLED)
 
@@ -23229,18 +24456,32 @@ class VideoClipCardsWindow:
                     "video_clip_cards",
                     meta={"deck_id": self.deck_id, "count": 1},
                 )
-                clip_path, poster_path = cut_video_clip_stream_copy_with_poster(
-                    self.video_path,
-                    start_sec,
-                    end_sec,
-                    output_dir,
-                    base_name,
-                )
-                sentence["clip_path"] = clip_path
-                sentence["poster_path"] = poster_path
-                video_html = build_video_html(clip_path, poster_path)
                 text_html = sentence.get("text_html") or f"<div>{html.escape(sentence.get('sentence') or '')}</div>"
-                front_html, back_html = video_html, text_html
+                clip_path = None
+                poster_path = None
+                audio_clip_path = None
+                if video_source:
+                    clip_path, poster_path = cut_video_clip_stream_copy_with_poster(
+                        video_source,
+                        start_sec,
+                        end_sec,
+                        output_dir,
+                        base_name,
+                    )
+                    sentence["clip_path"] = clip_path
+                    sentence["poster_path"] = poster_path
+                    video_html = build_video_html(clip_path, poster_path)
+                    front_html, back_html = video_html, text_html
+                else:
+                    audio_clip_path = self._cut_audio_segment(
+                        audio_source,
+                        start_sec,
+                        end_sec,
+                        output_dir,
+                        base_name,
+                    )
+                    front_html, back_html = text_html, text_html
+                    video_html = ""
                 note_fields = {
                     "word": sentence.get("sentence") or "",
                     "translation": "",
@@ -23251,7 +24492,7 @@ class VideoClipCardsWindow:
                     "back": back_html,
                     "front_image_path": poster_path,
                     "back_image_path": None,
-                    "audio_path": None,
+                    "audio_path": audio_clip_path,
                     "front_html": front_html,
                     "back_html": back_html,
                     "front_video_html": video_html,
@@ -23266,8 +24507,12 @@ class VideoClipCardsWindow:
                     note_type_id=ensure_generated_note_type_id(conn),
                     tags="video clip",
                 )
-                insert_media(conn, note_id=note_id, type="video", path=clip_path, side="front")
-                insert_media(conn, note_id=note_id, type="image", path=poster_path, side="front")
+                if clip_path:
+                    insert_media(conn, note_id=note_id, type="video", path=clip_path, side="front")
+                if poster_path:
+                    insert_media(conn, note_id=note_id, type="image", path=poster_path, side="front")
+                if audio_clip_path:
+                    insert_media(conn, note_id=note_id, type="audio", path=audio_clip_path, side="back")
                 return 1
 
             try:
@@ -23374,6 +24619,10 @@ class VideoClipCardsWindow:
             self.save_btn.configure(state=tk.DISABLED, image=self.coin_icon_disabled or self.coin_icon)
             self.save_hint_var.set("Идёт распознавание…")
             return
+        if self.youtube_download_running:
+            self.save_btn.configure(state=tk.DISABLED, image=self.coin_icon_disabled or self.coin_icon)
+            self.save_hint_var.set("Идёт загрузка YouTube…")
+            return
         if count == 0:
             self.save_btn.configure(state=tk.DISABLED, image=self.coin_icon_disabled or self.coin_icon)
             self.save_hint_var.set("Нет предложений")
@@ -23386,8 +24635,10 @@ class VideoClipCardsWindow:
         self.save_hint_var.set("")
 
     def _save_cards(self) -> None:
-        if not self.video_path:
-            messagebox.showwarning("Видео", "Сначала выберите видео файл.", parent=self.win)
+        video_source = self.video_path or self.youtube_video_path
+        audio_source = self.youtube_audio_path
+        if not video_source and not audio_source:
+            messagebox.showwarning("Видео", "Сначала выберите видео файл или YouTube-источник.", parent=self.win)
             return
         if not self.sentences:
             messagebox.showwarning("Сохранение", "Нет предложений для сохранения.", parent=self.win)
@@ -23400,7 +24651,11 @@ class VideoClipCardsWindow:
             return
 
         self.save_btn.configure(state=tk.DISABLED)
-        output_dir = os.path.join(MEDIA_FOLDER, "clips", str(self.deck_id))
+        output_dir = (
+            os.path.join(self.youtube_cache_dir, "clips")
+            if self.youtube_cache_dir
+            else os.path.join(MEDIA_FOLDER, "clips", str(self.deck_id))
+        )
 
         def _worker() -> tuple[bool, str]:
             conn = get_connection()
@@ -23416,21 +24671,36 @@ class VideoClipCardsWindow:
                 created = 0
                 for idx, sentence in enumerate(self.sentences, start=1):
                     base_name = f"clip_{idx}"
-                    clip_path, poster_path, _mode = cut_video_clip_with_poster_h264(
-                        self.video_path,
-                        float(sentence.get("start", 0)),
-                        float(sentence.get("end", 0)),
-                        output_dir,
-                        base_name,
-                    )
-                    sentence["clip_path"] = clip_path
-                    sentence["poster_path"] = poster_path
-                    video_html = build_video_html(clip_path, poster_path)
-                    text_html = sentence.get("text_html") or f"<div>{html.escape(sentence.get('sentence') or '')}</div>"
-                    if self.video_on_front.get():
-                        front_html, back_html = video_html, text_html
+                    clip_path = None
+                    poster_path = None
+                    audio_clip_path = None
+                    if video_source:
+                        clip_path, poster_path, _mode = cut_video_clip_with_poster_h264(
+                            video_source,
+                            float(sentence.get("start", 0)),
+                            float(sentence.get("end", 0)),
+                            output_dir,
+                            base_name,
+                        )
+                        sentence["clip_path"] = clip_path
+                        sentence["poster_path"] = poster_path
+                        video_html = build_video_html(clip_path, poster_path)
                     else:
+                        audio_clip_path = self._cut_audio_segment(
+                            audio_source,
+                            float(sentence.get("start", 0)),
+                            float(sentence.get("end", 0)),
+                            output_dir,
+                            base_name,
+                        )
+                        video_html = ""
+                    text_html = sentence.get("text_html") or f"<div>{html.escape(sentence.get('sentence') or '')}</div>"
+                    if video_html and self.video_on_front.get():
+                        front_html, back_html = video_html, text_html
+                    elif video_html:
                         front_html, back_html = text_html, video_html
+                    else:
+                        front_html, back_html = text_html, text_html
 
                     note_fields = {
                         "word": sentence.get("sentence") or "",
@@ -23440,15 +24710,15 @@ class VideoClipCardsWindow:
                         "image": poster_path or "",
                         "front": front_html,
                         "back": back_html,
-                        "front_image_path": poster_path if self.video_on_front.get() else None,
-                        "back_image_path": poster_path if not self.video_on_front.get() else None,
-                        "audio_path": None,
+                        "front_image_path": poster_path if (video_html and self.video_on_front.get()) else None,
+                        "back_image_path": poster_path if (video_html and not self.video_on_front.get()) else None,
+                        "audio_path": audio_clip_path,
                         "front_html": front_html,
                         "back_html": back_html,
-                        "front_video_html": video_html if self.video_on_front.get() else "",
-                        "back_video_html": video_html if not self.video_on_front.get() else "",
-                        "front_video": video_html if self.video_on_front.get() else "",
-                        "back_video": video_html if not self.video_on_front.get() else "",
+                        "front_video_html": video_html if (video_html and self.video_on_front.get()) else "",
+                        "back_video_html": video_html if (video_html and not self.video_on_front.get()) else "",
+                        "front_video": video_html if (video_html and self.video_on_front.get()) else "",
+                        "back_video": video_html if (video_html and not self.video_on_front.get()) else "",
                     }
                     note_id, _ = create_note_with_cards_in_transaction(
                         conn,
@@ -23457,8 +24727,24 @@ class VideoClipCardsWindow:
                         note_type_id=ensure_generated_note_type_id(conn),
                         tags="video clip",
                     )
-                    insert_media(conn, note_id=note_id, type="video", path=clip_path, side="front" if self.video_on_front.get() else "back")
-                    insert_media(conn, note_id=note_id, type="image", path=poster_path, side="front" if self.video_on_front.get() else "back")
+                    if clip_path:
+                        insert_media(
+                            conn,
+                            note_id=note_id,
+                            type="video",
+                            path=clip_path,
+                            side="front" if self.video_on_front.get() else "back",
+                        )
+                    if poster_path:
+                        insert_media(
+                            conn,
+                            note_id=note_id,
+                            type="image",
+                            path=poster_path,
+                            side="front" if self.video_on_front.get() else "back",
+                        )
+                    if audio_clip_path:
+                        insert_media(conn, note_id=note_id, type="audio", path=audio_clip_path, side="back")
                     created += 1
                 return created
 
