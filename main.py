@@ -268,6 +268,7 @@ from video_tools import (
     VlcPlayerWidget,
     cut_video_clip,
     cut_video_clip_with_fallback,
+    cut_video_clip_stream_copy_with_poster,
     get_clip_log_path,
     find_ffmpeg,
     format_hms,
@@ -21972,6 +21973,7 @@ class VideoClipCardsWindow:
         self.stt_progress_queue: queue.Queue | None = None
         self.stt_progress_mode = "determinate"
         self.stt_cancel_event: threading.Event | None = None
+        self.stt_process: subprocess.Popen[str] | None = None
         self.stt_last_progress_at = 0.0
         self.stt_last_progress_value: float | None = None
         self.stt_watchdog_warned = False
@@ -22276,15 +22278,15 @@ class VideoClipCardsWindow:
         self.stt_engine_var.set(label)
 
     def _build_sentences_block(self, parent: tk.Widget) -> None:
-        frame = ttk.LabelFrame(parent, text="Предложения и таймкоды")
+        frame = ttk.LabelFrame(parent, text="Фразы и таймкоды")
         frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
 
-        columns = ("№", "Предложение", "Start", "End")
+        columns = ("№", "Фраза", "Start", "End")
         self.sentences_tree = ttk.Treeview(frame, columns=columns, show="headings", height=8)
         for col in columns:
             self.sentences_tree.heading(col, text=col)
             self.sentences_tree.column(col, width=90)
-        self.sentences_tree.column("Предложение", width=520)
+        self.sentences_tree.column("Фраза", width=520)
         self.sentences_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=6)
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.sentences_tree.yview)
@@ -22295,7 +22297,15 @@ class VideoClipCardsWindow:
 
         action_row = ttk.Frame(parent)
         action_row.pack(fill=tk.X, padx=12, pady=(0, 8))
-        ttk.Button(action_row, text="Предпросмотр выбранного", command=self._open_preview).pack(side=tk.LEFT)
+        self.create_card_btn = ttk.Button(
+            action_row,
+            text="Сделать карточку из выбранной строки",
+            command=self._create_card_from_selected,
+        )
+        self.create_card_btn.pack(side=tk.LEFT)
+        ttk.Button(action_row, text="Предпросмотр выбранного", command=self._open_preview).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
 
     def _build_editor_block(self, parent: tk.Widget) -> None:
         frame = ttk.LabelFrame(parent, text="Редактор предложения")
@@ -22406,6 +22416,10 @@ class VideoClipCardsWindow:
         except Exception:
             pass
         try:
+            self.create_card_btn.configure(state=state)
+        except Exception:
+            pass
+        try:
             self.auto_stt_check.configure(state=state)
         except Exception:
             pass
@@ -22431,7 +22445,8 @@ class VideoClipCardsWindow:
             return
         progress_queue = self.stt_progress_queue
         if progress_queue is None:
-            self.win.after(100, lambda: self._poll_stt_progress(job_id))
+            if self.stt_running:
+                self.win.after(200, lambda: self._poll_stt_progress(job_id))
             return
         now = time.time()
         while True:
@@ -22490,6 +22505,11 @@ class VideoClipCardsWindow:
             self.stt_cancel_event.set()
             self.stt_status_var.set("⏳ Отменяю…")
             _append_stt_log_line("stt_cancel_requested=true")
+        if self.stt_process is not None and self.stt_process.poll() is None:
+            try:
+                self.stt_process.terminate()
+            except Exception:
+                pass
 
     def _open_stt_log(self) -> None:
         log_path = get_stt_log_path()
@@ -22657,7 +22677,7 @@ class VideoClipCardsWindow:
             if self.selected_index is None or self.selected_index >= len(self.sentences):
                 messagebox.showwarning(
                     "Фрагмент",
-                    "Выберите предложение в таблице, чтобы распознать текущий фрагмент.",
+                    "Выберите фразу в таблице, чтобы распознать текущий фрагмент.",
                     parent=self.win,
                 )
                 return
@@ -22690,10 +22710,10 @@ class VideoClipCardsWindow:
         self.stt_job_id += 1
         job_id = self.stt_job_id
         self._set_stt_controls_enabled(False)
-        self.stt_status_var.set("⏳ Извлекаю аудио…")
+        self.stt_status_var.set("⏳ Распознаю…")
         self.stt_progress.configure(value=0)
-        self._set_stt_progress_mode("determinate")
-        self.stt_progress_queue = queue.Queue()
+        self._set_stt_progress_mode("indeterminate")
+        self.stt_progress_queue = None
         self.stt_cancel_event = threading.Event()
         self.stt_last_progress_at = time.time()
         self.stt_last_progress_value = 0.0
@@ -22701,45 +22721,70 @@ class VideoClipCardsWindow:
         self.stt_total_duration_sec = None
 
         def _worker() -> tuple[str, object]:
+            result_path = os.path.join(
+                ensure_dir(os.path.join("tmp", "media")),
+                f"stt_result_{uuid4().hex}.json",
+            )
+            cmd = [
+                sys.executable,
+                os.path.join(BASE_DIR, "stt_engine.py"),
+                "--input",
+                self.video_path,
+                "--out",
+                result_path,
+                "--model",
+                (self.stt_model_var.get() or "small"),
+            ]
+            if start_sec is not None:
+                cmd += ["--start", f"{float(start_sec):.3f}"]
+            if end_sec is not None:
+                cmd += ["--end", f"{float(end_sec):.3f}"]
+            selected_lang = self._get_selected_stt_language()
+            if selected_lang:
+                cmd += ["--lang", selected_lang]
+            log_write(log_path, "stt_cmd=" + " ".join(cmd))
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.stt_process = proc
             try:
-                log_context = [
-                    f"video_path={self.video_path}",
-                    "clip_path=None",
-                    f"start={start_sec}",
-                    f"end={end_sec}",
-                    "source_type=file",
-                    f"mode={mode}",
-                ]
-                text, segments, engine, engine_detail = run_stt_pipeline(
-                    self.video_path,
-                    start=start_sec,
-                    end=end_sec,
-                    lang=self._get_selected_stt_language(),
-                    punctuate=True,
-                    log_context=log_context,
-                    progress_queue=self.stt_progress_queue,
-                    cancel_event=self.stt_cancel_event,
-                )
-                duration = get_video_duration_seconds(self.video_path)
-                return (
-                    "done",
-                    {
-                        "text": text,
-                        "duration": duration,
-                        "segments": segments,
-                        "engine": engine,
-                        "engine_detail": engine_detail,
-                        "start": start_sec,
-                        "end": end_sec,
-                        "range_label": range_label,
-                    },
-                )
-            except STTCancelled:
-                return ("cancelled", None)
-            except STTError as exc:
-                return ("error", {"message": exc.user_message, "reason": exc.reason})
+                while proc.poll() is None:
+                    if self.stt_cancel_event is not None and self.stt_cancel_event.is_set():
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        proc.wait(timeout=1)
+                        return ("cancelled", None)
+                    time.sleep(0.1)
+                stdout, stderr = proc.communicate()
+            finally:
+                self.stt_process = None
+            if proc.returncode != 0:
+                detail = (stderr or stdout or "").strip() or "Не удалось распознать аудио."
+                return ("error", {"message": detail, "reason": "stt_engine"})
+            try:
+                with open(result_path, "r", encoding="utf-8") as handle:
+                    phrases = json.load(handle)
             except Exception as exc:
-                return ("error", {"message": str(exc), "reason": "unknown"})
+                return ("error", {"message": f"Не удалось прочитать result.json: {exc}", "reason": "io"})
+            duration = get_video_duration_seconds(self.video_path)
+            return (
+                "done",
+                {
+                    "phrases": phrases or [],
+                    "duration": duration,
+                    "engine": "whisper",
+                    "engine_detail": None,
+                    "start": start_sec,
+                    "end": end_sec,
+                    "range_label": range_label,
+                },
+            )
 
         def _finish(result: tuple[str, object]) -> None:
             self.stt_running = False
@@ -22768,21 +22813,18 @@ class VideoClipCardsWindow:
                 self.stt_status_var.set("⛔ Отменено")
                 return
             payload = payload or {}
-            text = str(payload.get("text") or "")
-            duration = payload.get("duration")
-            segments = payload.get("segments") or []
+            phrases = payload.get("phrases") or []
             engine = str(payload.get("engine") or "")
             engine_detail = str(payload.get("engine_detail") or "")
-            start_offset = payload.get("start")
             range_label = str(payload.get("range_label") or "")
             if range_label:
                 self.stt_source_var.set(f"Источник: {range_label}")
-            self._append_stt_text(text)
+            self._set_stt_text_from_phrases(phrases)
             self._set_stt_progress_mode("determinate")
             self.stt_progress.configure(value=100)
             self.stt_status_var.set("✅ Готово")
             self._update_engine_label(engine, engine_detail or None)
-            self._append_sentences_from_text(text, duration, segments, base_offset=start_offset)
+            self._build_phrases_from_result(phrases)
             self._update_save_pricing()
 
         def _thread_runner() -> None:
@@ -22792,140 +22834,42 @@ class VideoClipCardsWindow:
         self._poll_stt_progress(job_id)
         threading.Thread(target=_thread_runner, daemon=True).start()
 
-    def _build_sentences_from_text(
-        self,
-        text: str,
-        duration: float | None,
-        segments: list[dict] | None,
-    ) -> None:
+    def _set_stt_text_from_phrases(self, phrases: list[dict]) -> None:
+        parts = [str(item.get("text") or "").strip() for item in phrases]
+        text_value = "\n".join([part for part in parts if part])
+        self.stt_text.delete("1.0", tk.END)
+        if text_value:
+            self.stt_text.insert("1.0", text_value)
+
+    def _build_phrases_from_result(self, phrases: list[dict]) -> None:
         self.sentences = []
         self.stt_segments = []
         self.sentences_tree.delete(*self.sentences_tree.get_children())
-        self._append_sentences_from_text(text, duration, segments or [])
-        if self.sentences:
-            self.sentences_tree.selection_set("0")
-            self._select_sentence(0)
-
-    def _append_stt_text(self, text: str) -> None:
-        new_text = (text or "").strip()
-        if not new_text:
-            return
-        existing = self._get_stt_text().strip()
-        combined = f"{existing}\n{new_text}".strip() if existing else new_text
-        self.stt_text.delete("1.0", tk.END)
-        self.stt_text.insert("1.0", combined)
-
-    def _append_sentences_from_text(
-        self,
-        text: str,
-        duration: float | None,
-        segments: list[dict],
-        *,
-        base_offset: float | None = None,
-    ) -> None:
-        sentences = split_into_sentences(text or "")
-        if not sentences and text.strip():
-            sentences = [text.strip()]
-        if not sentences:
-            return
-        timecodes = self._compute_sentence_timecodes(sentences, duration, segments or [])
-        if base_offset is not None and not segments:
-            timecodes = [
-                (start + float(base_offset), end + float(base_offset))
-                for start, end in timecodes
-            ]
-        start_index = len(self.sentences)
-        for idx, sentence in enumerate(sentences):
-            start, end = timecodes[idx]
-            sentence_html = f"<div>{html.escape(sentence)}</div>"
+        start_index = 0
+        for idx, phrase in enumerate(phrases, start=1):
+            text = str(phrase.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(phrase.get("start", 0.0))
+            end = float(phrase.get("end", start))
+            phrase_html = f"<div>{html.escape(text)}</div>"
             entry = {
-                "index": start_index + idx + 1,
-                "sentence": sentence,
-                "start": float(start),
-                "end": float(end),
-                "text_html": sentence_html,
+                "index": start_index + idx,
+                "sentence": text,
+                "start": start,
+                "end": end,
+                "text_html": phrase_html,
             }
             self.sentences.append(entry)
             self.sentences_tree.insert(
                 "",
                 "end",
-                iid=str(start_index + idx),
-                values=(start_index + idx + 1, sentence, f"{start:.2f}", f"{end:.2f}"),
+                iid=str(len(self.sentences) - 1),
+                values=(len(self.sentences), text, f"{start:.2f}", f"{end:.2f}"),
             )
-        if segments:
-            self.stt_segments.extend(segments)
-
-    def _compute_sentence_timecodes(
-        self,
-        sentences: list[str],
-        duration: float | None,
-        segments: list[dict],
-    ) -> list[tuple[float, float]]:
-        if not sentences:
-            return []
-        if segments:
-            return self._match_sentence_timecodes(sentences, segments)
-        duration = float(duration or 0)
-        if duration <= 0:
-            duration = max(2.0 * len(sentences), 2.0)
-        weights = []
-        for sentence in sentences:
-            words = re.findall(r"[\\w']+", sentence, flags=re.UNICODE)
-            weights.append(max(len(words), 1))
-        total = float(sum(weights)) or 1.0
-        results: list[tuple[float, float]] = []
-        cursor = 0.0
-        for idx, weight in enumerate(weights):
-            if idx == len(weights) - 1:
-                end = duration
-            else:
-                end = cursor + duration * (weight / total)
-            if end <= cursor:
-                end = cursor + max(0.2, duration / max(len(weights), 1))
-            results.append((cursor, end))
-            cursor = end
-        return results
-
-    def _match_sentence_timecodes(
-        self,
-        sentences: list[str],
-        segments: list[dict],
-    ) -> list[tuple[float, float]]:
-        def _normalize(text: str) -> str:
-            tokens = re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text.lower())
-            return "".join(tokens)
-
-        results: list[tuple[float, float]] = []
-        seg_idx = 0
-        last_end = 0.0
-        for sentence in sentences:
-            target = _normalize(sentence)
-            start = None
-            end = None
-            buffer = ""
-            while seg_idx < len(segments):
-                seg = segments[seg_idx]
-                seg_idx += 1
-                seg_text = _normalize(seg.get("text", ""))
-                if not seg_text:
-                    continue
-                if start is None:
-                    start = float(seg.get("start", 0.0))
-                end = float(seg.get("end", start))
-                buffer += seg_text
-                if target:
-                    if target in buffer or len(buffer) >= len(target):
-                        break
-                else:
-                    break
-            if start is None:
-                start = last_end
-                end = last_end
-            if end is None:
-                end = start
-            last_end = max(last_end, end)
-            results.append((start, end))
-        return results
+        if self.sentences:
+            self.sentences_tree.selection_set("0")
+            self._select_sentence(0)
 
     def _on_sentence_select(self, _event=None) -> None:
         selection = self.sentences_tree.selection()
@@ -22973,23 +22917,155 @@ class VideoClipCardsWindow:
             return clip_html, text_html
         return text_html, clip_html
 
-    def _open_preview(self) -> None:
+    def _ensure_preview_poster(self, sentence: dict) -> str | None:
+        cached = sentence.get("preview_poster_path")
+        if cached and os.path.exists(cached):
+            return cached
+        if not self.video_path:
+            return None
+        ffmpeg_path = find_ffmpeg()
+        if not ffmpeg_path:
+            return None
+        output_dir = ensure_dir(os.path.join("tmp", "media"))
+        poster_path = os.path.join(output_dir, f"preview_{uuid4().hex}.jpg")
+        start_sec = float(sentence.get("start", 0.0))
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-ss",
+            f"{start_sec:.3f}",
+            "-i",
+            self.video_path,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            poster_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.exists(poster_path):
+            return None
+        sentence["preview_poster_path"] = poster_path
+        return poster_path
+
+    def _create_card_from_selected(self) -> None:
         if self.selected_index is None or self.selected_index >= len(self.sentences):
-            messagebox.showinfo("Предпросмотр", "Сначала выберите предложение.", parent=self.win)
+            messagebox.showwarning("Карточка", "Сначала выберите строку с фразой.", parent=self.win)
+            return
+        if not self.video_path:
+            messagebox.showwarning("Карточка", "Сначала выберите видео файл.", parent=self.win)
             return
         sentence = self.sentences[self.selected_index]
-        start = sentence.get("start", 0)
-        end = sentence.get("end", 0)
-        clip_html = build_video_html(self.video_path, None)
-        text_html = sentence.get("text_html") or f"<div>{html.escape(sentence.get('sentence') or '')}</div>"
-        if self.video_on_front.get():
-            front_html, back_html = clip_html, text_html
-        else:
-            front_html, back_html = text_html, clip_html
+        start_sec = float(sentence.get("start", 0.0))
+        end_sec = float(sentence.get("end", start_sec))
+        if end_sec <= start_sec:
+            messagebox.showwarning("Карточка", "Некорректный диапазон выбранной строки.", parent=self.win)
+            return
+        price = self._get_video_clip_card_price()
+        if not self.app.can_afford(price):
+            self._update_save_pricing()
+            messagebox.showwarning("Кредиты", "Недостаточно кредитов.", parent=self.win)
+            return
+        output_dir = os.path.join(MEDIA_FOLDER, "clips", str(self.deck_id))
+        base_name = f"phrase_{self.selected_index + 1}_{int(start_sec * 1000)}_{int(end_sec * 1000)}"
+        self.create_card_btn.configure(state=tk.DISABLED)
 
-        print("[PREVIEW SELECTED]", sentence.get("sentence"), start, end)
-        print("[PREVIEW FRONT HTML]", (front_html or "")[:200])
-        print("[PREVIEW BACK HTML]", (back_html or "")[:200])
+        def _worker() -> tuple[bool, str]:
+            conn = get_connection()
+
+            def _op() -> int:
+                spend_credits_in_transaction(
+                    conn,
+                    self.app.user_id,
+                    price,
+                    "video_clip_cards",
+                    meta={"deck_id": self.deck_id, "count": 1},
+                )
+                clip_path, poster_path = cut_video_clip_stream_copy_with_poster(
+                    self.video_path,
+                    start_sec,
+                    end_sec,
+                    output_dir,
+                    base_name,
+                )
+                sentence["clip_path"] = clip_path
+                sentence["poster_path"] = poster_path
+                video_html = build_video_html(clip_path, poster_path)
+                text_html = sentence.get("text_html") or f"<div>{html.escape(sentence.get('sentence') or '')}</div>"
+                front_html, back_html = video_html, text_html
+                note_fields = {
+                    "word": sentence.get("sentence") or "",
+                    "translation": "",
+                    "example": "",
+                    "level": 1,
+                    "image": poster_path or "",
+                    "front": front_html,
+                    "back": back_html,
+                    "front_image_path": poster_path,
+                    "back_image_path": None,
+                    "audio_path": None,
+                    "front_html": front_html,
+                    "back_html": back_html,
+                    "front_video_html": video_html,
+                    "back_video_html": "",
+                    "front_video": video_html,
+                    "back_video": "",
+                }
+                note_id, _ = create_note_with_cards_in_transaction(
+                    conn,
+                    self.deck_id,
+                    note_fields,
+                    note_type_id=ensure_generated_note_type_id(conn),
+                    tags="video clip",
+                )
+                insert_media(conn, note_id=note_id, type="video", path=clip_path, side="front")
+                insert_media(conn, note_id=note_id, type="image", path=poster_path, side="front")
+                return 1
+
+            try:
+                created = commit_with_retry(conn, _op)
+            except Exception as exc:
+                conn.rollback()
+                return False, str(exc)
+            finally:
+                conn.close()
+            return True, str(created)
+
+        def _finish(result: tuple[bool, str]) -> None:
+            ok, payload = result
+            self.create_card_btn.configure(state=tk.NORMAL)
+            if not ok:
+                show_clip_error_dialog(self.win, "Ошибка", f"Не удалось сохранить карточку: {payload}")
+                return
+            self.app.refresh_balance_display()
+            self.app.refresh_decks()
+            self.app.update_deck_preview()
+            self.app.update_overdue_badge()
+            messagebox.showinfo(
+                "Сохранено",
+                "✅ Карточка сохранена",
+                parent=self.win,
+            )
+
+        def _thread_runner() -> None:
+            result = _worker()
+            self.win.after(0, lambda: _finish(result))
+
+        threading.Thread(target=_thread_runner, daemon=True).start()
+
+    def _open_preview(self) -> None:
+        if self.selected_index is None or self.selected_index >= len(self.sentences):
+            messagebox.showinfo("Предпросмотр", "Сначала выберите фразу.", parent=self.win)
+            return
+        sentence = self.sentences[self.selected_index]
+        poster_path = self._ensure_preview_poster(sentence)
+        image_html = build_image_html(poster_path) if poster_path else ""
+        text_html = sentence.get("text_html") or f"<div>{html.escape(sentence.get('sentence') or '')}</div>"
+        front_html, back_html = image_html, text_html
 
         preview_win = tk.Toplevel(self.win)
         preview_win.title("Предпросмотр выбранного")
@@ -23200,10 +23276,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import multiprocessing as mp
-
-    mp.freeze_support()
-    mp.set_start_method("spawn", force=True)
     main()
 # PATCH: tabs moved + dark scrollbar + video embed fixed + upload video in generator + unified card renderer
 # PATCH: unify card renderer sizes + white video background + image-over-video rule
