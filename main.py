@@ -3091,13 +3091,32 @@ def create_note_with_cards_in_transaction(
     return note_id, created
 
 
+def try_deserialize_rich(value: str | dict | None) -> str | dict | None:
+    if not value:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            json.loads(value)
+        except Exception:
+            return None
+        return value
+    return None
+
+
+def normalize_card_row(row: sqlite3.Row | dict) -> dict:
+    card_dict = dict(row)
+    card_dict["front_rich"] = try_deserialize_rich(card_dict.get("front_rich"))
+    card_dict["back_rich"] = try_deserialize_rich(card_dict.get("back_rich"))
+    return sanitize_card_sounds(card_dict)
+
+
 def ensure_notes_for_cards(cards: list[sqlite3.Row]) -> list[dict]:
     sanitized: list[dict] = []
     for card in cards:
         card_dict = ensure_note_for_card(card)
-        card_dict["front_rich"] = deserialize_rich_doc(card_dict.get("front_rich"))
-        card_dict["back_rich"] = deserialize_rich_doc(card_dict.get("back_rich"))
-        sanitized.append(sanitize_card_sounds(card_dict))
+        sanitized.append(normalize_card_row(card_dict))
     return sanitized
 
 
@@ -3680,7 +3699,10 @@ def get_card_by_id(card_id: int):
     cur.execute("SELECT * FROM cards WHERE id = ?;", (card_id,))
     row = cur.fetchone()
     conn.close()
-    return ensure_note_for_card(row) if row else None
+    if not row:
+        return None
+    card_dict = ensure_note_for_card(row)
+    return normalize_card_row(card_dict)
 
 
 def apply_srs_update(card_id: int, rating: int):
@@ -4526,6 +4548,43 @@ def insert_card(
     return card_id
 
 
+def insert_card_content(
+    deck_id: int,
+    front: str,
+    back: str,
+    *,
+    front_rich: str | dict | None = None,
+    back_rich: str | dict | None = None,
+    front_image_path: str | None = None,
+    back_image_path: str | None = None,
+    audio_path: str | None = None,
+    level: int = 1,
+    note_id: int | None = None,
+    template_ord: int | None = None,
+    ensure_note: bool = False,
+    note_fields: dict | None = None,
+    audio_side: str = "back",
+    audio_source: str | None = None,
+) -> int:
+    return insert_card(
+        deck_id,
+        front,
+        back,
+        front_image_path=front_image_path,
+        back_image_path=back_image_path,
+        front_rich=front_rich,
+        back_rich=back_rich,
+        audio_path=audio_path,
+        level=level,
+        note_id=note_id,
+        template_ord=template_ord,
+        ensure_note=ensure_note,
+        note_fields=note_fields,
+        audio_side=audio_side,
+        audio_source=audio_source,
+    )
+
+
 def update_card_text(card_id: int, front: str, back: str) -> bool:
     try:
         conn = get_connection()
@@ -4557,15 +4616,21 @@ def update_card_content(
     card_id: int,
     front: str,
     back: str,
-    front_rich: str | None,
-    back_rich: str | None,
+    front_rich: str | dict | None,
+    back_rich: str | dict | None,
 ) -> bool:
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute(
             "UPDATE cards SET front = ?, back = ?, front_rich = ?, back_rich = ? WHERE id = ?;",
-            (front, back, front_rich, back_rich, card_id),
+            (
+                front,
+                back,
+                serialize_rich_doc(front_rich),
+                serialize_rich_doc(back_rich),
+                card_id,
+            ),
         )
         conn.commit()
         conn.close()
@@ -7934,8 +7999,8 @@ class CardRenderer:
         return front_value, back_value
 
     def get_edited_rich_docs(self) -> tuple[str, str]:
-        _, front_doc = export_text_with_tags(self.front_text)
-        _, back_doc = export_text_with_tags(self.back_text)
+        _, front_doc = export_text_and_rich(self.front_text)
+        _, back_doc = export_text_and_rich(self.back_text)
         return front_doc, back_doc
 
     def revert_to_original(self) -> None:
@@ -7972,7 +8037,6 @@ class CardRenderer:
         *,
         fallback_text: str = "",
     ) -> None:
-        desired_state = tk.NORMAL if self.inline_editing else tk.DISABLED
         self._suppress_modified = True
         self._ensure_format_tags(widget)
         plain_text = fallback_text
@@ -7985,12 +8049,16 @@ class CardRenderer:
                     plain_text = parsed.get("text") or plain_text
             except Exception:
                 pass
-        import_text_with_tags(widget, plain_text, rich_doc)
+        apply_rich_to_text(
+            widget,
+            plain_text,
+            rich_doc,
+            readonly=not self.inline_editing,
+        )
         try:
             widget.edit_modified(False)
         except Exception:
             pass
-        widget.configure(state=desired_state)
         self._suppress_modified = False
 
     def _bind_mousewheel(self, target: tk.Widget) -> None:
@@ -8472,6 +8540,11 @@ def export_rich_from_editor(text_widget: tk.Text) -> dict:
     }
 
 
+def export_text_and_rich(text_widget: tk.Text) -> tuple[str, str | None]:
+    plain_text, rich_json = export_text_with_tags(text_widget)
+    return plain_text, rich_json
+
+
 def export_text_with_tags(
     text_widget: tk.Text,
     allowed_prefixes: tuple[str, ...] = ("fmt_",),
@@ -8579,6 +8652,18 @@ def import_text_with_tags(
                 except tk.TclError:
                     pass
     text_widget.configure(state=prev_state)
+
+
+def apply_rich_to_text(
+    text_widget: tk.Text,
+    plain_text: str,
+    rich_json: str | dict | None,
+    *,
+    readonly: bool,
+) -> None:
+    text_widget.configure(state=tk.NORMAL)
+    import_text_with_tags(text_widget, plain_text, rich_json)
+    text_widget.configure(state=tk.DISABLED if readonly else tk.NORMAL)
 
 
 def text_widget_to_html(text_widget: tk.Text) -> str:
@@ -17597,7 +17682,7 @@ class AnkiApp(tk.Tk):
                     stored_front = copy_image_asset_to_media(front_image, "front") if front_image else None
                     stored_back = copy_image_asset_to_media(back_image, "back") if back_image else None
 
-                    card_id = insert_card(
+                    card_id = insert_card_content(
                         deck_id,
                         front_value,
                         back_value,
@@ -22248,8 +22333,8 @@ class RepeatWindow(tk.Toplevel):
         card_id = self.current_card.get("id")
         if card_id is None:
             return False
-        front_text, front_rich = export_text_with_tags(self.card_renderer.front_text)
-        back_text, back_rich = export_text_with_tags(self.card_renderer.back_text)
+        front_text, front_rich = export_text_and_rich(self.card_renderer.front_text)
+        back_text, back_rich = export_text_and_rich(self.card_renderer.back_text)
         now_ts = time.time()
         if silent:
             if (now_ts - self._last_autosave_version_ts) > 120:
@@ -22259,10 +22344,15 @@ class RepeatWindow(tk.Toplevel):
             insert_card_version_snapshot(self.current_card, reason="before_manual_save", window_name="repeat")
         if not update_card_content(card_id, front_text, back_text, front_rich, back_rich):
             return False
-        self.current_card["front"] = front_text
-        self.current_card["back"] = back_text
-        self.current_card["front_rich"] = front_rich
-        self.current_card["back_rich"] = back_rich
+        refreshed = get_card_by_id(card_id)
+        if refreshed:
+            self.current_card = refreshed
+            self.session.cards[self.session.index] = refreshed
+        else:
+            self.current_card["front"] = front_text
+            self.current_card["back"] = back_text
+            self.current_card["front_rich"] = front_rich
+            self.current_card["back_rich"] = back_rich
         if self.card_renderer:
             self.card_renderer.clear_dirty()
         status_label = "Автосохранено" if silent else "Сохранено"
@@ -23024,8 +23114,8 @@ class ReviewWindow(tk.Toplevel):
         card_id = self.current_card.get("id")
         if card_id is None:
             return False
-        front_text, front_rich = export_text_with_tags(self.card_renderer.front_text)
-        back_text, back_rich = export_text_with_tags(self.card_renderer.back_text)
+        front_text, front_rich = export_text_and_rich(self.card_renderer.front_text)
+        back_text, back_rich = export_text_and_rich(self.card_renderer.back_text)
         now_ts = time.time()
         if silent:
             if (now_ts - self._last_autosave_version_ts) > 120:
@@ -23035,10 +23125,15 @@ class ReviewWindow(tk.Toplevel):
             insert_card_version_snapshot(self.current_card, reason="before_manual_save", window_name="review")
         if not update_card_content(card_id, front_text, back_text, front_rich, back_rich):
             return False
-        self.current_card["front"] = front_text
-        self.current_card["back"] = back_text
-        self.current_card["front_rich"] = front_rich
-        self.current_card["back_rich"] = back_rich
+        refreshed = get_card_by_id(card_id)
+        if refreshed:
+            self.current_card = refreshed
+            self.cards[self.current_index] = refreshed
+        else:
+            self.current_card["front"] = front_text
+            self.current_card["back"] = back_text
+            self.current_card["front_rich"] = front_rich
+            self.current_card["back_rich"] = back_rich
         if self.card_renderer:
             self.card_renderer.clear_dirty()
         status_label = "Автосохранено" if silent else "Сохранено"
