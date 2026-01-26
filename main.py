@@ -4591,7 +4591,7 @@ def update_card_text(card_id: int, front: str, back: str) -> bool:
         cur = conn.cursor()
         cur.execute("PRAGMA table_info(cards);")
         columns = {row[1] for row in cur.fetchall()}
-        set_parts = ["front = ?", "back = ?", "front_rich = NULL", "back_rich = NULL"]
+        set_parts = ["front = ?", "back = ?"]
         if "front_html" in columns:
             set_parts.append("front_html = NULL")
         if "back_html" in columns:
@@ -4622,17 +4622,25 @@ def update_card_content(
     try:
         conn = get_connection()
         cur = conn.cursor()
+        serialized_front = serialize_rich_doc(front_rich)
+        serialized_back = serialize_rich_doc(back_rich)
         cur.execute(
             "UPDATE cards SET front = ?, back = ?, front_rich = ?, back_rich = ? WHERE id = ?;",
             (
                 front,
                 back,
-                serialize_rich_doc(front_rich),
-                serialize_rich_doc(back_rich),
+                serialized_front,
+                serialized_back,
                 card_id,
             ),
         )
         conn.commit()
+        cur.execute(
+            "SELECT length(front_rich), length(back_rich) FROM cards WHERE id = ?;",
+            (card_id,),
+        )
+        row = cur.fetchone() or (None, None)
+        print("DB saved lengths:", row[0], row[1])
         conn.close()
         return True
     except Exception as exc:
@@ -7832,8 +7840,15 @@ class CardRenderer:
         if not self.inline_editing:
             return
         try:
+            start = widget.index("sel.first")
+            end = widget.index("sel.last")
+        except tk.TclError:
+            return
+        try:
             self._ensure_format_tags(widget)
-            widget.tag_add(tag, "sel.first", "sel.last")
+            widget.tag_add(tag, start, end)
+            if tag == "fmt_bold":
+                print("BOLD tags:", widget.tag_names(), "ranges:", widget.tag_ranges("fmt_bold"))
             self.mark_dirty()
         except tk.TclError:
             pass
@@ -7846,10 +7861,15 @@ class CardRenderer:
             return
         color = chosen[1]
         tag_name = f"fmt_color_{color}"
+        try:
+            start = widget.index("sel.first")
+            end = widget.index("sel.last")
+        except tk.TclError:
+            return
         if tag_name not in widget.tag_names():
             widget.tag_configure(tag_name, foreground=color)
         try:
-            widget.tag_add(tag_name, "sel.first", "sel.last")
+            widget.tag_add(tag_name, start, end)
             self.mark_dirty()
         except tk.TclError:
             pass
@@ -8265,6 +8285,20 @@ class CardRenderer:
         self._preview_card_context = prepare_template_fields(card) if card else None
         front_text = card.get("front") or ""
         back_text = card.get("back") or ""
+        raw_front_rich = card.get("front_rich")
+        raw_back_rich = card.get("back_rich")
+        print(
+            "LOAD card id",
+            card.get("id"),
+            "front len",
+            len(front_text),
+            "front_rich len",
+            len(serialize_rich_doc(raw_front_rich) or ""),
+            "back len",
+            len(back_text),
+            "back_rich len",
+            len(serialize_rich_doc(raw_back_rich) or ""),
+        )
         front_html = card.get("front_html")
         back_html = card.get("back_html")
         if not front_html and _looks_like_html(front_text):
@@ -8633,7 +8667,38 @@ def export_rich_from_editor(text_widget: tk.Text) -> dict:
 
 
 def export_text_and_rich(text_widget: tk.Text) -> tuple[str, str | None]:
-    plain_text, rich_json = export_text_with_tags(text_widget)
+    plain_text = text_widget.get("1.0", "end-1c")
+    tags_payload: list[dict[str, str]] = []
+    fmt_tags: list[str] = []
+    for tag in text_widget.tag_names():
+        if not tag.startswith("fmt_"):
+            continue
+        ranges = text_widget.tag_ranges(tag)
+        if not ranges:
+            continue
+        fmt_tags.append(tag)
+        for idx in range(0, len(ranges), 2):
+            start = text_widget.index(ranges[idx])
+            end = text_widget.index(ranges[idx + 1])
+            tags_payload.append({"name": tag, "start": start, "end": end})
+    tag_configs: dict[str, dict[str, object]] = {}
+    for tag in fmt_tags:
+        config: dict[str, object] = {}
+        for key in ("foreground", "background", "font", "underline"):
+            value = text_widget.tag_cget(tag, key)
+            if value in ("", None):
+                continue
+            config[key] = value
+        if config:
+            tag_configs[tag] = config
+    payload = {
+        "text": plain_text,
+        "tags": tags_payload,
+        "cfg": tag_configs,
+        "v": 1,
+    }
+    rich_json = json.dumps(payload, ensure_ascii=False)
+    print("EXPORT rich len:", len(rich_json), "tags count:", len(tags_payload), "sample:", tags_payload[:3])
     return plain_text, rich_json
 
 
@@ -8653,8 +8718,8 @@ def export_text_with_tags(
         if not ranges:
             continue
         for idx in range(0, len(ranges), 2):
-            start = str(ranges[idx])
-            end = str(ranges[idx + 1])
+            start = text_widget.index(ranges[idx])
+            end = text_widget.index(ranges[idx + 1])
             tags_payload.append({"name": tag, "start": start, "end": end})
         config: dict[str, object] = {}
         for key in ("foreground", "background", "font", "underline", "overstrike"):
@@ -8672,8 +8737,8 @@ def export_text_with_tags(
     payload = {
         "text": plain_text,
         "tags": tags_payload,
-        "tag_configs": tag_configs,
-        "version": 1,
+        "cfg": tag_configs,
+        "v": 1,
     }
     return plain_text, json.dumps(payload, ensure_ascii=False)
 
@@ -8721,13 +8786,35 @@ def import_text_with_tags(
                     except tk.TclError:
                         pass
         else:
-            tag_configs = payload.get("tag_configs") or {}
+            tag_configs = payload.get("cfg") or payload.get("tag_configs") or {}
+            fonts_cache = getattr(text_widget, "_rich_fonts", None)
+            if fonts_cache is None:
+                fonts_cache = {}
+                setattr(text_widget, "_rich_fonts", fonts_cache)
             for tag_name, config in tag_configs.items():
                 safe_config: dict[str, object] = {}
                 for key, value in (config or {}).items():
                     if value in ("", None):
                         continue
                     safe_config[key] = value
+                font_value = safe_config.get("font")
+                if font_value:
+                    font_obj = None
+                    if isinstance(font_value, tkfont.Font):
+                        font_obj = font_value
+                    else:
+                        try:
+                            font_obj = tkfont.Font(name=str(font_value), exists=True)
+                        except tk.TclError:
+                            base_font = tkfont.Font(font=text_widget.cget("font"))
+                            if tag_name == "fmt_bold":
+                                base_font.configure(weight="bold")
+                            elif tag_name == "fmt_italic":
+                                base_font.configure(slant="italic")
+                            font_obj = base_font
+                    if font_obj is not None:
+                        safe_config["font"] = font_obj
+                        fonts_cache[tag_name] = font_obj
                 if safe_config:
                     try:
                         text_widget.tag_configure(tag_name, **safe_config)
@@ -22117,8 +22204,6 @@ class BatchEditWindow(tk.Toplevel):
                 if self.back_var.get():
                     set_parts.append("back = REPLACE(back, ?, ?)" if not use_regex else "back = ?")
                     params.extend([find_text, replace_text] if not use_regex else [back_after])
-                set_parts.append("front_rich = NULL")
-                set_parts.append("back_rich = NULL")
                 if has_front_html:
                     set_parts.append("front_html = NULL")
                 if has_back_html:
@@ -22789,6 +22874,19 @@ class RepeatWindow(tk.Toplevel):
 
         use_custom = (not self.show_back) and self.show_translations and c["leitner_level"] == 1
         custom_items = self.extract_words_with_translations(front_text) if use_custom else None
+        print(
+            "[REPEAT RENDER]",
+            "card_id=",
+            c.get("id"),
+            "front_len=",
+            len(c.get("front") or ""),
+            "front_rich_len=",
+            len(serialize_rich_doc(c.get("front_rich")) or ""),
+            "back_len=",
+            len(c.get("back") or ""),
+            "back_rich_len=",
+            len(serialize_rich_doc(c.get("back_rich")) or ""),
+        )
         if self.card_renderer is not None:
             self.card_renderer.update_text(
                 c,
@@ -23507,6 +23605,19 @@ class ReviewWindow(tk.Toplevel):
         self.update_progress_view()
         self.update_timer_label()
         
+        print(
+            "[PLAYBACK RENDER]",
+            "card_id=",
+            c.get("id"),
+            "front_len=",
+            len(c.get("front") or ""),
+            "front_rich_len=",
+            len(serialize_rich_doc(c.get("front_rich")) or ""),
+            "back_len=",
+            len(c.get("back") or ""),
+            "back_rich_len=",
+            len(serialize_rich_doc(c.get("back_rich")) or ""),
+        )
         if self.card_renderer is not None:
             self.card_renderer.render(
                 c,
