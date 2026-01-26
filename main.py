@@ -5342,6 +5342,9 @@ STT_WHISPER_MODEL = os.environ.get("STT_WHISPER_MODEL", "small")
 STT_FFMPEG_TIMEOUT_SEC = int(os.environ.get("STT_FFMPEG_TIMEOUT_SEC", "180"))
 STT_WATCHDOG_IDLE_SEC = int(os.environ.get("STT_WATCHDOG_IDLE_SEC", "180"))
 STT_WHISPER_HEARTBEAT_SEC = float(os.environ.get("STT_WHISPER_HEARTBEAT_SEC", "1.0"))
+STT_FFMPEG_PRESET = os.environ.get("STT_FFMPEG_PRESET", "fast").lower()
+FAST_AF = "highpass=f=80,lowpass=f=8000,afftdn"
+QUALITY_AF = "highpass=f=80,lowpass=f=8000,afftdn,dynaudnorm,loudnorm=I=-16:TP=-1.5:LRA=11"
 
 
 class STTError(RuntimeError):
@@ -5501,6 +5504,8 @@ def run_ffmpeg(
     timeout_sec: int = STT_FFMPEG_TIMEOUT_SEC,
     log_lines: list[str] | None = None,
     cancel_event: threading.Event | None = None,
+    duration_sec: float | None = None,
+    preset_label: str | None = None,
 ) -> tuple[int, str, str]:
     log_lines = log_lines if log_lines is not None else []
     cmd = list(cmd)
@@ -5528,6 +5533,12 @@ def run_ffmpeg(
             if remaining <= 0:
                 proc.kill()
                 _append_log_line(log_lines, "TIMEOUT/DEADLOCK=ffmpeg_timeout")
+                if duration_sec is not None:
+                    _append_log_line(log_lines, f"ffmpeg_timeout_duration_sec={duration_sec:.3f}")
+                if preset_label:
+                    _append_log_line(log_lines, f"ffmpeg_timeout_preset={preset_label}")
+                _append_log_line(log_lines, f"ffmpeg_timeout_sec={timeout_sec}")
+                _append_log_line(log_lines, "ffmpeg_timeout_cmd=" + " ".join(cmd))
                 raise RuntimeError("FFmpeg превысил лимит времени.")
             try:
                 stdout, stderr = proc.communicate(timeout=min(1.0, remaining))
@@ -5564,6 +5575,13 @@ def run_ffmpeg(
     _append_log_line(log_lines, "ffmpeg_stdout=" + _trim_output(stdout))
     _append_log_line(log_lines, "ffmpeg_stderr=" + _trim_output(stderr))
     return proc.returncode or 0, stdout, stderr
+
+
+def _calc_ffmpeg_timeout(duration_sec: float | None, base_timeout: int = STT_FFMPEG_TIMEOUT_SEC) -> int:
+    if duration_sec is None:
+        return base_timeout
+    timeout = max(base_timeout, int(duration_sec * 8 + 30))
+    return min(timeout, 900)
 
 
 def _normalize_lang(lang: str | None) -> str | None:
@@ -5720,32 +5738,64 @@ def extract_preprocessed_wav(
     ffmpeg_path = find_ffmpeg()
     log_lines = log_lines if log_lines is not None else []
     if ffmpeg_path:
-        filters = "highpass=f=80,lowpass=f=8000,afftdn,dynaudnorm,loudnorm=I=-16:TP=-1.5:LRA=11"
-        cmd = [ffmpeg_path, "-y"]
-        if start is not None:
-            cmd += ["-ss", str(start)]
+        duration_sec = None
         if end is not None:
-            cmd += ["-to", str(end)]
-        cmd += [
-            "-i",
-            video_path,
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-sample_fmt",
-            "s16",
-            "-af",
-            filters,
-            output_path,
-        ]
-        returncode, _stdout, stderr = run_ffmpeg(
-            cmd,
-            timeout_sec=STT_FFMPEG_TIMEOUT_SEC,
-            log_lines=log_lines,
-            cancel_event=cancel_event,
-        )
+            duration_sec = max(0.1, float(end) - float(start or 0.0))
+        elif start is not None:
+            total = get_video_duration_seconds(video_path)
+            if total:
+                duration_sec = max(0.1, float(total) - float(start))
+        else:
+            total = get_video_duration_seconds(video_path)
+            if total:
+                duration_sec = float(total)
+
+        def _build_cmd(filters: str) -> list[str]:
+            cmd = [ffmpeg_path, "-y"]
+            if start is not None:
+                cmd += ["-ss", str(start)]
+            cmd += ["-i", video_path]
+            if duration_sec is not None:
+                cmd += ["-t", f"{duration_sec:.3f}"]
+            cmd += [
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-sample_fmt",
+                "s16",
+                "-af",
+                filters,
+                output_path,
+            ]
+            return cmd
+
+        def _run_with_filters(filters: str, preset_label: str, timeout_sec: int) -> tuple[int, str]:
+            cmd = _build_cmd(filters)
+            returncode, _stdout, stderr = run_ffmpeg(
+                cmd,
+                timeout_sec=timeout_sec,
+                log_lines=log_lines,
+                cancel_event=cancel_event,
+                duration_sec=duration_sec,
+                preset_label=preset_label,
+            )
+            return returncode, stderr
+
+        use_quality = STT_FFMPEG_PRESET == "quality"
+        timeout_sec = _calc_ffmpeg_timeout(duration_sec)
+        filters = QUALITY_AF if use_quality else FAST_AF
+        preset_label = "quality" if use_quality else "fast"
+        try:
+            returncode, stderr = _run_with_filters(filters, preset_label, timeout_sec)
+        except RuntimeError as exc:
+            if use_quality and "превысил лимит времени" in str(exc).lower():
+                retry_timeout = int(timeout_sec * 1.5)
+                _append_log_line(log_lines, "ffmpeg_retry_preset=fast")
+                returncode, stderr = _run_with_filters(FAST_AF, "fast", retry_timeout)
+            else:
+                raise
         if returncode != 0:
             error_text = stderr.strip() or "Не удалось извлечь аудио."
             raise RuntimeError(error_text)
@@ -5797,32 +5847,64 @@ def extract_audio_from_video(
     log_lines = log_lines if log_lines is not None else []
     ffmpeg_path = find_ffmpeg()
     if ffmpeg_path:
-        filters = "highpass=f=80,lowpass=f=8000,afftdn,dynaudnorm,loudnorm=I=-16:TP=-1.5:LRA=11"
-        cmd = [ffmpeg_path, "-y"]
-        if start is not None:
-            cmd += ["-ss", str(start)]
+        duration_sec = None
         if end is not None:
-            cmd += ["-to", str(end)]
-        cmd += [
-            "-i",
-            video_path,
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-sample_fmt",
-            "s16",
-            "-af",
-            filters,
-            output_path,
-        ]
-        returncode, _stdout, stderr = run_ffmpeg(
-            cmd,
-            timeout_sec=STT_FFMPEG_TIMEOUT_SEC,
-            log_lines=log_lines,
-            cancel_event=cancel_event,
-        )
+            duration_sec = max(0.1, float(end) - float(start or 0.0))
+        elif start is not None:
+            total = get_video_duration_seconds(video_path)
+            if total:
+                duration_sec = max(0.1, float(total) - float(start))
+        else:
+            total = get_video_duration_seconds(video_path)
+            if total:
+                duration_sec = float(total)
+
+        def _build_cmd(filters: str) -> list[str]:
+            cmd = [ffmpeg_path, "-y"]
+            if start is not None:
+                cmd += ["-ss", str(start)]
+            cmd += ["-i", video_path]
+            if duration_sec is not None:
+                cmd += ["-t", f"{duration_sec:.3f}"]
+            cmd += [
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-sample_fmt",
+                "s16",
+                "-af",
+                filters,
+                output_path,
+            ]
+            return cmd
+
+        def _run_with_filters(filters: str, preset_label: str, timeout_sec: int) -> tuple[int, str]:
+            cmd = _build_cmd(filters)
+            returncode, _stdout, stderr = run_ffmpeg(
+                cmd,
+                timeout_sec=timeout_sec,
+                log_lines=log_lines,
+                cancel_event=cancel_event,
+                duration_sec=duration_sec,
+                preset_label=preset_label,
+            )
+            return returncode, stderr
+
+        use_quality = STT_FFMPEG_PRESET == "quality"
+        timeout_sec = _calc_ffmpeg_timeout(duration_sec)
+        filters = QUALITY_AF if use_quality else FAST_AF
+        preset_label = "quality" if use_quality else "fast"
+        try:
+            returncode, stderr = _run_with_filters(filters, preset_label, timeout_sec)
+        except RuntimeError as exc:
+            if use_quality and "превысил лимит времени" in str(exc).lower():
+                retry_timeout = int(timeout_sec * 1.5)
+                _append_log_line(log_lines, "ffmpeg_retry_preset=fast")
+                returncode, stderr = _run_with_filters(FAST_AF, "fast", retry_timeout)
+            else:
+                raise
         if returncode != 0:
             error_text = stderr.strip() or "Не удалось извлечь аудио."
             raise RuntimeError(error_text)
@@ -7164,6 +7246,16 @@ def attach_clipboard_context(widget, root=None):
     widget.bind("<Control-Insert>", lambda e: (copy(), "break"))
     widget.bind("<Shift-Delete>", lambda e: (cut(), "break"))
 
+    return menu
+
+
+def bind_entry_context_menu(entry: tk.Entry | ttk.Entry):
+    """Привязка контекстного меню и горячих клавиш для Entry."""
+    menu = attach_clipboard_context(entry)
+    try:
+        entry.configure(state=tk.NORMAL)
+    except Exception:
+        pass
     return menu
 
 def create_context_menu(widget):
@@ -23893,6 +23985,9 @@ def parse_webvtt(path: str) -> list[dict]:
     idx = 0
     while idx < len(lines):
         line = lines[idx].strip()
+        if not line or line.upper().startswith("WEBVTT"):
+            idx += 1
+            continue
         if "-->" not in line:
             idx += 1
             continue
@@ -23911,10 +24006,87 @@ def parse_webvtt(path: str) -> list[dict]:
     return segments
 
 
+_CAPTION_NOISE_RE = re.compile(r"^\s*[\[(].*?[\])]\s*$")
+
+
+def _split_long_text(text: str, max_len: int = 200) -> list[str]:
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    parts = re.split(r"(?<=[.!?])\s+|(?<=[,;])\s+", text)
+    buffer = ""
+    for part in parts:
+        if not part:
+            continue
+        candidate = f"{buffer} {part}".strip() if buffer else part.strip()
+        if len(candidate) > max_len and buffer:
+            chunks.append(buffer.strip())
+            buffer = part.strip()
+        else:
+            buffer = candidate
+    if buffer:
+        chunks.append(buffer.strip())
+    if not chunks:
+        chunks = [text[:max_len]]
+    return chunks
+
+
+def segments_to_sentences(segments: list[dict]) -> list[dict]:
+    cleaned: list[dict] = []
+    for segment in sorted(segments, key=lambda item: float(item.get("start", 0.0))):
+        text = " ".join(str(segment.get("text") or "").split())
+        if not text or _CAPTION_NOISE_RE.match(text):
+            continue
+        cleaned.append(
+            {
+                "start": float(segment.get("start", 0.0)),
+                "end": float(segment.get("end", segment.get("start", 0.0))),
+                "text": text,
+            }
+        )
+
+    sentences: list[dict] = []
+    buffer_text = ""
+    buffer_start: float | None = None
+    buffer_end: float | None = None
+    min_len = 30
+
+    def _flush() -> None:
+        nonlocal buffer_text, buffer_start, buffer_end
+        if not buffer_text:
+            return
+        start = float(buffer_start or 0.0)
+        end = float(buffer_end or start)
+        if end <= start:
+            end = start + 1.0
+        sentences.append({"start": start, "end": end, "text": buffer_text.strip()})
+        buffer_text = ""
+        buffer_start = None
+        buffer_end = None
+
+    for segment in cleaned:
+        parts = _split_long_text(segment["text"])
+        for part in parts:
+            if buffer_start is None:
+                buffer_start = float(segment["start"])
+            buffer_end = float(segment["end"])
+            if buffer_text:
+                buffer_text = f"{buffer_text} {part}".strip()
+            else:
+                buffer_text = part.strip()
+            if len(buffer_text) >= min_len and buffer_text.endswith((".", "!", "?", ";", ",")):
+                _flush()
+        if buffer_text and len(buffer_text) >= min_len:
+            _flush()
+
+    _flush()
+    return sentences
+
+
 class VideoClipCardsWindow:
     """Видео → клипы → карточки (автозапуск + авто-STT + таймкоды)."""
 
-    STT_LANG_CHOICES = ["Auto", "ru-RU", "en-US", "de-DE"]
+    STT_LANG_CHOICES = ["Auto", "de-DE", "ru-RU", "en-US"]
     STT_MODEL_CHOICES = ["tiny", "base", "small", "medium"]
 
     def __init__(self, app: "AnkiApp", deck_id: int) -> None:
@@ -24013,23 +24185,41 @@ class VideoClipCardsWindow:
 
         youtube_row = ttk.Frame(frame)
         youtube_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Label(youtube_row, text="YouTube URL:").pack(side=tk.LEFT)
         self.youtube_url_var = tk.StringVar()
         self.youtube_url_entry = ttk.Entry(youtube_row, textvariable=self.youtube_url_var)
         try:
             self.youtube_url_entry.configure(exportselection=True)
         except Exception:
             pass
-        self.youtube_url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        attach_clipboard_context(self.youtube_url_entry)
+        self.youtube_url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        bind_entry_context_menu(self.youtube_url_entry)
+
+        def _paste_youtube_url() -> None:
+            try:
+                text = self.win.clipboard_get()
+            except Exception:
+                text = ""
+            if text:
+                self.youtube_url_var.set(text.strip())
+
+        def _clear_youtube_url() -> None:
+            self.youtube_url_var.set("")
+            self.youtube_url_entry.focus_set()
+
+        self.youtube_paste_btn = ttk.Button(youtube_row, text="Вставить", command=_paste_youtube_url)
+        self.youtube_paste_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.youtube_clear_btn = ttk.Button(youtube_row, text="Очистить", command=_clear_youtube_url)
+        self.youtube_clear_btn.pack(side=tk.LEFT, padx=(6, 0))
         self.youtube_load_btn = ttk.Button(
             youtube_row,
-            text="Загрузить YouTube",
+            text="Получить",
             command=lambda: self._load_youtube(self.youtube_url_var.get().strip()),
         )
         self.youtube_load_btn.pack(side=tk.LEFT, padx=(6, 0))
         self.youtube_cancel_btn = ttk.Button(
             youtube_row,
-            text="Отменить",
+            text="Отмена",
             command=self._cancel_youtube_download,
             state=tk.DISABLED,
         )
@@ -24038,28 +24228,29 @@ class VideoClipCardsWindow:
         youtube_opts = ttk.Frame(frame)
         youtube_opts.pack(fill=tk.X, padx=6, pady=(0, 4))
         self.youtube_subs_first_var = tk.BooleanVar(value=True)
-        self.youtube_download_video_var = tk.BooleanVar(value=False)
-        self.youtube_audio_only_var = tk.BooleanVar(value=True)
+        self.youtube_fallback_stt_var = tk.BooleanVar(value=True)
         self.youtube_subs_first_check = ttk.Checkbutton(
             youtube_opts,
-            text="Сначала пробовать субтитры (быстро)",
+            text="Сначала субтитры (быстро)",
             variable=self.youtube_subs_first_var,
         )
         self.youtube_subs_first_check.pack(side=tk.LEFT)
-        self.youtube_download_video_check = ttk.Checkbutton(
+        self.youtube_fallback_stt_check = ttk.Checkbutton(
             youtube_opts,
-            text="Скачивать видео (для нарезки клипов)",
-            variable=self.youtube_download_video_var,
-            command=self._sync_youtube_options,
+            text="Если нет субтитров — STT (Whisper)",
+            variable=self.youtube_fallback_stt_var,
         )
-        self.youtube_download_video_check.pack(side=tk.LEFT, padx=(10, 0))
-        self.youtube_audio_only_check = ttk.Checkbutton(
+        self.youtube_fallback_stt_check.pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(youtube_opts, text="Язык:").pack(side=tk.LEFT, padx=(12, 2))
+        self.youtube_lang_var = tk.StringVar(value="Auto")
+        self.youtube_lang_combo = ttk.Combobox(
             youtube_opts,
-            text="Только аудио (быстрее)",
-            variable=self.youtube_audio_only_var,
-            command=self._sync_youtube_options,
+            textvariable=self.youtube_lang_var,
+            values=self.STT_LANG_CHOICES,
+            state="readonly",
+            width=8,
         )
-        self.youtube_audio_only_check.pack(side=tk.LEFT, padx=(10, 0))
+        self.youtube_lang_combo.pack(side=tk.LEFT)
 
         self.video_status_var = tk.StringVar(value="Видео не выбрано")
         ttk.Label(frame, textvariable=self.video_status_var, foreground="gray").pack(
@@ -24132,46 +24323,30 @@ class VideoClipCardsWindow:
         except Exception:
             pass
         try:
-            self.youtube_url_entry.configure(state=youtube_state)
+            self.youtube_url_entry.configure(state=tk.NORMAL)
+            self.youtube_paste_btn.configure(state=youtube_state)
+            self.youtube_clear_btn.configure(state=youtube_state)
             self.youtube_load_btn.configure(state=youtube_state)
             cancel_state = tk.NORMAL if (is_youtube and self.youtube_download_running) else tk.DISABLED
             self.youtube_cancel_btn.configure(state=cancel_state)
             self.youtube_subs_first_check.configure(state=youtube_state)
-            self.youtube_download_video_check.configure(state=youtube_state)
-            self.youtube_audio_only_check.configure(state=youtube_state)
+            self.youtube_fallback_stt_check.configure(state=youtube_state)
+            self.youtube_lang_combo.configure(state="readonly" if is_youtube else tk.DISABLED)
             if is_youtube:
                 self.youtube_url_entry.focus_set()
         except Exception:
             pass
-        self._sync_youtube_options()
-
-    def _sync_youtube_options(self) -> None:
-        if self.source_var.get() != "youtube":
-            try:
-                self.youtube_audio_only_check.configure(state=tk.DISABLED)
-            except Exception:
-                pass
-            return
-        if self.youtube_download_video_var.get():
-            self.youtube_audio_only_var.set(False)
-            try:
-                self.youtube_audio_only_check.configure(state=tk.DISABLED)
-            except Exception:
-                pass
-        else:
-            try:
-                self.youtube_audio_only_check.configure(state=tk.NORMAL)
-            except Exception:
-                pass
 
     def _set_youtube_controls_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
         try:
-            self.youtube_url_entry.configure(state=state)
+            self.youtube_url_entry.configure(state=tk.NORMAL)
+            self.youtube_paste_btn.configure(state=state)
+            self.youtube_clear_btn.configure(state=state)
             self.youtube_load_btn.configure(state=state)
             self.youtube_subs_first_check.configure(state=state)
-            self.youtube_download_video_check.configure(state=state)
-            self.youtube_audio_only_check.configure(state=state)
+            self.youtube_fallback_stt_check.configure(state=state)
+            self.youtube_lang_combo.configure(state="readonly" if enabled else tk.DISABLED)
         except Exception:
             pass
         cancel_state = tk.NORMAL if not enabled else tk.DISABLED
@@ -24186,7 +24361,7 @@ class VideoClipCardsWindow:
             self.youtube_status_var.set("⏳ Отменяю загрузку…")
 
     def _get_preferred_youtube_lang(self) -> str | None:
-        value = (self.stt_lang_var.get() or "").strip()
+        value = (self.youtube_lang_var.get() or "").strip()
         if not value or value.lower() == "auto":
             return None
         return value.split("-")[0].lower()
@@ -24201,41 +24376,47 @@ class VideoClipCardsWindow:
                     return path
         return candidates[0]
 
-    def _normalize_vtt_segments(self, segments: list[dict]) -> list[dict]:
-        merged: list[dict] = []
-        buffer_text = ""
-        buffer_start: float | None = None
-        buffer_end: float | None = None
-        for segment in segments:
-            text = " ".join(str(segment.get("text") or "").split())
-            if not text:
-                continue
-            if buffer_start is None:
-                buffer_start = float(segment.get("start", 0.0))
-            buffer_end = float(segment.get("end", buffer_start or 0.0))
-            if buffer_text:
-                buffer_text = f"{buffer_text} {text}"
-            else:
-                buffer_text = text
-            if text.endswith((".", "!", "?")) or len(buffer_text) > 160:
-                if buffer_text and buffer_text[-1] not in ".!?":
-                    buffer_text += "."
-                merged.append({"text": buffer_text.strip(), "start": buffer_start or 0.0, "end": buffer_end or 0.0})
-                buffer_text = ""
-                buffer_start = None
-                buffer_end = None
-        if buffer_text:
-            if buffer_text[-1] not in ".!?":
-                buffer_text += "."
-            merged.append({"text": buffer_text.strip(), "start": buffer_start or 0.0, "end": buffer_end or 0.0})
-        return merged
-
     def _apply_youtube_sentences(self, phrases: list[dict], status: str) -> None:
         self.stt_status_var.set(status)
         self.stt_source_var.set("Источник: субтитры YouTube (VTT)")
         self._set_stt_text_from_phrases(phrases)
-        self._set_sentences_from_phrases(phrases)
+        self._set_sentences_from_phrases(phrases, processed=True)
         self._update_save_pricing()
+
+    def _set_sentences_from_phrases(self, phrases: list[dict], *, processed: bool = False) -> None:
+        sentences = phrases if processed else segments_to_sentences(phrases)
+        self.sentences = []
+        self.stt_segments = phrases
+        self.selected_index = None
+        try:
+            self.sentences_tree.delete(*self.sentences_tree.get_children())
+        except Exception:
+            pass
+        for idx, sentence in enumerate(sentences, start=1):
+            text = str(sentence.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(sentence.get("start", 0.0))
+            end = float(sentence.get("end", start))
+            phrase_html = f"<div>{html.escape(text)}</div>"
+            entry = {
+                "index": idx,
+                "sentence": text,
+                "start": start,
+                "end": end,
+                "text_html": phrase_html,
+                "include": True,
+            }
+            self.sentences.append(entry)
+            self.sentences_tree.insert(
+                "",
+                "end",
+                iid=str(len(self.sentences) - 1),
+                values=("✅", len(self.sentences), text, f"{start:.2f}", f"{end:.2f}"),
+            )
+        if self.sentences:
+            self.sentences_tree.selection_set("0")
+            self._select_sentence(0)
 
     def _download_youtube_subtitles(
         self,
@@ -24248,23 +24429,79 @@ class VideoClipCardsWindow:
             import yt_dlp
         except Exception:
             return None
-        ydl_opts = {
+        base_opts = {
             "skip_download": True,
             "writesubtitles": True,
-            "writeautomaticsub": True,
+            "writeautomaticsub": False,
             "subtitlesformat": "vtt",
             "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
             "quiet": True,
         }
         if prefer_lang:
-            ydl_opts["subtitleslangs"] = [prefer_lang]
+            base_opts["subtitleslangs"] = [prefer_lang]
         if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
             return None
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(base_opts) as ydl:
+            ydl.extract_info(url, download=True)
+        subtitle_path = self._find_subtitle_file(cache_dir, video_id, prefer_lang)
+        if subtitle_path:
+            return subtitle_path
+        if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
+            return None
+        auto_opts = dict(base_opts)
+        auto_opts["writeautomaticsub"] = True
+        with yt_dlp.YoutubeDL(auto_opts) as ydl:
             ydl.extract_info(url, download=True)
         return self._find_subtitle_file(cache_dir, video_id, prefer_lang)
 
-    def _start_stt_from_audio(self, audio_path: str, source_label: str) -> None:
+    def _download_youtube_audio(self, url: str, cache_dir: str) -> str | None:
+        try:
+            import yt_dlp
+        except Exception:
+            return None
+        output_template = os.path.join(cache_dir, "audio.%(ext)s")
+
+        def _progress_hook(data):
+            if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
+                raise RuntimeError("cancelled")
+
+        ydl_opts = {
+            "quiet": True,
+            "outtmpl": output_template,
+            "format": "bestaudio/best",
+            "progress_hooks": [_progress_hook],
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        files = glob.glob(os.path.join(cache_dir, "audio.*"))
+        return files[0] if files else None
+
+    def _convert_audio_to_wav(self, input_path: str, cache_dir: str) -> str:
+        ffmpeg_path = find_ffmpeg()
+        if not ffmpeg_path:
+            raise RuntimeError("FFmpeg не найден для конвертации аудио.")
+        output_path = os.path.join(cache_dir, "source_audio.wav")
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            input_path,
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.exists(output_path):
+            raise RuntimeError(result.stderr or "FFmpeg error")
+        return output_path
+
+    def _start_stt_from_audio(self, audio_path: str, source_label: str, *, preprocessed: bool = False) -> None:
         if not audio_path or not os.path.exists(audio_path):
             messagebox.showwarning("YouTube", "Аудиофайл не найден для распознавания.", parent=self.win)
             return
@@ -24292,7 +24529,7 @@ class VideoClipCardsWindow:
                     audio_path,
                     lang=selected_lang,
                     punctuate=True,
-                    preprocessed=False,
+                    preprocessed=preprocessed,
                     progress_queue=self.stt_progress_queue,
                     cancel_event=self.stt_cancel_event,
                 )
@@ -24327,6 +24564,7 @@ class VideoClipCardsWindow:
             self._set_stt_progress_mode("determinate")
             self.stt_progress.configure(value=100)
             self.stt_status_var.set("✅ Готово")
+            self._update_save_pricing()
 
         def _runner() -> None:
             result = _worker()
@@ -24361,6 +24599,13 @@ class VideoClipCardsWindow:
         self._set_youtube_controls_enabled(False)
         self.youtube_status_var.set("⏳ Подключаюсь к YouTube…")
 
+        def _emit_status(message: str) -> None:
+            self.win.after(0, lambda: self.youtube_status_var.set(message))
+
+        def _check_cancel() -> None:
+            if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
+                raise RuntimeError("cancelled")
+
         def _worker() -> tuple[str, dict | None]:
             try:
                 with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
@@ -24380,58 +24625,33 @@ class VideoClipCardsWindow:
                 }
                 with open(meta_path, "w", encoding="utf-8") as handle:
                     json.dump(meta_payload, handle, ensure_ascii=False, indent=2)
-                if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
-                    return ("cancelled", None)
+                _check_cancel()
                 prefer_lang = self._get_preferred_youtube_lang()
                 if self.youtube_subs_first_var.get():
+                    _emit_status("⏳ Получаю субтитры…")
                     sub_path = self._download_youtube_subtitles(url, cache_dir, video_id, prefer_lang)
                     if sub_path and os.path.exists(sub_path):
                         segments = parse_webvtt(sub_path)
-                        phrases = self._normalize_vtt_segments(segments)
+                        phrases = segments_to_sentences(segments)
                         if phrases:
                             return ("subs", {"phrases": phrases, "video_id": video_id, "cache_dir": cache_dir})
-                if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
-                    return ("cancelled", None)
-                download_video = bool(self.youtube_download_video_var.get())
-                output_template = os.path.join(cache_dir, "video.%(ext)s" if download_video else "audio.%(ext)s")
-
-                def _progress_hook(data):
-                    if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
-                        raise RuntimeError("cancelled")
-
-                ydl_opts = {
-                    "quiet": True,
-                    "outtmpl": output_template,
-                    "progress_hooks": [_progress_hook],
-                }
-                if download_video:
-                    ydl_opts.update(
-                        {
-                            "format": "bv*+ba/b",
-                            "merge_output_format": "mp4",
-                        }
-                    )
-                else:
-                    ydl_opts.update({"format": "bestaudio/best"})
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                if self.youtube_cancel_event is not None and self.youtube_cancel_event.is_set():
-                    return ("cancelled", None)
-                if download_video:
-                    files = glob.glob(os.path.join(cache_dir, "video.*"))
-                    video_path = files[0] if files else None
-                    audio_path = None
-                else:
-                    files = glob.glob(os.path.join(cache_dir, "audio.*"))
-                    audio_path = files[0] if files else None
-                    video_path = None
+                _check_cancel()
+                if not self.youtube_fallback_stt_var.get():
+                    return ("nosubs", {"video_id": video_id, "cache_dir": cache_dir})
+                _emit_status("⏳ Скачиваю аудио…")
+                audio_path = self._download_youtube_audio(url, cache_dir)
+                if not audio_path:
+                    return ("error", {"message": "Не удалось скачать аудио."})
+                _check_cancel()
+                _emit_status("⏳ Конвертирую аудио…")
+                wav_path = self._convert_audio_to_wav(audio_path, cache_dir)
+                _check_cancel()
                 payload = {
                     "video_id": video_id,
                     "cache_dir": cache_dir,
-                    "video_path": video_path,
-                    "audio_path": audio_path,
+                    "audio_path": wav_path,
                 }
-                return ("media", payload)
+                return ("audio", payload)
             except RuntimeError as exc:
                 if "cancelled" in str(exc).lower():
                     return ("cancelled", None)
@@ -24463,37 +24683,23 @@ class VideoClipCardsWindow:
                     self.youtube_status_var.set("✅ Субтитры загружены")
                     self._apply_youtube_sentences(phrases, "✅ Субтитры YouTube")
                     return
-            if status == "media":
-                video_path = payload.get("video_path") if payload else None
+            if status == "nosubs":
+                self.youtube_status_var.set("⚠️ Субтитры не найдены")
+                return
+            if status == "audio":
                 audio_path = payload.get("audio_path") if payload else None
-                self.youtube_video_path = video_path
+                self.youtube_video_path = None
                 self.youtube_audio_path = audio_path
-                if video_path:
-                    self.video_path = video_path
-                    self._render_player(video_path)
-                    duration = get_video_duration_seconds(video_path)
-                    self.video_duration_sec = float(duration) if duration else None
-                    if duration:
-                        self.video_status_var.set(f"Длительность: {format_hms(int(duration))}")
-                        self.range_start_var.set("00:00:00")
-                        self.range_end_var.set(format_hms(int(duration)))
-                        self.range_status_var.set(f"Диапазон: 00:00:00 → {format_hms(int(duration))}")
-                    else:
-                        self.video_status_var.set("Видео загружено")
-                else:
-                    self.video_path = None
-                    self.video_status_var.set("Видео не загружено (только аудио)")
-                    for widget in self.player_frame.winfo_children():
-                        widget.destroy()
-                    ttk.Label(self.player_frame, text="Воспроизведение только аудио").pack(
-                        anchor="w", padx=6, pady=6
-                    )
+                self.video_path = None
+                self.video_status_var.set("Видео не загружено (только аудио)")
+                for widget in self.player_frame.winfo_children():
+                    widget.destroy()
+                ttk.Label(self.player_frame, text="Воспроизведение только аудио").pack(
+                    anchor="w", padx=6, pady=6
+                )
                 if audio_path:
                     self.youtube_status_var.set("⏳ Распознаю аудио…")
-                    self._start_stt_from_audio(audio_path, "Источник: YouTube audio")
-                elif video_path:
-                    self.youtube_status_var.set("⏳ Распознаю видео…")
-                    self._request_stt()
+                    self._start_stt_from_audio(audio_path, "Источник: YouTube audio", preprocessed=True)
                 else:
                     self.youtube_status_var.set("⚠️ Аудио не найдено для распознавания")
 
@@ -24701,11 +24907,13 @@ class VideoClipCardsWindow:
         frame = ttk.LabelFrame(parent, text="Фразы и таймкоды")
         frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
 
-        columns = ("№", "Фраза", "Start", "End")
+        columns = ("✓", "№", "Фраза", "Start", "End")
         self.sentences_tree = ttk.Treeview(frame, columns=columns, show="headings", height=8)
         for col in columns:
             self.sentences_tree.heading(col, text=col)
             self.sentences_tree.column(col, width=90)
+        self.sentences_tree.column("✓", width=40, anchor="center")
+        self.sentences_tree.column("№", width=50, anchor="center")
         self.sentences_tree.column("Фраза", width=520)
         self.sentences_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=6)
 
@@ -24714,6 +24922,7 @@ class VideoClipCardsWindow:
         self.sentences_tree.configure(yscrollcommand=scrollbar.set)
 
         self.sentences_tree.bind("<<TreeviewSelect>>", self._on_sentence_select)
+        self.sentences_tree.bind("<Button-1>", self._on_sentence_click, add=True)
 
         action_row = ttk.Frame(parent)
         action_row.pack(fill=tk.X, padx=12, pady=(0, 8))
@@ -24782,7 +24991,7 @@ class VideoClipCardsWindow:
 
         self.save_btn = tk.Button(
             cost_row,
-            text="Сохранить — 0",
+            text="Сгенерировать карточки — 0",
             image=coin_icon,
             compound=tk.LEFT,
             padx=10,
@@ -25057,6 +25266,7 @@ class VideoClipCardsWindow:
             raise RuntimeError("FFmpeg не найден для нарезки аудио.")
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{base_name}.wav")
+        duration = max(0.1, float(end_sec) - float(start_sec))
         cmd = [
             ffmpeg_path,
             "-hide_banner",
@@ -25066,10 +25276,10 @@ class VideoClipCardsWindow:
             "-y",
             "-ss",
             f"{start_sec:.3f}",
-            "-to",
-            f"{end_sec:.3f}",
             "-i",
             source_path,
+            "-t",
+            f"{duration:.3f}",
             "-acodec",
             "pcm_s16le",
             "-ar",
@@ -25312,34 +25522,7 @@ class VideoClipCardsWindow:
             self.stt_text.insert("1.0", text_value)
 
     def _build_phrases_from_result(self, phrases: list[dict]) -> None:
-        self.sentences = []
-        self.stt_segments = []
-        self.sentences_tree.delete(*self.sentences_tree.get_children())
-        start_index = 0
-        for idx, phrase in enumerate(phrases, start=1):
-            text = str(phrase.get("text") or "").strip()
-            if not text:
-                continue
-            start = float(phrase.get("start", 0.0))
-            end = float(phrase.get("end", start))
-            phrase_html = f"<div>{html.escape(text)}</div>"
-            entry = {
-                "index": start_index + idx,
-                "sentence": text,
-                "start": start,
-                "end": end,
-                "text_html": phrase_html,
-            }
-            self.sentences.append(entry)
-            self.sentences_tree.insert(
-                "",
-                "end",
-                iid=str(len(self.sentences) - 1),
-                values=(len(self.sentences), text, f"{start:.2f}", f"{end:.2f}"),
-            )
-        if self.sentences:
-            self.sentences_tree.selection_set("0")
-            self._select_sentence(0)
+        self._set_sentences_from_phrases(phrases)
 
     def _on_sentence_select(self, _event=None) -> None:
         selection = self.sentences_tree.selection()
@@ -25347,6 +25530,29 @@ class VideoClipCardsWindow:
             return
         idx = int(selection[0])
         self._select_sentence(idx)
+
+    def _on_sentence_click(self, event) -> str | None:
+        region = self.sentences_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return None
+        column = self.sentences_tree.identify_column(event.x)
+        if column != "#1":
+            return None
+        item_id = self.sentences_tree.identify_row(event.y)
+        if not item_id:
+            return None
+        idx = int(item_id)
+        if idx < 0 or idx >= len(self.sentences):
+            return None
+        entry = self.sentences[idx]
+        entry["include"] = not bool(entry.get("include", True))
+        marker = "✅" if entry["include"] else ""
+        values = list(self.sentences_tree.item(item_id, "values"))
+        if values:
+            values[0] = marker
+            self.sentences_tree.item(item_id, values=values)
+        self._update_save_pricing()
+        return "break"
 
     def _select_sentence(self, idx: int) -> None:
         if idx < 0 or idx >= len(self.sentences):
@@ -25614,12 +25820,15 @@ class VideoClipCardsWindow:
             return 10
         return 25
 
+    def _get_included_sentences(self) -> list[dict]:
+        return [sentence for sentence in self.sentences if sentence.get("include", True)]
+
     def _update_save_pricing(self) -> None:
-        count = len(self.sentences)
+        count = len(self._get_included_sentences())
         price = self._get_video_clip_card_price()
         total = price * count
         self.save_total_var.set(str(total))
-        self.save_btn.configure(text=f"Сохранить — {total}")
+        self.save_btn.configure(text=f"Сгенерировать карточки — {total}")
         if self.stt_running:
             self.save_btn.configure(state=tk.DISABLED, image=self.coin_icon_disabled or self.coin_icon)
             self.save_hint_var.set("Идёт распознавание…")
@@ -25630,7 +25839,7 @@ class VideoClipCardsWindow:
             return
         if count == 0:
             self.save_btn.configure(state=tk.DISABLED, image=self.coin_icon_disabled or self.coin_icon)
-            self.save_hint_var.set("Нет предложений")
+            self.save_hint_var.set("Нет выбранных предложений")
             return
         if not self.app.can_afford(total):
             self.save_btn.configure(state=tk.DISABLED, image=self.coin_icon_disabled or self.coin_icon)
@@ -25645,11 +25854,12 @@ class VideoClipCardsWindow:
         if not video_source and not audio_source:
             messagebox.showwarning("Видео", "Сначала выберите видео файл или YouTube-источник.", parent=self.win)
             return
-        if not self.sentences:
-            messagebox.showwarning("Сохранение", "Нет предложений для сохранения.", parent=self.win)
+        selected_sentences = self._get_included_sentences()
+        if not selected_sentences:
+            messagebox.showwarning("Сохранение", "Нет выбранных предложений для сохранения.", parent=self.win)
             return
         price = self._get_video_clip_card_price()
-        total_cost = price * len(self.sentences)
+        total_cost = price * len(selected_sentences)
         if not self.app.can_afford(total_cost):
             self._update_save_pricing()
             messagebox.showwarning("Кредиты", "Недостаточно кредитов.", parent=self.win)
@@ -25671,10 +25881,10 @@ class VideoClipCardsWindow:
                     self.app.user_id,
                     total_cost,
                     "video_clip_cards",
-                    meta={"deck_id": self.deck_id, "count": len(self.sentences)},
+                    meta={"deck_id": self.deck_id, "count": len(selected_sentences)},
                 )
                 created = 0
-                for idx, sentence in enumerate(self.sentences, start=1):
+                for idx, sentence in enumerate(selected_sentences, start=1):
                     base_name = f"clip_{idx}"
                     clip_path = None
                     poster_path = None
