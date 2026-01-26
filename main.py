@@ -4656,8 +4656,8 @@ def update_card_rich_text(
     card_id: int,
     front: str,
     back: str,
-    front_rich: dict | None,
-    back_rich: dict | None,
+    front_rich: dict | str | None,
+    back_rich: dict | str | None,
 ) -> bool:
     try:
         conn = get_connection()
@@ -8149,6 +8149,8 @@ class CardRenderer:
         *,
         fallback_text: str = "",
     ) -> None:
+        if not isinstance(widget, tk.Text):
+            return
         self._suppress_modified = True
         self._ensure_format_tags(widget)
         plain_text = fallback_text
@@ -8161,12 +8163,16 @@ class CardRenderer:
                     plain_text = parsed.get("text") or plain_text
             except Exception:
                 pass
-        apply_rich_to_text(
-            widget,
-            plain_text,
-            rich_doc,
-            readonly=not self.inline_editing,
-        )
+        try:
+            apply_rich_to_text(
+                widget,
+                plain_text,
+                rich_doc,
+                readonly=not self.inline_editing,
+            )
+        except Exception as exc:
+            print("Rich render failed, fallback to plain text:", exc)
+            self._set_text_widget_content(widget, plain_text)
         try:
             widget.edit_modified(False)
         except Exception:
@@ -8957,43 +8963,29 @@ def render_rich_to_container(parent: tk.Widget, rich_doc: dict, card_bg: str, ca
     text_widget = tk.Text(
         parent,
         wrap=tk.WORD,
-        bg="white",
+        bg=card_bg,
         fg=card_text_color,
         relief=tk.FLAT,
         bd=0,
         height=10,
     )
     text_widget.pack(fill=tk.BOTH, expand=True)
-    text_widget.configure(state=tk.NORMAL)
-    text_widget.delete("1.0", tk.END)
-    text_widget.insert("1.0", rich_doc.get("text") or "")
-    for tag_info in rich_doc.get("tags", []) or []:
-        tag_name = tag_info.get("name")
-        if not tag_name:
-            continue
-        config = tag_info.get("config") or {}
-        safe_config: dict[str, object] = {}
-        for key, value in config.items():
-            if value in ("", None):
-                continue
-            if key in ("underline", "offset"):
-                try:
-                    value = int(value)
-                except (TypeError, ValueError):
-                    pass
-            safe_config[key] = value
-        if safe_config:
-            try:
-                text_widget.tag_configure(tag_name, **safe_config)
-            except tk.TclError:
-                pass
-        ranges = tag_info.get("ranges") or []
-        for start, end in ranges:
-            try:
-                text_widget.tag_add(tag_name, start, end)
-            except tk.TclError:
-                pass
-    text_widget.configure(state=tk.DISABLED)
+    plain_text = ""
+    if isinstance(rich_doc, dict):
+        plain_text = rich_doc.get("text") or ""
+    try:
+        apply_rich_to_text(
+            text_widget,
+            plain_text,
+            rich_doc,
+            readonly=True,
+        )
+    except Exception as exc:
+        print("Rich render failed in container, fallback to plain text:", exc)
+        text_widget.configure(state=tk.NORMAL)
+        text_widget.delete("1.0", tk.END)
+        text_widget.insert("1.0", plain_text)
+        text_widget.configure(state=tk.DISABLED)
     return text_widget
 
 
