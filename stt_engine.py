@@ -44,14 +44,19 @@ def _extract_wav(
     ffmpeg_path = _find_ffmpeg()
     tmp_dir = tempfile.gettempdir()
     output_path = os.path.join(tmp_dir, f"stt_engine_{uuid.uuid4().hex}.wav")
+    duration = None
+    if end is not None:
+        duration = max(0.1, float(end) - float(start or 0.0))
     cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error", "-nostdin"]
     if start is not None:
         cmd += ["-ss", str(start)]
-    if end is not None:
-        cmd += ["-to", str(end)]
     cmd += [
         "-i",
         input_path,
+    ]
+    if duration is not None:
+        cmd += ["-t", f"{duration:.3f}"]
+    cmd += [
         "-vn",
         "-ac",
         "1",
