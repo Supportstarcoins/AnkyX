@@ -8708,6 +8708,75 @@ def export_text_and_rich(text_widget: tk.Text) -> tuple[str, str | None]:
     return plain_text, rich_json
 
 
+def ensure_fmt_tags(text_widget: tk.Text) -> None:
+    base_font = tkfont.Font(font=text_widget.cget("font"))
+    bold = base_font.copy()
+    bold.configure(weight="bold")
+    italic = base_font.copy()
+    italic.configure(slant="italic")
+    fonts_cache = getattr(text_widget, "_anky_fonts", {})
+    fonts_cache["bold"] = bold
+    fonts_cache["italic"] = italic
+    text_widget._anky_fonts = fonts_cache
+    text_widget.tag_configure("fmt_bold", font=bold)
+    text_widget.tag_configure("fmt_italic", font=italic)
+    text_widget.tag_configure("fmt_underline", underline=1)
+    text_widget.tag_configure("fmt_highlight", background="#fff59d")
+
+
+def apply_rich(
+    text_widget: tk.Text,
+    plain: str,
+    rich_json: str | dict | None,
+    readonly: bool,
+) -> None:
+    text_widget.configure(state=tk.NORMAL)
+    text_widget.delete("1.0", tk.END)
+    payload: dict | None = None
+    if rich_json:
+        if isinstance(rich_json, dict):
+            payload = rich_json
+        else:
+            try:
+                payload = json.loads(rich_json)
+            except Exception:
+                payload = None
+    if payload and isinstance(payload, dict) and payload.get("v") == 1:
+        text_widget.insert("1.0", payload.get("text", ""))
+        tag_configs = payload.get("cfg") or payload.get("tag_configs") or {}
+        if not tag_configs:
+            ensure_fmt_tags(text_widget)
+        for tag_name, config in (tag_configs or {}).items():
+            safe_config: dict[str, object] = {}
+            for key, value in (config or {}).items():
+                if value in ("", None):
+                    continue
+                safe_config[key] = value
+            if safe_config:
+                try:
+                    text_widget.tag_configure(tag_name, **safe_config)
+                except tk.TclError:
+                    pass
+        for tag_info in payload.get("tags", []):
+            name = tag_info.get("name")
+            start = tag_info.get("start")
+            end = tag_info.get("end")
+            if not name or not start or not end:
+                continue
+            if name.startswith("fmt_color_") and name not in tag_configs:
+                try:
+                    text_widget.tag_configure(name, foreground=name.replace("fmt_color_", ""))
+                except tk.TclError:
+                    pass
+            try:
+                text_widget.tag_add(name, start, end)
+            except tk.TclError:
+                pass
+    else:
+        import_text_with_tags(text_widget, plain or "", payload if payload is not None else rich_json)
+    text_widget.configure(state=tk.DISABLED if readonly else tk.NORMAL)
+
+
 def export_text_with_tags(
     text_widget: tk.Text,
     allowed_prefixes: tuple[str, ...] = ("fmt_",),
@@ -8846,9 +8915,7 @@ def apply_rich_to_text(
     *,
     readonly: bool,
 ) -> None:
-    text_widget.configure(state=tk.NORMAL)
-    import_text_with_tags(text_widget, plain_text, rich_json)
-    text_widget.configure(state=tk.DISABLED if readonly else tk.NORMAL)
+    apply_rich(text_widget, plain_text, rich_json, readonly=readonly)
 
 
 def text_widget_to_html(text_widget: tk.Text) -> str:
@@ -18111,13 +18178,27 @@ class AnkiApp(tk.Tk):
 
             def make_save_handler(card_id, tf, tb, fimg_var, bimg_var):
                 def handler():
-                    f = tf.get("1.0", tk.END).strip()
-                    b = tb.get("1.0", tk.END).strip()
+                    f, f_rich = export_text_and_rich(tf)
+                    b, b_rich = export_text_and_rich(tb)
                     conn = get_connection()
                     cur = conn.cursor()
                     cur.execute(
-                        "UPDATE cards SET front = ?, back = ?, front_image_path = ?, back_image_path = ? WHERE id = ?;",
-                        (f, b, fimg_var.get() or None, bimg_var.get() or None, card_id)
+                        """
+                        UPDATE cards
+                           SET front = ?, back = ?,
+                               front_rich = ?, back_rich = ?,
+                               front_image_path = ?, back_image_path = ?
+                         WHERE id = ?;
+                        """,
+                        (
+                            f,
+                            b,
+                            f_rich,
+                            b_rich,
+                            fimg_var.get() or None,
+                            bimg_var.get() or None,
+                            card_id,
+                        ),
                     )
                     conn.commit()
                     conn.close()
