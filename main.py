@@ -75,6 +75,7 @@ import collections
 import html
 import math
 from html.parser import HTMLParser
+from chat_bot_tab import ChatBotTab
 from csv_importer import (
     attach_image_if_exists,
     detect_encoding,
@@ -10356,6 +10357,8 @@ class AnkiApp(tk.Tk):
         self.main_notebook: ttk.Notebook | None = None
         self.dashboard_tab: ttk.Frame | None = None
         self.personal_tab = None
+        self.chatbot_tab: ChatBotTab | None = None
+        self.chatbot_tab_frame: ttk.Frame | None = None
         self.settings_tab: ttk.Frame | None = None
         self.stats_tab: ttk.Frame | None = None
         self.ledger_tree: ttk.Treeview | None = None
@@ -14364,6 +14367,11 @@ class AnkiApp(tk.Tk):
         self.personal_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
         self.main_notebook.add(self.personal_tab, text="Личный кабинет")
 
+        self.chatbot_tab_frame = ttk.Frame(self.main_notebook, style="Surface.TFrame")
+        self.main_notebook.add(self.chatbot_tab_frame, text="Чат-бот")
+        self.chatbot_tab = ChatBotTab(self.chatbot_tab_frame, app=self)
+        self.chatbot_tab.pack(fill=tk.BOTH, expand=True)
+
         self.settings_tab = ttk.Frame(self.main_notebook, style="Surface.TFrame")
         self.main_notebook.add(self.settings_tab, text="Настройки")
 
@@ -14597,6 +14605,9 @@ class AnkiApp(tk.Tk):
             except Exception:
                 continue
         self.refresh_generation_menu_state()
+
+    def refresh_balance_ui(self) -> None:
+        self._after_balance_change()
 
     def register_balance_observer(self, handler) -> None:
         if handler not in self.balance_observers:
@@ -16089,6 +16100,8 @@ class AnkiApp(tk.Tk):
             self.selected_phase = None
             self.after(50, self.update_overdue_badge)
             self.update_deck_preview()
+            if self.chatbot_tab:
+                self.chatbot_tab.refresh_deck_options()
             self._refresh_in_progress = False
 
         def on_error(exc):
