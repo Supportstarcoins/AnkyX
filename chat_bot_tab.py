@@ -9,6 +9,7 @@ from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from card_widget import CardWidget
 from chatbot_models import ChatSession, DraftBatch, DraftCard, Message
 from credit_manager import CreditManager
 from csv_importer import upsert_note_and_cards
@@ -32,7 +33,7 @@ class CardPreviewWidget(ttk.Frame):
         self.prev_btn = ttk.Button(nav_frame, text="◀", width=3, command=self._prev)
         self.prev_btn.pack(side=tk.LEFT)
 
-        self.index_var = tk.StringVar(value="0/0")
+        self.index_var = tk.StringVar(value="Карточка 0/0")
         ttk.Label(nav_frame, textvariable=self.index_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
 
         self.next_btn = ttk.Button(nav_frame, text="▶", width=3, command=self._next)
@@ -41,17 +42,15 @@ class CardPreviewWidget(ttk.Frame):
         self.toggle_btn = ttk.Button(nav_frame, text="Показать BACK", command=self._toggle_side)
         self.toggle_btn.pack(side=tk.RIGHT)
 
-        self.preview_text = tk.Text(
+        self.card_widget = CardWidget(
             self,
-            height=6,
-            wrap=tk.WORD,
-            bg=self.palette.get("panel"),
-            fg=self.palette.get("text"),
-            relief="flat",
-            bd=0,
+            palette=self.palette,
+            editable=False,
+            width=620,
+            height=220,
+            show_image_toolbar=False,
         )
-        self.preview_text.pack(fill=tk.BOTH, expand=True, pady=(8, 6))
-        self.preview_text.configure(state=tk.DISABLED)
+        self.card_widget.pack(fill=tk.BOTH, expand=True, pady=(8, 6))
 
         self.media_var = tk.StringVar(value="")
         self.media_label = ttk.Label(self, textvariable=self.media_var, style="Muted.TLabel")
@@ -62,11 +61,34 @@ class CardPreviewWidget(ttk.Frame):
 
         self._update_ui_state()
 
-    def set_cards(self, cards: list[DraftCard], total_credits: int) -> None:
-        self.cards = cards
-        self.total_credits = total_credits
-        self.current_index = 0
+    def set_cards(self, cards: list[DraftCard], start_index: int = 0, total_credits: int | None = None) -> None:
+        self.cards = list(cards)
+        if total_credits is not None:
+            self.total_credits = total_credits
+        if self.cards:
+            self.current_index = max(0, min(start_index, len(self.cards) - 1))
+        else:
+            self.current_index = 0
         self.show_back = False
+        self._render()
+
+    def append_cards(
+        self,
+        cards: list[DraftCard],
+        select_last: bool = True,
+        total_credits: int | None = None,
+    ) -> None:
+        if not cards:
+            return
+        previous_count = len(self.cards)
+        self.cards.extend(cards)
+        if total_credits is not None:
+            self.total_credits = total_credits
+        if select_last:
+            self.current_index = len(self.cards) - 1
+            self.show_back = False
+        elif previous_count == 0:
+            self.current_index = 0
         self._render()
 
     def clear(self) -> None:
@@ -75,6 +97,27 @@ class CardPreviewWidget(ttk.Frame):
         self.current_index = 0
         self.show_back = False
         self._render()
+
+    def next_card(self) -> None:
+        if self.current_index < len(self.cards) - 1:
+            self.current_index += 1
+            self._render()
+
+    def prev_card(self) -> None:
+        if self.current_index > 0:
+            self.current_index -= 1
+            self._render()
+
+    def get_current_card(self) -> DraftCard | None:
+        if not self.cards:
+            return None
+        return self.cards[self.current_index]
+
+    def update_counter_label(self) -> None:
+        if not self.cards:
+            self.index_var.set("Карточка 0/0")
+            return
+        self.index_var.set(f"Карточка {self.current_index + 1}/{len(self.cards)}")
 
     def set_save_state(self, enabled: bool, total_credits: int | None = None) -> None:
         if total_credits is not None:
@@ -86,8 +129,9 @@ class CardPreviewWidget(ttk.Frame):
 
     def _render(self) -> None:
         if not self.cards:
-            self._set_text("Черновик пуст. Сначала сформируйте карточки.")
-            self.index_var.set("0/0")
+            self.card_widget.set_text("Черновик пуст. Сначала сформируйте карточки.", "")
+            self.card_widget.show_side(False)
+            self.update_counter_label()
             self.media_var.set("")
             self.toggle_btn.configure(state=tk.DISABLED)
             self.prev_btn.configure(state=tk.DISABLED)
@@ -95,21 +139,16 @@ class CardPreviewWidget(ttk.Frame):
             self.set_save_state(False, 0)
             return
         card = self.cards[self.current_index]
-        content = card.back if self.show_back else card.front
-        self._set_text(content)
-        self.index_var.set(f"{self.current_index + 1}/{len(self.cards)}")
+        self.card_widget.set_text(card.front, card.back)
+        self.card_widget.show_side(self.show_back)
+        self.update_counter_label()
         self.media_var.set("Медиа: есть" if card.media else "")
         self.toggle_btn.configure(text="Показать FRONT" if self.show_back else "Показать BACK")
         self.toggle_btn.configure(state=tk.NORMAL)
-        self.prev_btn.configure(state=(tk.NORMAL if self.current_index > 0 else tk.DISABLED))
-        self.next_btn.configure(state=(tk.NORMAL if self.current_index < len(self.cards) - 1 else tk.DISABLED))
+        allow_nav = len(self.cards) > 1
+        self.prev_btn.configure(state=(tk.NORMAL if allow_nav and self.current_index > 0 else tk.DISABLED))
+        self.next_btn.configure(state=(tk.NORMAL if allow_nav and self.current_index < len(self.cards) - 1 else tk.DISABLED))
         self.set_save_state(True, self.total_credits)
-
-    def _set_text(self, text: str) -> None:
-        self.preview_text.configure(state=tk.NORMAL)
-        self.preview_text.delete("1.0", tk.END)
-        self.preview_text.insert(tk.END, text)
-        self.preview_text.configure(state=tk.DISABLED)
 
     def _toggle_side(self) -> None:
         if not self.cards:
@@ -119,18 +158,16 @@ class CardPreviewWidget(ttk.Frame):
         self._render()
 
     def _prev(self) -> None:
-        if self.current_index > 0:
-            self.current_index -= 1
-            self._render()
+        self.prev_card()
 
     def _next(self) -> None:
-        if self.current_index < len(self.cards) - 1:
-            self.current_index += 1
-            self._render()
+        self.next_card()
 
     def _update_ui_state(self) -> None:
         self.set_save_state(False, 0)
-        self._set_text("Черновик пуст. Сначала сформируйте карточки.")
+        self.card_widget.set_text("Черновик пуст. Сначала сформируйте карточки.", "")
+        self.card_widget.show_side(False)
+        self.update_counter_label()
         self.toggle_btn.configure(state=tk.DISABLED)
         self.prev_btn.configure(state=tk.DISABLED)
         self.next_btn.configure(state=tk.DISABLED)
@@ -518,10 +555,25 @@ class ChatBotTab(ttk.Frame):
         return self.engine.generate_from_text(text, deck_context)
 
     def _on_generation_success(self, draft: DraftBatch) -> None:
-        self.current_draft = draft
-        self.card_preview.set_cards(draft.cards, draft.total_credits)
+        if self.current_draft and self.current_draft.cards and self.current_draft.deck_id == draft.deck_id:
+            self.current_draft.cards.extend(draft.cards)
+            self.current_draft.total_credits = self._calculate_total_credits(self.current_draft.cards)
+            self.card_preview.append_cards(draft.cards, select_last=True, total_credits=self.current_draft.total_credits)
+            total_cards = len(self.current_draft.cards)
+            self._append_message(
+                "assistant",
+                f"Добавлено {len(draft.cards)} карточек. Всего: {total_cards}.",
+            )
+        else:
+            draft.total_credits = self._calculate_total_credits(draft.cards)
+            self.current_draft = draft
+            self.card_preview.set_cards(draft.cards, start_index=0, total_credits=draft.total_credits)
+            self._append_message("assistant", f"Сформирован черновик на {len(draft.cards)} карточек.")
         self._update_save_button_state()
-        self._append_message("assistant", f"Сформирован черновик на {len(draft.cards)} карточек.")
+
+    def _calculate_total_credits(self, cards: list[DraftCard]) -> int:
+        plan = self.app.get_pricing_plan()
+        return self.engine.estimate_cost(len(cards), plan)
 
     def _on_generation_error(self, message: str) -> None:
         self._append_message("system", f"Ошибка генерации: {message}")
