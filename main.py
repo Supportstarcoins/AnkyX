@@ -21935,6 +21935,136 @@ class ReviewSession:
         return result
 
 
+class RepeatModeCardView(ttk.Frame):
+    def __init__(
+        self,
+        master: tk.Widget,
+        *,
+        palette: dict | None = None,
+        card_width: int = CARD_VIEW_WIDTH,
+        card_height: int = CARD_VIEW_HEIGHT,
+        on_checkpoint_change=None,
+        on_media_state_change=None,
+        enable_state_restore: bool = False,
+    ) -> None:
+        super().__init__(master, style="Surface.TFrame")
+        self.palette = palette or getattr(master, "palette", None) or {}
+        self._on_checkpoint_change = on_checkpoint_change
+        self._checkpoint_buttons: list[tk.Checkbutton] = []
+
+        colors = self.palette
+        card_bg, card_text, _ = get_card_surface_colors(master)
+
+        self.status_label = ttk.Label(self, text="")
+        self.status_label.pack(anchor="w")
+
+        self.timer_label = tk.Label(
+            self,
+            text="⏰ 00:00",
+            bg=colors["background"] if colors else self.cget("bg"),
+            fg=colors["error"] if colors else "#FF4D4D",
+            font=("Segoe UI", 11, "bold"),
+        )
+        self.timer_label.pack(anchor="center", pady=(3, 5))
+
+        cards_bg = tk.Frame(self, bg=DARK_BG)
+        cards_bg.pack(fill=tk.BOTH, expand=True, pady=10)
+        card_wrap = tk.Frame(
+            cards_bg,
+            bg=DARK_BG,
+            highlightbackground=CARD_BORDER,
+            highlightthickness=1,
+            bd=0,
+            width=card_width,
+            height=card_height,
+        )
+        card_wrap.pack(padx=10, pady=10)
+        card_wrap.pack_propagate(False)
+
+        self.card_frame = card_wrap
+        self.card_renderer = CardRenderer(
+            self.card_frame,
+            palette=colors,
+            editable=False,
+            width=card_width,
+            height=card_height,
+            show_image_toolbar=False,
+            image_layout="side",
+            on_media_state_change=on_media_state_change,
+            enable_state_restore=enable_state_restore,
+            fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
+            render_mode="repeat",
+        )
+
+        self.checkpoint_frame = tk.Frame(cards_bg, bg=card_bg)
+        self.checkpoint_frame.pack(pady=(0, 8))
+
+        self.checkpoint_vars = []
+        for i in range(6):
+            var = tk.BooleanVar(value=False)
+            self.checkpoint_vars.append(var)
+            cb = tk.Checkbutton(
+                self.checkpoint_frame,
+                text=f"✓{i+1}",
+                variable=var,
+                bg=card_bg,
+                fg=card_text,
+                command=lambda idx=i: self._handle_checkpoint_change(idx),
+            )
+            cb.pack(side=tk.LEFT, padx=5)
+            self._checkpoint_buttons.append(cb)
+
+        self._current_card: dict | None = None
+        self._show_back = False
+
+    def _handle_checkpoint_change(self, idx: int) -> None:
+        if callable(self._on_checkpoint_change):
+            self._on_checkpoint_change(idx)
+
+    def load_card(
+        self,
+        card: dict,
+        *,
+        status_text: str,
+        header_text: str,
+        show_back: bool = False,
+        image_override: str | None = None,
+    ) -> None:
+        self._current_card = card
+        self._show_back = show_back
+        self.set_status_text(status_text)
+        self.card_renderer.set_header_text(header_text)
+        self.card_renderer.update_text(card, show_back=show_back, image_override=image_override)
+
+    def show_front(self) -> None:
+        self._show_back = False
+        if self._current_card:
+            self.card_renderer.update_text(self._current_card, show_back=False)
+
+    def show_back(self) -> None:
+        self._show_back = True
+        if self._current_card:
+            self.card_renderer.update_text(self._current_card, show_back=True)
+
+    def set_rating_enabled(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for cb in self._checkpoint_buttons:
+            cb.configure(state=state)
+
+    def set_checkpoint_states(self, states: list[bool]) -> None:
+        for idx, var in enumerate(self.checkpoint_vars):
+            try:
+                var.set(bool(states[idx]))
+            except Exception:
+                var.set(False)
+
+    def set_timer_text(self, text: str) -> None:
+        self.timer_label.configure(text=text)
+
+    def set_status_text(self, text: str) -> None:
+        self.status_label.configure(text=text)
+
+
 def open_card_versions_window(
     parent: tk.Misc,
     card_id: int,
@@ -22355,72 +22485,23 @@ class RepeatWindow(tk.Toplevel):
         frame_main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         colors = getattr(self.master, "palette", None)
-        card_bg, card_text, _ = get_card_surface_colors(self.master)
-
-        # Статус
-        self.lbl_status = ttk.Label(frame_main, text="")
-        self.lbl_status.pack(anchor="w")
-
-        # Таймер
-        self.timer_label = tk.Label(
+        self.card_view = RepeatModeCardView(
             frame_main,
-            text="⏰ 00:00",
-            bg=colors["background"] if colors else self.cget("bg"),
-            fg=colors["error"] if colors else "#FF4D4D",
-            font=("Segoe UI", 11, "bold"),
-        )
-        self.timer_label.pack(anchor="center", pady=(3, 5))
-
-        # Основной фрейм карточки
-        cards_bg = tk.Frame(frame_main, bg=DARK_BG)
-        cards_bg.pack(fill=tk.BOTH, expand=True, pady=10)
-        card_wrap = tk.Frame(
-            cards_bg,
-            bg=DARK_BG,
-            highlightbackground=CARD_BORDER,
-            highlightthickness=1,
-            bd=0,
-            width=CARD_VIEW_WIDTH,
-            height=CARD_VIEW_HEIGHT,
-        )
-        card_wrap.pack(padx=10, pady=10)
-        card_wrap.pack_propagate(False)
-        self.card_frame = card_wrap
-        self.card_renderer = CardRenderer(
-            self.card_frame,
             palette=colors,
-            editable=False,
-            width=CARD_VIEW_WIDTH,
-            height=CARD_VIEW_HEIGHT,
-            show_image_toolbar=False,
-            image_layout="side",
+            on_checkpoint_change=self.update_checkpoint_state,
             on_media_state_change=self._handle_media_state_update,
             enable_state_restore=True,
-            fixed_media_slot=REPEAT_MEDIA_SLOT_SIZE,
-            render_mode="repeat",
         )
+        self.card_view.pack(fill=tk.BOTH, expand=True)
+        self.lbl_status = self.card_view.status_label
+        self.timer_label = self.card_view.timer_label
+        self.card_frame = self.card_view.card_frame
+        self.card_renderer = self.card_view.card_renderer
         self.card_renderer._on_dirty_changed = self._on_inline_dirty_changed
         self.card_renderer._on_request_save = self._on_inline_autosave_request
         self.card_renderer._on_status = self._on_inline_status
-
-        # Фрейм для 6-клеточного чекпоинта (внизу карточки)
-        self.checkpoint_frame = tk.Frame(cards_bg, bg=card_bg)
-        self.checkpoint_frame.pack(pady=(0, 8))
-        
-        # Создаем 6 чекбоксов в ряд
-        self.checkpoint_vars = []
-        for i in range(6):
-            var = tk.BooleanVar(value=False)
-            self.checkpoint_vars.append(var)
-            cb = tk.Checkbutton(
-                self.checkpoint_frame,
-                text=f"✓{i+1}",
-                variable=var,
-                bg=card_bg,
-                fg=card_text,
-                command=lambda idx=i: self.update_checkpoint_state(idx)
-            )
-            cb.pack(side=tk.LEFT, padx=5)
+        self.checkpoint_frame = self.card_view.checkpoint_frame
+        self.checkpoint_vars = self.card_view.checkpoint_vars
 
         self.audio_inline_frame = self.card_renderer.audio_frame
         self.video_inline_frame = self.card_renderer.video_frame

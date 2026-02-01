@@ -4,7 +4,7 @@ import json
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -15,6 +15,9 @@ from credit_manager import CreditManager
 from csv_importer import upsert_note_and_cards
 from db_connect import open_db
 from mock_ai_engine import MockAIEngine
+
+if TYPE_CHECKING:
+    from main import RepeatModeCardView
 
 
 class CardPreviewWidget(ttk.Frame):
@@ -173,6 +176,27 @@ class CardPreviewWidget(ttk.Frame):
         self.next_btn.configure(state=tk.DISABLED)
 
 
+def draft_to_card(draft: DraftCard) -> dict:
+    media = getattr(draft, "media", {}) or {}
+    meta = getattr(draft, "meta", {}) or {}
+    return {
+        "id": meta.get("id") or meta.get("temp_id") or -1,
+        "deck_id": meta.get("deck_id"),
+        "front": getattr(draft, "front", "") or "",
+        "back": getattr(draft, "back", "") or "",
+        "front_rich": meta.get("front_rich"),
+        "back_rich": meta.get("back_rich"),
+        "front_html": meta.get("front_html"),
+        "back_html": meta.get("back_html"),
+        "front_image_path": media.get("front_image_path"),
+        "back_image_path": media.get("back_image_path"),
+        "image_path": media.get("image_path") or media.get("image"),
+        "audio_path": media.get("audio_path"),
+        "video_path": media.get("video_path"),
+        "audio_entries": media.get("audio_entries"),
+    }
+
+
 class ChatBotTab(ttk.Frame):
     def __init__(self, master: tk.Widget, app) -> None:
         super().__init__(master, style="Surface.TFrame")
@@ -182,11 +206,15 @@ class ChatBotTab(ttk.Frame):
         self.credit_manager = CreditManager()
         self.current_session_id: int | None = None
         self.current_draft: DraftBatch | None = None
+        self.draft_cards: list[DraftCard] = []
+        self.draft_index = 0
+        self.draft_show_back = False
         self.attachments: list[dict[str, Any]] = []
         self._deck_map: dict[str, int] = {}
 
         self._ensure_chat_tables()
         self._build_ui()
+        self._render_current_draft()
         self._load_sessions()
         self.refresh_deck_options()
         self._lock_chat()
@@ -268,12 +296,35 @@ class ChatBotTab(ttk.Frame):
         self.status_label = ttk.Label(deck_frame, textvariable=self.status_var, style="Muted.TLabel")
         self.status_label.pack(side=tk.RIGHT, padx=(8, 0))
 
-        self.sticky_frame = ttk.Frame(right_frame, style="Card.TFrame", height=200, padding=6)
+        self.sticky_frame = ttk.Frame(right_frame, style="Surface.TFrame", padding=6)
         self.sticky_frame.pack(fill=tk.X)
-        self.sticky_frame.pack_propagate(False)
 
-        self.card_preview = CardPreviewWidget(self.sticky_frame, self.palette, self._save_draft)
-        self.card_preview.pack(fill=tk.BOTH, expand=True)
+        nav_frame = ttk.Frame(self.sticky_frame, style="CardInner.TFrame")
+        nav_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self.prev_draft_btn = ttk.Button(nav_frame, text="◀", width=3, command=self._prev_draft)
+        self.prev_draft_btn.pack(side=tk.LEFT)
+
+        self.draft_index_var = tk.StringVar(value="0/0")
+        ttk.Label(nav_frame, textvariable=self.draft_index_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
+
+        self.next_draft_btn = ttk.Button(nav_frame, text="▶", width=3, command=self._next_draft)
+        self.next_draft_btn.pack(side=tk.LEFT)
+
+        from main import RepeatModeCardView
+
+        self.card_view: RepeatModeCardView = RepeatModeCardView(self.sticky_frame, palette=self.palette)
+        self.card_view.pack(fill=tk.BOTH, expand=True)
+        self.card_view.set_rating_enabled(False)
+        self.card_view.set_timer_text("⏰ 00:00")
+
+        self.save_draft_btn = ttk.Button(
+            self.sticky_frame,
+            text="Сохранить карточки",
+            command=self._save_draft,
+            style="Primary.TButton",
+        )
+        self.save_draft_btn.pack(fill=tk.X, pady=(6, 0))
 
         history_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=6)
         history_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
@@ -558,7 +609,10 @@ class ChatBotTab(ttk.Frame):
         if self.current_draft and self.current_draft.cards and self.current_draft.deck_id == draft.deck_id:
             self.current_draft.cards.extend(draft.cards)
             self.current_draft.total_credits = self._calculate_total_credits(self.current_draft.cards)
-            self.card_preview.append_cards(draft.cards, select_last=True, total_credits=self.current_draft.total_credits)
+            self.draft_cards = self.current_draft.cards
+            self.draft_index = max(0, len(self.draft_cards) - 1)
+            self.draft_show_back = False
+            self._render_current_draft()
             total_cards = len(self.current_draft.cards)
             self._append_message(
                 "assistant",
@@ -567,7 +621,10 @@ class ChatBotTab(ttk.Frame):
         else:
             draft.total_credits = self._calculate_total_credits(draft.cards)
             self.current_draft = draft
-            self.card_preview.set_cards(draft.cards, start_index=0, total_credits=draft.total_credits)
+            self.draft_cards = list(draft.cards)
+            self.draft_index = 0
+            self.draft_show_back = False
+            self._render_current_draft()
             self._append_message("assistant", f"Сформирован черновик на {len(draft.cards)} карточек.")
         self._update_save_button_state()
 
@@ -580,11 +637,78 @@ class ChatBotTab(ttk.Frame):
 
     def _update_save_button_state(self) -> None:
         if not self.current_draft:
-            self.card_preview.set_save_state(False, 0)
+            self._set_save_state(False, 0)
             return
         can_afford = self.credit_manager.can_afford(self.app.user_id, self.current_draft.total_credits)
         enabled = can_afford and bool(self.current_draft.cards)
-        self.card_preview.set_save_state(enabled, self.current_draft.total_credits)
+        self._set_save_state(enabled, self.current_draft.total_credits)
+
+    def _set_save_state(self, enabled: bool, total_credits: int | None = None) -> None:
+        label = "Сохранить карточки"
+        if total_credits and total_credits > 0:
+            label = f"Сохранить карточки ({total_credits} кредитов)"
+        self.save_draft_btn.configure(text=label, state=(tk.NORMAL if enabled else tk.DISABLED))
+
+    def _draft_display_id(self, draft: DraftCard, card_payload: dict) -> str:
+        meta = getattr(draft, "meta", {}) or {}
+        raw_id = meta.get("temp_id") or meta.get("id") or card_payload.get("id")
+        if raw_id in (None, -1):
+            return "Draft"
+        return str(raw_id)
+
+    def _render_current_draft(self) -> None:
+        total = len(self.draft_cards)
+        if total == 0:
+            placeholder = {
+                "front": "Черновик пуст. Сначала сформируйте карточки.",
+                "back": "",
+                "front_rich": None,
+                "back_rich": None,
+            }
+            self.card_view.load_card(
+                placeholder,
+                status_text="Карточка 0/0 | ID —",
+                header_text="Фаза | след. повтор: —",
+                show_back=False,
+            )
+            self.card_view.set_timer_text("⏰ 00:00")
+            self.card_view.set_checkpoint_states([False] * 6)
+            self.card_view.set_rating_enabled(False)
+            self.draft_index_var.set("0/0")
+            self.prev_draft_btn.configure(state=tk.DISABLED)
+            self.next_draft_btn.configure(state=tk.DISABLED)
+            return
+
+        self.draft_index = max(0, min(self.draft_index, total - 1))
+        draft = self.draft_cards[self.draft_index]
+        card_payload = draft_to_card(draft)
+        display_id = self._draft_display_id(draft, card_payload)
+        status_text = f"Карточка {self.draft_index + 1}/{total} | ID {display_id}"
+        self.card_view.load_card(
+            card_payload,
+            status_text=status_text,
+            header_text="Фаза | след. повтор: —",
+            show_back=self.draft_show_back,
+        )
+        self.card_view.set_timer_text("⏰ 00:00")
+        self.card_view.set_checkpoint_states([False] * 6)
+        self.card_view.set_rating_enabled(False)
+
+        self.draft_index_var.set(f"{self.draft_index + 1}/{total}")
+        self.prev_draft_btn.configure(state=(tk.NORMAL if self.draft_index > 0 else tk.DISABLED))
+        self.next_draft_btn.configure(state=(tk.NORMAL if self.draft_index < total - 1 else tk.DISABLED))
+
+    def _prev_draft(self) -> None:
+        if self.draft_index > 0:
+            self.draft_index -= 1
+            self.draft_show_back = False
+            self._render_current_draft()
+
+    def _next_draft(self) -> None:
+        if self.draft_index < len(self.draft_cards) - 1:
+            self.draft_index += 1
+            self.draft_show_back = False
+            self._render_current_draft()
 
     def _save_draft(self) -> None:
         if not self.current_draft:
@@ -637,7 +761,11 @@ class ChatBotTab(ttk.Frame):
             conn.close()
         self.app.refresh_balance_ui()
         self.current_draft = None
-        self.card_preview.clear()
+        self.draft_cards = []
+        self.draft_index = 0
+        self.draft_show_back = False
+        self._render_current_draft()
+        self._set_save_state(False, 0)
         self._append_message("system", f"Сохранено {saved_count} карточек.")
 
     def _save_draft_to_deck(self, conn, deck_id: int, cards: list[DraftCard]) -> int:
