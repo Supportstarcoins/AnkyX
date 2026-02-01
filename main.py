@@ -21946,11 +21946,13 @@ class RepeatModeCardView(ttk.Frame):
         on_checkpoint_change=None,
         on_media_state_change=None,
         enable_state_restore: bool = False,
+        view_mode: str = "repeat",
     ) -> None:
         super().__init__(master, style="Surface.TFrame")
         self.palette = palette or getattr(master, "palette", None) or {}
         self._on_checkpoint_change = on_checkpoint_change
         self._checkpoint_buttons: list[tk.Checkbutton] = []
+        self.view_mode = view_mode
 
         colors = self.palette
         card_bg, card_text, _ = get_card_surface_colors(master)
@@ -22016,6 +22018,12 @@ class RepeatModeCardView(ttk.Frame):
 
         self._current_card: dict | None = None
         self._show_back = False
+        self._apply_view_mode()
+
+    def _apply_view_mode(self) -> None:
+        if self.view_mode == "chatbot":
+            self.timer_label.pack_forget()
+            self.checkpoint_frame.pack_forget()
 
     def _handle_checkpoint_change(self, idx: int) -> None:
         if callable(self._on_checkpoint_change):

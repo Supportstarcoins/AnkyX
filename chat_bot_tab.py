@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from card_widget import CardWidget
 from chatbot_models import ChatSession, DraftBatch, DraftCard, Message
@@ -18,6 +19,177 @@ from mock_ai_engine import MockAIEngine
 
 if TYPE_CHECKING:
     from main import RepeatModeCardView
+
+try:
+    from tkinterdnd2 import DND_FILES
+except Exception:  # noqa: BLE001
+    DND_FILES = None
+
+
+class AutoGrowText(ttk.Frame):
+    def __init__(
+        self,
+        master: tk.Widget,
+        *,
+        min_lines: int = 1,
+        max_lines: int = 10,
+        on_send: Callable[[], None] | None = None,
+        on_change: Callable[[], None] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(master)
+        self.min_lines = min_lines
+        self.max_lines = max_lines
+        self._on_send = on_send
+        self._on_change = on_change
+        self._scrollbar_visible = False
+
+        self.text = tk.Text(
+            self,
+            height=min_lines,
+            wrap=tk.WORD,
+            relief="flat",
+            bd=0,
+            **kwargs,
+        )
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=self.scrollbar.set)
+
+        self.text.bind("<<Modified>>", self._on_modified)
+        self.text.bind("<Return>", self._handle_return)
+        self.text.bind("<Shift-Return>", self._handle_shift_return)
+
+        self._menu = tk.Menu(self, tearoff=False)
+        self._menu.add_command(label="Вырезать", command=self._cut)
+        self._menu.add_command(label="Копировать", command=self._copy)
+        self._menu.add_command(label="Вставить", command=self._paste)
+        self._menu.add_separator()
+        self._menu.add_command(label="Выделить всё", command=self._select_all)
+        self.text.bind("<Button-3>", self._show_menu)
+
+    def get_text(self) -> str:
+        return self.text.get("1.0", "end-1c")
+
+    def clear(self) -> None:
+        self.text.delete("1.0", tk.END)
+        self._update_height()
+        if self._on_change:
+            self._on_change()
+
+    def set_state(self, state: str) -> None:
+        self.text.configure(state=state)
+
+    def focus_text(self) -> None:
+        self.text.focus_set()
+
+    def _handle_return(self, event: tk.Event) -> str:
+        if self._on_send:
+            self._on_send()
+        return "break"
+
+    def _handle_shift_return(self, _event: tk.Event) -> str:
+        self.text.insert(tk.INSERT, "\n")
+        return "break"
+
+    def _on_modified(self, _event=None) -> None:
+        self.text.edit_modified(False)
+        self._update_height()
+        if self._on_change:
+            self._on_change()
+
+    def _update_height(self) -> None:
+        lines = int(self.text.index("end-1c").split(".")[0])
+        new_height = max(self.min_lines, min(lines, self.max_lines))
+        self.text.configure(height=new_height)
+        if lines > self.max_lines:
+            if not self._scrollbar_visible:
+                self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                self._scrollbar_visible = True
+        else:
+            if self._scrollbar_visible:
+                self.scrollbar.pack_forget()
+                self._scrollbar_visible = False
+
+    def _show_menu(self, event: tk.Event) -> None:
+        self._menu.tk_popup(event.x_root, event.y_root)
+
+    def _cut(self) -> None:
+        self.text.event_generate("<<Cut>>")
+
+    def _copy(self) -> None:
+        self.text.event_generate("<<Copy>>")
+
+    def _paste(self) -> None:
+        self.text.event_generate("<<Paste>>")
+
+    def _select_all(self) -> None:
+        self.text.tag_add("sel", "1.0", "end-1c")
+
+
+class AttachmentsBar(ttk.Frame):
+    def __init__(self, master: tk.Widget, *, palette: dict, on_remove: Callable[[int], None]) -> None:
+        super().__init__(master)
+        self.palette = palette
+        self.on_remove = on_remove
+        self._chips: list[ttk.Frame] = []
+
+    def render(self, attachments: list[dict[str, Any]]) -> None:
+        for chip in self._chips:
+            chip.destroy()
+        self._chips.clear()
+        if not attachments:
+            return
+        for index, item in enumerate(attachments):
+            chip = ttk.Frame(self, style="CardInner.TFrame", padding=(6, 3))
+            chip.pack(side=tk.LEFT, padx=(0, 6), pady=4)
+            name = item.get("name") or os.path.basename(item.get("path", "")) or "файл"
+            label = ttk.Label(chip, text=name, style="Muted.TLabel")
+            label.pack(side=tk.LEFT)
+            size_label = ttk.Label(chip, text=f" {item.get('size_label', '')}", style="Muted.TLabel")
+            size_label.pack(side=tk.LEFT)
+            btn = ttk.Button(chip, text="✕", width=2, command=lambda idx=index: self.on_remove(idx))
+            btn.pack(side=tk.LEFT, padx=(4, 0))
+            self._chips.append(chip)
+
+
+class RoundSendButton(tk.Canvas):
+    def __init__(self, master: tk.Widget, *, command: Callable[[], None], size: int = 36) -> None:
+        super().__init__(master, width=size, height=size, highlightthickness=0, bd=0)
+        self._command = command
+        self._size = size
+        self._enabled = True
+        self._bg_enabled = "#1E6EFF"
+        self._bg_disabled = "#4B4B4B"
+        self._fg_enabled = "#FFFFFF"
+        self._fg_disabled = "#B0B0B0"
+        self._draw_button()
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = enabled
+        self._draw_button()
+
+    def _draw_button(self) -> None:
+        self.delete("all")
+        bg = self._bg_enabled if self._enabled else self._bg_disabled
+        fg = self._fg_enabled if self._enabled else self._fg_disabled
+        pad = 2
+        self.create_oval(pad, pad, self._size - pad, self._size - pad, fill=bg, outline=bg)
+        self.create_text(self._size // 2, self._size // 2 - 1, text="▲", fill=fg, font=("Segoe UI", 11, "bold"))
+
+    def _on_click(self, _event: tk.Event) -> None:
+        if self._enabled:
+            self._command()
+
+    def _on_enter(self, _event: tk.Event) -> None:
+        self.configure(cursor="hand2" if self._enabled else "")
+
+    def _on_leave(self, _event: tk.Event) -> None:
+        self.configure(cursor="")
 
 
 class CardPreviewWidget(ttk.Frame):
@@ -209,8 +381,9 @@ class ChatBotTab(ttk.Frame):
         self.draft_cards: list[DraftCard] = []
         self.draft_index = 0
         self.draft_show_back = False
-        self.attachments: list[dict[str, Any]] = []
+        self.pending_attachments: list[dict[str, Any]] = []
         self._deck_map: dict[str, int] = {}
+        self.max_total_attachment_size = 100 * 1024 * 1024
 
         self._ensure_chat_tables()
         self._build_ui()
@@ -313,10 +486,13 @@ class ChatBotTab(ttk.Frame):
 
         from main import RepeatModeCardView
 
-        self.card_view: RepeatModeCardView = RepeatModeCardView(self.sticky_frame, palette=self.palette)
+        self.card_view: RepeatModeCardView = RepeatModeCardView(
+            self.sticky_frame,
+            palette=self.palette,
+            view_mode="chatbot",
+        )
         self.card_view.pack(fill=tk.BOTH, expand=True)
         self.card_view.set_rating_enabled(False)
-        self.card_view.set_timer_text("⏰ 00:00")
 
         self.save_draft_btn = ttk.Button(
             self.sticky_frame,
@@ -344,32 +520,77 @@ class ChatBotTab(ttk.Frame):
         history_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.chat_text.configure(yscrollcommand=history_scroll.set)
 
-        input_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=8)
-        input_frame.pack(fill=tk.X)
+        self.composer_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=8)
+        self.composer_frame.pack(fill=tk.X)
 
-        self.input_var = tk.StringVar(value="")
-        self.input_entry = ttk.Entry(input_frame, textvariable=self.input_var)
-        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.attachments_bar = AttachmentsBar(
+            self.composer_frame,
+            palette=self.palette,
+            on_remove=self._remove_attachment,
+        )
+        self.attachments_bar.pack(fill=tk.X, pady=(0, 6))
 
-        self.send_btn = ttk.Button(input_frame, text="Send", command=self._on_send)
-        self.send_btn.pack(side=tk.LEFT, padx=6)
+        self.composer_row = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
+        self.composer_row.pack(fill=tk.X)
 
-        self.attach_btn = ttk.Button(input_frame, text="Attach", command=self._on_attach)
-        self.attach_btn.pack(side=tk.LEFT)
+        self.attach_btn = ttk.Button(self.composer_row, text="📎", width=3, command=self._on_attach)
+        self.attach_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.link_btn = ttk.Button(input_frame, text="Paste Link", command=self._on_paste_link)
-        self.link_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.input_text = AutoGrowText(
+            self.composer_row,
+            min_lines=1,
+            max_lines=10,
+            on_send=self._on_send,
+            on_change=self._update_send_button_state,
+            bg=self.palette.get("panel"),
+            fg=self.palette.get("text"),
+            insertbackground=self.palette.get("text"),
+        )
+        self.input_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.attachments_var = tk.StringVar(value="")
-        self.attachments_label = ttk.Label(right_frame, textvariable=self.attachments_var, style="Muted.TLabel")
-        self.attachments_label.pack(anchor=tk.W, pady=(4, 0))
+        self.send_btn = RoundSendButton(self.composer_row, command=self._on_send)
+        self.send_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         self._configure_text_tags()
+        self._setup_drag_and_drop()
 
     def _configure_text_tags(self) -> None:
         self.chat_text.tag_configure("user", foreground=self.palette.get("text"))
         self.chat_text.tag_configure("assistant", foreground=self.palette.get("accent"))
         self.chat_text.tag_configure("system", foreground=self.palette.get("muted"))
+
+    def _setup_drag_and_drop(self) -> None:
+        if DND_FILES is None:
+            return
+        for widget in (self.chat_text, self.composer_frame, self.input_text.text):
+            if hasattr(widget, "drop_target_register"):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._on_drop_files)
+
+    def _on_drop_files(self, event: tk.Event) -> str:
+        if str(self.attach_btn.cget("state")) == str(tk.DISABLED):
+            return "break"
+        paths = list(self.tk.splitlist(event.data))
+        self._add_attachments(paths)
+        return "break"
+
+    def _update_send_button_state(self) -> None:
+        if str(self.input_text.text.cget("state")) == str(tk.DISABLED):
+            self.send_btn.set_enabled(False)
+            return
+        text = self.input_text.get_text().strip()
+        enabled = bool(text) or bool(self.pending_attachments)
+        self.send_btn.set_enabled(enabled)
+
+    def _attachment_label(self, item: dict[str, Any]) -> str:
+        return item.get("name") or os.path.basename(item.get("path", ""))
+
+    def _format_size(self, size: int) -> str:
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+            size /= 1024
+        return f"{size:.1f}GB"
 
     def refresh_deck_options(self) -> None:
         values = []
@@ -385,18 +606,16 @@ class ChatBotTab(ttk.Frame):
         self._lock_chat()
 
     def _lock_chat(self) -> None:
-        self.input_entry.configure(state=tk.DISABLED)
-        self.send_btn.configure(state=tk.DISABLED)
+        self.input_text.set_state(tk.DISABLED)
+        self.send_btn.set_enabled(False)
         self.attach_btn.configure(state=tk.DISABLED)
-        self.link_btn.configure(state=tk.DISABLED)
         self.status_var.set("Выберите колоду")
 
     def _unlock_chat(self) -> None:
-        self.input_entry.configure(state=tk.NORMAL)
-        self.send_btn.configure(state=tk.NORMAL)
+        self.input_text.set_state(tk.NORMAL)
         self.attach_btn.configure(state=tk.NORMAL)
-        self.link_btn.configure(state=tk.NORMAL)
         self.status_var.set("")
+        self._update_send_button_state()
 
     def _on_deck_change(self, _event=None) -> None:
         selection = self.deck_var.get()
@@ -510,8 +729,11 @@ class ChatBotTab(ttk.Frame):
             prefix = "Система: "
         payload = message.text or ""
         if message.attachments:
-            attachments_info = ", ".join([item.get("label", "вложение") for item in message.attachments])
-            payload = f"{payload}\n[Вложения: {attachments_info}]"
+            attachments_info = ", ".join(
+                [self._attachment_label(item) for item in message.attachments if self._attachment_label(item)]
+            )
+            if attachments_info:
+                payload = f"{payload}\n[Вложения: {attachments_info}]"
         self.chat_text.insert(tk.END, f"{prefix}{payload}\n\n", message.role)
 
     def _append_message(self, role: str, text: str, attachments: list[dict[str, Any]] | None = None) -> None:
@@ -533,25 +755,53 @@ class ChatBotTab(ttk.Frame):
         self.chat_text.see(tk.END)
 
     def _on_attach(self) -> None:
-        path = filedialog.askopenfilename(title="Выберите файл")
-        if not path:
+        filetypes = [
+            ("Images", "*.png *.jpg *.jpeg *.webp"),
+            ("PDF", "*.pdf"),
+            ("Text", "*.txt *.md"),
+            ("Documents", "*.doc *.docx *.ppt *.pptx *.xls *.xlsx"),
+            ("Archives", "*.zip"),
+            ("Audio", "*.mp3 *.wav *.m4a *.ogg"),
+            ("Video", "*.mp4 *.mov *.mkv *.webm"),
+            ("All files", "*.*"),
+        ]
+        paths = filedialog.askopenfilenames(title="Выберите файлы", filetypes=filetypes)
+        if not paths:
             return
-        self.attachments.append({"type": "file", "value": path, "label": path.split("/")[-1]})
-        self._refresh_attachments_label()
+        self._add_attachments(paths)
 
-    def _on_paste_link(self) -> None:
-        url = simpledialog.askstring("Ссылка", "Вставьте ссылку (например, YouTube URL)")
-        if not url:
-            return
-        self.attachments.append({"type": "url", "value": url, "label": url})
-        self._refresh_attachments_label()
+    def _add_attachments(self, paths: list[str]) -> None:
+        current_paths = {item.get("path") for item in self.pending_attachments}
+        total_size = sum(item.get("size", 0) for item in self.pending_attachments)
+        for path in paths:
+            if not path or path in current_paths:
+                continue
+            if not os.path.exists(path):
+                continue
+            size = os.path.getsize(path)
+            if total_size + size > self.max_total_attachment_size:
+                messagebox.showwarning("Вложения", "Общий размер вложений превышает лимит.")
+                break
+            name = os.path.basename(path)
+            item = {
+                "path": path,
+                "name": name,
+                "size": size,
+                "size_label": self._format_size(size),
+            }
+            self.pending_attachments.append(item)
+            current_paths.add(path)
+            total_size += size
+        self._refresh_attachments_ui()
 
-    def _refresh_attachments_label(self) -> None:
-        if not self.attachments:
-            self.attachments_var.set("")
-            return
-        labels = ", ".join(item.get("label", "") for item in self.attachments)
-        self.attachments_var.set(f"Вложения: {labels}")
+    def _remove_attachment(self, index: int) -> None:
+        if 0 <= index < len(self.pending_attachments):
+            self.pending_attachments.pop(index)
+        self._refresh_attachments_ui()
+
+    def _refresh_attachments_ui(self) -> None:
+        self.attachments_bar.render(self.pending_attachments)
+        self._update_send_button_state()
 
     def _on_send(self) -> None:
         if self.current_session_id is None:
@@ -560,14 +810,15 @@ class ChatBotTab(ttk.Frame):
         if not self.deck_var.get():
             self._lock_chat()
             return
-        text = self.input_var.get().strip()
-        if not text and not self.attachments:
+        text = self.input_text.get_text().strip()
+        if not text and not self.pending_attachments:
             return
-        attachments = list(self.attachments)
-        self.attachments = []
-        self._refresh_attachments_label()
-        self.input_var.set("")
+        attachments = list(self.pending_attachments)
+        self.pending_attachments = []
+        self._refresh_attachments_ui()
+        self.input_text.clear()
         self._append_message("user", text, attachments)
+        self._append_message("assistant", "Получено. (заглушка) Готовлю черновик.")
 
         self._start_generation(text, attachments)
 
@@ -596,13 +847,9 @@ class ChatBotTab(ttk.Frame):
 
     def _generate_cards(self, text: str, attachments: list[dict[str, Any]], deck_context: dict) -> list[DraftCard]:
         for item in attachments:
-            if item.get("type") == "file":
-                return self.engine.generate_from_file(item.get("value", ""), deck_context)
-            if item.get("type") == "url":
-                url = item.get("value", "")
-                if "youtube" in url or "youtu.be" in url:
-                    return self.engine.generate_from_youtube(url, "ru", deck_context)
-                return self.engine.generate_from_text(url, deck_context)
+            path = item.get("path")
+            if path:
+                return self.engine.generate_from_file(path, deck_context)
         return self.engine.generate_from_text(text, deck_context)
 
     def _on_generation_success(self, draft: DraftBatch) -> None:
@@ -671,8 +918,6 @@ class ChatBotTab(ttk.Frame):
                 header_text="Фаза | след. повтор: —",
                 show_back=False,
             )
-            self.card_view.set_timer_text("⏰ 00:00")
-            self.card_view.set_checkpoint_states([False] * 6)
             self.card_view.set_rating_enabled(False)
             self.draft_index_var.set("0/0")
             self.prev_draft_btn.configure(state=tk.DISABLED)
@@ -690,8 +935,6 @@ class ChatBotTab(ttk.Frame):
             header_text="Фаза | след. повтор: —",
             show_back=self.draft_show_back,
         )
-        self.card_view.set_timer_text("⏰ 00:00")
-        self.card_view.set_checkpoint_states([False] * 6)
         self.card_view.set_rating_enabled(False)
 
         self.draft_index_var.set(f"{self.draft_index + 1}/{total}")
