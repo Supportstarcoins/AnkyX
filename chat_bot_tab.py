@@ -383,7 +383,7 @@ class ChatBotTab(ttk.Frame):
         self.draft_show_back = False
         self.pending_attachments: list[dict[str, Any]] = []
         self._deck_map: dict[str, int] = {}
-        self.max_total_attachment_size = 100 * 1024 * 1024
+        self.max_total_attachment_size = 200 * 1024 * 1024
 
         self._ensure_chat_tables()
         self._build_ui()
@@ -456,8 +456,12 @@ class ChatBotTab(ttk.Frame):
         right_frame = ttk.Frame(container, style="Surface.TFrame")
         container.add(right_frame, weight=4)
 
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(4, weight=1)
+        right_frame.grid_rowconfigure(5, weight=0)
+
         deck_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=8)
-        deck_frame.pack(fill=tk.X, pady=(0, 8))
+        deck_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
         ttk.Label(deck_frame, text="Колода:", style="Muted.TLabel").pack(side=tk.LEFT)
         self.deck_var = tk.StringVar(value="")
@@ -469,11 +473,8 @@ class ChatBotTab(ttk.Frame):
         self.status_label = ttk.Label(deck_frame, textvariable=self.status_var, style="Muted.TLabel")
         self.status_label.pack(side=tk.RIGHT, padx=(8, 0))
 
-        self.sticky_frame = ttk.Frame(right_frame, style="Surface.TFrame", padding=6)
-        self.sticky_frame.pack(fill=tk.X)
-
-        nav_frame = ttk.Frame(self.sticky_frame, style="CardInner.TFrame")
-        nav_frame.pack(fill=tk.X, pady=(0, 6))
+        nav_frame = ttk.Frame(right_frame, style="CardInner.TFrame")
+        nav_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
 
         self.prev_draft_btn = ttk.Button(nav_frame, text="◀", width=3, command=self._prev_draft)
         self.prev_draft_btn.pack(side=tk.LEFT)
@@ -486,6 +487,9 @@ class ChatBotTab(ttk.Frame):
 
         from main import RepeatModeCardView
 
+        self.sticky_frame = ttk.Frame(right_frame, style="Surface.TFrame", padding=6)
+        self.sticky_frame.grid(row=2, column=0, sticky="ew")
+
         self.card_view: RepeatModeCardView = RepeatModeCardView(
             self.sticky_frame,
             palette=self.palette,
@@ -495,15 +499,15 @@ class ChatBotTab(ttk.Frame):
         self.card_view.set_rating_enabled(False)
 
         self.save_draft_btn = ttk.Button(
-            self.sticky_frame,
+            right_frame,
             text="Сохранить карточки",
             command=self._save_draft,
             style="Primary.TButton",
         )
-        self.save_draft_btn.pack(fill=tk.X, pady=(6, 0))
+        self.save_draft_btn.grid(row=3, column=0, sticky="ew", pady=(6, 0))
 
         history_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=6)
-        history_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        history_frame.grid(row=4, column=0, sticky="nsew", pady=(8, 8))
 
         self.chat_text = tk.Text(
             history_frame,
@@ -521,7 +525,7 @@ class ChatBotTab(ttk.Frame):
         self.chat_text.configure(yscrollcommand=history_scroll.set)
 
         self.composer_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=8)
-        self.composer_frame.pack(fill=tk.X)
+        self.composer_frame.grid(row=5, column=0, sticky="ew")
 
         self.attachments_bar = AttachmentsBar(
             self.composer_frame,
@@ -553,6 +557,7 @@ class ChatBotTab(ttk.Frame):
 
         self._configure_text_tags()
         self._setup_drag_and_drop()
+        self._update_send_button_state()
 
     def _configure_text_tags(self) -> None:
         self.chat_text.tag_configure("user", foreground=self.palette.get("text"))
@@ -584,6 +589,35 @@ class ChatBotTab(ttk.Frame):
 
     def _attachment_label(self, item: dict[str, Any]) -> str:
         return item.get("name") or os.path.basename(item.get("path", ""))
+
+    def _is_allowed_attachment(self, path: str) -> bool:
+        _, ext = os.path.splitext(path.lower())
+        allowed = {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".pdf",
+            ".txt",
+            ".md",
+            ".doc",
+            ".docx",
+            ".csv",
+            ".xls",
+            ".xlsx",
+            ".ppt",
+            ".pptx",
+            ".mp3",
+            ".wav",
+            ".m4a",
+            ".ogg",
+            ".mp4",
+            ".mov",
+            ".mkv",
+            ".webm",
+            ".zip",
+        }
+        return ext in allowed
 
     def _format_size(self, size: int) -> str:
         for unit in ("B", "KB", "MB", "GB"):
@@ -759,7 +793,7 @@ class ChatBotTab(ttk.Frame):
             ("Images", "*.png *.jpg *.jpeg *.webp"),
             ("PDF", "*.pdf"),
             ("Text", "*.txt *.md"),
-            ("Documents", "*.doc *.docx *.ppt *.pptx *.xls *.xlsx"),
+            ("Documents", "*.doc *.docx *.ppt *.pptx *.xls *.xlsx *.csv"),
             ("Archives", "*.zip"),
             ("Audio", "*.mp3 *.wav *.m4a *.ogg"),
             ("Video", "*.mp4 *.mov *.mkv *.webm"),
@@ -777,6 +811,9 @@ class ChatBotTab(ttk.Frame):
             if not path or path in current_paths:
                 continue
             if not os.path.exists(path):
+                continue
+            if not self._is_allowed_attachment(path):
+                messagebox.showwarning("Вложения", f"Формат не поддерживается: {os.path.basename(path)}")
                 continue
             size = os.path.getsize(path)
             if total_size + size > self.max_total_attachment_size:
@@ -803,6 +840,17 @@ class ChatBotTab(ttk.Frame):
         self.attachments_bar.render(self.pending_attachments)
         self._update_send_button_state()
 
+    def _set_sending_state(self, sending: bool) -> None:
+        if sending:
+            self.input_text.set_state(tk.DISABLED)
+            self.attach_btn.configure(state=tk.DISABLED)
+            self.send_btn.set_enabled(False)
+            return
+        if self.deck_var.get():
+            self.input_text.set_state(tk.NORMAL)
+            self.attach_btn.configure(state=tk.NORMAL)
+            self._update_send_button_state()
+
     def _on_send(self) -> None:
         if self.current_session_id is None:
             messagebox.showinfo("Выбор чата", "Выберите чат слева.")
@@ -820,6 +868,7 @@ class ChatBotTab(ttk.Frame):
         self._append_message("user", text, attachments)
         self._append_message("assistant", "Получено. (заглушка) Готовлю черновик.")
 
+        self._set_sending_state(True)
         self._start_generation(text, attachments)
 
     def _start_generation(self, text: str, attachments: list[dict[str, Any]]) -> None:
@@ -874,6 +923,7 @@ class ChatBotTab(ttk.Frame):
             self._render_current_draft()
             self._append_message("assistant", f"Сформирован черновик на {len(draft.cards)} карточек.")
         self._update_save_button_state()
+        self._set_sending_state(False)
 
     def _calculate_total_credits(self, cards: list[DraftCard]) -> int:
         plan = self.app.get_pricing_plan()
@@ -881,6 +931,7 @@ class ChatBotTab(ttk.Frame):
 
     def _on_generation_error(self, message: str) -> None:
         self._append_message("system", f"Ошибка генерации: {message}")
+        self._set_sending_state(False)
 
     def _update_save_button_state(self) -> None:
         if not self.current_draft:
