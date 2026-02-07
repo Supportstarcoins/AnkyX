@@ -17,6 +17,7 @@ from chatbot_models import ChatSession, DraftBatch, DraftCard, Message
 from credit_manager import CreditManager
 from csv_importer import upsert_note_and_cards
 from db_connect import open_db
+from cloud_llm_provider import CloudProviderError, XFlashCloudProvider
 from llm_engine import LlamaCppEngine, LLMEngineBase, MockEngine
 from mock_ai_engine import MockAIEngine
 
@@ -382,7 +383,9 @@ class ChatBotTab(ttk.Frame):
         "4) Не выдумывай факты, если их нет в сообщениях пользователя."
     )
     LLM_PROVIDER_LLAMA = "Локальная Llama 3.1"
+    LLM_PROVIDER_CLOUD = "XFLASH Cloud API"
     LLM_PROVIDER_MOCK = "Заглушка"
+    CLOUD_MODEL_DEFAULT = "xflash-llama31"
 
     def __init__(self, master: tk.Widget, app) -> None:
         super().__init__(master, style="Surface.TFrame")
@@ -410,6 +413,12 @@ class ChatBotTab(ttk.Frame):
         self._deck_map: dict[str, int] = {}
         self.max_total_attachment_size = 200 * 1024 * 1024
         self._llm_model_hint = self._format_llm_model_hint()
+        self._cloud_settings_save_job: str | None = None
+        self._cloud_settings_path = self._resolve_cloud_settings_path()
+        self._cloud_settings = self._load_cloud_settings()
+        self.cloud_url_var = tk.StringVar(value=self._cloud_settings.get("cloud_url", ""))
+        self.cloud_api_key_var = tk.StringVar(value=self._cloud_settings.get("api_key", ""))
+        self.cloud_status_var = tk.StringVar(value="Cloud: —")
 
         self._ensure_chat_tables()
         self._build_ui()
@@ -420,6 +429,9 @@ class ChatBotTab(ttk.Frame):
         self._update_llm_status_label()
 
         self.app.register_balance_observer(self._update_save_button_state)
+
+        self.cloud_url_var.trace_add("write", self._on_cloud_settings_change)
+        self.cloud_api_key_var.trace_add("write", self._on_cloud_settings_change)
 
     def destroy(self):
         self.app.unregister_balance_observer(self._update_save_button_state)
@@ -594,7 +606,7 @@ class ChatBotTab(ttk.Frame):
             llm_control_frame,
             textvariable=self.llm_provider_var,
             state="readonly",
-            values=[self.LLM_PROVIDER_LLAMA, self.LLM_PROVIDER_MOCK],
+            values=[self.LLM_PROVIDER_LLAMA, self.LLM_PROVIDER_CLOUD, self.LLM_PROVIDER_MOCK],
             width=22,
         )
         self.llm_provider_combo.pack(side=tk.LEFT, padx=(6, 0))
@@ -603,6 +615,26 @@ class ChatBotTab(ttk.Frame):
         self.llm_status_var = tk.StringVar(value="")
         self.llm_status_label = ttk.Label(llm_control_frame, textvariable=self.llm_status_var, style="Muted.TLabel")
         self.llm_status_label.pack(side=tk.RIGHT)
+
+        cloud_frame = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
+        cloud_frame.pack(fill=tk.X, pady=(0, 6))
+        cloud_frame.columnconfigure(1, weight=1)
+        cloud_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(cloud_frame, text="Cloud URL:", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        cloud_url_entry = ttk.Entry(cloud_frame, textvariable=self.cloud_url_var)
+        cloud_url_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+
+        ttk.Label(cloud_frame, text="API ключ:", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        cloud_key_entry = ttk.Entry(cloud_frame, textvariable=self.cloud_api_key_var, show="•")
+        cloud_key_entry.grid(row=0, column=3, sticky="ew")
+
+        cloud_actions = ttk.Frame(cloud_frame, style="CardInner.TFrame")
+        cloud_actions.grid(row=0, column=4, sticky="e", padx=(10, 0))
+        ttk.Button(cloud_actions, text="Проверить соединение", command=self._check_cloud_connection).pack(
+            side=tk.LEFT
+        )
+        ttk.Label(cloud_actions, textvariable=self.cloud_status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
 
         self.attachments_bar = AttachmentsBar(
             self.composer_frame,
@@ -656,7 +688,9 @@ class ChatBotTab(ttk.Frame):
 
     def _on_llm_provider_change(self, _event=None) -> None:
         selected = self.llm_provider_var.get()
-        if selected == self.LLM_PROVIDER_LLAMA:
+        if selected == self.LLM_PROVIDER_CLOUD:
+            self.llm_engine = self.mock_llm_engine
+        elif selected == self.LLM_PROVIDER_LLAMA:
             self.llm_engine = self.llama_engine
         else:
             self.llm_engine = self.mock_llm_engine
@@ -668,6 +702,8 @@ class ChatBotTab(ttk.Frame):
         self.llm_status_var.set(status)
 
     def _get_llm_status_text(self) -> str:
+        if self.llm_provider_var.get() == self.LLM_PROVIDER_CLOUD:
+            return "Cloud: используется XFLASH API"
         if not self.llm_model_path:
             return f"Llama: не найден GGUF (положите файл сюда {self._llm_model_hint})"
         if not self.llama_engine.is_llama_cpp_available():
@@ -950,6 +986,8 @@ class ChatBotTab(ttk.Frame):
     def _resolve_llm_engine(self) -> tuple[LLMEngineBase, str | None]:
         self._refresh_llm_model_path()
         selected = self.llm_provider_var.get()
+        if selected == self.LLM_PROVIDER_CLOUD:
+            return self.mock_llm_engine, None
         if selected == self.LLM_PROVIDER_LLAMA:
             if self.llama_engine.is_available():
                 return self.llama_engine, None
@@ -962,6 +1000,113 @@ class ChatBotTab(ttk.Frame):
                 return self.mock_llm_engine, "LLM недоступна: не установлен модуль llama-cpp-python."
             return self.mock_llm_engine, "LLM недоступна из-за ошибки загрузки."
         return self.mock_llm_engine, None
+
+    def _resolve_cloud_settings_path(self) -> str:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base_dir, "chatbot_settings.json")
+
+    def _load_cloud_settings(self) -> dict[str, str]:
+        try:
+            if os.path.exists(self._cloud_settings_path):
+                with open(self._cloud_settings_path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                if isinstance(payload, dict):
+                    return {
+                        "cloud_url": str(payload.get("cloud_url") or ""),
+                        "api_key": str(payload.get("api_key") or ""),
+                    }
+        except Exception:  # noqa: BLE001
+            logging.exception("Failed to load cloud settings")
+        return {"cloud_url": "", "api_key": ""}
+
+    def _save_cloud_settings(self) -> None:
+        self._cloud_settings_save_job = None
+        payload = {
+            "cloud_url": self.cloud_url_var.get().strip(),
+            "api_key": self.cloud_api_key_var.get().strip(),
+        }
+        try:
+            with open(self._cloud_settings_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            logging.exception("Failed to save cloud settings")
+
+    def _on_cloud_settings_change(self, *_args) -> None:
+        if self._cloud_settings_save_job:
+            self.after_cancel(self._cloud_settings_save_job)
+        self._cloud_settings_save_job = self.after(400, self._save_cloud_settings)
+
+    def _get_cloud_provider(self) -> XFlashCloudProvider | None:
+        base_url = self.cloud_url_var.get().strip()
+        api_key = self.cloud_api_key_var.get().strip()
+        if not base_url or not api_key:
+            return None
+        return XFlashCloudProvider(base_url, api_key)
+
+    def _check_cloud_connection(self) -> None:
+        provider = self._get_cloud_provider()
+        if not provider:
+            self.cloud_status_var.set("Cloud: Invalid key")
+            return
+        self.cloud_status_var.set("Cloud: проверка...")
+
+        def worker() -> None:
+            try:
+                provider.chat(
+                    messages=[{"role": "user", "content": "ping"}],
+                    chat_id=self.current_session_id,
+                    model=self.CLOUD_MODEL_DEFAULT,
+                    temperature=0.0,
+                    max_tokens=1,
+                )
+            except CloudProviderError as exc:
+                self.after(0, lambda: self._update_cloud_status_from_error(exc))
+                return
+            self.after(0, lambda: self.cloud_status_var.set("Cloud: OK"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_cloud_status_from_error(self, exc: CloudProviderError) -> None:
+        if exc.status_code == 401:
+            self.cloud_status_var.set("Cloud: Invalid key")
+            return
+        if exc.status_code == 503:
+            self.cloud_status_var.set("Cloud: Offline")
+            return
+        if exc.status_code == 429:
+            self.cloud_status_var.set("Cloud: Offline")
+            return
+        if exc.status_code == 402:
+            self.cloud_status_var.set("Cloud: Offline")
+            return
+        self.cloud_status_var.set("Cloud: Offline")
+
+    def _sync_cloud_credits(self, remaining_credits: int | None, credits_spent: int | None = None) -> None:
+        if remaining_credits is None:
+            return
+        current = self.app.credits_service.get_balance(self.app.user_id)
+        if remaining_credits == current:
+            return
+        delta = remaining_credits - current
+        reason = "Синхронизация баланса (Cloud LLM)"
+        meta = {"credits_spent": credits_spent, "source": "chatbot"}
+        if delta > 0:
+            self.app.credits_service.add_credits(self.app.user_id, delta, reason, meta=meta)
+        elif delta < 0:
+            self.app.credits_service.spend_credits(self.app.user_id, abs(delta), reason, meta=meta)
+        self.app.refresh_balance_ui()
+
+    def _resolve_chat_backend(
+        self,
+    ) -> tuple[str, LLMEngineBase | XFlashCloudProvider, str | None]:
+        selected = self.llm_provider_var.get()
+        if selected == self.LLM_PROVIDER_CLOUD:
+            provider = self._get_cloud_provider()
+            if not provider:
+                return "local", self.mock_llm_engine, "Cloud API не настроен, используется заглушка."
+            return "cloud", provider, None
+        engine, warning = self._resolve_llm_engine()
+        return "local", engine, warning
 
     def _parse_cards_from_response(self, response_text: str) -> list[DraftCard]:
         if not response_text:
@@ -1109,19 +1254,39 @@ class ChatBotTab(ttk.Frame):
         user_id = self.app.user_id
         deck_context = {"deck_id": self._deck_map.get(self.deck_var.get())}
         messages = self._build_chat_messages()
-        selected_engine, warning_message = self._resolve_llm_engine()
+        backend_kind, backend, warning_message = self._resolve_chat_backend()
         if warning_message:
             self._append_message("system", warning_message)
-        if selected_engine is self.llama_engine and not self.llama_engine.is_loaded():
+        if backend_kind == "local" and backend is self.llama_engine and not self.llama_engine.is_loaded():
             self.llm_status_var.set("Llama: загрузка...")
 
         def worker():
             try:
-                response_text = selected_engine.chat(
-                    messages,
-                    temperature=0.6,
-                    max_tokens=768,
-                )
+                if backend_kind == "cloud":
+                    cloud_response = backend.chat(
+                        messages=messages,
+                        chat_id=self.current_session_id,
+                        model=self.CLOUD_MODEL_DEFAULT,
+                        temperature=0.6,
+                        max_tokens=768,
+                    )
+                    response_text = str(cloud_response.get("reply") or "")
+                    credits_spent = cloud_response.get("credits_spent")
+                    remaining_credits = cloud_response.get("remaining_credits")
+                    self.after(
+                        0,
+                        lambda: self._sync_cloud_credits(
+                            remaining_credits if remaining_credits is not None else None,
+                            credits_spent=credits_spent,
+                        ),
+                    )
+                    self.after(0, lambda: self.cloud_status_var.set("Cloud: OK"))
+                else:
+                    response_text = backend.chat(
+                        messages,
+                        temperature=0.6,
+                        max_tokens=768,
+                    )
                 cards = self._parse_cards_from_response(response_text)
                 draft = None
                 if cards:
@@ -1135,11 +1300,29 @@ class ChatBotTab(ttk.Frame):
                         created_at=int(time.time()),
                     )
                 self.after(0, lambda: self._on_chat_success(response_text, draft))
+            except CloudProviderError as exc:
+                logging.exception("Cloud LLM generation failed")
+                self.after(0, lambda: self._handle_cloud_error(exc))
             except Exception as exc:  # noqa: BLE001
                 logging.exception("LLM generation failed")
                 self.after(0, lambda: self._on_chat_error(str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_cloud_error(self, exc: CloudProviderError) -> None:
+        self._update_cloud_status_from_error(exc)
+        message = exc.message
+        if exc.status_code == 503:
+            message = "Сервер ИИ оффлайн"
+        elif exc.status_code == 429:
+            message = "Сервер занят/лимит"
+            if exc.retry_after:
+                message = f"{message} (retry_after: {exc.retry_after})"
+        elif exc.status_code == 402:
+            message = "Недостаточно кредитов"
+        elif exc.status_code == 401:
+            message = "Неверный ключ"
+        self._on_chat_error(message)
 
     def _on_generation_success(self, draft: DraftBatch) -> None:
         if self.current_draft and self.current_draft.cards and self.current_draft.deck_id == draft.deck_id:
