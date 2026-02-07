@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -15,6 +17,7 @@ from chatbot_models import ChatSession, DraftBatch, DraftCard, Message
 from credit_manager import CreditManager
 from csv_importer import upsert_note_and_cards
 from db_connect import open_db
+from llm_engine import LlamaCppEngine, LLMEngineBase, MockEngine
 from mock_ai_engine import MockAIEngine
 
 if TYPE_CHECKING:
@@ -370,11 +373,33 @@ def draft_to_card(draft: DraftCard) -> dict:
 
 
 class ChatBotTab(ttk.Frame):
+    SYSTEM_PROMPT = (
+        "Ты — тренер по обучению. Помогаешь учить материал по выбранной колоде.\n"
+        "1) Отвечай кратко и по делу.\n"
+        "2) Если пользователь просит — генерируй карточки в JSON массиве вида:\n"
+        "   [{\"front\":\"...\",\"back\":\"...\",\"tags\":[...]}]\n"
+        "3) Если контекста мало — задавай уточняющий вопрос.\n"
+        "4) Не выдумывай факты, если их нет в сообщениях пользователя."
+    )
+    LLM_PROVIDER_LLAMA = "Локальная Llama 3.1"
+    LLM_PROVIDER_MOCK = "Заглушка"
+
     def __init__(self, master: tk.Widget, app) -> None:
         super().__init__(master, style="Surface.TFrame")
         self.app = app
         self.palette = app.palette
-        self.engine = MockAIEngine()
+        self.card_engine = MockAIEngine()
+        self.llm_model_path = self._resolve_llm_model_path()
+        self.llama_engine = LlamaCppEngine(
+            self.llm_model_path,
+            n_ctx=4096,
+            n_threads=max(1, (os.cpu_count() or 2) // 2),
+            n_gpu_layers=-1,
+            verbose=False,
+        )
+        self.mock_llm_engine = MockEngine()
+        self.llm_engine: LLMEngineBase = self._select_default_llm_engine()
+        self._pending_llm_marker: tuple[str, str] | None = None
         self.credit_manager = CreditManager()
         self.current_session_id: int | None = None
         self.current_draft: DraftBatch | None = None
@@ -384,6 +409,7 @@ class ChatBotTab(ttk.Frame):
         self.pending_attachments: list[dict[str, Any]] = []
         self._deck_map: dict[str, int] = {}
         self.max_total_attachment_size = 200 * 1024 * 1024
+        self._llm_model_hint = self._format_llm_model_hint()
 
         self._ensure_chat_tables()
         self._build_ui()
@@ -391,6 +417,7 @@ class ChatBotTab(ttk.Frame):
         self._load_sessions()
         self.refresh_deck_options()
         self._lock_chat()
+        self._update_llm_status_label()
 
         self.app.register_balance_observer(self._update_save_button_state)
 
@@ -425,6 +452,37 @@ class ChatBotTab(ttk.Frame):
         )
         conn.commit()
         conn.close()
+
+    def _resolve_llm_model_path(self) -> str | None:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        llama_dir = os.path.join(base_dir, "models", "llm", "llama31")
+        llm_dir = os.path.join(base_dir, "models", "llm")
+        os.makedirs(llama_dir, exist_ok=True)
+        os.makedirs(llm_dir, exist_ok=True)
+        for search_dir in (llama_dir, llm_dir):
+            if not os.path.isdir(search_dir):
+                continue
+            candidates = [
+                os.path.join(search_dir, name)
+                for name in os.listdir(search_dir)
+                if name.lower().endswith(".gguf")
+            ]
+            if not candidates:
+                continue
+            candidates.sort(key=lambda path: os.path.getsize(path), reverse=True)
+            return candidates[0]
+        return None
+
+    def _format_llm_model_hint(self) -> str:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        llama_dir = os.path.join(base_dir, "models", "llm", "llama31")
+        example_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        return f"{llama_dir}\nНапример: {example_name}"
+
+    def _select_default_llm_engine(self) -> LLMEngineBase:
+        if self.llama_engine.is_available():
+            return self.llama_engine
+        return self.mock_llm_engine
 
     def _build_ui(self) -> None:
         container = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -527,6 +585,25 @@ class ChatBotTab(ttk.Frame):
         self.composer_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=8)
         self.composer_frame.grid(row=5, column=0, sticky="ew")
 
+        llm_control_frame = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
+        llm_control_frame.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(llm_control_frame, text="LLM:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.llm_provider_var = tk.StringVar(value=self._get_llm_provider_label(self.llm_engine))
+        self.llm_provider_combo = ttk.Combobox(
+            llm_control_frame,
+            textvariable=self.llm_provider_var,
+            state="readonly",
+            values=[self.LLM_PROVIDER_LLAMA, self.LLM_PROVIDER_MOCK],
+            width=22,
+        )
+        self.llm_provider_combo.pack(side=tk.LEFT, padx=(6, 0))
+        self.llm_provider_combo.bind("<<ComboboxSelected>>", self._on_llm_provider_change)
+
+        self.llm_status_var = tk.StringVar(value="")
+        self.llm_status_label = ttk.Label(llm_control_frame, textvariable=self.llm_status_var, style="Muted.TLabel")
+        self.llm_status_label.pack(side=tk.RIGHT)
+
         self.attachments_bar = AttachmentsBar(
             self.composer_frame,
             palette=self.palette,
@@ -571,6 +648,39 @@ class ChatBotTab(ttk.Frame):
             if hasattr(widget, "drop_target_register"):
                 widget.drop_target_register(DND_FILES)
                 widget.dnd_bind("<<Drop>>", self._on_drop_files)
+
+    def _get_llm_provider_label(self, engine: LLMEngineBase) -> str:
+        if engine is self.llama_engine:
+            return self.LLM_PROVIDER_LLAMA
+        return self.LLM_PROVIDER_MOCK
+
+    def _on_llm_provider_change(self, _event=None) -> None:
+        selected = self.llm_provider_var.get()
+        if selected == self.LLM_PROVIDER_LLAMA:
+            self.llm_engine = self.llama_engine
+        else:
+            self.llm_engine = self.mock_llm_engine
+        self._update_llm_status_label()
+
+    def _update_llm_status_label(self) -> None:
+        self._refresh_llm_model_path()
+        status = self._get_llm_status_text()
+        self.llm_status_var.set(status)
+
+    def _get_llm_status_text(self) -> str:
+        if not self.llm_model_path:
+            return f"Llama: не найден GGUF (положите файл сюда {self._llm_model_hint})"
+        if not self.llama_engine.is_llama_cpp_available():
+            return "Llama: не установлен модуль llama-cpp-python"
+        if self.llm_engine is self.llama_engine:
+            return f"Llama: {self.llama_engine.get_status()}"
+        return "Llama: заглушка"
+
+    def _refresh_llm_model_path(self) -> None:
+        latest_path = self._resolve_llm_model_path()
+        if latest_path != self.llm_model_path:
+            self.llm_model_path = latest_path
+            self.llama_engine.model_path = latest_path
 
     def _on_drop_files(self, event: tk.Event) -> str:
         if str(self.attach_btn.cget("state")) == str(tk.DISABLED):
@@ -761,13 +871,7 @@ class ChatBotTab(ttk.Frame):
             prefix = "Ассистент: "
         elif message.role == "system":
             prefix = "Система: "
-        payload = message.text or ""
-        if message.attachments:
-            attachments_info = ", ".join(
-                [self._attachment_label(item) for item in message.attachments if self._attachment_label(item)]
-            )
-            if attachments_info:
-                payload = f"{payload}\n[Вложения: {attachments_info}]"
+        payload = self._format_message_payload(message.text, message.attachments)
         self.chat_text.insert(tk.END, f"{prefix}{payload}\n\n", message.role)
 
     def _append_message(self, role: str, text: str, attachments: list[dict[str, Any]] | None = None) -> None:
@@ -787,6 +891,135 @@ class ChatBotTab(ttk.Frame):
         self._append_message_to_ui(message)
         self.chat_text.configure(state=tk.DISABLED)
         self.chat_text.see(tk.END)
+
+    def _format_message_payload(self, text: str, attachments: list[dict[str, Any]] | None) -> str:
+        payload = text or ""
+        if attachments:
+            attachments_info = ", ".join(
+                [self._attachment_label(item) for item in attachments if self._attachment_label(item)]
+            )
+            if attachments_info:
+                payload = f"{payload}\n[Вложения: {attachments_info}]" if payload else f"[Вложения: {attachments_info}]"
+        return payload
+
+    def _append_temporary_message(self, text: str, role: str = "assistant") -> None:
+        prefix = "Ассистент: " if role == "assistant" else "Система: "
+        self.chat_text.configure(state=tk.NORMAL)
+        start_index = self.chat_text.index(tk.END)
+        self.chat_text.insert(tk.END, f"{prefix}{text}\n\n", role)
+        end_index = self.chat_text.index(tk.END)
+        self.chat_text.configure(state=tk.DISABLED)
+        self.chat_text.see(tk.END)
+        self._pending_llm_marker = (start_index, end_index)
+
+    def _remove_temporary_message(self) -> None:
+        if not self._pending_llm_marker:
+            return
+        start_index, end_index = self._pending_llm_marker
+        self.chat_text.configure(state=tk.NORMAL)
+        self.chat_text.delete(start_index, end_index)
+        self.chat_text.configure(state=tk.DISABLED)
+        self._pending_llm_marker = None
+
+    def _build_chat_messages(self) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = [{"role": "system", "content": self.SYSTEM_PROMPT}]
+        if self.current_session_id is None:
+            return messages
+        conn = open_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, text, attachments_json FROM chat_messages WHERE session_id = ? ORDER BY ts ASC;",
+            (self.current_session_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        for row in rows:
+            role = row["role"]
+            if role not in ("user", "assistant"):
+                continue
+            attachments = []
+            if row["attachments_json"]:
+                try:
+                    attachments = json.loads(row["attachments_json"])
+                except Exception:
+                    attachments = []
+            payload = self._format_message_payload(row["text"] or "", attachments)
+            messages.append({"role": role, "content": payload})
+        return messages
+
+    def _resolve_llm_engine(self) -> tuple[LLMEngineBase, str | None]:
+        self._refresh_llm_model_path()
+        selected = self.llm_provider_var.get()
+        if selected == self.LLM_PROVIDER_LLAMA:
+            if self.llama_engine.is_available():
+                return self.llama_engine, None
+            if not self.llm_model_path:
+                return self.mock_llm_engine, (
+                    "LLM недоступна: не найден GGUF.\n"
+                    f"Положите файл сюда:\n{self._llm_model_hint}"
+                )
+            if not self.llama_engine.is_llama_cpp_available():
+                return self.mock_llm_engine, "LLM недоступна: не установлен модуль llama-cpp-python."
+            return self.mock_llm_engine, "LLM недоступна из-за ошибки загрузки."
+        return self.mock_llm_engine, None
+
+    def _parse_cards_from_response(self, response_text: str) -> list[DraftCard]:
+        if not response_text:
+            return []
+        json_block = None
+        fenced_match = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", response_text)
+        if fenced_match:
+            json_block = fenced_match.group(1)
+        else:
+            bracket_match = re.search(r"(\[[\s\S]*\])", response_text)
+            if bracket_match:
+                json_block = bracket_match.group(1)
+        if not json_block:
+            return []
+        try:
+            payload = json.loads(json_block)
+        except Exception:
+            return []
+        if not isinstance(payload, list):
+            return []
+        cards: list[DraftCard] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            front = str(item.get("front") or "").strip()
+            back = str(item.get("back") or "").strip()
+            if not front or not back:
+                continue
+            tags_value = item.get("tags") or []
+            tags = [str(tag).strip() for tag in tags_value if str(tag).strip()] if isinstance(tags_value, list) else []
+            cards.append(
+                DraftCard(
+                    front=front,
+                    back=back,
+                    tags=tags,
+                    media={"source": "llm"},
+                    meta={"ts": int(time.time())},
+                )
+            )
+        return cards
+
+    def _on_chat_success(self, response_text: str, draft: DraftBatch | None) -> None:
+        self._remove_temporary_message()
+        if response_text:
+            self._append_message("assistant", response_text)
+        else:
+            self._append_message("assistant", "...")
+        if draft:
+            self._on_generation_success(draft)
+        else:
+            self._set_sending_state(False)
+        self._update_llm_status_label()
+
+    def _on_chat_error(self, message: str) -> None:
+        self._remove_temporary_message()
+        self._append_message("system", f"[LLM ERROR] {message}")
+        self._set_sending_state(False)
+        self._update_llm_status_label()
 
     def _on_attach(self) -> None:
         filetypes = [
@@ -866,40 +1099,47 @@ class ChatBotTab(ttk.Frame):
         self._refresh_attachments_ui()
         self.input_text.clear()
         self._append_message("user", text, attachments)
-        self._append_message("assistant", "Получено. (заглушка) Готовлю черновик.")
 
         self._set_sending_state(True)
+        self._append_temporary_message("Думаю...", role="assistant")
         self._start_generation(text, attachments)
 
     def _start_generation(self, text: str, attachments: list[dict[str, Any]]) -> None:
         plan = self.app.get_pricing_plan()
         user_id = self.app.user_id
         deck_context = {"deck_id": self._deck_map.get(self.deck_var.get())}
+        messages = self._build_chat_messages()
+        selected_engine, warning_message = self._resolve_llm_engine()
+        if warning_message:
+            self._append_message("system", warning_message)
+        if selected_engine is self.llama_engine and not self.llama_engine.is_loaded():
+            self.llm_status_var.set("Llama: загрузка...")
 
         def worker():
             try:
-                cards = self._generate_cards(text, attachments, deck_context)
-                self.engine.check_and_record_generation(user_id, plan, len(cards))
-                total_credits = self.engine.estimate_cost(len(cards), plan)
-                draft = DraftBatch(
-                    draft_id=str(uuid.uuid4()),
-                    deck_id=deck_context.get("deck_id") or 0,
-                    cards=cards,
-                    total_credits=total_credits,
-                    created_at=int(time.time()),
+                response_text = selected_engine.chat(
+                    messages,
+                    temperature=0.6,
+                    max_tokens=768,
                 )
-                self.after(0, lambda: self._on_generation_success(draft))
+                cards = self._parse_cards_from_response(response_text)
+                draft = None
+                if cards:
+                    self.card_engine.check_and_record_generation(user_id, plan, len(cards))
+                    total_credits = self.card_engine.estimate_cost(len(cards), plan)
+                    draft = DraftBatch(
+                        draft_id=str(uuid.uuid4()),
+                        deck_id=deck_context.get("deck_id") or 0,
+                        cards=cards,
+                        total_credits=total_credits,
+                        created_at=int(time.time()),
+                    )
+                self.after(0, lambda: self._on_chat_success(response_text, draft))
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._on_generation_error(str(exc)))
+                logging.exception("LLM generation failed")
+                self.after(0, lambda: self._on_chat_error(str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _generate_cards(self, text: str, attachments: list[dict[str, Any]], deck_context: dict) -> list[DraftCard]:
-        for item in attachments:
-            path = item.get("path")
-            if path:
-                return self.engine.generate_from_file(path, deck_context)
-        return self.engine.generate_from_text(text, deck_context)
 
     def _on_generation_success(self, draft: DraftBatch) -> None:
         if self.current_draft and self.current_draft.cards and self.current_draft.deck_id == draft.deck_id:
@@ -927,11 +1167,10 @@ class ChatBotTab(ttk.Frame):
 
     def _calculate_total_credits(self, cards: list[DraftCard]) -> int:
         plan = self.app.get_pricing_plan()
-        return self.engine.estimate_cost(len(cards), plan)
+        return self.card_engine.estimate_cost(len(cards), plan)
 
     def _on_generation_error(self, message: str) -> None:
-        self._append_message("system", f"Ошибка генерации: {message}")
-        self._set_sending_state(False)
+        self._on_chat_error(message)
 
     def _update_save_button_state(self) -> None:
         if not self.current_draft:
