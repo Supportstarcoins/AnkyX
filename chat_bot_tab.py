@@ -140,6 +140,29 @@ class AutoGrowText(ttk.Frame):
         self.text.tag_add("sel", "1.0", "end-1c")
 
 
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, master: tk.Widget) -> None:
+        super().__init__(master)
+        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.internal_frame = ttk.Frame(self.canvas)
+        self._window_id = self.canvas.create_window((0, 0), window=self.internal_frame, anchor="nw")
+
+        self.internal_frame.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+    def _on_frame_configure(self, _event=None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self._window_id, width=event.width)
+
+
 class AttachmentsBar(ttk.Frame):
     def __init__(self, master: tk.Widget, *, palette: dict, on_remove: Callable[[int], None]) -> None:
         super().__init__(master)
@@ -442,6 +465,7 @@ class ChatBotTab(ttk.Frame):
         self.llm_provider_var = tk.StringVar(value=self._get_llm_provider_label(self.llm_engine))
         self.llm_status_var = tk.StringVar(value="")
         self.llm_settings_window: tk.Toplevel | None = None
+        self._mousewheel_bound = False
 
         self._ensure_chat_tables()
         self._build_ui()
@@ -459,9 +483,11 @@ class ChatBotTab(ttk.Frame):
         self.ollama_model_var.trace_add("write", self._on_ollama_settings_change)
         self.cloud_status_var.trace_add("write", self._on_llm_status_change)
         self.ollama_status_var.trace_add("write", self._on_llm_status_change)
+        self._setup_scroll_bindings()
 
     def destroy(self):
         self.app.unregister_balance_observer(self._update_save_button_state)
+        self._unbind_mousewheel()
         super().destroy()
 
     def _ensure_chat_tables(self) -> None:
@@ -524,7 +550,11 @@ class ChatBotTab(ttk.Frame):
         return self.mock_llm_engine
 
     def _build_ui(self) -> None:
-        container = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        self.scrollable_frame = ScrollableFrame(self)
+        self.scrollable_frame.pack(fill=tk.BOTH, expand=True)
+        self.scroll_canvas = self.scrollable_frame.canvas
+
+        container = ttk.PanedWindow(self.scrollable_frame.internal_frame, orient=tk.HORIZONTAL)
         container.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         left_frame = ttk.Frame(container, style="Card.TFrame", padding=10)
@@ -607,8 +637,9 @@ class ChatBotTab(ttk.Frame):
         render_area = ttk.Frame(vpane, style="Surface.TFrame")
         chat_area = ttk.Frame(vpane, style="Surface.TFrame")
 
-        vpane.add(render_area, weight=7, minsize=420)
-        vpane.add(chat_area, weight=3)
+        vpane.add(render_area, weight=8)
+        vpane.add(chat_area, weight=2)
+        self.after(200, lambda: vpane.sashpos(0, int(vpane.winfo_height() * 0.80)))
 
         render_inner = ttk.Frame(render_area, style="Surface.TFrame", padding=6)
         render_inner.pack(fill=tk.BOTH, expand=True)
@@ -653,7 +684,6 @@ class ChatBotTab(ttk.Frame):
         self.chat_text.configure(state=tk.DISABLED)
 
         history_scroll = ttk.Scrollbar(history_area, orient="vertical", command=self.chat_text.yview)
-        history_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.chat_text.configure(yscrollcommand=history_scroll.set)
 
         self.composer_frame = ttk.Frame(chat_area, style="Card.TFrame", padding=8)
@@ -681,6 +711,7 @@ class ChatBotTab(ttk.Frame):
         self.input_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.input_text.bind("<KeyRelease>", self._on_input_keyrelease)
         self.input_text.bind("<Return>", self._on_input_return)
+        self._configure_input_copy_paste()
 
         self.send_btn_var = tk.StringVar(value="Отправить")
         self.send_btn = tk.Button(
@@ -708,6 +739,92 @@ class ChatBotTab(ttk.Frame):
         self._setup_drag_and_drop()
         self._update_send_button_state()
         self._append_chat("system", "Чат готов. Напишите сообщение снизу.")
+        self._bind_scroll_widgets()
+
+    def _configure_input_copy_paste(self) -> None:
+        self.input_text.bind(
+            "<Control-c>",
+            lambda e: (self.input_text.event_generate("<<Copy>>"), "break")[1],
+        )
+        self.input_text.bind(
+            "<Control-v>",
+            lambda e: (self.input_text.event_generate("<<Paste>>"), "break")[1],
+        )
+        self.input_text.bind(
+            "<Control-x>",
+            lambda e: (self.input_text.event_generate("<<Cut>>"), "break")[1],
+        )
+        self.input_text.bind("<Control-a>", self._select_all_input_text)
+
+        self._input_menu = tk.Menu(self, tearoff=False)
+        self._input_menu.add_command(
+            label="Copy",
+            command=lambda: self.input_text.event_generate("<<Copy>>"),
+        )
+        self._input_menu.add_command(
+            label="Paste",
+            command=lambda: self.input_text.event_generate("<<Paste>>"),
+        )
+        self._input_menu.add_command(
+            label="Cut",
+            command=lambda: self.input_text.event_generate("<<Cut>>"),
+        )
+        self._input_menu.add_command(
+            label="Select All",
+            command=self._select_all_input_text,
+        )
+        self.input_text.bind("<Button-3>", self._show_input_menu)
+
+    def _select_all_input_text(self, _event=None) -> str:
+        self.input_text.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def _show_input_menu(self, event: tk.Event) -> None:
+        self._input_menu.tk_popup(event.x_root, event.y_root)
+
+    def _bind_scroll_widgets(self) -> None:
+        for widget in (self.chat_text, self.input_text, self.chats_listbox):
+            widget.bind("<MouseWheel>", self._on_mousewheel)
+
+    def _setup_scroll_bindings(self) -> None:
+        notebook = getattr(self.app, "main_notebook", None)
+        if notebook is not None:
+            notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed, add="+")
+        self._sync_mousewheel_binding()
+
+    def _on_notebook_tab_changed(self, _event=None) -> None:
+        self._sync_mousewheel_binding()
+
+    def _sync_mousewheel_binding(self) -> None:
+        notebook = getattr(self.app, "main_notebook", None)
+        if notebook is None:
+            self._bind_mousewheel()
+            return
+        try:
+            current = notebook.nametowidget(notebook.select())
+        except Exception:
+            self._unbind_mousewheel()
+            return
+        if current is getattr(self.app, "chatbot_tab_frame", None):
+            self._bind_mousewheel()
+        else:
+            self._unbind_mousewheel()
+
+    def _bind_mousewheel(self) -> None:
+        if self._mousewheel_bound:
+            return
+        self.scroll_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self._mousewheel_bound = True
+
+    def _unbind_mousewheel(self) -> None:
+        if not self._mousewheel_bound:
+            return
+        self.scroll_canvas.unbind_all("<MouseWheel>")
+        self._mousewheel_bound = False
+
+    def _on_mousewheel(self, event: tk.Event) -> str:
+        self.scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
 
     def _configure_text_tags(self) -> None:
         self.chat_text.tag_configure("user", foreground="#e6e6e6")
