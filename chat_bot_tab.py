@@ -158,8 +158,6 @@ class AttachmentsBar(ttk.Frame):
             name = item.get("name") or os.path.basename(item.get("path", "")) or "файл"
             label = ttk.Label(chip, text=name, style="Muted.TLabel")
             label.pack(side=tk.LEFT)
-            size_label = ttk.Label(chip, text=f" {item.get('size_label', '')}", style="Muted.TLabel")
-            size_label.pack(side=tk.LEFT)
             btn = ttk.Button(chip, text="✕", width=2, command=lambda idx=index: self.on_remove(idx))
             btn.pack(side=tk.LEFT, padx=(4, 0))
             self._chips.append(chip)
@@ -420,7 +418,8 @@ class ChatBotTab(ttk.Frame):
         self.draft_show_back = False
         self.pending_attachments: list[dict[str, Any]] = []
         self._deck_map: dict[str, int] = {}
-        self.max_total_attachment_size = 200 * 1024 * 1024
+        self.max_attachment_count = 10
+        self.max_attachment_size = 25 * 1024 * 1024
         self._llm_model_hint = self._format_llm_model_hint()
         self._cloud_settings_save_job: str | None = None
         self._cloud_settings_path = self._resolve_cloud_settings_path()
@@ -438,6 +437,9 @@ class ChatBotTab(ttk.Frame):
             self.ollama_model_var.get().strip() or self.OLLAMA_MODEL_DEFAULT,
         )
         self.llm_engine: LLMEngineBase = self._select_default_llm_engine()
+        self.llm_provider_var = tk.StringVar(value=self._get_llm_provider_label(self.llm_engine))
+        self.llm_status_var = tk.StringVar(value="")
+        self.llm_settings_window: tk.Toplevel | None = None
 
         self._ensure_chat_tables()
         self._build_ui()
@@ -548,11 +550,22 @@ class ChatBotTab(ttk.Frame):
         container.add(right_frame, weight=4)
 
         right_frame.grid_columnconfigure(0, weight=1)
-        right_frame.grid_rowconfigure(4, weight=1)
-        right_frame.grid_rowconfigure(5, weight=0)
+        right_frame.grid_rowconfigure(5, weight=1)
+        right_frame.grid_rowconfigure(6, weight=0)
+
+        header_frame = ttk.Frame(right_frame, style="Surface.TFrame")
+        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        header_frame.columnconfigure(0, weight=1)
+
+        self.llm_settings_btn = ttk.Button(
+            header_frame,
+            text="⚙ Настройки LLM",
+            command=self._open_llm_settings,
+        )
+        self.llm_settings_btn.grid(row=0, column=1, sticky="e")
 
         deck_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=8)
-        deck_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        deck_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
 
         ttk.Label(deck_frame, text="Колода:", style="Muted.TLabel").pack(side=tk.LEFT)
         self.deck_var = tk.StringVar(value="")
@@ -565,7 +578,7 @@ class ChatBotTab(ttk.Frame):
         self.status_label.pack(side=tk.RIGHT, padx=(8, 0))
 
         nav_frame = ttk.Frame(right_frame, style="CardInner.TFrame")
-        nav_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        nav_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
 
         self.prev_draft_btn = ttk.Button(nav_frame, text="◀", width=3, command=self._prev_draft)
         self.prev_draft_btn.pack(side=tk.LEFT)
@@ -579,7 +592,7 @@ class ChatBotTab(ttk.Frame):
         from main import RepeatModeCardView
 
         self.sticky_frame = ttk.Frame(right_frame, style="Surface.TFrame", padding=6)
-        self.sticky_frame.grid(row=2, column=0, sticky="ew")
+        self.sticky_frame.grid(row=3, column=0, sticky="ew")
 
         self.card_view: RepeatModeCardView = RepeatModeCardView(
             self.sticky_frame,
@@ -595,10 +608,10 @@ class ChatBotTab(ttk.Frame):
             command=self._save_draft,
             style="Primary.TButton",
         )
-        self.save_draft_btn.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self.save_draft_btn.grid(row=4, column=0, sticky="ew", pady=(6, 0))
 
         history_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=6)
-        history_frame.grid(row=4, column=0, sticky="nsew", pady=(8, 8))
+        history_frame.grid(row=5, column=0, sticky="nsew", pady=(8, 8))
 
         self.chat_text = tk.Text(
             history_frame,
@@ -616,89 +629,7 @@ class ChatBotTab(ttk.Frame):
         self.chat_text.configure(yscrollcommand=history_scroll.set)
 
         self.composer_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=8)
-        self.composer_frame.grid(row=5, column=0, sticky="ew")
-
-        llm_control_frame = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
-        llm_control_frame.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Label(llm_control_frame, text="LLM:", style="Muted.TLabel").pack(side=tk.LEFT)
-        self.llm_provider_var = tk.StringVar(value=self._get_llm_provider_label(self.llm_engine))
-        self.llm_provider_combo = ttk.Combobox(
-            llm_control_frame,
-            textvariable=self.llm_provider_var,
-            state="readonly",
-            values=[
-                self.LLM_PROVIDER_OLLAMA,
-                self.LLM_PROVIDER_LLAMA,
-                self.LLM_PROVIDER_CLOUD,
-                self.LLM_PROVIDER_MOCK,
-            ],
-            width=22,
-        )
-        self.llm_provider_combo.pack(side=tk.LEFT, padx=(6, 0))
-        self.llm_provider_combo.bind("<<ComboboxSelected>>", self._on_llm_provider_change)
-
-        self.llm_status_var = tk.StringVar(value="")
-        self.llm_status_label = ttk.Label(llm_control_frame, textvariable=self.llm_status_var, style="Muted.TLabel")
-        self.llm_status_label.pack(side=tk.RIGHT)
-
-        ollama_frame = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
-        ollama_frame.pack(fill=tk.X, pady=(0, 6))
-        ollama_frame.columnconfigure(1, weight=1)
-        ollama_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(ollama_frame, text="Ollama URL:", style="Muted.TLabel").grid(
-            row=0,
-            column=0,
-            sticky="w",
-            padx=(0, 6),
-        )
-        ollama_url_entry = ttk.Entry(ollama_frame, textvariable=self.ollama_url_var)
-        ollama_url_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
-
-        ttk.Label(ollama_frame, text="Модель:", style="Muted.TLabel").grid(
-            row=0,
-            column=2,
-            sticky="w",
-            padx=(0, 6),
-        )
-        ollama_model_entry = ttk.Entry(ollama_frame, textvariable=self.ollama_model_var)
-        ollama_model_entry.grid(row=0, column=3, sticky="ew")
-
-        ollama_actions = ttk.Frame(ollama_frame, style="CardInner.TFrame")
-        ollama_actions.grid(row=0, column=4, sticky="e", padx=(10, 0))
-        ttk.Button(ollama_actions, text="Проверить", command=self._check_ollama_connection).pack(side=tk.LEFT)
-        ttk.Label(ollama_actions, textvariable=self.ollama_status_var, style="Muted.TLabel").pack(
-            side=tk.LEFT,
-            padx=8,
-        )
-
-        cloud_frame = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
-        cloud_frame.pack(fill=tk.X, pady=(0, 6))
-        cloud_frame.columnconfigure(1, weight=1)
-        cloud_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(cloud_frame, text="Cloud URL:", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        cloud_url_entry = ttk.Entry(cloud_frame, textvariable=self.cloud_url_var)
-        cloud_url_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
-
-        ttk.Label(cloud_frame, text="API ключ:", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        cloud_key_entry = ttk.Entry(cloud_frame, textvariable=self.cloud_api_key_var, show="•")
-        cloud_key_entry.grid(row=0, column=3, sticky="ew")
-
-        cloud_actions = ttk.Frame(cloud_frame, style="CardInner.TFrame")
-        cloud_actions.grid(row=0, column=4, sticky="e", padx=(10, 0))
-        ttk.Button(cloud_actions, text="Проверить соединение", command=self._check_cloud_connection).pack(
-            side=tk.LEFT
-        )
-        ttk.Label(cloud_actions, textvariable=self.cloud_status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
-
-        self.attachments_bar = AttachmentsBar(
-            self.composer_frame,
-            palette=self.palette,
-            on_remove=self._remove_attachment,
-        )
-        self.attachments_bar.pack(fill=tk.X, pady=(0, 6))
+        self.composer_frame.grid(row=6, column=0, sticky="ew")
 
         self.composer_row = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
         self.composer_row.pack(fill=tk.X)
@@ -709,7 +640,7 @@ class ChatBotTab(ttk.Frame):
         self.input_text = AutoGrowText(
             self.composer_row,
             min_lines=1,
-            max_lines=10,
+            max_lines=6,
             on_send=self._on_send,
             on_change=self._update_send_button_state,
             bg=self.palette.get("panel"),
@@ -718,8 +649,21 @@ class ChatBotTab(ttk.Frame):
         )
         self.input_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.send_btn = RoundSendButton(self.composer_row, command=self._on_send)
+        self.send_btn_var = tk.StringVar(value="Отправить")
+        self.send_btn = ttk.Button(
+            self.composer_row,
+            textvariable=self.send_btn_var,
+            command=self._on_send,
+            style="Primary.TButton",
+        )
         self.send_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        self.attachments_bar = AttachmentsBar(
+            self.composer_frame,
+            palette=self.palette,
+            on_remove=self._remove_attachment,
+        )
+        self.attachments_bar.pack(fill=tk.X, pady=(4, 0))
 
         self._configure_text_tags()
         self._setup_drag_and_drop()
@@ -737,6 +681,99 @@ class ChatBotTab(ttk.Frame):
             if hasattr(widget, "drop_target_register"):
                 widget.drop_target_register(DND_FILES)
                 widget.dnd_bind("<<Drop>>", self._on_drop_files)
+
+    def _open_llm_settings(self) -> None:
+        if self.llm_settings_window and self.llm_settings_window.winfo_exists():
+            self.llm_settings_window.lift()
+            self.llm_settings_window.focus_force()
+            return
+        window = tk.Toplevel(self)
+        window.title("Настройки LLM")
+        window.transient(self.winfo_toplevel())
+        window.grab_set()
+        window.resizable(False, False)
+        self.llm_settings_window = window
+
+        container = ttk.Frame(window, style="Card.TFrame", padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(container, text="LLM настройки", style="Section.TLabel").pack(anchor=tk.W, pady=(0, 6))
+
+        llm_control_frame = ttk.Frame(container, style="CardInner.TFrame", padding=6)
+        llm_control_frame.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(llm_control_frame, text="LLM:", style="Muted.TLabel").pack(side=tk.LEFT)
+        llm_provider_combo = ttk.Combobox(
+            llm_control_frame,
+            textvariable=self.llm_provider_var,
+            state="readonly",
+            values=[
+                self.LLM_PROVIDER_OLLAMA,
+                self.LLM_PROVIDER_LLAMA,
+                self.LLM_PROVIDER_CLOUD,
+                self.LLM_PROVIDER_MOCK,
+            ],
+            width=22,
+        )
+        llm_provider_combo.pack(side=tk.LEFT, padx=(6, 0))
+        llm_provider_combo.bind("<<ComboboxSelected>>", self._on_llm_provider_change)
+
+        llm_status_label = ttk.Label(llm_control_frame, textvariable=self.llm_status_var, style="Muted.TLabel")
+        llm_status_label.pack(side=tk.RIGHT)
+
+        ollama_frame = ttk.Frame(container, style="CardInner.TFrame", padding=6)
+        ollama_frame.pack(fill=tk.X, pady=(0, 6))
+        ollama_frame.columnconfigure(1, weight=1)
+        ollama_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(ollama_frame, text="Ollama URL:", style="Muted.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(0, 6),
+        )
+        ttk.Entry(ollama_frame, textvariable=self.ollama_url_var).grid(row=0, column=1, sticky="ew", padx=(0, 10))
+
+        ttk.Label(ollama_frame, text="Модель:", style="Muted.TLabel").grid(
+            row=0,
+            column=2,
+            sticky="w",
+            padx=(0, 6),
+        )
+        ttk.Entry(ollama_frame, textvariable=self.ollama_model_var).grid(row=0, column=3, sticky="ew")
+
+        ollama_actions = ttk.Frame(ollama_frame, style="CardInner.TFrame")
+        ollama_actions.grid(row=0, column=4, sticky="e", padx=(10, 0))
+        ttk.Button(ollama_actions, text="Проверить", command=self._check_ollama_connection).pack(side=tk.LEFT)
+        ttk.Label(ollama_actions, textvariable=self.ollama_status_var, style="Muted.TLabel").pack(
+            side=tk.LEFT,
+            padx=8,
+        )
+
+        cloud_frame = ttk.Frame(container, style="CardInner.TFrame", padding=6)
+        cloud_frame.pack(fill=tk.X, pady=(0, 6))
+        cloud_frame.columnconfigure(1, weight=1)
+        cloud_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(cloud_frame, text="Cloud URL:", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(cloud_frame, textvariable=self.cloud_url_var).grid(row=0, column=1, sticky="ew", padx=(0, 10))
+
+        ttk.Label(cloud_frame, text="API ключ:", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Entry(cloud_frame, textvariable=self.cloud_api_key_var, show="•").grid(row=0, column=3, sticky="ew")
+
+        cloud_actions = ttk.Frame(cloud_frame, style="CardInner.TFrame")
+        cloud_actions.grid(row=0, column=4, sticky="e", padx=(10, 0))
+        ttk.Button(cloud_actions, text="Проверить", command=self._check_cloud_connection).pack(side=tk.LEFT)
+        ttk.Label(cloud_actions, textvariable=self.cloud_status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
+
+        def on_close() -> None:
+            if self.llm_settings_window and self.llm_settings_window.winfo_exists():
+                self.llm_settings_window.grab_release()
+                self.llm_settings_window.destroy()
+            self.llm_settings_window = None
+
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        self._update_llm_status_label()
 
     def _get_llm_provider_label(self, engine: LLMEngineBase) -> str:
         if engine is self.ollama_engine:
@@ -797,11 +834,11 @@ class ChatBotTab(ttk.Frame):
 
     def _update_send_button_state(self) -> None:
         if str(self.input_text.text.cget("state")) == str(tk.DISABLED):
-            self.send_btn.set_enabled(False)
+            self.send_btn.configure(state=tk.DISABLED)
             return
         text = self.input_text.get_text().strip()
         enabled = bool(text) or bool(self.pending_attachments)
-        self.send_btn.set_enabled(enabled)
+        self.send_btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
 
     def _attachment_label(self, item: dict[str, Any]) -> str:
         return item.get("name") or os.path.basename(item.get("path", ""))
@@ -815,23 +852,12 @@ class ChatBotTab(ttk.Frame):
             ".webp",
             ".pdf",
             ".txt",
-            ".md",
-            ".doc",
             ".docx",
-            ".csv",
-            ".xls",
-            ".xlsx",
-            ".ppt",
-            ".pptx",
             ".mp3",
             ".wav",
-            ".m4a",
             ".ogg",
             ".mp4",
-            ".mov",
             ".mkv",
-            ".webm",
-            ".zip",
         }
         return ext in allowed
 
@@ -857,7 +883,7 @@ class ChatBotTab(ttk.Frame):
 
     def _lock_chat(self) -> None:
         self.input_text.set_state(tk.DISABLED)
-        self.send_btn.set_enabled(False)
+        self.send_btn.configure(state=tk.DISABLED)
         self.attach_btn.configure(state=tk.DISABLED)
         self.status_var.set("Выберите колоду")
 
@@ -958,10 +984,10 @@ class ChatBotTab(ttk.Frame):
         self.chat_text.configure(state=tk.NORMAL)
         self.chat_text.delete("1.0", tk.END)
         for row in rows:
-            attachments = []
+            attachments: list[str] = []
             if row["attachments_json"]:
                 try:
-                    attachments = json.loads(row["attachments_json"])
+                    attachments = self._normalize_attachments(json.loads(row["attachments_json"]))
                 except Exception:
                     attachments = []
             message = Message(role=row["role"], text=row["text"] or "", attachments=attachments)
@@ -980,7 +1006,7 @@ class ChatBotTab(ttk.Frame):
         payload = self._format_message_payload(message.text, message.attachments)
         self.chat_text.insert(tk.END, f"{prefix}{payload}\n\n", message.role)
 
-    def _append_message(self, role: str, text: str, attachments: list[dict[str, Any]] | None = None) -> None:
+    def _append_message(self, role: str, text: str, attachments: list[str] | None = None) -> None:
         if self.current_session_id is None:
             return
         attachments_json = json.dumps(attachments or [], ensure_ascii=False)
@@ -998,15 +1024,48 @@ class ChatBotTab(ttk.Frame):
         self.chat_text.configure(state=tk.DISABLED)
         self.chat_text.see(tk.END)
 
-    def _format_message_payload(self, text: str, attachments: list[dict[str, Any]] | None) -> str:
+    def _normalize_attachments(self, raw: Any) -> list[str]:
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            normalized: list[str] = []
+            for item in raw:
+                if isinstance(item, str):
+                    normalized.append(item)
+                    continue
+                if isinstance(item, dict):
+                    candidate = item.get("path") or item.get("name")
+                    if candidate:
+                        normalized.append(str(candidate))
+            return normalized
+        return []
+
+    def _format_message_payload(self, text: str, attachments: list[str] | None) -> str:
         payload = text or ""
         if attachments:
             attachments_info = ", ".join(
-                [self._attachment_label(item) for item in attachments if self._attachment_label(item)]
+                [os.path.basename(path) for path in attachments if os.path.basename(path)]
             )
             if attachments_info:
-                payload = f"{payload}\n[Вложения: {attachments_info}]" if payload else f"[Вложения: {attachments_info}]"
+                payload = f"{payload}\n📎 {attachments_info}" if payload else f"📎 {attachments_info}"
         return payload
+
+    def _build_cloud_attachment_metadata(self, attachments: list[str]) -> list[dict[str, Any]]:
+        metadata: list[dict[str, Any]] = []
+        for path in attachments:
+            if not path:
+                continue
+            name = os.path.basename(path)
+            if not name:
+                continue
+            size = 0
+            try:
+                if os.path.exists(path):
+                    size = os.path.getsize(path)
+            except Exception:  # noqa: BLE001
+                size = 0
+            metadata.append({"name": name, "size": size})
+        return metadata
 
     def _append_temporary_message(self, text: str, role: str = "assistant") -> None:
         prefix = "Ассистент: " if role == "assistant" else "Система: "
@@ -1027,8 +1086,8 @@ class ChatBotTab(ttk.Frame):
         self.chat_text.configure(state=tk.DISABLED)
         self._pending_llm_marker = None
 
-    def _build_chat_messages(self) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = [{"role": "system", "content": self.SYSTEM_PROMPT}]
+    def _build_chat_messages(self, *, for_cloud: bool) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = [{"role": "system", "content": self.SYSTEM_PROMPT}]
         if self.current_session_id is None:
             return messages
         conn = open_db()
@@ -1043,14 +1102,24 @@ class ChatBotTab(ttk.Frame):
             role = row["role"]
             if role not in ("user", "assistant"):
                 continue
-            attachments = []
+            attachments: list[str] = []
             if row["attachments_json"]:
                 try:
-                    attachments = json.loads(row["attachments_json"])
+                    attachments = self._normalize_attachments(json.loads(row["attachments_json"]))
                 except Exception:
                     attachments = []
-            payload = self._format_message_payload(row["text"] or "", attachments)
-            messages.append({"role": role, "content": payload})
+            text = row["text"] or ""
+            if for_cloud:
+                messages.append(
+                    {
+                        "role": role,
+                        "content": text,
+                        "attachments": self._build_cloud_attachment_metadata(attachments),
+                    }
+                )
+            else:
+                payload = self._format_message_payload(text, attachments)
+                messages.append({"role": role, "content": payload})
         return messages
 
     def _resolve_llm_engine(self) -> tuple[LLMEngineBase, str | None]:
@@ -1274,12 +1343,10 @@ class ChatBotTab(ttk.Frame):
         filetypes = [
             ("Images", "*.png *.jpg *.jpeg *.webp"),
             ("PDF", "*.pdf"),
-            ("Text", "*.txt *.md"),
-            ("Documents", "*.doc *.docx *.ppt *.pptx *.xls *.xlsx *.csv"),
-            ("Archives", "*.zip"),
-            ("Audio", "*.mp3 *.wav *.m4a *.ogg"),
-            ("Video", "*.mp4 *.mov *.mkv *.webm"),
-            ("All files", "*.*"),
+            ("Text", "*.txt"),
+            ("Documents", "*.docx"),
+            ("Audio", "*.mp3 *.wav *.ogg"),
+            ("Video", "*.mp4 *.mkv"),
         ]
         paths = filedialog.askopenfilenames(title="Выберите файлы", filetypes=filetypes)
         if not paths:
@@ -1288,8 +1355,13 @@ class ChatBotTab(ttk.Frame):
 
     def _add_attachments(self, paths: list[str]) -> None:
         current_paths = {item.get("path") for item in self.pending_attachments}
-        total_size = sum(item.get("size", 0) for item in self.pending_attachments)
         for path in paths:
+            if len(self.pending_attachments) >= self.max_attachment_count:
+                messagebox.showwarning(
+                    "Вложения",
+                    f"Можно прикрепить не более {self.max_attachment_count} файлов за раз.",
+                )
+                break
             if not path or path in current_paths:
                 continue
             if not os.path.exists(path):
@@ -1298,9 +1370,12 @@ class ChatBotTab(ttk.Frame):
                 messagebox.showwarning("Вложения", f"Формат не поддерживается: {os.path.basename(path)}")
                 continue
             size = os.path.getsize(path)
-            if total_size + size > self.max_total_attachment_size:
-                messagebox.showwarning("Вложения", "Общий размер вложений превышает лимит.")
-                break
+            if size > self.max_attachment_size:
+                messagebox.showwarning(
+                    "Вложения",
+                    f"Файл больше 25MB: {os.path.basename(path)}",
+                )
+                continue
             name = os.path.basename(path)
             item = {
                 "path": path,
@@ -1310,7 +1385,6 @@ class ChatBotTab(ttk.Frame):
             }
             self.pending_attachments.append(item)
             current_paths.add(path)
-            total_size += size
         self._refresh_attachments_ui()
 
     def _remove_attachment(self, index: int) -> None:
@@ -1326,11 +1400,13 @@ class ChatBotTab(ttk.Frame):
         if sending:
             self.input_text.set_state(tk.DISABLED)
             self.attach_btn.configure(state=tk.DISABLED)
-            self.send_btn.set_enabled(False)
+            self.send_btn_var.set("Думаю...")
+            self.send_btn.configure(state=tk.DISABLED)
             return
         if self.deck_var.get():
             self.input_text.set_state(tk.NORMAL)
             self.attach_btn.configure(state=tk.NORMAL)
+            self.send_btn_var.set("Отправить")
             self._update_send_button_state()
 
     def _on_send(self) -> None:
@@ -1343,7 +1419,7 @@ class ChatBotTab(ttk.Frame):
         text = self.input_text.get_text().strip()
         if not text and not self.pending_attachments:
             return
-        attachments = list(self.pending_attachments)
+        attachments = [item.get("path", "") for item in self.pending_attachments if item.get("path")]
         self.pending_attachments = []
         self._refresh_attachments_ui()
         self.input_text.clear()
@@ -1353,12 +1429,12 @@ class ChatBotTab(ttk.Frame):
         self._append_temporary_message("Думаю...", role="assistant")
         self._start_generation(text, attachments)
 
-    def _start_generation(self, text: str, attachments: list[dict[str, Any]]) -> None:
+    def _start_generation(self, text: str, attachments: list[str]) -> None:
         plan = self.app.get_pricing_plan()
         user_id = self.app.user_id
         deck_context = {"deck_id": self._deck_map.get(self.deck_var.get())}
-        messages = self._build_chat_messages()
         backend_kind, backend, warning_message = self._resolve_chat_backend()
+        messages = self._build_chat_messages(for_cloud=backend_kind == "cloud")
         if warning_message:
             self._append_message("system", warning_message)
         if backend_kind == "local" and backend is self.llama_engine and not self.llama_engine.is_loaded():
