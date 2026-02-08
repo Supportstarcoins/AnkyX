@@ -25,7 +25,7 @@ class XFlashCloudProvider:
 
     def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         chat_id: int | str | None,
         model: str,
         temperature: float,
