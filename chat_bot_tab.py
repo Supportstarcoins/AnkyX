@@ -69,6 +69,7 @@ class AutoGrowText(ttk.Frame):
         self.text.configure(yscrollcommand=self.scrollbar.set)
 
         self.text.bind("<<Modified>>", self._on_modified)
+        self.text.bind("<KeyRelease>", self._on_modified)
         self.text.bind("<Return>", self._handle_return)
         self.text.bind("<Shift-Return>", self._handle_shift_return)
 
@@ -146,16 +147,16 @@ class AttachmentsBar(ttk.Frame):
         self.on_remove = on_remove
         self._chips: list[ttk.Frame] = []
 
-    def render(self, attachments: list[dict[str, Any]]) -> None:
+    def render(self, attachments: list[str]) -> None:
         for chip in self._chips:
             chip.destroy()
         self._chips.clear()
         if not attachments:
             return
-        for index, item in enumerate(attachments):
+        for index, path in enumerate(attachments):
             chip = ttk.Frame(self, style="CardInner.TFrame", padding=(6, 3))
             chip.pack(side=tk.LEFT, padx=(0, 6), pady=4)
-            name = item.get("name") or os.path.basename(item.get("path", "")) or "файл"
+            name = os.path.basename(path) or "файл"
             label = ttk.Label(chip, text=name, style="Muted.TLabel")
             label.pack(side=tk.LEFT)
             btn = ttk.Button(chip, text="✕", width=2, command=lambda idx=index: self.on_remove(idx))
@@ -416,7 +417,7 @@ class ChatBotTab(ttk.Frame):
         self.draft_cards: list[DraftCard] = []
         self.draft_index = 0
         self.draft_show_back = False
-        self.pending_attachments: list[dict[str, Any]] = []
+        self.pending_attachments: list[str] = []
         self._deck_map: dict[str, int] = {}
         self.max_attachment_count = 10
         self.max_attachment_size = 25 * 1024 * 1024
@@ -432,6 +433,7 @@ class ChatBotTab(ttk.Frame):
         self.ollama_url_var = tk.StringVar(value=self._cloud_settings.get("ollama_url") or default_ollama_url)
         self.ollama_model_var = tk.StringVar(value=self._cloud_settings.get("ollama_model") or default_ollama_model)
         self.ollama_status_var = tk.StringVar(value="Ollama: —")
+        self.llm_header_status_var = tk.StringVar(value="Ollama: — / Cloud: —")
         self.ollama_engine = OllamaEngine(
             self.ollama_url_var.get().strip(),
             self.ollama_model_var.get().strip() or self.OLLAMA_MODEL_DEFAULT,
@@ -455,6 +457,8 @@ class ChatBotTab(ttk.Frame):
         self.cloud_api_key_var.trace_add("write", self._on_cloud_settings_change)
         self.ollama_url_var.trace_add("write", self._on_ollama_settings_change)
         self.ollama_model_var.trace_add("write", self._on_ollama_settings_change)
+        self.cloud_status_var.trace_add("write", self._on_llm_status_change)
+        self.ollama_status_var.trace_add("write", self._on_llm_status_change)
 
     def destroy(self):
         self.app.unregister_balance_observer(self._update_save_button_state)
@@ -550,12 +554,20 @@ class ChatBotTab(ttk.Frame):
         container.add(right_frame, weight=4)
 
         right_frame.grid_columnconfigure(0, weight=1)
-        right_frame.grid_rowconfigure(5, weight=1)
+        chat_row = 5
+        right_frame.grid_rowconfigure(chat_row, weight=1)
         right_frame.grid_rowconfigure(6, weight=0)
 
         header_frame = ttk.Frame(right_frame, style="Surface.TFrame")
         header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         header_frame.columnconfigure(0, weight=1)
+
+        self.llm_status_label = ttk.Label(
+            header_frame,
+            textvariable=self.llm_header_status_var,
+            style="Muted.TLabel",
+        )
+        self.llm_status_label.grid(row=0, column=0, sticky="w")
 
         self.llm_settings_btn = ttk.Button(
             header_frame,
@@ -611,21 +623,25 @@ class ChatBotTab(ttk.Frame):
         self.save_draft_btn.grid(row=4, column=0, sticky="ew", pady=(6, 0))
 
         history_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=6)
-        history_frame.grid(row=5, column=0, sticky="nsew", pady=(8, 8))
+        history_frame.grid(row=chat_row, column=0, sticky="nsew", pady=(8, 8))
+        history_frame.grid_rowconfigure(0, weight=1)
+        history_frame.grid_columnconfigure(0, weight=1)
 
         self.chat_text = tk.Text(
             history_frame,
             wrap=tk.WORD,
-            bg=self.palette.get("panel"),
-            fg=self.palette.get("text"),
+            bg="#0b1220",
+            fg="#e6e6e6",
+            insertbackground="#e6e6e6",
             relief="flat",
             bd=0,
+            highlightthickness=0,
         )
-        self.chat_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.chat_text.grid(row=0, column=0, sticky="nsew")
         self.chat_text.configure(state=tk.DISABLED)
 
         history_scroll = ttk.Scrollbar(history_frame, orient="vertical", command=self.chat_text.yview)
-        history_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        history_scroll.grid(row=0, column=1, sticky="ns")
         self.chat_text.configure(yscrollcommand=history_scroll.set)
 
         self.composer_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=8)
@@ -643,18 +659,24 @@ class ChatBotTab(ttk.Frame):
             max_lines=6,
             on_send=self._on_send,
             on_change=self._update_send_button_state,
-            bg=self.palette.get("panel"),
-            fg=self.palette.get("text"),
-            insertbackground=self.palette.get("text"),
+            bg="#0e1626",
+            fg="#e6e6e6",
+            insertbackground="#e6e6e6",
         )
         self.input_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.send_btn_var = tk.StringVar(value="Отправить")
-        self.send_btn = ttk.Button(
+        self.send_btn = tk.Button(
             self.composer_row,
             textvariable=self.send_btn_var,
             command=self._on_send,
-            style="Primary.TButton",
+            bg="#2f6fed",
+            fg="#ffffff",
+            activebackground="#2a61d4",
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
         )
         self.send_btn.pack(side=tk.LEFT, padx=(6, 0))
 
@@ -670,9 +692,10 @@ class ChatBotTab(ttk.Frame):
         self._update_send_button_state()
 
     def _configure_text_tags(self) -> None:
-        self.chat_text.tag_configure("user", foreground=self.palette.get("text"))
-        self.chat_text.tag_configure("assistant", foreground=self.palette.get("accent"))
-        self.chat_text.tag_configure("system", foreground=self.palette.get("muted"))
+        self.chat_text.tag_configure("user", foreground="#e6e6e6", font=("Segoe UI", 10, "bold"))
+        self.chat_text.tag_configure("assistant", foreground="#cfd8ff")
+        self.chat_text.tag_configure("meta", foreground="#9aa4b2")
+        self.chat_text.tag_configure("system", foreground="#9aa4b2")
 
     def _setup_drag_and_drop(self) -> None:
         if DND_FILES is None:
@@ -800,6 +823,13 @@ class ChatBotTab(ttk.Frame):
         self._refresh_ollama_settings()
         status = self._get_llm_status_text()
         self.llm_status_var.set(status)
+        self._update_llm_header_status()
+
+    def _on_llm_status_change(self, *_args) -> None:
+        self._update_llm_header_status()
+
+    def _update_llm_header_status(self) -> None:
+        self.llm_header_status_var.set(f"{self.ollama_status_var.get()} / {self.cloud_status_var.get()}")
 
     def _get_llm_status_text(self) -> str:
         if self.llm_provider_var.get() == self.LLM_PROVIDER_OLLAMA:
@@ -839,9 +869,6 @@ class ChatBotTab(ttk.Frame):
         text = self.input_text.get_text().strip()
         enabled = bool(text) or bool(self.pending_attachments)
         self.send_btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
-
-    def _attachment_label(self, item: dict[str, Any]) -> str:
-        return item.get("name") or os.path.basename(item.get("path", ""))
 
     def _is_allowed_attachment(self, path: str) -> bool:
         _, ext = os.path.splitext(path.lower())
@@ -983,6 +1010,7 @@ class ChatBotTab(ttk.Frame):
         conn.close()
         self.chat_text.configure(state=tk.NORMAL)
         self.chat_text.delete("1.0", tk.END)
+        self.chat_text.configure(state=tk.DISABLED)
         for row in rows:
             attachments: list[str] = []
             if row["attachments_json"]:
@@ -992,19 +1020,39 @@ class ChatBotTab(ttk.Frame):
                     attachments = []
             message = Message(role=row["role"], text=row["text"] or "", attachments=attachments)
             self._append_message_to_ui(message)
-        self.chat_text.configure(state=tk.DISABLED)
-        self.chat_text.see(tk.END)
 
     def _append_message_to_ui(self, message: Message) -> None:
+        self.append_chat(message.role, message.text, message.attachments)
+
+    def append_chat(self, role: str, text: str, attachments: list[str] | None = None) -> None:
         prefix = ""
-        if message.role == "user":
-            prefix = "Вы: "
-        elif message.role == "assistant":
-            prefix = "Ассистент: "
-        elif message.role == "system":
-            prefix = "Система: "
-        payload = self._format_message_payload(message.text, message.attachments)
-        self.chat_text.insert(tk.END, f"{prefix}{payload}\n\n", message.role)
+        tag = "meta"
+        if role == "user":
+            prefix = "Вы:"
+            tag = "user"
+        elif role == "assistant":
+            prefix = "Ассистент:"
+            tag = "assistant"
+        elif role == "system":
+            prefix = "Система:"
+            tag = "system"
+        payload = text or ""
+        self.chat_text.configure(state=tk.NORMAL)
+        if prefix:
+            self.chat_text.insert(tk.END, f"{prefix} ", tag)
+        if payload:
+            self.chat_text.insert(tk.END, payload)
+        if attachments:
+            attachment_names = ", ".join(
+                [os.path.basename(path) for path in attachments if os.path.basename(path)]
+            )
+            if attachment_names:
+                if payload or prefix:
+                    self.chat_text.insert(tk.END, "\n")
+                self.chat_text.insert(tk.END, f"📎 {attachment_names}", "meta")
+        self.chat_text.insert(tk.END, "\n\n")
+        self.chat_text.configure(state=tk.DISABLED)
+        self.chat_text.see(tk.END)
 
     def _append_message(self, role: str, text: str, attachments: list[str] | None = None) -> None:
         if self.current_session_id is None:
@@ -1019,10 +1067,7 @@ class ChatBotTab(ttk.Frame):
         conn.commit()
         conn.close()
         message = Message(role=role, text=text, attachments=attachments or [])
-        self.chat_text.configure(state=tk.NORMAL)
         self._append_message_to_ui(message)
-        self.chat_text.configure(state=tk.DISABLED)
-        self.chat_text.see(tk.END)
 
     def _normalize_attachments(self, raw: Any) -> list[str]:
         if not raw:
@@ -1068,10 +1113,13 @@ class ChatBotTab(ttk.Frame):
         return metadata
 
     def _append_temporary_message(self, text: str, role: str = "assistant") -> None:
-        prefix = "Ассистент: " if role == "assistant" else "Система: "
+        prefix = "Ассистент:" if role == "assistant" else "Система:"
+        tag = "assistant" if role == "assistant" else "system"
         self.chat_text.configure(state=tk.NORMAL)
         start_index = self.chat_text.index(tk.END)
-        self.chat_text.insert(tk.END, f"{prefix}{text}\n\n", role)
+        self.chat_text.insert(tk.END, f"{prefix} ", tag)
+        self.chat_text.insert(tk.END, text)
+        self.chat_text.insert(tk.END, "\n\n")
         end_index = self.chat_text.index(tk.END)
         self.chat_text.configure(state=tk.DISABLED)
         self.chat_text.see(tk.END)
@@ -1329,7 +1377,7 @@ class ChatBotTab(ttk.Frame):
 
     def _on_chat_error(self, message: str) -> None:
         self._remove_temporary_message()
-        self._append_message("system", f"[LLM ERROR] {message}")
+        self._append_message("assistant", f"[ERROR] {message}")
         self._set_sending_state(False)
         self._update_llm_status_label()
 
@@ -1354,7 +1402,7 @@ class ChatBotTab(ttk.Frame):
         self._add_attachments(paths)
 
     def _add_attachments(self, paths: list[str]) -> None:
-        current_paths = {item.get("path") for item in self.pending_attachments}
+        current_paths = set(self.pending_attachments)
         for path in paths:
             if len(self.pending_attachments) >= self.max_attachment_count:
                 messagebox.showwarning(
@@ -1376,14 +1424,7 @@ class ChatBotTab(ttk.Frame):
                     f"Файл больше 25MB: {os.path.basename(path)}",
                 )
                 continue
-            name = os.path.basename(path)
-            item = {
-                "path": path,
-                "name": name,
-                "size": size,
-                "size_label": self._format_size(size),
-            }
-            self.pending_attachments.append(item)
+            self.pending_attachments.append(path)
             current_paths.add(path)
         self._refresh_attachments_ui()
 
@@ -1419,7 +1460,7 @@ class ChatBotTab(ttk.Frame):
         text = self.input_text.get_text().strip()
         if not text and not self.pending_attachments:
             return
-        attachments = [item.get("path", "") for item in self.pending_attachments if item.get("path")]
+        attachments = list(self.pending_attachments)
         self.pending_attachments = []
         self._refresh_attachments_ui()
         self.input_text.clear()
