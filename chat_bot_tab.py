@@ -554,9 +554,7 @@ class ChatBotTab(ttk.Frame):
         container.add(right_frame, weight=4)
 
         right_frame.grid_columnconfigure(0, weight=1)
-        chat_row = 5
-        right_frame.grid_rowconfigure(chat_row, weight=1)
-        right_frame.grid_rowconfigure(6, weight=0)
+        right_frame.grid_rowconfigure(3, weight=1)
 
         header_frame = ttk.Frame(right_frame, style="Surface.TFrame")
         header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -603,8 +601,20 @@ class ChatBotTab(ttk.Frame):
 
         from main import RepeatModeCardView
 
-        self.sticky_frame = ttk.Frame(right_frame, style="Surface.TFrame", padding=6)
-        self.sticky_frame.grid(row=3, column=0, sticky="ew")
+        vpane = ttk.PanedWindow(right_frame, orient=tk.VERTICAL)
+        vpane.grid(row=3, column=0, sticky="nsew")
+
+        render_container = ttk.Frame(vpane, style="Surface.TFrame")
+        chat_container = ttk.Frame(vpane, style="Surface.TFrame")
+
+        vpane.add(render_container, weight=3)
+        vpane.add(chat_container, weight=2)
+
+        render_inner = ttk.Frame(render_container, style="Surface.TFrame", padding=6)
+        render_inner.pack(fill=tk.BOTH, expand=True)
+
+        self.sticky_frame = ttk.Frame(render_inner, style="Surface.TFrame")
+        self.sticky_frame.pack(fill=tk.BOTH, expand=True)
 
         self.card_view: RepeatModeCardView = RepeatModeCardView(
             self.sticky_frame,
@@ -615,17 +625,15 @@ class ChatBotTab(ttk.Frame):
         self.card_view.set_rating_enabled(False)
 
         self.save_draft_btn = ttk.Button(
-            right_frame,
+            render_container,
             text="Сохранить карточки",
             command=self._save_draft,
             style="Primary.TButton",
         )
-        self.save_draft_btn.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        self.save_draft_btn.pack(fill=tk.X, padx=6, pady=(6, 0))
 
-        history_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=6)
-        history_frame.grid(row=chat_row, column=0, sticky="nsew", pady=(8, 8))
-        history_frame.grid_rowconfigure(0, weight=1)
-        history_frame.grid_columnconfigure(0, weight=1)
+        history_frame = ttk.Frame(chat_container, style="Card.TFrame", padding=6)
+        history_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         self.chat_text = tk.Text(
             history_frame,
@@ -637,15 +645,15 @@ class ChatBotTab(ttk.Frame):
             bd=0,
             highlightthickness=0,
         )
-        self.chat_text.grid(row=0, column=0, sticky="nsew")
+        self.chat_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.chat_text.configure(state=tk.DISABLED)
 
         history_scroll = ttk.Scrollbar(history_frame, orient="vertical", command=self.chat_text.yview)
-        history_scroll.grid(row=0, column=1, sticky="ns")
+        history_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.chat_text.configure(yscrollcommand=history_scroll.set)
 
-        self.composer_frame = ttk.Frame(right_frame, style="Card.TFrame", padding=8)
-        self.composer_frame.grid(row=6, column=0, sticky="ew")
+        self.composer_frame = ttk.Frame(chat_container, style="Card.TFrame", padding=8)
+        self.composer_frame.pack(fill=tk.X)
 
         self.composer_row = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
         self.composer_row.pack(fill=tk.X)
@@ -653,17 +661,23 @@ class ChatBotTab(ttk.Frame):
         self.attach_btn = ttk.Button(self.composer_row, text="📎", width=3, command=self._on_attach)
         self.attach_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.input_text = AutoGrowText(
+        self.input_min_lines = 2
+        self.input_max_lines = 6
+        self.input_text = tk.Text(
             self.composer_row,
-            min_lines=1,
-            max_lines=6,
-            on_send=self._on_send,
-            on_change=self._update_send_button_state,
+            height=self.input_min_lines,
+            wrap=tk.WORD,
             bg="#0e1626",
             fg="#e6e6e6",
             insertbackground="#e6e6e6",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
         )
         self.input_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.input_text.bind("<KeyRelease>", self._on_input_keyrelease)
+        self.input_text.bind("<Return>", self._on_input_return)
+        self.input_text.bind("<Shift-Return>", self._on_input_shift_return)
 
         self.send_btn_var = tk.StringVar(value="Отправить")
         self.send_btn = tk.Button(
@@ -690,9 +704,10 @@ class ChatBotTab(ttk.Frame):
         self._configure_text_tags()
         self._setup_drag_and_drop()
         self._update_send_button_state()
+        self._append_chat("system", "Чат готов. Напишите сообщение снизу.")
 
     def _configure_text_tags(self) -> None:
-        self.chat_text.tag_configure("user", foreground="#e6e6e6", font=("Segoe UI", 10, "bold"))
+        self.chat_text.tag_configure("user", foreground="#e6e6e6")
         self.chat_text.tag_configure("assistant", foreground="#cfd8ff")
         self.chat_text.tag_configure("meta", foreground="#9aa4b2")
         self.chat_text.tag_configure("system", foreground="#9aa4b2")
@@ -700,7 +715,7 @@ class ChatBotTab(ttk.Frame):
     def _setup_drag_and_drop(self) -> None:
         if DND_FILES is None:
             return
-        for widget in (self.chat_text, self.composer_frame, self.input_text.text):
+        for widget in (self.chat_text, self.composer_frame, self.input_text):
             if hasattr(widget, "drop_target_register"):
                 widget.drop_target_register(DND_FILES)
                 widget.dnd_bind("<<Drop>>", self._on_drop_files)
@@ -863,12 +878,32 @@ class ChatBotTab(ttk.Frame):
         return "break"
 
     def _update_send_button_state(self) -> None:
-        if str(self.input_text.text.cget("state")) == str(tk.DISABLED):
+        if str(self.input_text.cget("state")) == str(tk.DISABLED):
             self.send_btn.configure(state=tk.DISABLED)
             return
-        text = self.input_text.get_text().strip()
+        text = self.input_text.get("1.0", "end-1c").strip()
         enabled = bool(text) or bool(self.pending_attachments)
         self.send_btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+
+    def _on_input_keyrelease(self, _event=None) -> None:
+        self._resize_input_text()
+        self._update_send_button_state()
+
+    def _on_input_return(self, _event: tk.Event) -> str:
+        if _event.state & 0x0001:
+            return "break"
+        self._on_send()
+        return "break"
+
+    def _on_input_shift_return(self, _event: tk.Event) -> str:
+        self.input_text.insert(tk.INSERT, "\n")
+        self._resize_input_text()
+        return "break"
+
+    def _resize_input_text(self) -> None:
+        lines = int(self.input_text.index("end-1c").split(".")[0])
+        new_height = max(self.input_min_lines, min(lines, self.input_max_lines))
+        self.input_text.configure(height=new_height)
 
     def _is_allowed_attachment(self, path: str) -> bool:
         _, ext = os.path.splitext(path.lower())
@@ -909,13 +944,13 @@ class ChatBotTab(ttk.Frame):
         self._lock_chat()
 
     def _lock_chat(self) -> None:
-        self.input_text.set_state(tk.DISABLED)
+        self.input_text.configure(state=tk.DISABLED)
         self.send_btn.configure(state=tk.DISABLED)
         self.attach_btn.configure(state=tk.DISABLED)
         self.status_var.set("Выберите колоду")
 
     def _unlock_chat(self) -> None:
-        self.input_text.set_state(tk.NORMAL)
+        self.input_text.configure(state=tk.NORMAL)
         self.attach_btn.configure(state=tk.NORMAL)
         self.status_var.set("")
         self._update_send_button_state()
@@ -1011,6 +1046,9 @@ class ChatBotTab(ttk.Frame):
         self.chat_text.configure(state=tk.NORMAL)
         self.chat_text.delete("1.0", tk.END)
         self.chat_text.configure(state=tk.DISABLED)
+        if not rows:
+            self._append_chat("system", "Чат готов. Напишите сообщение снизу.")
+            return
         for row in rows:
             attachments: list[str] = []
             if row["attachments_json"]:
@@ -1022,9 +1060,12 @@ class ChatBotTab(ttk.Frame):
             self._append_message_to_ui(message)
 
     def _append_message_to_ui(self, message: Message) -> None:
-        self.append_chat(message.role, message.text, message.attachments)
+        self._append_chat(message.role, message.text, message.attachments)
 
     def append_chat(self, role: str, text: str, attachments: list[str] | None = None) -> None:
+        self._append_chat(role, text, attachments)
+
+    def _append_chat(self, role: str, text: str, attachments: list[str] | None = None) -> None:
         prefix = ""
         tag = "meta"
         if role == "user":
@@ -1033,15 +1074,15 @@ class ChatBotTab(ttk.Frame):
         elif role == "assistant":
             prefix = "Ассистент:"
             tag = "assistant"
-        elif role == "system":
-            prefix = "Система:"
-            tag = "system"
+        elif role in ("system", "meta"):
+            prefix = "Система:" if role == "system" else ""
+            tag = "system" if role == "system" else "meta"
         payload = text or ""
         self.chat_text.configure(state=tk.NORMAL)
         if prefix:
             self.chat_text.insert(tk.END, f"{prefix} ", tag)
         if payload:
-            self.chat_text.insert(tk.END, payload)
+            self.chat_text.insert(tk.END, payload, tag)
         if attachments:
             attachment_names = ", ".join(
                 [os.path.basename(path) for path in attachments if os.path.basename(path)]
@@ -1439,13 +1480,13 @@ class ChatBotTab(ttk.Frame):
 
     def _set_sending_state(self, sending: bool) -> None:
         if sending:
-            self.input_text.set_state(tk.DISABLED)
+            self.input_text.configure(state=tk.DISABLED)
             self.attach_btn.configure(state=tk.DISABLED)
             self.send_btn_var.set("Думаю...")
             self.send_btn.configure(state=tk.DISABLED)
             return
         if self.deck_var.get():
-            self.input_text.set_state(tk.NORMAL)
+            self.input_text.configure(state=tk.NORMAL)
             self.attach_btn.configure(state=tk.NORMAL)
             self.send_btn_var.set("Отправить")
             self._update_send_button_state()
@@ -1457,13 +1498,14 @@ class ChatBotTab(ttk.Frame):
         if not self.deck_var.get():
             self._lock_chat()
             return
-        text = self.input_text.get_text().strip()
+        text = self.input_text.get("1.0", "end-1c").strip()
         if not text and not self.pending_attachments:
             return
         attachments = list(self.pending_attachments)
         self.pending_attachments = []
         self._refresh_attachments_ui()
-        self.input_text.clear()
+        self.input_text.delete("1.0", tk.END)
+        self._resize_input_text()
         self._append_message("user", text, attachments)
 
         self._set_sending_state(True)
