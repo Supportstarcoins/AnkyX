@@ -601,16 +601,14 @@ class ChatBotTab(ttk.Frame):
 
         from main import RepeatModeCardView
 
-        vpane = ttk.PanedWindow(right_frame, orient=tk.VERTICAL)
+        vpane = tk.PanedWindow(right_frame, orient=tk.VERTICAL)
         vpane.grid(row=3, column=0, sticky="nsew")
 
         top_container = ttk.Frame(vpane, style="Surface.TFrame")
         bottom_container = ttk.Frame(vpane, style="Surface.TFrame")
 
-        vpane.add(top_container, weight=7)
-        vpane.add(bottom_container, weight=3)
-        vpane.paneconfig(top_container, minsize=420)
-        vpane.paneconfig(bottom_container, minsize=180)
+        vpane.add(top_container, minsize=420)
+        vpane.add(bottom_container)
         right_frame.after(200, lambda: vpane.sashpos(0, int(vpane.winfo_height() * 0.72)))
 
         render_inner = ttk.Frame(top_container, style="Surface.TFrame", padding=6)
