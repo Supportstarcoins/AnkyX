@@ -604,13 +604,16 @@ class ChatBotTab(ttk.Frame):
         vpane = ttk.PanedWindow(right_frame, orient=tk.VERTICAL)
         vpane.grid(row=3, column=0, sticky="nsew")
 
-        render_container = ttk.Frame(vpane, style="Surface.TFrame")
-        chat_container = ttk.Frame(vpane, style="Surface.TFrame")
+        top_container = ttk.Frame(vpane, style="Surface.TFrame")
+        bottom_container = ttk.Frame(vpane, style="Surface.TFrame")
 
-        vpane.add(render_container, weight=3)
-        vpane.add(chat_container, weight=2)
+        vpane.add(top_container, weight=7)
+        vpane.add(bottom_container, weight=3)
+        vpane.paneconfig(top_container, minsize=420)
+        vpane.paneconfig(bottom_container, minsize=180)
+        right_frame.after(200, lambda: vpane.sashpos(0, int(vpane.winfo_height() * 0.72)))
 
-        render_inner = ttk.Frame(render_container, style="Surface.TFrame", padding=6)
+        render_inner = ttk.Frame(top_container, style="Surface.TFrame", padding=6)
         render_inner.pack(fill=tk.BOTH, expand=True)
 
         self.sticky_frame = ttk.Frame(render_inner, style="Surface.TFrame")
@@ -625,18 +628,18 @@ class ChatBotTab(ttk.Frame):
         self.card_view.set_rating_enabled(False)
 
         self.save_draft_btn = ttk.Button(
-            render_container,
+            top_container,
             text="Сохранить карточки",
             command=self._save_draft,
             style="Primary.TButton",
         )
         self.save_draft_btn.pack(fill=tk.X, padx=6, pady=(6, 0))
 
-        history_frame = ttk.Frame(chat_container, style="Card.TFrame", padding=6)
-        history_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        history_area = ttk.Frame(bottom_container, style="Card.TFrame", padding=6)
+        history_area.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         self.chat_text = tk.Text(
-            history_frame,
+            history_area,
             wrap=tk.WORD,
             bg="#0b1220",
             fg="#e6e6e6",
@@ -648,11 +651,11 @@ class ChatBotTab(ttk.Frame):
         self.chat_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.chat_text.configure(state=tk.DISABLED)
 
-        history_scroll = ttk.Scrollbar(history_frame, orient="vertical", command=self.chat_text.yview)
+        history_scroll = ttk.Scrollbar(history_area, orient="vertical", command=self.chat_text.yview)
         history_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.chat_text.configure(yscrollcommand=history_scroll.set)
 
-        self.composer_frame = ttk.Frame(chat_container, style="Card.TFrame", padding=8)
+        self.composer_frame = ttk.Frame(bottom_container, style="Card.TFrame", padding=8)
         self.composer_frame.pack(fill=tk.X)
 
         self.composer_row = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
@@ -677,7 +680,6 @@ class ChatBotTab(ttk.Frame):
         self.input_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.input_text.bind("<KeyRelease>", self._on_input_keyrelease)
         self.input_text.bind("<Return>", self._on_input_return)
-        self.input_text.bind("<Shift-Return>", self._on_input_shift_return)
 
         self.send_btn_var = tk.StringVar(value="Отправить")
         self.send_btn = tk.Button(
@@ -889,15 +891,10 @@ class ChatBotTab(ttk.Frame):
         self._resize_input_text()
         self._update_send_button_state()
 
-    def _on_input_return(self, _event: tk.Event) -> str:
+    def _on_input_return(self, _event: tk.Event) -> str | None:
         if _event.state & 0x0001:
-            return "break"
+            return None
         self._on_send()
-        return "break"
-
-    def _on_input_shift_return(self, _event: tk.Event) -> str:
-        self.input_text.insert(tk.INSERT, "\n")
-        self._resize_input_text()
         return "break"
 
     def _resize_input_text(self) -> None:
@@ -1069,18 +1066,18 @@ class ChatBotTab(ttk.Frame):
         prefix = ""
         tag = "meta"
         if role == "user":
-            prefix = "Вы:"
+            prefix = "Вы: "
             tag = "user"
         elif role == "assistant":
-            prefix = "Ассистент:"
+            prefix = "Ассистент: "
             tag = "assistant"
         elif role in ("system", "meta"):
-            prefix = "Система:" if role == "system" else ""
+            prefix = "Система: " if role == "system" else ""
             tag = "system" if role == "system" else "meta"
         payload = text or ""
         self.chat_text.configure(state=tk.NORMAL)
         if prefix:
-            self.chat_text.insert(tk.END, f"{prefix} ", tag)
+            self.chat_text.insert(tk.END, prefix, tag)
         if payload:
             self.chat_text.insert(tk.END, payload, tag)
         if attachments:
