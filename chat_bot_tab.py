@@ -18,7 +18,14 @@ from credit_manager import CreditManager
 from csv_importer import upsert_note_and_cards
 from db_connect import open_db
 from cloud_llm_provider import CloudProviderError, XFlashCloudProvider
-from llm_engine import LlamaCppEngine, LLMEngineBase, MockEngine
+from llm_engine import (
+    LlamaCppEngine,
+    LLMEngineBase,
+    MockEngine,
+    OllamaEngine,
+    OllamaModelNotFoundError,
+    OllamaUnavailableError,
+)
 from mock_ai_engine import MockAIEngine
 
 if TYPE_CHECKING:
@@ -382,10 +389,13 @@ class ChatBotTab(ttk.Frame):
         "3) Если контекста мало — задавай уточняющий вопрос.\n"
         "4) Не выдумывай факты, если их нет в сообщениях пользователя."
     )
+    LLM_PROVIDER_OLLAMA = "Ollama (HTTP)"
     LLM_PROVIDER_LLAMA = "Локальная Llama 3.1"
     LLM_PROVIDER_CLOUD = "XFLASH Cloud API"
     LLM_PROVIDER_MOCK = "Заглушка"
     CLOUD_MODEL_DEFAULT = "xflash-llama31"
+    OLLAMA_URL_DEFAULT = "http://127.0.0.1:11434"
+    OLLAMA_MODEL_DEFAULT = "xflash-llama31"
 
     def __init__(self, master: tk.Widget, app) -> None:
         super().__init__(master, style="Surface.TFrame")
@@ -401,7 +411,6 @@ class ChatBotTab(ttk.Frame):
             verbose=False,
         )
         self.mock_llm_engine = MockEngine()
-        self.llm_engine: LLMEngineBase = self._select_default_llm_engine()
         self._pending_llm_marker: tuple[str, str] | None = None
         self.credit_manager = CreditManager()
         self.current_session_id: int | None = None
@@ -419,6 +428,16 @@ class ChatBotTab(ttk.Frame):
         self.cloud_url_var = tk.StringVar(value=self._cloud_settings.get("cloud_url", ""))
         self.cloud_api_key_var = tk.StringVar(value=self._cloud_settings.get("api_key", ""))
         self.cloud_status_var = tk.StringVar(value="Cloud: —")
+        default_ollama_url = os.getenv("XFLASH_OLLAMA_URL", self.OLLAMA_URL_DEFAULT)
+        default_ollama_model = os.getenv("XFLASH_OLLAMA_MODEL", self.OLLAMA_MODEL_DEFAULT)
+        self.ollama_url_var = tk.StringVar(value=self._cloud_settings.get("ollama_url") or default_ollama_url)
+        self.ollama_model_var = tk.StringVar(value=self._cloud_settings.get("ollama_model") or default_ollama_model)
+        self.ollama_status_var = tk.StringVar(value="Ollama: —")
+        self.ollama_engine = OllamaEngine(
+            self.ollama_url_var.get().strip(),
+            self.ollama_model_var.get().strip() or self.OLLAMA_MODEL_DEFAULT,
+        )
+        self.llm_engine: LLMEngineBase = self._select_default_llm_engine()
 
         self._ensure_chat_tables()
         self._build_ui()
@@ -432,6 +451,8 @@ class ChatBotTab(ttk.Frame):
 
         self.cloud_url_var.trace_add("write", self._on_cloud_settings_change)
         self.cloud_api_key_var.trace_add("write", self._on_cloud_settings_change)
+        self.ollama_url_var.trace_add("write", self._on_ollama_settings_change)
+        self.ollama_model_var.trace_add("write", self._on_ollama_settings_change)
 
     def destroy(self):
         self.app.unregister_balance_observer(self._update_save_button_state)
@@ -492,8 +513,8 @@ class ChatBotTab(ttk.Frame):
         return f"{llama_dir}\nНапример: {example_name}"
 
     def _select_default_llm_engine(self) -> LLMEngineBase:
-        if self.llama_engine.is_available():
-            return self.llama_engine
+        if self.ollama_engine.is_available():
+            return self.ollama_engine
         return self.mock_llm_engine
 
     def _build_ui(self) -> None:
@@ -606,7 +627,12 @@ class ChatBotTab(ttk.Frame):
             llm_control_frame,
             textvariable=self.llm_provider_var,
             state="readonly",
-            values=[self.LLM_PROVIDER_LLAMA, self.LLM_PROVIDER_CLOUD, self.LLM_PROVIDER_MOCK],
+            values=[
+                self.LLM_PROVIDER_OLLAMA,
+                self.LLM_PROVIDER_LLAMA,
+                self.LLM_PROVIDER_CLOUD,
+                self.LLM_PROVIDER_MOCK,
+            ],
             width=22,
         )
         self.llm_provider_combo.pack(side=tk.LEFT, padx=(6, 0))
@@ -615,6 +641,37 @@ class ChatBotTab(ttk.Frame):
         self.llm_status_var = tk.StringVar(value="")
         self.llm_status_label = ttk.Label(llm_control_frame, textvariable=self.llm_status_var, style="Muted.TLabel")
         self.llm_status_label.pack(side=tk.RIGHT)
+
+        ollama_frame = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
+        ollama_frame.pack(fill=tk.X, pady=(0, 6))
+        ollama_frame.columnconfigure(1, weight=1)
+        ollama_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(ollama_frame, text="Ollama URL:", style="Muted.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(0, 6),
+        )
+        ollama_url_entry = ttk.Entry(ollama_frame, textvariable=self.ollama_url_var)
+        ollama_url_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+
+        ttk.Label(ollama_frame, text="Модель:", style="Muted.TLabel").grid(
+            row=0,
+            column=2,
+            sticky="w",
+            padx=(0, 6),
+        )
+        ollama_model_entry = ttk.Entry(ollama_frame, textvariable=self.ollama_model_var)
+        ollama_model_entry.grid(row=0, column=3, sticky="ew")
+
+        ollama_actions = ttk.Frame(ollama_frame, style="CardInner.TFrame")
+        ollama_actions.grid(row=0, column=4, sticky="e", padx=(10, 0))
+        ttk.Button(ollama_actions, text="Проверить", command=self._check_ollama_connection).pack(side=tk.LEFT)
+        ttk.Label(ollama_actions, textvariable=self.ollama_status_var, style="Muted.TLabel").pack(
+            side=tk.LEFT,
+            padx=8,
+        )
 
         cloud_frame = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
         cloud_frame.pack(fill=tk.X, pady=(0, 6))
@@ -682,6 +739,8 @@ class ChatBotTab(ttk.Frame):
                 widget.dnd_bind("<<Drop>>", self._on_drop_files)
 
     def _get_llm_provider_label(self, engine: LLMEngineBase) -> str:
+        if engine is self.ollama_engine:
+            return self.LLM_PROVIDER_OLLAMA
         if engine is self.llama_engine:
             return self.LLM_PROVIDER_LLAMA
         return self.LLM_PROVIDER_MOCK
@@ -690,6 +749,9 @@ class ChatBotTab(ttk.Frame):
         selected = self.llm_provider_var.get()
         if selected == self.LLM_PROVIDER_CLOUD:
             self.llm_engine = self.mock_llm_engine
+        elif selected == self.LLM_PROVIDER_OLLAMA:
+            self._refresh_ollama_settings()
+            self.llm_engine = self.ollama_engine
         elif selected == self.LLM_PROVIDER_LLAMA:
             self.llm_engine = self.llama_engine
         else:
@@ -698,10 +760,13 @@ class ChatBotTab(ttk.Frame):
 
     def _update_llm_status_label(self) -> None:
         self._refresh_llm_model_path()
+        self._refresh_ollama_settings()
         status = self._get_llm_status_text()
         self.llm_status_var.set(status)
 
     def _get_llm_status_text(self) -> str:
+        if self.llm_provider_var.get() == self.LLM_PROVIDER_OLLAMA:
+            return f"Ollama: {self.ollama_engine.get_status()}"
         if self.llm_provider_var.get() == self.LLM_PROVIDER_CLOUD:
             return "Cloud: используется XFLASH API"
         if not self.llm_model_path:
@@ -717,6 +782,11 @@ class ChatBotTab(ttk.Frame):
         if latest_path != self.llm_model_path:
             self.llm_model_path = latest_path
             self.llama_engine.model_path = latest_path
+
+    def _refresh_ollama_settings(self) -> None:
+        self.ollama_engine.base_url = self.ollama_url_var.get().strip()
+        model = self.ollama_model_var.get().strip()
+        self.ollama_engine.model = model or self.OLLAMA_MODEL_DEFAULT
 
     def _on_drop_files(self, event: tk.Event) -> str:
         if str(self.attach_btn.cget("state")) == str(tk.DISABLED):
@@ -986,6 +1056,11 @@ class ChatBotTab(ttk.Frame):
     def _resolve_llm_engine(self) -> tuple[LLMEngineBase, str | None]:
         self._refresh_llm_model_path()
         selected = self.llm_provider_var.get()
+        if selected == self.LLM_PROVIDER_OLLAMA:
+            self._refresh_ollama_settings()
+            if self.ollama_engine.is_available():
+                return self.ollama_engine, None
+            return self.mock_llm_engine, "[LLM OFFLINE] Запусти Ollama и проверь модель xflash-llama31"
         if selected == self.LLM_PROVIDER_CLOUD:
             return self.mock_llm_engine, None
         if selected == self.LLM_PROVIDER_LLAMA:
@@ -1014,16 +1089,20 @@ class ChatBotTab(ttk.Frame):
                     return {
                         "cloud_url": str(payload.get("cloud_url") or ""),
                         "api_key": str(payload.get("api_key") or ""),
+                        "ollama_url": str(payload.get("ollama_url") or ""),
+                        "ollama_model": str(payload.get("ollama_model") or ""),
                     }
         except Exception:  # noqa: BLE001
             logging.exception("Failed to load cloud settings")
-        return {"cloud_url": "", "api_key": ""}
+        return {"cloud_url": "", "api_key": "", "ollama_url": "", "ollama_model": ""}
 
     def _save_cloud_settings(self) -> None:
         self._cloud_settings_save_job = None
         payload = {
             "cloud_url": self.cloud_url_var.get().strip(),
             "api_key": self.cloud_api_key_var.get().strip(),
+            "ollama_url": self.ollama_url_var.get().strip(),
+            "ollama_model": self.ollama_model_var.get().strip(),
         }
         try:
             with open(self._cloud_settings_path, "w", encoding="utf-8") as handle:
@@ -1035,6 +1114,11 @@ class ChatBotTab(ttk.Frame):
         if self._cloud_settings_save_job:
             self.after_cancel(self._cloud_settings_save_job)
         self._cloud_settings_save_job = self.after(400, self._save_cloud_settings)
+
+    def _on_ollama_settings_change(self, *_args) -> None:
+        self._refresh_ollama_settings()
+        self._update_llm_status_label()
+        self._on_cloud_settings_change()
 
     def _get_cloud_provider(self) -> XFlashCloudProvider | None:
         base_url = self.cloud_url_var.get().strip()
@@ -1063,6 +1147,20 @@ class ChatBotTab(ttk.Frame):
                 self.after(0, lambda: self._update_cloud_status_from_error(exc))
                 return
             self.after(0, lambda: self.cloud_status_var.set("Cloud: OK"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _check_ollama_connection(self) -> None:
+        self._refresh_ollama_settings()
+        self.ollama_status_var.set("Ollama: проверка...")
+
+        def worker() -> None:
+            try:
+                ok = self.ollama_engine.is_available()
+            except Exception:  # noqa: BLE001
+                ok = False
+            status = "Ollama: OK" if ok else "Ollama: offline"
+            self.after(0, lambda: self.ollama_status_var.set(status))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1163,6 +1261,12 @@ class ChatBotTab(ttk.Frame):
     def _on_chat_error(self, message: str) -> None:
         self._remove_temporary_message()
         self._append_message("system", f"[LLM ERROR] {message}")
+        self._set_sending_state(False)
+        self._update_llm_status_label()
+
+    def _on_chat_notice(self, message: str) -> None:
+        self._remove_temporary_message()
+        self._append_message("system", message)
         self._set_sending_state(False)
         self._update_llm_status_label()
 
@@ -1287,6 +1391,8 @@ class ChatBotTab(ttk.Frame):
                         temperature=0.6,
                         max_tokens=768,
                     )
+                    if backend is self.ollama_engine:
+                        self.after(0, lambda: self.ollama_status_var.set("Ollama: OK"))
                 cards = self._parse_cards_from_response(response_text)
                 draft = None
                 if cards:
@@ -1303,6 +1409,22 @@ class ChatBotTab(ttk.Frame):
             except CloudProviderError as exc:
                 logging.exception("Cloud LLM generation failed")
                 self.after(0, lambda: self._handle_cloud_error(exc))
+            except OllamaUnavailableError:
+                self.after(
+                    0,
+                    lambda: self._on_chat_notice(
+                        "[LLM OFFLINE] Запусти Ollama и проверь модель xflash-llama31"
+                    ),
+                )
+                self.after(0, lambda: self.ollama_status_var.set("Ollama: offline"))
+            except OllamaModelNotFoundError:
+                self.after(
+                    0,
+                    lambda: self._on_chat_notice(
+                        "[MODEL NOT FOUND] Выполни: ollama create xflash-llama31 -f Modelfile"
+                    ),
+                )
+                self.after(0, lambda: self.ollama_status_var.set("Ollama: offline"))
             except Exception as exc:  # noqa: BLE001
                 logging.exception("LLM generation failed")
                 self.after(0, lambda: self._on_chat_error(str(exc)))

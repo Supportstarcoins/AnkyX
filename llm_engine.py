@@ -6,6 +6,8 @@ import os
 import threading
 from typing import Any
 
+import requests
+
 
 class LLMEngineBase:
     def is_available(self) -> bool:
@@ -16,6 +18,59 @@ class LLMEngineBase:
 
     def chat(self, messages: list[dict[str, Any]], *, temperature: float, max_tokens: int) -> str:
         raise NotImplementedError
+
+
+class OllamaUnavailableError(RuntimeError):
+    pass
+
+
+class OllamaModelNotFoundError(RuntimeError):
+    pass
+
+
+class OllamaEngine(LLMEngineBase):
+    def __init__(self, base_url: str, model: str) -> None:
+        self.base_url = base_url.rstrip("/") if base_url else ""
+        self.model = model
+
+    def _resolve_url(self, path: str) -> str:
+        base = self.base_url or "http://127.0.0.1:11434"
+        return f"{base}{path}"
+
+    def is_available(self) -> bool:
+        try:
+            response = requests.get(self._resolve_url("/api/version"), timeout=1.5)
+            return response.ok
+        except requests.RequestException:
+            return False
+
+    def get_status(self) -> str:
+        return "OK" if self.is_available() else "offline"
+
+    def chat(self, messages: list[dict[str, Any]], *, temperature: float, max_tokens: int) -> str:
+        if not self.is_available():
+            raise OllamaUnavailableError("Ollama недоступна")
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+        }
+        try:
+            response = requests.post(
+                self._resolve_url("/api/chat"),
+                json=payload,
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            raise OllamaUnavailableError("Ollama недоступна") from exc
+        if response.status_code == 404:
+            raise OllamaModelNotFoundError("Модель не найдена")
+        if not response.ok:
+            raise OllamaUnavailableError(f"Ollama error: {response.status_code}")
+        data = response.json() or {}
+        message = data.get("message") or {}
+        return str(message.get("content") or "")
 
 
 class MockEngine(LLMEngineBase):
