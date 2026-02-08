@@ -601,17 +601,16 @@ class ChatBotTab(ttk.Frame):
 
         from main import RepeatModeCardView
 
-        vpane = tk.PanedWindow(right_frame, orient=tk.VERTICAL)
+        vpane = ttk.PanedWindow(right_frame, orient=tk.VERTICAL)
         vpane.grid(row=3, column=0, sticky="nsew")
 
-        top_container = ttk.Frame(vpane, style="Surface.TFrame")
-        bottom_container = ttk.Frame(vpane, style="Surface.TFrame")
+        render_area = ttk.Frame(vpane, style="Surface.TFrame")
+        chat_area = ttk.Frame(vpane, style="Surface.TFrame")
 
-        vpane.add(top_container, minsize=420)
-        vpane.add(bottom_container)
-        right_frame.after(200, lambda: vpane.sashpos(0, int(vpane.winfo_height() * 0.72)))
+        vpane.add(render_area, weight=7, minsize=420)
+        vpane.add(chat_area, weight=3)
 
-        render_inner = ttk.Frame(top_container, style="Surface.TFrame", padding=6)
+        render_inner = ttk.Frame(render_area, style="Surface.TFrame", padding=6)
         render_inner.pack(fill=tk.BOTH, expand=True)
 
         self.sticky_frame = ttk.Frame(render_inner, style="Surface.TFrame")
@@ -626,15 +625,19 @@ class ChatBotTab(ttk.Frame):
         self.card_view.set_rating_enabled(False)
 
         self.save_draft_btn = ttk.Button(
-            top_container,
+            render_area,
             text="Сохранить карточки",
             command=self._save_draft,
             style="Primary.TButton",
         )
         self.save_draft_btn.pack(fill=tk.X, padx=6, pady=(6, 0))
 
-        history_area = ttk.Frame(bottom_container, style="Card.TFrame", padding=6)
-        history_area.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        chat_area.columnconfigure(0, weight=1)
+        chat_area.rowconfigure(0, weight=1)
+        chat_area.rowconfigure(1, weight=0)
+
+        history_area = ttk.Frame(chat_area, style="Card.TFrame", padding=6)
+        history_area.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
 
         self.chat_text = tk.Text(
             history_area,
@@ -653,8 +656,8 @@ class ChatBotTab(ttk.Frame):
         history_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.chat_text.configure(yscrollcommand=history_scroll.set)
 
-        self.composer_frame = ttk.Frame(bottom_container, style="Card.TFrame", padding=8)
-        self.composer_frame.pack(fill=tk.X)
+        self.composer_frame = ttk.Frame(chat_area, style="Card.TFrame", padding=8)
+        self.composer_frame.grid(row=1, column=0, sticky="ew")
 
         self.composer_row = ttk.Frame(self.composer_frame, style="CardInner.TFrame", padding=6)
         self.composer_row.pack(fill=tk.X)
