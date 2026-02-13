@@ -17,6 +17,8 @@ from chatbot_models import ChatSession, DraftBatch, DraftCard, Message
 from csv_importer import upsert_note_and_cards
 from db_connect import open_db
 from cloud_llm_provider import CloudProviderError, XFlashCloudProvider
+from ollama_client import OllamaClient
+from pdf_ingest import chunk_sentences, detect_lang, extract_text_from_pdf, split_to_sentences
 from llm_engine import (
     LlamaCppEngine,
     LLMEngineBase,
@@ -27,6 +29,7 @@ from llm_engine import (
 )
 from mock_ai_engine import MockAIEngine
 from sdxl_provider import SDXLProvider, SDXLProviderError
+from vocab_store import load_known_words, mask_unknown_words
 
 if TYPE_CHECKING:
     from main import RepeatModeCardView
@@ -511,6 +514,9 @@ class ChatBotTab(ttk.Frame):
         self.llm_settings_window: tk.Toplevel | None = None
         self._mousewheel_bound = False
         self.sd_enabled = tk.BooleanVar(value=True)
+        self.foreign_mode_var = tk.BooleanVar(value=False)
+        self.native_sentences_var = tk.IntVar(value=10)
+        self.foreign_sentences_var = tk.IntVar(value=2)
         self._chat_pending_save_cost = 0
         self.sd_api_url_var = tk.StringVar(value=self.SD_API_URL_DEFAULT)
 
@@ -1001,6 +1007,17 @@ class ChatBotTab(ttk.Frame):
             text="Model: sd_xl_base_1.0.safetensors (WebUI --api)",
             style="Muted.TLabel",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        pdf_mode_frame = ttk.Frame(container, style="CardInner.TFrame", padding=6)
+        pdf_mode_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Checkbutton(pdf_mode_frame, text="Иностранный язык", variable=self.foreign_mode_var).pack(side=tk.LEFT)
+
+        sentences_frame = ttk.Frame(container, style="CardInner.TFrame", padding=6)
+        sentences_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(sentences_frame, text="Native предложений/карточку (5-20):", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Spinbox(sentences_frame, from_=5, to=20, textvariable=self.native_sentences_var, width=6).grid(row=0, column=1, sticky="w")
+        ttk.Label(sentences_frame, text="Foreign предложений/карточку (1-5):", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(16, 8))
+        ttk.Spinbox(sentences_frame, from_=1, to=5, textvariable=self.foreign_sentences_var, width=6).grid(row=0, column=3, sticky="w")
 
         def on_close() -> None:
             if self.llm_settings_window and self.llm_settings_window.winfo_exists():
@@ -1685,6 +1702,9 @@ class ChatBotTab(ttk.Frame):
                 continue
             self.pending_attachments.append(path)
             current_paths.add(path)
+            if path.lower().endswith('.pdf'):
+                self._append_message('system', 'PDF загружен, анализирую...')
+                self._start_pdf_ingest(path)
         self._refresh_attachments_ui()
 
     def _remove_attachment(self, index: int) -> None:
@@ -1850,7 +1870,141 @@ class ChatBotTab(ttk.Frame):
             card.media = {}
         card.media["image_path"] = img_path
         self.refresh_render()
-        self._append_message("system", "Сгенерировано изображение SDXL.")
+
+    def _rebalance_chunks(self, sentences: list[str], mode_native: bool) -> list[list[str]]:
+        target = self.native_sentences_var.get() if mode_native else self.foreign_sentences_var.get()
+        target = max(5, min(20, target)) if mode_native else max(1, min(5, target))
+        if not sentences:
+            return []
+        chunks: list[list[str]] = []
+        cur: list[str] = []
+        for sentence in sentences:
+            cur.append(sentence)
+            if len(cur) >= target:
+                chunks.append(cur)
+                cur = []
+        if cur:
+            if chunks and len(cur) < (5 if mode_native else 1):
+                chunks[-1].extend(cur)
+            else:
+                chunks.append(cur)
+        return chunks
+
+    def _extract_cards_payload(self, raw: str) -> list[dict[str, Any]]:
+        payload = _extract_json_object(raw)
+        if not isinstance(payload, dict):
+            return []
+        cards = payload.get('cards')
+        if not isinstance(cards, list):
+            return []
+        return [c for c in cards if isinstance(c, dict)]
+
+    def _start_pdf_ingest(self, pdf_path: str) -> None:
+        deck_id = self._deck_map.get(self.deck_var.get()) or 0
+
+        def worker() -> None:
+            try:
+                text = extract_text_from_pdf(pdf_path)
+                lang = detect_lang(text)
+                mode_native = (not self.foreign_mode_var.get()) and lang == 'ru'
+                sentences = split_to_sentences(text, lang)
+                base_chunks = chunk_sentences(sentences, mode_native)
+                flat_sentences = [s for chunk in base_chunks for s in chunk]
+                chunks = self._rebalance_chunks(flat_sentences, mode_native)
+                preview_text = text[:3500] if text else ' '
+                ollama = OllamaClient(
+                    base_url=self.ollama_url_var.get().strip() or self.OLLAMA_URL_DEFAULT,
+                    model=self.ollama_model_var.get().strip() or 'llama3.1:8b',
+                )
+                summary = ollama.chat([
+                    {'role': 'system', 'content': 'Ты аналитик. Выдели общий смысл, главные темы, 5-10 ключевых тезисов. Без воды.'},
+                    {'role': 'user', 'content': preview_text},
+                ])
+                known_words = set()
+                if not mode_native:
+                    known_words = load_known_words(lang)
+                cards: list[DraftCard] = []
+                for chunk in chunks:
+                    chunk_text = ' '.join(chunk)
+                    user_prompt = (
+                        f"summary:\n{summary}\n\n"
+                        f"chunk_text:\n{chunk_text}\n\n"
+                        "Правила:\n"
+                        f"* {'native' if mode_native else 'foreign'} режим\n"
+                        "* 1 карточка на chunk\n"
+                        "* image_prompt короткий, по смыслу\n"
+                        "* не выдумывать фактов вне chunk"
+                    )
+                    raw = ollama.chat([
+                        {
+                            'role': 'system',
+                            'content': "Ты генератор флэш-карточек. Верни строго JSON без markdown. Схема: { 'cards':[{'front':'...','back':'...','image_prompt':'...','tags':['...']}] }",
+                        },
+                        {'role': 'user', 'content': user_prompt},
+                    ])
+                    for item in self._extract_cards_payload(raw):
+                        front = str(item.get('front') or '').strip()
+                        back = str(item.get('back') or '').strip()
+                        if not front or not back:
+                            continue
+                        if not mode_native:
+                            back = mask_unknown_words(back, lang, known_words)
+                        image_prompt = str(item.get('image_prompt') or front or back).strip()
+                        tags = item.get('tags') if isinstance(item.get('tags'), list) else []
+                        cards.append(DraftCard(front=front, back=back, image_path=None, tags=[str(t) for t in tags], media={'source': 'pdf_ingest'}, meta={'image_prompt': image_prompt, 'lang': lang}))
+                batch = DraftBatch(
+                    draft_id=str(uuid.uuid4()),
+                    deck_id=deck_id,
+                    cards=cards,
+                    total_credits=self._calculate_total_credits(cards),
+                    created_at=int(time.time()),
+                )
+                def apply_batch() -> None:
+                    self.current_draft_batch = batch
+                    self.draft_index = 0
+                    self._render_side = 'front'
+                    self.refresh_render()
+                    self._update_save_button_state()
+                    self._append_message('system', f'PDF обработан: карточек {len(cards)}.')
+                self.winfo_toplevel().after(0, apply_batch)
+                self._start_pdf_images_generation(cards)
+            except Exception as exc:
+                logging.exception('PDF ingest failed')
+                self.winfo_toplevel().after(0, lambda: self._append_message('system', f'Ошибка PDF ingest: {exc}'))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_pdf_images_generation(self, cards: list[DraftCard]) -> None:
+        if not cards or not self.sd_enabled.get():
+            return
+        api_url = self.sd_api_url_var.get().strip() or self.SD_API_URL_DEFAULT
+
+        def worker() -> None:
+            try:
+                provider = SDXLProvider(api_url)
+                provider.ensure_model(self.SDXL_CHECKPOINT)
+                for card in cards:
+                    prompt = str((card.meta or {}).get('image_prompt') or card.front or card.back).strip()
+                    if not prompt:
+                        continue
+                    try:
+                        img_path = provider.txt2img(
+                            prompt=prompt,
+                            negative_prompt='lowres, blurry, bad anatomy, text, watermark',
+                            width=1024,
+                            height=1024,
+                            steps=24,
+                            cfg=7,
+                            sampler='Euler a',
+                            seed=None,
+                        )
+                    except Exception:
+                        continue
+                    self.winfo_toplevel().after(0, lambda c=card, p=img_path: self._apply_sd_image(c, p))
+            except Exception:
+                logging.exception('PDF SDXL queue failed')
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _start_generation(self, text: str, attachments: list[str]) -> None:
         plan = self.app.get_pricing_plan()
