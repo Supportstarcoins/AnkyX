@@ -402,6 +402,50 @@ def draft_to_card(draft: DraftCard) -> dict:
     }
 
 
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    raw = text[start : end + 1].strip()
+    candidates = [raw]
+    candidates.append(re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip())
+    candidates.append(candidates[-1].replace("“", '"').replace("”", '"').replace("’", "'"))
+    candidates.append(re.sub(r",\s*([}\]])", r"\1", candidates[-1]))
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _parse_card_from_llm(text: str) -> tuple[str, str] | None:
+    payload = _extract_json_object(text)
+    if isinstance(payload, dict):
+        front = str(payload.get("front") or payload.get("question") or "").strip()
+        back = str(payload.get("back") or payload.get("answer") or "").strip()
+        if front and back:
+            return front, back
+
+    labeled_match = re.search(r"front\s*:\s*(.*?)\s*back\s*:\s*(.+)$", text, flags=re.IGNORECASE | re.DOTALL)
+    if labeled_match:
+        front = labeled_match.group(1).strip()
+        back = labeled_match.group(2).strip()
+        if front and back:
+            return front, back
+
+    if "||" in text:
+        front, back = (part.strip() for part in text.split("||", 1))
+        if front and back:
+            return front, back
+    return None
+
+
 class ChatBotTab(ttk.Frame):
     SYSTEM_PROMPT = (
         "Ты — тренер по обучению. Помогаешь учить материал по выбранной колоде.\n"
@@ -439,7 +483,7 @@ class ChatBotTab(ttk.Frame):
         self.current_session_id: int | None = None
         self.current_draft_batch: DraftBatch | None = None
         self.draft_index = 0
-        self.draft_show_back = False
+        self._render_side = "front"
         self.pending_attachments: list[str] = []
         self._deck_map: dict[str, int] = {}
         self.max_attachment_count = 10
@@ -690,11 +734,18 @@ class ChatBotTab(ttk.Frame):
             bd=0,
             highlightthickness=0,
         )
-        self.chat_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        history_area.columnconfigure(0, weight=1)
+        history_area.rowconfigure(0, weight=1)
+        self.chat_text.grid(row=0, column=0, sticky="nsew")
         self.chat_text.configure(state=tk.DISABLED)
 
         history_scroll = ttk.Scrollbar(history_area, orient="vertical", command=self.chat_text.yview)
+        history_scroll.grid(row=0, column=1, sticky="ns")
         self.chat_text.configure(yscrollcommand=history_scroll.set)
+        self.chat_text.bind(
+            "<MouseWheel>",
+            lambda e: (self.chat_text.yview_scroll(int(-1 * (e.delta / 120)), "units"), "break")[1],
+        )
 
         self.composer_frame = ttk.Frame(chat_area, style="Card.TFrame", padding=8)
         self.composer_frame.grid(row=1, column=0, sticky="ew")
@@ -793,7 +844,7 @@ class ChatBotTab(ttk.Frame):
         self._input_menu.tk_popup(event.x_root, event.y_root)
 
     def _bind_scroll_widgets(self) -> None:
-        for widget in (self.chat_text, self.input_text, self.chats_listbox):
+        for widget in (self.input_text, self.chats_listbox):
             widget.bind("<MouseWheel>", self._on_mousewheel)
 
     def _setup_scroll_bindings(self) -> None:
@@ -1546,12 +1597,37 @@ class ChatBotTab(ttk.Frame):
             )
         return cards
 
-    def _on_chat_success(self, response_text: str, draft: DraftBatch | None) -> None:
+    def _on_chat_success(self, response_text: str, draft: DraftBatch | None, user_message: str) -> None:
         self._remove_temporary_message()
         if response_text:
             self._append_message("assistant", response_text)
         else:
             self._append_message("assistant", "...")
+        if "сгенерируй карточку" in user_message.lower():
+            parsed = _parse_card_from_llm(response_text)
+            if parsed:
+                front, back = parsed
+                self._ensure_draft_batch_exists()
+                card = DraftCard(
+                    front=front,
+                    back=back,
+                    image_path=None,
+                    tags=[],
+                    media={"source": "llm"},
+                    meta={"ts": int(time.time())},
+                )
+                self.current_draft_batch.cards.append(card)
+                self.current_draft_batch.total_credits = self._calculate_total_credits(self.current_draft_batch.cards)
+                self.draft_index = len(self.current_draft_batch.cards) - 1
+                self._render_side = "front"
+                self.refresh_render()
+                self._update_save_button_state()
+            else:
+                self._append_message(
+                    "system",
+                    "Не удалось распарсить карточку из ответа. Ответ должен содержать JSON {front, back}.",
+                )
+
         if draft:
             self._on_generation_success(draft)
         else:
@@ -1651,9 +1727,7 @@ class ChatBotTab(ttk.Frame):
         self._append_message("user", text, attachments)
 
         lower = text.lower()
-        if text == "сгенерируй карточку":
-            self._create_ai_card_with_image_deferred_charge(text)
-        elif any(k in lower for k in ("нарисуй картинку", "сгенерируй картинку", "draw image", "generate image")):
+        if any(k in lower for k in ("нарисуй картинку", "сгенерируй картинку", "draw image", "generate image")):
             prompt = text
             if self.current_draft_batch and self.current_draft_batch.cards:
                 prompt = self.current_draft_batch.cards[self.draft_index].front or text
@@ -1684,18 +1758,30 @@ class ChatBotTab(ttk.Frame):
         self.current_draft_batch.cards.append(card)
         self.current_draft_batch.total_credits = self._calculate_total_credits(self.current_draft_batch.cards)
         self.draft_index = len(self.current_draft_batch.cards) - 1
-        self.draft_show_back = False
+        self._render_side = "front"
         return card
 
+    def _ensure_draft_batch_exists(self) -> None:
+        deck_id = self._deck_map.get(self.deck_var.get()) or 0
+        if self.current_draft_batch and self.current_draft_batch.deck_id == deck_id:
+            return
+        self.current_draft_batch = DraftBatch(
+            draft_id=str(uuid.uuid4()),
+            deck_id=deck_id,
+            cards=[],
+            total_credits=0,
+            created_at=int(time.time()),
+        )
+
     def refresh_render(self) -> None:
-        self._render_current_draft()
+        self.winfo_toplevel().after(0, self._render_current_draft)
 
     def _show_front(self) -> None:
-        self.draft_show_back = False
+        self._render_side = "front"
         self.refresh_render()
 
     def _show_back(self) -> None:
-        self.draft_show_back = True
+        self._render_side = "back"
         self.refresh_render()
 
     def _delete_current_draft(self) -> None:
@@ -1818,7 +1904,7 @@ class ChatBotTab(ttk.Frame):
                         total_credits=total_credits,
                         created_at=int(time.time()),
                     )
-                self.after(0, lambda: self._on_chat_success(response_text, draft))
+                self.after(0, lambda: self._on_chat_success(response_text, draft, text))
             except CloudProviderError as exc:
                 logging.exception("Cloud LLM generation failed")
                 self.after(0, lambda: self._handle_cloud_error(exc))
@@ -1864,7 +1950,7 @@ class ChatBotTab(ttk.Frame):
             self.current_draft_batch.cards.extend(draft.cards)
             self.current_draft_batch.total_credits = self._calculate_total_credits(self.current_draft_batch.cards)
             self.draft_index = max(0, len(self.current_draft_batch.cards) - 1)
-            self.draft_show_back = False
+            self._render_side = "front"
             self._render_current_draft()
             total_cards = len(self.current_draft_batch.cards)
             self._append_message(
@@ -1875,7 +1961,7 @@ class ChatBotTab(ttk.Frame):
             draft.total_credits = self._calculate_total_credits(draft.cards)
             self.current_draft_batch = draft
             self.draft_index = 0
-            self.draft_show_back = False
+            self._render_side = "front"
             self._render_current_draft()
             self._append_message("assistant", f"Сформирован черновик на {len(draft.cards)} карточек.")
         self._update_save_button_state()
@@ -1940,7 +2026,7 @@ class ChatBotTab(ttk.Frame):
             card_payload,
             status_text=status_text,
             header_text="Фаза | след. повтор: —",
-            show_back=self.draft_show_back,
+            show_back=self._render_side == "back",
         )
         self.card_view.set_rating_enabled(False)
 
@@ -1951,13 +2037,13 @@ class ChatBotTab(ttk.Frame):
     def _prev_draft(self) -> None:
         if self.draft_index > 0:
             self.draft_index -= 1
-            self.draft_show_back = False
+            self._render_side = "front"
             self._render_current_draft()
 
     def _next_draft(self) -> None:
         if self.current_draft_batch and self.draft_index < len(self.current_draft_batch.cards) - 1:
             self.draft_index += 1
-            self.draft_show_back = False
+            self._render_side = "front"
             self._render_current_draft()
 
     def _save_draft(self) -> None:
@@ -1984,7 +2070,7 @@ class ChatBotTab(ttk.Frame):
         self.current_draft_batch = None
         self._chat_pending_save_cost = 0
         self.draft_index = 0
-        self.draft_show_back = False
+        self._render_side = "front"
         self.refresh_render()
         self._set_save_state(False, 0)
         self._append_message("system", f"Сохранено {saved_count} карточек.")
