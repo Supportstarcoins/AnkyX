@@ -19,6 +19,14 @@ from db_connect import open_db
 from cloud_llm_provider import CloudProviderError, XFlashCloudProvider
 from ollama_client import OllamaClient
 from pdf_ingest import chunk_sentences, detect_lang, extract_text_from_pdf, split_to_sentences
+from llm_json_guard import (
+    LLMJsonError,
+    SYSTEM_JSON_ONLY,
+    ensure_question,
+    extract_json_strict,
+    fallback_cards_from_text,
+    validate_cards_schema,
+)
 from llm_engine import (
     LlamaCppEngine,
     LLMEngineBase,
@@ -518,6 +526,7 @@ class ChatBotTab(ttk.Frame):
         self.native_sentences_var = tk.IntVar(value=10)
         self.foreign_sentences_var = tk.IntVar(value=2)
         self._chat_pending_save_cost = 0
+        self.pending_cost = 0
         self.sd_api_url_var = tk.StringVar(value=self.SD_API_URL_DEFAULT)
 
         self._ensure_chat_tables()
@@ -715,6 +724,9 @@ class ChatBotTab(ttk.Frame):
             style="Primary.TButton",
         )
         self.save_draft_btn.pack(fill=tk.X, padx=6, pady=(6, 0))
+        self.pending_cost_var = tk.StringVar(value="")
+        self.pending_cost_label = ttk.Label(render_area, textvariable=self.pending_cost_var, style="Muted.TLabel")
+        self.pending_cost_label.pack(fill=tk.X, padx=6, pady=(2, 0))
 
         draft_actions = ttk.Frame(render_area, style="Surface.TFrame")
         draft_actions.pack(fill=tk.X, padx=6, pady=(4, 0))
@@ -1574,33 +1586,19 @@ class ChatBotTab(ttk.Frame):
         engine, warning = self._resolve_llm_engine()
         return "local", engine, warning
 
-    def _parse_cards_from_response(self, response_text: str) -> list[DraftCard]:
-        if not response_text:
-            return []
-        json_block = None
-        fenced_match = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", response_text)
-        if fenced_match:
-            json_block = fenced_match.group(1)
-        else:
-            bracket_match = re.search(r"(\[[\s\S]*\])", response_text)
-            if bracket_match:
-                json_block = bracket_match.group(1)
-        if not json_block:
-            return []
-        try:
-            payload = json.loads(json_block)
-        except Exception:
-            return []
-        if not isinstance(payload, list):
-            return []
+    def _parse_cards_from_response(self, response_text: str, context_text: str = "") -> list[DraftCard]:
+        payload = extract_json_strict(response_text)
+        if not isinstance(payload, dict) or not validate_cards_schema(payload):
+            payload = fallback_cards_from_text(response_text)
+            if not payload:
+                return []
+        cards_payload = payload.get("cards") if isinstance(payload, dict) else []
         cards: list[DraftCard] = []
-        for item in payload:
+        for item in cards_payload if isinstance(cards_payload, list) else []:
             if not isinstance(item, dict):
                 continue
-            front = str(item.get("front") or "").strip()
-            back = str(item.get("back") or "").strip()
-            if not front or not back:
-                continue
+            front, back = ensure_question(str(item.get("front") or ""), str(item.get("back") or ""), context_text)
+            image_prompt = str(item.get("image_prompt") or "").strip() or "high quality educational illustration, minimal background"
             tags_value = item.get("tags") or []
             tags = [str(tag).strip() for tag in tags_value if str(tag).strip()] if isinstance(tags_value, list) else []
             cards.append(
@@ -1609,10 +1607,38 @@ class ChatBotTab(ttk.Frame):
                     back=back,
                     tags=tags,
                     media={"source": "llm"},
-                    meta={"ts": int(time.time())},
+                    meta={"ts": int(time.time()), "image_prompt": image_prompt},
+                    created_by_ai=True,
                 )
             )
         return cards
+
+    def _call_ollama_json(self, ollama: OllamaClient, user_content: str) -> dict[str, Any]:
+        messages = [
+            {"role": "system", "content": SYSTEM_JSON_ONLY},
+            {"role": "user", "content": user_content},
+        ]
+        options = {"temperature": 0.2, "top_p": 0.9, "num_ctx": 8192, "stop": ["\n\n", "```"]}
+        response_1 = ollama.chat(messages, options=options)
+        obj = extract_json_strict(response_1)
+        if obj and validate_cards_schema(obj):
+            return obj
+        retry_user = (
+            "Ты вернул НЕ JSON. Верни ТОЛЬКО JSON строго по схеме ниже, без текста\n"
+            '{"cards":[{"front":"... ?","back":"...","image_prompt":"...","tags":["..."]}]}\n'
+            f"Вот твой предыдущий ответ (для исправления): {response_1}"
+        )
+        response_2 = ollama.chat(
+            [{"role": "system", "content": SYSTEM_JSON_ONLY}, {"role": "user", "content": retry_user}],
+            options=options,
+        )
+        obj2 = extract_json_strict(response_2)
+        if obj2 and validate_cards_schema(obj2):
+            return obj2
+        fallback = fallback_cards_from_text(response_2 or response_1)
+        if fallback and validate_cards_schema(fallback):
+            return fallback
+        raise LLMJsonError("Не удалось получить валидный JSON от Ollama")
 
     def _on_chat_success(self, response_text: str, draft: DraftBatch | None, user_message: str) -> None:
         self._remove_temporary_message()
@@ -1625,6 +1651,7 @@ class ChatBotTab(ttk.Frame):
             if parsed:
                 front, back = parsed
                 self._ensure_draft_batch_exists()
+                front, back = ensure_question(front, back, user_message)
                 card = DraftCard(
                     front=front,
                     back=back,
@@ -1632,13 +1659,14 @@ class ChatBotTab(ttk.Frame):
                     tags=[],
                     media={"source": "llm"},
                     meta={"ts": int(time.time())},
+                    created_by_ai=True,
                 )
                 self.current_draft_batch.cards.append(card)
-                self.current_draft_batch.total_credits = self._calculate_total_credits(self.current_draft_batch.cards)
+                self.recalc_draft_cost()
                 self.draft_index = len(self.current_draft_batch.cards) - 1
                 self._render_side = "front"
                 self.refresh_render()
-                self._update_save_button_state()
+                self.update_save_button_price()
             else:
                 self._append_message(
                     "system",
@@ -1774,9 +1802,11 @@ class ChatBotTab(ttk.Frame):
             tags=[],
             media={"source": "chatbot"},
             meta={"ts": int(time.time())},
+            created_by_ai=False,
+            image_paid=False,
         )
         self.current_draft_batch.cards.append(card)
-        self.current_draft_batch.total_credits = self._calculate_total_credits(self.current_draft_batch.cards)
+        self.recalc_draft_cost()
         self.draft_index = len(self.current_draft_batch.cards) - 1
         self._render_side = "front"
         return card
@@ -1815,15 +1845,16 @@ class ChatBotTab(ttk.Frame):
         else:
             self.draft_index = min(self.draft_index, len(self.current_draft_batch.cards) - 1)
         self._chat_pending_save_cost = 0
-        self._update_save_button_state()
+        self.pending_cost = 0
         self.refresh_render()
+        self.update_save_button_price()
 
     def _create_ai_card_with_image_deferred_charge(self, prompt: str) -> None:
         card = self._create_draft_from_text(prompt)
         card.back = "Карточка создана через чат-команду"
-        self._chat_pending_save_cost = 2 if self.app.has_pro() else 5
-        self._set_save_state(True, self._chat_pending_save_cost)
+        card.created_by_ai = True
         self.refresh_render()
+        self.update_save_button_price()
         self._generate_image_for_card(card, prompt, charge_now=False)
 
     def _generate_image_for_current_card(self, prompt: str | None = None, charge_now: bool = True) -> None:
@@ -1866,10 +1897,12 @@ class ChatBotTab(ttk.Frame):
 
     def _apply_sd_image(self, card: DraftCard, img_path: str) -> None:
         card.image_path = img_path
+        card.image_paid = True
         if not card.media:
             card.media = {}
         card.media["image_path"] = img_path
         self.refresh_render()
+        self.update_save_button_price()
 
     def _rebalance_chunks(self, sentences: list[str], mode_native: bool) -> list[list[str]]:
         target = self.native_sentences_var.get() if mode_native else self.foreign_sentences_var.get()
@@ -1935,14 +1968,9 @@ class ChatBotTab(ttk.Frame):
                         "* image_prompt короткий, по смыслу\n"
                         "* не выдумывать фактов вне chunk"
                     )
-                    raw = ollama.chat([
-                        {
-                            'role': 'system',
-                            'content': "Ты генератор флэш-карточек. Верни строго JSON без markdown. Схема: { 'cards':[{'front':'...','back':'...','image_prompt':'...','tags':['...']}] }",
-                        },
-                        {'role': 'user', 'content': user_prompt},
-                    ])
-                    for item in self._extract_cards_payload(raw):
+                    user_content = f"Сформируй 1 карточку по тексту: {chunk_text}. Язык: {lang}. Обязателен image_prompt. Контекст: {summary}."
+                    obj = self._call_ollama_json(ollama, user_content)
+                    for item in obj.get('cards', []):
                         front = str(item.get('front') or '').strip()
                         back = str(item.get('back') or '').strip()
                         if not front or not back:
@@ -1951,7 +1979,7 @@ class ChatBotTab(ttk.Frame):
                             back = mask_unknown_words(back, lang, known_words)
                         image_prompt = str(item.get('image_prompt') or front or back).strip()
                         tags = item.get('tags') if isinstance(item.get('tags'), list) else []
-                        cards.append(DraftCard(front=front, back=back, image_path=None, tags=[str(t) for t in tags], media={'source': 'pdf_ingest'}, meta={'image_prompt': image_prompt, 'lang': lang}))
+                        cards.append(DraftCard(front=front, back=back, image_path=None, tags=[str(t) for t in tags], media={'source': 'pdf_ingest'}, meta={'image_prompt': image_prompt, 'lang': lang}, created_by_ai=True, image_paid=False))
                 batch = DraftBatch(
                     draft_id=str(uuid.uuid4()),
                     deck_id=deck_id,
@@ -2046,7 +2074,7 @@ class ChatBotTab(ttk.Frame):
                     )
                     if backend is self.ollama_engine:
                         self.after(0, lambda: self.ollama_status_var.set("Ollama: OK"))
-                cards = self._parse_cards_from_response(response_text)
+                cards = self._parse_cards_from_response(response_text, text)
                 draft = None
                 if cards:
                     self.card_engine.check_and_record_generation(user_id, plan, len(cards))
@@ -2102,7 +2130,7 @@ class ChatBotTab(ttk.Frame):
     def _on_generation_success(self, draft: DraftBatch) -> None:
         if self.current_draft_batch and self.current_draft_batch.cards and self.current_draft_batch.deck_id == draft.deck_id:
             self.current_draft_batch.cards.extend(draft.cards)
-            self.current_draft_batch.total_credits = self._calculate_total_credits(self.current_draft_batch.cards)
+            self.recalc_draft_cost()
             self.draft_index = max(0, len(self.current_draft_batch.cards) - 1)
             self._render_side = "front"
             self._render_current_draft()
@@ -2112,8 +2140,8 @@ class ChatBotTab(ttk.Frame):
                 f"Добавлено {len(draft.cards)} карточек. Всего: {total_cards}.",
             )
         else:
-            draft.total_credits = self._calculate_total_credits(draft.cards)
             self.current_draft_batch = draft
+            self.recalc_draft_cost()
             self.draft_index = 0
             self._render_side = "front"
             self._render_current_draft()
@@ -2121,21 +2149,39 @@ class ChatBotTab(ttk.Frame):
         self._update_save_button_state()
         self._set_sending_state(False)
 
+    def recalc_draft_cost(self) -> int:
+        if not self.current_draft_batch or not self.current_draft_batch.cards:
+            self.pending_cost = 0
+            return 0
+        total = 0
+        for card in self.current_draft_batch.cards:
+            if getattr(card, "created_by_ai", False):
+                total += 2 if self.app.has_pro() else 5
+            if getattr(card, "image_paid", False):
+                total += 2
+        self.pending_cost = total
+        self.current_draft_batch.total_credits = total
+        return total
+
     def _calculate_total_credits(self, cards: list[DraftCard]) -> int:
-        plan = self.app.get_pricing_plan()
-        return self.card_engine.estimate_cost(len(cards), plan)
+        return self.recalc_draft_cost()
 
     def _on_generation_error(self, message: str) -> None:
         self._on_chat_error(message)
 
+    def update_save_button_price(self) -> None:
+        cost = self.recalc_draft_cost()
+        if cost <= 0:
+            label = "Сохранить"
+            self.pending_cost_var.set("")
+        else:
+            label = f"Сохранить 🪙 {cost}"
+            self.pending_cost_var.set(f"Итоговая стоимость: {cost}")
+        enabled = bool(self.current_draft_batch and self.current_draft_batch.cards) and self.app.get_credits() >= cost
+        self.save_draft_btn.configure(text=label, state=(tk.NORMAL if enabled else tk.DISABLED))
+
     def _update_save_button_state(self) -> None:
-        if not self.current_draft_batch:
-            self._set_save_state(False, 0)
-            return
-        cost = self._chat_pending_save_cost or self.current_draft_batch.total_credits
-        can_afford = self.app.get_credits() >= cost
-        enabled = can_afford and bool(self.current_draft_batch.cards)
-        self._set_save_state(enabled, cost)
+        self.update_save_button_price()
 
     def _set_save_state(self, enabled: bool, total_credits: int | None = None) -> None:
         label = "Сохранить"
@@ -2203,7 +2249,7 @@ class ChatBotTab(ttk.Frame):
     def _save_draft(self) -> None:
         if not self.current_draft_batch:
             return
-        cost = self._chat_pending_save_cost or self.current_draft_batch.total_credits
+        cost = getattr(self, "pending_cost", 0) or self.recalc_draft_cost()
         deck_id = self._deck_map.get(self.deck_var.get()) or self.current_draft_batch.deck_id
         if not deck_id:
             messagebox.showwarning("Колода", "Выберите колоду для сохранения.")
@@ -2223,6 +2269,7 @@ class ChatBotTab(ttk.Frame):
             conn.close()
         self.current_draft_batch = None
         self._chat_pending_save_cost = 0
+        self.pending_cost = 0
         self.draft_index = 0
         self._render_side = "front"
         self.refresh_render()
