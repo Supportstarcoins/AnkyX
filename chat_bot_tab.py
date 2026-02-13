@@ -14,7 +14,6 @@ from tkinter import filedialog, messagebox, ttk
 
 from card_widget import CardWidget
 from chatbot_models import ChatSession, DraftBatch, DraftCard, Message
-from credit_manager import CreditManager
 from csv_importer import upsert_note_and_cards
 from db_connect import open_db
 from cloud_llm_provider import CloudProviderError, XFlashCloudProvider
@@ -27,7 +26,7 @@ from llm_engine import (
     OllamaUnavailableError,
 )
 from mock_ai_engine import MockAIEngine
-from sd15_provider import SD15Provider, SDProviderError
+from sdxl_provider import SDXLProvider, SDXLProviderError
 
 if TYPE_CHECKING:
     from main import RepeatModeCardView
@@ -396,7 +395,7 @@ def draft_to_card(draft: DraftCard) -> dict:
         "back_html": meta.get("back_html"),
         "front_image_path": media.get("front_image_path"),
         "back_image_path": media.get("back_image_path"),
-        "image_path": media.get("image_path") or media.get("image"),
+        "image_path": getattr(draft, "image_path", None) or media.get("image_path") or media.get("image"),
         "audio_path": media.get("audio_path"),
         "video_path": media.get("video_path"),
         "audio_entries": media.get("audio_entries"),
@@ -420,7 +419,7 @@ class ChatBotTab(ttk.Frame):
     OLLAMA_URL_DEFAULT = "http://127.0.0.1:11434"
     OLLAMA_MODEL_DEFAULT = "xflash-llama31"
     SD_API_URL_DEFAULT = "http://127.0.0.1:7860"
-    SD_IMAGE_DIR = r"C:\X-FLASH\media\chat_images"
+    SDXL_CHECKPOINT = "sd_xl_base_1.0.safetensors"
 
     def __init__(self, master: tk.Widget, app) -> None:
         super().__init__(master, style="Surface.TFrame")
@@ -437,7 +436,6 @@ class ChatBotTab(ttk.Frame):
         )
         self.mock_llm_engine = MockEngine()
         self._pending_llm_marker: tuple[str, str] | None = None
-        self.credit_manager = CreditManager()
         self.current_session_id: int | None = None
         self.current_draft_batch: DraftBatch | None = None
         self.draft_index = 0
@@ -469,6 +467,7 @@ class ChatBotTab(ttk.Frame):
         self.llm_settings_window: tk.Toplevel | None = None
         self._mousewheel_bound = False
         self.sd_enabled = tk.BooleanVar(value=True)
+        self._chat_pending_save_cost = 0
         self.sd_api_url_var = tk.StringVar(value=self.SD_API_URL_DEFAULT)
 
         self._ensure_chat_tables()
@@ -661,11 +660,18 @@ class ChatBotTab(ttk.Frame):
 
         self.save_draft_btn = ttk.Button(
             render_area,
-            text="Сохранить карточки",
+            text="Сохранить",
             command=self._save_draft,
             style="Primary.TButton",
         )
         self.save_draft_btn.pack(fill=tk.X, padx=6, pady=(6, 0))
+
+        draft_actions = ttk.Frame(render_area, style="Surface.TFrame")
+        draft_actions.pack(fill=tk.X, padx=6, pady=(4, 0))
+        ttk.Button(draft_actions, text="Передняя", command=self._show_front).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(draft_actions, text="Обратная", command=self._show_back).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(draft_actions, text="Удалить карточку", command=self._delete_current_draft).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(draft_actions, text="Сгенерировать картинку", command=self._generate_image_for_current_card).pack(side=tk.RIGHT)
 
         chat_area.columnconfigure(0, weight=1)
         chat_area.rowconfigure(0, weight=1)
@@ -932,7 +938,7 @@ class ChatBotTab(ttk.Frame):
         sd_frame.pack(fill=tk.X, pady=(0, 6))
         sd_frame.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(sd_frame, text="Stable Diffusion 1.5 (txt2img)", variable=self.sd_enabled).grid(
+        ttk.Checkbutton(sd_frame, text="SDXL (AUTOMATIC1111 txt2img)", variable=self.sd_enabled).grid(
             row=0,
             column=0,
             sticky="w",
@@ -941,7 +947,7 @@ class ChatBotTab(ttk.Frame):
         ttk.Entry(sd_frame, textvariable=self.sd_api_url_var).grid(row=0, column=1, sticky="ew")
         ttk.Label(
             sd_frame,
-            text="Model: SD 1.5 (checkpoint должен быть выбран в WebUI)",
+            text="Model: sd_xl_base_1.0.safetensors (WebUI --api)",
             style="Muted.TLabel",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
@@ -1644,12 +1650,14 @@ class ChatBotTab(ttk.Frame):
         self._resize_input_text()
         self._append_message("user", text, attachments)
 
-        current_card = None
-        if text:
-            current_card = self._create_draft_from_text(text)
-            self._render_current_draft()
-            if self.sd_enabled.get():
-                self._start_sd_generation(text, current_card)
+        lower = text.lower()
+        if text == "сгенерируй карточку":
+            self._create_ai_card_with_image_deferred_charge(text)
+        elif any(k in lower for k in ("нарисуй картинку", "сгенерируй картинку", "draw image", "generate image")):
+            prompt = text
+            if self.current_draft_batch and self.current_draft_batch.cards:
+                prompt = self.current_draft_batch.cards[self.draft_index].front or text
+            self._generate_image_for_current_card(prompt=prompt, charge_now=True)
 
         self._set_sending_state(True)
         self._append_temporary_message("Думаю...", role="assistant")
@@ -1668,6 +1676,7 @@ class ChatBotTab(ttk.Frame):
         card = DraftCard(
             front=text,
             back="",
+            image_path=None,
             tags=[],
             media={"source": "chatbot"},
             meta={"ts": int(time.time())},
@@ -1678,43 +1687,84 @@ class ChatBotTab(ttk.Frame):
         self.draft_show_back = False
         return card
 
-    def _start_sd_generation(self, prompt: str, card: DraftCard) -> None:
+    def refresh_render(self) -> None:
+        self._render_current_draft()
+
+    def _show_front(self) -> None:
+        self.draft_show_back = False
+        self.refresh_render()
+
+    def _show_back(self) -> None:
+        self.draft_show_back = True
+        self.refresh_render()
+
+    def _delete_current_draft(self) -> None:
+        if not self.current_draft_batch or not self.current_draft_batch.cards:
+            messagebox.showinfo("Черновик", "Черновик пуст")
+            return
+        self.current_draft_batch.cards.pop(self.draft_index)
+        if not self.current_draft_batch.cards:
+            self.current_draft_batch = None
+            self.draft_index = 0
+        else:
+            self.draft_index = min(self.draft_index, len(self.current_draft_batch.cards) - 1)
+        self._chat_pending_save_cost = 0
+        self._update_save_button_state()
+        self.refresh_render()
+
+    def _create_ai_card_with_image_deferred_charge(self, prompt: str) -> None:
+        card = self._create_draft_from_text(prompt)
+        card.back = "Карточка создана через чат-команду"
+        self._chat_pending_save_cost = 2 if self.app.has_pro() else 5
+        self._set_save_state(True, self._chat_pending_save_cost)
+        self.refresh_render()
+        self._generate_image_for_card(card, prompt, charge_now=False)
+
+    def _generate_image_for_current_card(self, prompt: str | None = None, charge_now: bool = True) -> None:
+        if not self.current_draft_batch or not self.current_draft_batch.cards:
+            messagebox.showinfo("Черновик", "Сначала создайте карточку")
+            return
+        card = self.current_draft_batch.cards[self.draft_index]
+        final_prompt = prompt or card.front or card.back
+        self._generate_image_for_card(card, final_prompt, charge_now=charge_now)
+
+    def _generate_image_for_card(self, card: DraftCard, prompt: str, charge_now: bool) -> None:
+        if not self.sd_enabled.get():
+            return
+        if charge_now and not self.app.try_spend_credits(2, "SDXL image generation"):
+            return
         api_url = self.sd_api_url_var.get().strip() or self.SD_API_URL_DEFAULT
 
         def worker() -> None:
             try:
-                provider = SD15Provider(api_url)
+                provider = SDXLProvider(api_url)
+                provider.ensure_model(self.SDXL_CHECKPOINT)
                 img_path = provider.txt2img(
                     prompt=prompt,
-                    out_dir=self.SD_IMAGE_DIR,
-                    width=512,
-                    height=512,
-                    steps=20,
-                    sampler_name="Euler a",
-                    cfg_scale=7,
-                    negative_prompt="lowres, blurry, bad anatomy, extra fingers, text, watermark",
+                    negative_prompt="lowres, blurry, bad anatomy, text, watermark",
+                    width=1024,
+                    height=1024,
+                    steps=28,
+                    cfg=7,
+                    sampler="Euler a",
+                    seed=None,
                 )
                 self.after(0, lambda: self._apply_sd_image(card, img_path))
-            except SDProviderError:
-                self.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "Stable Diffusion",
-                        "Stable Diffusion API не доступно. Запустите WebUI с --api.",
-                    ),
-                )
+            except SDXLProviderError as exc:
+                self.after(0, lambda: messagebox.showerror("Stable Diffusion", str(exc)))
             except Exception as exc:  # noqa: BLE001
-                logging.exception("Stable Diffusion generation failed")
+                logging.exception("SDXL generation failed")
                 self.after(0, lambda: messagebox.showerror("Stable Diffusion", str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_sd_image(self, card: DraftCard, img_path: str) -> None:
+        card.image_path = img_path
         if not card.media:
             card.media = {}
         card.media["image_path"] = img_path
-        self._render_current_draft()
-        self._append_message("system", "Сгенерировано изображение.")
+        self.refresh_render()
+        self._append_message("system", "Сгенерировано изображение SDXL.")
 
     def _start_generation(self, text: str, attachments: list[str]) -> None:
         plan = self.app.get_pricing_plan()
@@ -1842,14 +1892,15 @@ class ChatBotTab(ttk.Frame):
         if not self.current_draft_batch:
             self._set_save_state(False, 0)
             return
-        can_afford = self.credit_manager.can_afford(self.app.user_id, self.current_draft_batch.total_credits)
+        cost = self._chat_pending_save_cost or self.current_draft_batch.total_credits
+        can_afford = self.app.get_credits() >= cost
         enabled = can_afford and bool(self.current_draft_batch.cards)
-        self._set_save_state(enabled, self.current_draft_batch.total_credits)
+        self._set_save_state(enabled, cost)
 
     def _set_save_state(self, enabled: bool, total_credits: int | None = None) -> None:
-        label = "Сохранить карточки"
+        label = "Сохранить"
         if total_credits and total_credits > 0:
-            label = f"Сохранить карточки ({total_credits} кредитов)"
+            label = f"Сохранить 🪙 {total_credits}"
         self.save_draft_btn.configure(text=label, state=(tk.NORMAL if enabled else tk.DISABLED))
 
     def _draft_display_id(self, draft: DraftCard, card_payload: dict) -> str:
@@ -1912,44 +1963,16 @@ class ChatBotTab(ttk.Frame):
     def _save_draft(self) -> None:
         if not self.current_draft_batch:
             return
-        cost = self.current_draft_batch.total_credits
+        cost = self._chat_pending_save_cost or self.current_draft_batch.total_credits
         deck_id = self._deck_map.get(self.deck_var.get()) or self.current_draft_batch.deck_id
         if not deck_id:
             messagebox.showwarning("Колода", "Выберите колоду для сохранения.")
             return
+        if cost > 0 and not self.app.try_spend_credits(cost, "chatbot save draft"):
+            self._update_save_button_state()
+            return
         conn = open_db()
         try:
-            cur = conn.cursor()
-            cur.execute("BEGIN IMMEDIATE;")
-            cur.execute(
-                "INSERT OR IGNORE INTO credits_balance (user_id, balance) VALUES (?, 0);",
-                (self.app.user_id,),
-            )
-            cur.execute(
-                "SELECT balance FROM credits_balance WHERE user_id = ? LIMIT 1;",
-                (self.app.user_id,),
-            )
-            row = cur.fetchone()
-            balance = int(row[0]) if row else 0
-            if balance < cost:
-                conn.rollback()
-                messagebox.showwarning("Недостаточно кредитов", "Недостаточно кредитов для сохранения.")
-                self._update_save_button_state()
-                return
-            cur.execute(
-                "UPDATE credits_balance SET balance = balance - ? WHERE user_id = ?;",
-                (cost, self.app.user_id),
-            )
-            cur.execute(
-                "INSERT INTO credits_ledger (user_id, ts, delta, reason, meta) VALUES (?, ?, ?, ?, ?);",
-                (
-                    self.app.user_id,
-                    int(time.time()),
-                    -abs(cost),
-                    "Сохранение карточек (чат-бот)",
-                    json.dumps({"draft_id": self.current_draft_batch.draft_id}, ensure_ascii=False),
-                ),
-            )
             saved_count = self._save_draft_to_deck(conn, deck_id, self.current_draft_batch.cards)
             conn.commit()
         except Exception as exc:  # noqa: BLE001
@@ -1958,11 +1981,11 @@ class ChatBotTab(ttk.Frame):
             return
         finally:
             conn.close()
-        self.app.refresh_balance_ui()
         self.current_draft_batch = None
+        self._chat_pending_save_cost = 0
         self.draft_index = 0
         self.draft_show_back = False
-        self._render_current_draft()
+        self.refresh_render()
         self._set_save_state(False, 0)
         self._append_message("system", f"Сохранено {saved_count} карточек.")
 
