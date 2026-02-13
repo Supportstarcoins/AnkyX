@@ -27,6 +27,8 @@ class DraftCard:
     tags: list[str] = field(default_factory=list)
     media: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
+    created_by_ai: bool = False
+    image_paid: bool = False
 
 
 @dataclass

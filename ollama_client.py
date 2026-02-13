@@ -10,12 +10,12 @@ class OllamaClient:
         self.base_url = (base_url or "").rstrip("/")
         self.model = model
 
-    def chat(self, messages: list[dict[str, str]]) -> str:
+    def chat(self, messages: list[dict[str, str]], options: dict[str, Any] | None = None) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.4},
+            "options": options or {"temperature": 0.4},
         }
         response = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=180)
         response.raise_for_status()
