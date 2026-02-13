@@ -23,6 +23,7 @@ class ChatSession:
 class DraftCard:
     front: str
     back: str
+    image_path: str | None = None
     tags: list[str] = field(default_factory=list)
     media: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)

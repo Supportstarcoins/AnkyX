@@ -279,6 +279,7 @@ from video_tools import (
     open_in_external_player,
 )
 from audio_player_widget import AudioPlayerWidget
+from sdxl_provider import SDXLProvider, SDXLProviderError
 # ui_theme: в разных версиях проекта функции темы могут называться иначе.
 # Нельзя падать на ImportError — интерфейс должен запускаться даже без темы.
 try:
@@ -14626,6 +14627,23 @@ class AnkiApp(tk.Tk):
         balance = self.credits_service.get_balance(self.user_id)
         return balance >= cost
 
+    def has_pro(self) -> bool:
+        return self.is_premium_active()
+
+    def get_credits(self) -> int:
+        return int(self.credits_service.get_balance(self.user_id) or 0)
+
+    def try_spend_credits(self, amount: int, reason: str) -> bool:
+        if amount <= 0:
+            return True
+        if self.get_credits() < amount:
+            messagebox.showwarning("Недостаточно кредитов", "Недостаточно кредитов")
+            return False
+        ok = self.charge_credits(amount, reason, meta={"source": "ui"})
+        if ok:
+            self.refresh_balance_ui()
+        return ok
+
     def get_pricing_plan(self) -> str:
         self.user_account = ensure_user_account(self.user_id)
         self.user_profile = ensure_user_profile_row(self.user_id)
@@ -19541,23 +19559,40 @@ class AnkiApp(tk.Tk):
             win._preview_img_ref = None
 
         def generate_image():
-            if not self.guard_premium_and_spend(
-                "AI image generation",
-                2,
-                require_premium=True,
-                meta={"operation": "ai_image", "images": 1},
-            ):
+            if not self.try_spend_credits(2, "SDXL image generation"):
                 return
-            set_preview_text("Генерация изображения…")
+            set_preview_text("Генерация SDXL изображения…")
+            prompt = prompt_text.get("1.0", tk.END).strip()
+            if not prompt:
+                messagebox.showwarning("Промпт", "Введите Front text (промпт)", parent=win)
+                return
 
-            def finish():
-                prompt = prompt_text.get("1.0", tk.END).strip()
-                path = self._create_ai_placeholder_image(prompt) or ""
+            def worker() -> None:
+                try:
+                    provider = SDXLProvider("http://127.0.0.1:7860")
+                    provider.ensure_model("sd_xl_base_1.0.safetensors")
+                    path = provider.txt2img(
+                        prompt=prompt,
+                        negative_prompt="lowres, blurry, bad anatomy, text, watermark",
+                        width=1024,
+                        height=1024,
+                        steps=28,
+                        cfg=7,
+                        sampler="Euler a",
+                        seed=None,
+                    )
+                    self.after(0, lambda: _on_done(path))
+                except SDXLProviderError as exc:
+                    self.after(0, lambda: messagebox.showerror("SDXL", str(exc), parent=win))
+                except Exception as exc:  # noqa: BLE001
+                    self.after(0, lambda: messagebox.showerror("SDXL", str(exc), parent=win))
+
+            def _on_done(path: str) -> None:
                 media_state["image_path"] = path
                 media_state["video_path"] = None
                 update_preview_image(path)
 
-            win.after(1200, finish)
+            threading.Thread(target=worker, daemon=True).start()
 
         def generate_video():
             if not self.guard_premium_and_spend(
