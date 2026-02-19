@@ -137,3 +137,119 @@ def fallback_cards_from_text(text: str) -> dict[str, Any] | None:
         return None
     front, back = ensure_question(front, back, text)
     return {"cards": [{"front": front, "back": back, "image_prompt": "illustration of the concept", "tags": []}]}
+
+
+def regex_extract_front_back(text: str) -> tuple[str, str] | None:
+    if not text:
+        return None
+    front = ""
+    back = ""
+    front_match = re.search(r"(?:front|question|вопрос)\s*[:\-]\s*(.+)", text, flags=re.IGNORECASE)
+    back_match = re.search(r"(?:back|answer|ответ)\s*[:\-]\s*(.+)", text, flags=re.IGNORECASE)
+    if front_match:
+        front = front_match.group(1).strip()
+    if back_match:
+        back = back_match.group(1).strip()
+    if not front and not back:
+        return None
+    return front, back
+
+
+def normalize_cards_payload(cards: Any) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for raw in cards if isinstance(cards, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        front = str(raw.get("front") or "").strip() or "В чём суть?"
+        if "?" not in front:
+            front = front.rstrip(".!") + "?"
+        if not front.endswith("?"):
+            front = front.rstrip(".!") + "?"
+        back = str(raw.get("back") or "").strip() or "—"
+        image_prompt = (
+            str(raw.get("image_prompt") or "").strip()
+            or "educational illustration of the concept, clean background"
+        )
+        tags_raw = raw.get("tags")
+        tags = [str(tag).strip() for tag in tags_raw if str(tag).strip()] if isinstance(tags_raw, list) else []
+        normalized.append(
+            {
+                "front": front,
+                "back": back,
+                "image_prompt": image_prompt,
+                "tags": tags,
+            }
+        )
+    return normalized
+
+
+def call_ollama_json_strict_with_repair(
+    ollama_client: Any,
+    base_messages: list[dict[str, str]],
+) -> dict[str, Any]:
+    options = {"temperature": 0.2, "top_p": 0.9, "num_ctx": 8192, "stop": ["```", "\n\n\n"]}
+
+    response_1 = ollama_client.chat(base_messages, options=options)
+    obj = extract_json_strict(response_1)
+    if validate_cards_schema(obj):
+        return obj
+
+    retry_messages = [
+        {"role": "system", "content": SYSTEM_JSON_ONLY},
+        {
+            "role": "user",
+            "content": (
+                "Ты вернул НЕ JSON. Верни ТОЛЬКО валидный JSON строго по схеме:\n"
+                '{"cards":[{"front":"... ?","back":"...","image_prompt":"...","tags":["..."]}]}\n'
+                "Никакого текста. Исправь свой предыдущий ответ:\n" + response_1
+            ),
+        },
+    ]
+    response_2 = ollama_client.chat(retry_messages, options=options)
+    obj = extract_json_strict(response_2)
+    if validate_cards_schema(obj):
+        return obj
+
+    repair_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты конвертер. Тебе дают произвольный текст. Ты обязан вернуть ТОЛЬКО JSON по схеме "
+                '{"cards":[{"front":"... ?","back":"...","image_prompt":"...","tags":[]}]}.'
+                "\nНикаких комментариев, никаких отказов.\n"
+                "Если в тексте есть факты/утверждения — преврати их в вопрос (front) и ответ (back).\n"
+                "Если нет image_prompt — придумай подходящий короткий image_prompt на английском.\n"
+                'front ВСЕГДА заканчивается "?".'
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Преобразуй этот текст в JSON СТРОГО по схеме, без лишнего:\n" + (response_2 or response_1),
+        },
+    ]
+    response_3 = ollama_client.chat(repair_messages, options=options)
+    obj = extract_json_strict(response_3)
+    if validate_cards_schema(obj):
+        return obj
+
+    parsed = regex_extract_front_back(response_3 or response_2 or response_1)
+    if parsed:
+        front, back = ensure_question(parsed[0], parsed[1], context_text="")
+    else:
+        user_messages = [m.get("content", "") for m in base_messages if m.get("role") == "user"]
+        source_text = str(user_messages[-1] if user_messages else "").strip()
+        front = "О чём это?"
+        back = re.sub(r"\s+", " ", source_text).strip()[:240] or "Краткое описание отсутствует."
+        if len(back) >= 240:
+            back = back.rstrip() + "..."
+
+    return {
+        "cards": [
+            {
+                "front": front if front.endswith("?") else f"{front}?",
+                "back": back,
+                "image_prompt": "high quality educational illustration, minimal background",
+                "tags": [],
+            }
+        ]
+    }
