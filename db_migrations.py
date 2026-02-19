@@ -375,7 +375,110 @@ def run_migrations(conn: sqlite3.Connection):
     )
     _add_column_if_missing(cur, "users", "starter_bonus_claimed", "INTEGER DEFAULT 0")
 
-    # Добавляем дефолтный тип заметки "Basic"
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS llm_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            api_key TEXT,
+            model TEXT,
+            base_url TEXT,
+            fallback_provider TEXT,
+            timeout_sec INTEGER DEFAULT 60,
+            updated_at INTEGER NOT NULL
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS media_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            path TEXT NOT NULL,
+            source TEXT,
+            sha256 TEXT UNIQUE,
+            meta_json TEXT,
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS youtube_imports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            title TEXT,
+            sha256 TEXT UNIQUE,
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS youtube_clips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            clip_id TEXT NOT NULL UNIQUE,
+            video_id TEXT NOT NULL,
+            start_ms INTEGER NOT NULL,
+            end_ms INTEGER NOT NULL,
+            text TEXT,
+            path TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vocab_progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            word TEXT NOT NULL,
+            lang TEXT NOT NULL,
+            seen_count INTEGER NOT NULL DEFAULT 0,
+            last_seen_at INTEGER,
+            UNIQUE(word, lang)
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS study_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            filter_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_cards (
+            session_id INTEGER NOT NULL,
+            card_id INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(session_id, card_id),
+            FOREIGN KEY(session_id) REFERENCES study_sessions(id),
+            FOREIGN KEY(card_id) REFERENCES cards(id)
+        );
+        """
+    )
+
+    _add_column_if_missing(cur, "cards", "media_id", "INTEGER")
+    _add_column_if_missing(cur, "cards", "media_json", "TEXT")
+    _add_column_if_missing(cur, "cards", "source_ref", "TEXT")
+    _add_column_if_missing(cur, "cards", "tags", "TEXT")
+
+    _add_column_if_missing(cur, "user_profile", "is_pro", "INTEGER DEFAULT 0")
+    _add_column_if_missing(cur, "user_profile", "pro_expires", "INTEGER DEFAULT 0")
+
+        # Добавляем дефолтный тип заметки "Basic"
     cur.execute(
         "SELECT id FROM note_types WHERE name = 'Basic' LIMIT 1;"
     )
