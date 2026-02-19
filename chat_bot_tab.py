@@ -22,10 +22,10 @@ from pdf_ingest import chunk_sentences, detect_lang, extract_text_from_pdf, spli
 from llm_json_guard import (
     LLMJsonError,
     SYSTEM_JSON_ONLY,
+    call_ollama_json_strict_with_repair,
     ensure_question,
     extract_json_strict,
-    fallback_cards_from_text,
-    validate_cards_schema,
+    normalize_cards_payload,
 )
 from llm_engine import (
     LlamaCppEngine,
@@ -1588,26 +1588,17 @@ class ChatBotTab(ttk.Frame):
 
     def _parse_cards_from_response(self, response_text: str, context_text: str = "") -> list[DraftCard]:
         payload = extract_json_strict(response_text)
-        if not isinstance(payload, dict) or not validate_cards_schema(payload):
-            payload = fallback_cards_from_text(response_text)
-            if not payload:
-                return []
-        cards_payload = payload.get("cards") if isinstance(payload, dict) else []
+        cards_payload = normalize_cards_payload(payload.get("cards") if isinstance(payload, dict) else [])
         cards: list[DraftCard] = []
-        for item in cards_payload if isinstance(cards_payload, list) else []:
-            if not isinstance(item, dict):
-                continue
+        for item in cards_payload:
             front, back = ensure_question(str(item.get("front") or ""), str(item.get("back") or ""), context_text)
-            image_prompt = str(item.get("image_prompt") or "").strip() or "high quality educational illustration, minimal background"
-            tags_value = item.get("tags") or []
-            tags = [str(tag).strip() for tag in tags_value if str(tag).strip()] if isinstance(tags_value, list) else []
             cards.append(
                 DraftCard(
                     front=front,
                     back=back,
-                    tags=tags,
+                    tags=item.get("tags") or [],
                     media={"source": "llm"},
-                    meta={"ts": int(time.time()), "image_prompt": image_prompt},
+                    meta={"ts": int(time.time()), "image_prompt": str(item.get("image_prompt") or "")},
                     created_by_ai=True,
                 )
             )
@@ -1618,27 +1609,11 @@ class ChatBotTab(ttk.Frame):
             {"role": "system", "content": SYSTEM_JSON_ONLY},
             {"role": "user", "content": user_content},
         ]
-        options = {"temperature": 0.2, "top_p": 0.9, "num_ctx": 8192, "stop": ["\n\n", "```"]}
-        response_1 = ollama.chat(messages, options=options)
-        obj = extract_json_strict(response_1)
-        if obj and validate_cards_schema(obj):
-            return obj
-        retry_user = (
-            "Ты вернул НЕ JSON. Верни ТОЛЬКО JSON строго по схеме ниже, без текста\n"
-            '{"cards":[{"front":"... ?","back":"...","image_prompt":"...","tags":["..."]}]}\n'
-            f"Вот твой предыдущий ответ (для исправления): {response_1}"
-        )
-        response_2 = ollama.chat(
-            [{"role": "system", "content": SYSTEM_JSON_ONLY}, {"role": "user", "content": retry_user}],
-            options=options,
-        )
-        obj2 = extract_json_strict(response_2)
-        if obj2 and validate_cards_schema(obj2):
-            return obj2
-        fallback = fallback_cards_from_text(response_2 or response_1)
-        if fallback and validate_cards_schema(fallback):
-            return fallback
-        raise LLMJsonError("Не удалось получить валидный JSON от Ollama")
+        obj = call_ollama_json_strict_with_repair(ollama, messages)
+        normalized_cards = normalize_cards_payload(obj.get("cards") if isinstance(obj, dict) else [])
+        if not normalized_cards:
+            raise LLMJsonError("Не удалось получить валидный JSON от Ollama")
+        return {"cards": normalized_cards}
 
     def _on_chat_success(self, response_text: str, draft: DraftBatch | None, user_message: str) -> None:
         self._remove_temporary_message()
@@ -1970,14 +1945,11 @@ class ChatBotTab(ttk.Frame):
                     )
                     user_content = f"Сформируй 1 карточку по тексту: {chunk_text}. Язык: {lang}. Обязателен image_prompt. Контекст: {summary}."
                     obj = self._call_ollama_json(ollama, user_content)
-                    for item in obj.get('cards', []):
-                        front = str(item.get('front') or '').strip()
-                        back = str(item.get('back') or '').strip()
-                        if not front or not back:
-                            continue
+                    for item in normalize_cards_payload(obj.get('cards', [])):
+                        front, back = ensure_question(str(item.get('front') or ''), str(item.get('back') or ''), chunk_text)
                         if not mode_native:
                             back = mask_unknown_words(back, lang, known_words)
-                        image_prompt = str(item.get('image_prompt') or front or back).strip()
+                        image_prompt = str(item.get('image_prompt') or '').strip()
                         tags = item.get('tags') if isinstance(item.get('tags'), list) else []
                         cards.append(DraftCard(front=front, back=back, image_path=None, tags=[str(t) for t in tags], media={'source': 'pdf_ingest'}, meta={'image_prompt': image_prompt, 'lang': lang}, created_by_ai=True, image_paid=False))
                 batch = DraftBatch(
