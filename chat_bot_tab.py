@@ -36,7 +36,7 @@ from llm_engine import (
     OllamaUnavailableError,
 )
 from mock_ai_engine import MockAIEngine
-from sdxl_provider import SDXLProvider, SDXLProviderError
+from sd_api_client import SDAPIClient, SDAPIError
 from vocab_store import load_known_words, mask_unknown_words
 
 if TYPE_CHECKING:
@@ -474,7 +474,8 @@ class ChatBotTab(ttk.Frame):
     OLLAMA_URL_DEFAULT = "http://127.0.0.1:11434"
     OLLAMA_MODEL_DEFAULT = "xflash-llama31"
     SD_API_URL_DEFAULT = "http://127.0.0.1:7860"
-    SDXL_CHECKPOINT = "sd_xl_base_1.0.safetensors"
+    SD_CHECKPOINT_DEFAULT = "sd_xl_base_1.0.safetensors"
+    SD_NEGATIVE_PROMPT_DEFAULT = "lowres, blurry, bad anatomy, text, watermark"
 
     def __init__(self, master: tk.Widget, app) -> None:
         super().__init__(master, style="Surface.TFrame")
@@ -527,7 +528,13 @@ class ChatBotTab(ttk.Frame):
         self.foreign_sentences_var = tk.IntVar(value=2)
         self._chat_pending_save_cost = 0
         self.pending_cost = 0
-        self.sd_api_url_var = tk.StringVar(value=self.SD_API_URL_DEFAULT)
+        self.sd_api_url_var = tk.StringVar(
+            value=self._cloud_settings.get("sd_api_url") or self.SD_API_URL_DEFAULT
+        )
+        self.sd_checkpoint_var = tk.StringVar(
+            value=self._cloud_settings.get("sd_checkpoint") or self.SD_CHECKPOINT_DEFAULT
+        )
+        self.sd_status_var = tk.StringVar(value="SD: —")
 
         self._ensure_chat_tables()
         self._build_ui()
@@ -543,6 +550,8 @@ class ChatBotTab(ttk.Frame):
         self.cloud_api_key_var.trace_add("write", self._on_cloud_settings_change)
         self.ollama_url_var.trace_add("write", self._on_ollama_settings_change)
         self.ollama_model_var.trace_add("write", self._on_ollama_settings_change)
+        self.sd_api_url_var.trace_add("write", self._on_cloud_settings_change)
+        self.sd_checkpoint_var.trace_add("write", self._on_cloud_settings_change)
         self.cloud_status_var.trace_add("write", self._on_llm_status_change)
         self.ollama_status_var.trace_add("write", self._on_llm_status_change)
         self._setup_scroll_bindings()
@@ -1006,19 +1015,27 @@ class ChatBotTab(ttk.Frame):
         sd_frame = ttk.Frame(container, style="CardInner.TFrame", padding=6)
         sd_frame.pack(fill=tk.X, pady=(0, 6))
         sd_frame.columnconfigure(1, weight=1)
+        sd_frame.columnconfigure(3, weight=1)
 
-        ttk.Checkbutton(sd_frame, text="SDXL (AUTOMATIC1111 txt2img)", variable=self.sd_enabled).grid(
+        ttk.Checkbutton(sd_frame, text="Stable Diffusion (AUTOMATIC1111 txt2img)", variable=self.sd_enabled).grid(
             row=0,
             column=0,
             sticky="w",
             padx=(0, 10),
         )
-        ttk.Entry(sd_frame, textvariable=self.sd_api_url_var).grid(row=0, column=1, sticky="ew")
-        ttk.Label(
-            sd_frame,
-            text="Model: sd_xl_base_1.0.safetensors (WebUI --api)",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(sd_frame, text="SD API URL:", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(sd_frame, textvariable=self.sd_api_url_var).grid(row=1, column=1, sticky="ew", padx=(0, 10))
+        ttk.Label(sd_frame, text="SD Model (checkpoint):", style="Muted.TLabel").grid(
+            row=1,
+            column=2,
+            sticky="w",
+            padx=(0, 6),
+        )
+        ttk.Entry(sd_frame, textvariable=self.sd_checkpoint_var).grid(row=1, column=3, sticky="ew")
+        sd_actions = ttk.Frame(sd_frame, style="CardInner.TFrame")
+        sd_actions.grid(row=1, column=4, sticky="e", padx=(10, 0))
+        ttk.Button(sd_actions, text="Проверить SD", command=self._check_sd_connection).pack(side=tk.LEFT)
+        ttk.Label(sd_actions, textvariable=self.sd_status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
 
         pdf_mode_frame = ttk.Frame(container, style="CardInner.TFrame", padding=6)
         pdf_mode_frame.pack(fill=tk.X, pady=(0, 6))
@@ -1471,10 +1488,19 @@ class ChatBotTab(ttk.Frame):
                         "api_key": str(payload.get("api_key") or ""),
                         "ollama_url": str(payload.get("ollama_url") or ""),
                         "ollama_model": str(payload.get("ollama_model") or ""),
+                        "sd_api_url": str(payload.get("sd_api_url") or ""),
+                        "sd_checkpoint": str(payload.get("sd_checkpoint") or ""),
                     }
         except Exception:  # noqa: BLE001
             logging.exception("Failed to load cloud settings")
-        return {"cloud_url": "", "api_key": "", "ollama_url": "", "ollama_model": ""}
+        return {
+            "cloud_url": "",
+            "api_key": "",
+            "ollama_url": "",
+            "ollama_model": "",
+            "sd_api_url": "",
+            "sd_checkpoint": "",
+        }
 
     def _save_cloud_settings(self) -> None:
         self._cloud_settings_save_job = None
@@ -1483,6 +1509,8 @@ class ChatBotTab(ttk.Frame):
             "api_key": self.cloud_api_key_var.get().strip(),
             "ollama_url": self.ollama_url_var.get().strip(),
             "ollama_model": self.ollama_model_var.get().strip(),
+            "sd_api_url": self.sd_api_url_var.get().strip(),
+            "sd_checkpoint": self.sd_checkpoint_var.get().strip(),
         }
         try:
             with open(self._cloud_settings_path, "w", encoding="utf-8") as handle:
@@ -1541,6 +1569,22 @@ class ChatBotTab(ttk.Frame):
                 ok = False
             status = "Ollama: OK" if ok else "Ollama: offline"
             self.after(0, lambda: self.ollama_status_var.set(status))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _check_sd_connection(self) -> None:
+        api_url = self.sd_api_url_var.get().strip() or self.SD_API_URL_DEFAULT
+        self.sd_status_var.set("SD: проверка...")
+
+        def worker() -> None:
+            ok = False
+            try:
+                ok = SDAPIClient(api_url).health()
+            except SDAPIError:
+                ok = False
+            status = "SD: OK" if ok else "SD: FAIL"
+            self.after(0, lambda: self.sd_status_var.set(status))
+            self.after(0, lambda: messagebox.showinfo("Stable Diffusion", status))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1732,6 +1776,49 @@ class ChatBotTab(ttk.Frame):
             self.send_btn_var.set("Отправить")
             self._update_send_button_state()
 
+    def _extract_sd_prompt(self, text: str) -> tuple[bool, bool, str]:
+        normalized = (text or "").strip()
+        if not normalized:
+            return False, False, ""
+        slash_match = re.match(r"^/img\s*(.*)$", normalized, flags=re.IGNORECASE)
+        if slash_match:
+            return True, False, slash_match.group(1).strip()
+
+        trigger_patterns = (
+            r"\bнарисуй\b",
+            r"\bсгенерируй\s+картинк(?:у|и|а)\b",
+            r"\bdraw\s+image\b",
+        )
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in trigger_patterns):
+            prompt = re.sub(r"(?i)\bнарисуй\b", "", normalized)
+            prompt = re.sub(r"(?i)\bсгенерируй\s+картинк(?:у|и|а)\b", "", prompt)
+            prompt = re.sub(r"(?i)\bdraw\s+image\b", "", prompt)
+            return True, True, prompt.strip(" :,-")
+        return False, False, ""
+
+    def _resolve_sd_prompt_fallback(self, base_prompt: str) -> str:
+        prompt = (base_prompt or "").strip()
+        if len(prompt) >= 6:
+            return prompt
+        if self.current_draft_batch and self.current_draft_batch.cards:
+            current = self.current_draft_batch.cards[self.draft_index]
+            fallback = (current.front or current.back or "").strip()
+            if fallback:
+                return fallback
+        conn = open_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT text FROM chat_messages WHERE session_id = ? AND role = 'user' ORDER BY ts DESC LIMIT 10;",
+            (self.current_session_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        for row in rows:
+            candidate = str(row["text"] or "").strip()
+            if len(candidate) >= 6:
+                return candidate
+        return prompt or "image concept"
+
     def _on_send(self) -> None:
         if self.current_session_id is None:
             messagebox.showinfo("Выбор чата", "Выберите чат слева.")
@@ -1749,12 +1836,19 @@ class ChatBotTab(ttk.Frame):
         self._resize_input_text()
         self._append_message("user", text, attachments)
 
-        lower = text.lower()
-        if any(k in lower for k in ("нарисуй картинку", "сгенерируй картинку", "draw image", "generate image")):
-            prompt = text
-            if self.current_draft_batch and self.current_draft_batch.cards:
-                prompt = self.current_draft_batch.cards[self.draft_index].front or text
-            self._generate_image_for_current_card(prompt=prompt, charge_now=True)
+        is_sd_command, send_to_llm, parsed_prompt = self._extract_sd_prompt(text)
+        if is_sd_command:
+            cost = 2 if self.app.has_pro() else 4
+            if not self.app.try_spend_credits(cost, "SD image generation"):
+                self._append_message("system", "Недостаточно кредитов")
+                if not send_to_llm:
+                    return
+            else:
+                prompt = self._resolve_sd_prompt_fallback(parsed_prompt)
+                card = self._get_or_create_current_draft_card(prompt)
+                self._generate_image_for_card(card, prompt, charge_now=False)
+            if not send_to_llm:
+                return
 
         self._set_sending_state(True)
         self._append_temporary_message("Думаю...", role="assistant")
@@ -1797,6 +1891,13 @@ class ChatBotTab(ttk.Frame):
             total_credits=0,
             created_at=int(time.time()),
         )
+
+    def _get_or_create_current_draft_card(self, prompt: str = "") -> DraftCard:
+        self._ensure_draft_batch_exists()
+        if self.current_draft_batch and self.current_draft_batch.cards:
+            self.draft_index = max(0, min(self.draft_index, len(self.current_draft_batch.cards) - 1))
+            return self.current_draft_batch.cards[self.draft_index]
+        return self._create_draft_from_text(prompt or "SD image")
 
     def refresh_render(self) -> None:
         self.winfo_toplevel().after(0, self._render_current_draft)
@@ -1843,29 +1944,33 @@ class ChatBotTab(ttk.Frame):
     def _generate_image_for_card(self, card: DraftCard, prompt: str, charge_now: bool) -> None:
         if not self.sd_enabled.get():
             return
-        if charge_now and not self.app.try_spend_credits(2, "SDXL image generation"):
-            return
+        if charge_now:
+            cost = 2 if self.app.has_pro() else 4
+            if not self.app.try_spend_credits(cost, "SD image generation"):
+                return
         api_url = self.sd_api_url_var.get().strip() or self.SD_API_URL_DEFAULT
+        checkpoint = self.sd_checkpoint_var.get().strip() or self.SD_CHECKPOINT_DEFAULT
 
         def worker() -> None:
             try:
-                provider = SDXLProvider(api_url)
-                provider.ensure_model(self.SDXL_CHECKPOINT)
-                img_path = provider.txt2img(
+                sd = SDAPIClient(api_url)
+                sd.set_checkpoint(checkpoint)
+                png_bytes = sd.txt2img(
                     prompt=prompt,
-                    negative_prompt="lowres, blurry, bad anatomy, text, watermark",
+                    negative_prompt=self.SD_NEGATIVE_PROMPT_DEFAULT,
                     width=1024,
                     height=1024,
                     steps=28,
-                    cfg=7,
-                    sampler="Euler a",
-                    seed=None,
+                    cfg=6.5,
+                    sampler="DPM++ 2M Karras",
+                    seed=-1,
                 )
+                img_path = sd.save_image_bytes(png_bytes)
                 self.after(0, lambda: self._apply_sd_image(card, img_path))
-            except SDXLProviderError as exc:
+            except SDAPIError as exc:
                 self.after(0, lambda: messagebox.showerror("Stable Diffusion", str(exc)))
             except Exception as exc:  # noqa: BLE001
-                logging.exception("SDXL generation failed")
+                logging.exception("SD generation failed")
                 self.after(0, lambda: messagebox.showerror("Stable Diffusion", str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1978,31 +2083,33 @@ class ChatBotTab(ttk.Frame):
         if not cards or not self.sd_enabled.get():
             return
         api_url = self.sd_api_url_var.get().strip() or self.SD_API_URL_DEFAULT
+        checkpoint = self.sd_checkpoint_var.get().strip() or self.SD_CHECKPOINT_DEFAULT
 
         def worker() -> None:
             try:
-                provider = SDXLProvider(api_url)
-                provider.ensure_model(self.SDXL_CHECKPOINT)
+                sd = SDAPIClient(api_url)
+                sd.set_checkpoint(checkpoint)
                 for card in cards:
                     prompt = str((card.meta or {}).get('image_prompt') or card.front or card.back).strip()
                     if not prompt:
                         continue
                     try:
-                        img_path = provider.txt2img(
+                        png_bytes = sd.txt2img(
                             prompt=prompt,
-                            negative_prompt='lowres, blurry, bad anatomy, text, watermark',
+                            negative_prompt=self.SD_NEGATIVE_PROMPT_DEFAULT,
                             width=1024,
                             height=1024,
                             steps=24,
-                            cfg=7,
-                            sampler='Euler a',
-                            seed=None,
+                            cfg=6.5,
+                            sampler='DPM++ 2M Karras',
+                            seed=-1,
                         )
+                        img_path = sd.save_image_bytes(png_bytes)
                     except Exception:
                         continue
                     self.winfo_toplevel().after(0, lambda c=card, p=img_path: self._apply_sd_image(c, p))
             except Exception:
-                logging.exception('PDF SDXL queue failed')
+                logging.exception('PDF SD queue failed')
 
         threading.Thread(target=worker, daemon=True).start()
 
