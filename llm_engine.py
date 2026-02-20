@@ -20,6 +20,10 @@ class LLMEngineBase:
         raise NotImplementedError
 
 
+    def supports_strict_json(self) -> bool:
+        return False
+
+
 class OllamaUnavailableError(RuntimeError):
     pass
 
@@ -29,6 +33,12 @@ class OllamaModelNotFoundError(RuntimeError):
 
 
 class OllamaEngine(LLMEngineBase):
+    def supports_strict_json(self) -> bool:
+        return True
+
+    def supports_schema_mode(self, mode: str) -> bool:
+        return mode in {"cards", "image_prompt_only"}
+
     def __init__(self, base_url: str, model: str) -> None:
         self.base_url = base_url.rstrip("/") if base_url else ""
         self.model = model
