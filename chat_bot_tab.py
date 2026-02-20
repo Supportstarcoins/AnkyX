@@ -25,6 +25,7 @@ from llm_json_guard import (
     call_ollama_json_strict_with_repair,
     ensure_question,
     extract_json_strict,
+    is_generic_image_prompt,
     normalize_cards_payload,
 )
 from llm_engine import (
@@ -475,7 +476,7 @@ class ChatBotTab(ttk.Frame):
     OLLAMA_MODEL_DEFAULT = "xflash-llama31"
     SD_API_URL_DEFAULT = "http://127.0.0.1:7860"
     SD_CHECKPOINT_DEFAULT = "sd_xl_base_1.0.safetensors"
-    SD_NEGATIVE_PROMPT_DEFAULT = "lowres, blurry, bad anatomy, text, watermark"
+    SD_NEGATIVE_PROMPT_DEFAULT = "text, watermark, logo, low quality, blurry, deformed, bad anatomy, extra limbs, caption"
 
     def __init__(self, master: tk.Widget, app) -> None:
         super().__init__(master, style="Surface.TFrame")
@@ -1635,14 +1636,17 @@ class ChatBotTab(ttk.Frame):
         cards_payload = normalize_cards_payload(payload.get("cards") if isinstance(payload, dict) else [])
         cards: list[DraftCard] = []
         for item in cards_payload:
-            front, back = ensure_question(str(item.get("front") or ""), str(item.get("back") or ""), context_text)
+            normalized = self.normalize_card_fields(context_text, item, context_text)
+            front, back = ensure_question(str(normalized.get("front") or ""), str(normalized.get("back") or ""), context_text)
+            image_prompt = str(normalized.get("image_prompt") or "").strip()
             cards.append(
                 DraftCard(
                     front=front,
                     back=back,
-                    tags=item.get("tags") or [],
+                    image_prompt=image_prompt,
+                    tags=normalized.get("tags") or [],
                     media={"source": "llm"},
-                    meta={"ts": int(time.time()), "image_prompt": str(item.get("image_prompt") or "")},
+                    meta={"ts": int(time.time()), "image_prompt": image_prompt},
                     created_by_ai=True,
                 )
             )
@@ -1659,6 +1663,114 @@ class ChatBotTab(ttk.Frame):
             raise LLMJsonError("Не удалось получить валидный JSON от Ollama")
         return {"cards": normalized_cards}
 
+    def _token_similarity(self, left: str, right: str) -> float:
+        left_tokens = {t for t in re.findall(r"[\wа-яА-ЯёЁ]+", (left or "").lower()) if len(t) > 2}
+        right_tokens = {t for t in re.findall(r"[\wа-яА-ЯёЁ]+", (right or "").lower()) if len(t) > 2}
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / max(1, len(left_tokens))
+
+    def make_question_from_back(self, back: str, context_text: str) -> str:
+        source = (back or context_text or "").strip()
+        year_match = re.search(r"\b(1[0-9]{3}|20[0-9]{2})\b", source)
+        if year_match:
+            return "В каком году это произошло?"
+        term_match = re.search(r"([А-ЯA-Z][\w\-]{2,})\s+—\s+", source)
+        if term_match:
+            return f"Что такое {term_match.group(1)}?"
+        words = [w for w in re.findall(r"[\wа-яА-ЯёЁ]+", source) if len(w) > 3][:4]
+        if words:
+            return f"В чём смысл: {' '.join(words)}?"
+        return "Что это означает?"
+
+    def shorten_to_question(self, front: str, back: str) -> str:
+        words = re.findall(r"[\wа-яА-ЯёЁ]+", (front or ""))
+        if 6 <= len(words) <= 10:
+            return f"{' '.join(words)}?"
+        return self.make_question_from_back(back, front)
+
+    def _extract_1_3_sentences(self, text: str) -> str:
+        raw = re.split(r"(?<=[.!?])\s+", (text or "").strip())
+        parts = [p.strip() for p in raw if p.strip()]
+        return " ".join(parts[:3]) if parts else "Краткое объяснение отсутствует."
+
+    def generate_image_prompt_only(self, front: str, back: str, context: str = "") -> str:
+        if self.llm_provider_var.get() != self.LLM_PROVIDER_OLLAMA:
+            base = f"{front} {back}".strip()
+            return f"{base[:120]}, educational illustration, clean background".strip(", ")
+        ollama = OllamaClient(
+            base_url=self.ollama_url_var.get().strip() or self.OLLAMA_URL_DEFAULT,
+            model=self.ollama_model_var.get().strip() or self.OLLAMA_MODEL_DEFAULT,
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Верни только JSON: {\"image_prompt\":\"...\"}. "
+                    "Сформируй конкретный английский промпт для Stable Diffusion: объекты, сцена, окружение, "
+                    "educational illustration, clean background. Запрещены random/something/concept/idea."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"front: {front}\nback: {back}\ncontext: {context}",
+            },
+        ]
+        try:
+            obj = call_ollama_json_strict_with_repair(ollama, messages, mode="image_prompt_only")
+            prompt = str((obj or {}).get("image_prompt") or "").strip()
+            if len(prompt.split()) >= 3 and not is_generic_image_prompt(prompt):
+                return prompt
+        except Exception:
+            pass
+        base = re.sub(r"\s+", " ", f"{front} {back}").strip()
+        return f"{base[:120]}, educational illustration, clean background"
+
+    def normalize_card_fields(self, user_prompt: str, card: dict[str, Any], context_text: str) -> dict[str, Any]:
+        front = str(card.get("front") or "").strip()
+        back = str(card.get("back") or "").strip()
+        image_prompt = str(card.get("image_prompt") or "").strip()
+        tags = card.get("tags") if isinstance(card.get("tags"), list) else []
+
+        if len(front) > 120:
+            front = self.shorten_to_question(front, back)
+        if self._token_similarity(front, user_prompt) > 0.75:
+            front = self.make_question_from_back(back, context_text)
+        if not front:
+            front = self.make_question_from_back(back, context_text)
+        if not front.endswith("?"):
+            front = front.rstrip(".! ") + "?"
+
+        if not back:
+            back = self._extract_1_3_sentences(context_text or user_prompt)
+        sentences = [p for p in re.split(r"(?<=[.!?])\s+", back) if p.strip()]
+        if len(sentences) > 3:
+            back = " ".join(sentences[:3]).strip()
+
+        if not image_prompt or is_generic_image_prompt(image_prompt):
+            image_prompt = self.generate_image_prompt_only(front, back, context_text)
+
+        return {
+            "front": front[:120],
+            "back": back,
+            "image_prompt": image_prompt,
+            "tags": [str(t).strip() for t in tags if str(t).strip()],
+        }
+
+    def derive_fallback_image_prompt(self, front: str, back: str) -> str:
+        text = f"{front} {back}".lower()
+        words = [w for w in re.findall(r"[a-zа-яё0-9\-]+", text) if len(w) > 3]
+        if words:
+            return f"{', '.join(words[:5])}, educational illustration"
+        return "illustration of the concept described"
+
+    def build_sd_prompt(self, card: DraftCard) -> str:
+        base = (getattr(card, "image_prompt", "") or "").strip()
+        style = "educational illustration, clean background, high detail, sharp focus"
+        if not base:
+            base = self.derive_fallback_image_prompt(card.front, card.back)
+        return f"{base}. {style}".strip()
+
     def _on_chat_success(self, response_text: str, draft: DraftBatch | None, user_message: str) -> None:
         self._remove_temporary_message()
         if response_text:
@@ -1670,14 +1782,16 @@ class ChatBotTab(ttk.Frame):
             if parsed:
                 front, back = parsed
                 self._ensure_draft_batch_exists()
-                front, back = ensure_question(front, back, user_message)
+                normalized = self.normalize_card_fields(user_message, {"front": front, "back": back, "image_prompt": "", "tags": []}, user_message)
+                front, back = ensure_question(normalized["front"], normalized["back"], user_message)
                 card = DraftCard(
                     front=front,
                     back=back,
                     image_path=None,
+                    image_prompt=normalized.get("image_prompt", ""),
                     tags=[],
                     media={"source": "llm"},
-                    meta={"ts": int(time.time())},
+                    meta={"ts": int(time.time()), "image_prompt": normalized.get("image_prompt", "")},
                     created_by_ai=True,
                 )
                 self.current_draft_batch.cards.append(card)
@@ -1846,7 +1960,8 @@ class ChatBotTab(ttk.Frame):
             else:
                 prompt = self._resolve_sd_prompt_fallback(parsed_prompt)
                 card = self._get_or_create_current_draft_card(prompt)
-                self._generate_image_for_card(card, prompt, charge_now=False)
+                card.image_prompt = self.generate_image_prompt_only(card.front, card.back or prompt, prompt)
+                self._generate_image_for_card(card, charge_now=False)
             if not send_to_llm:
                 return
 
@@ -1868,6 +1983,8 @@ class ChatBotTab(ttk.Frame):
             front=text,
             back="",
             image_path=None,
+            image_prompt="",
+            image_style="educational illustration, clean background",
             tags=[],
             media={"source": "chatbot"},
             meta={"ts": int(time.time())},
@@ -1929,19 +2046,22 @@ class ChatBotTab(ttk.Frame):
         card = self._create_draft_from_text(prompt)
         card.back = "Карточка создана через чат-команду"
         card.created_by_ai = True
+        if not card.image_prompt:
+            card.image_prompt = self.generate_image_prompt_only(card.front, card.back, prompt)
         self.refresh_render()
         self.update_save_button_price()
-        self._generate_image_for_card(card, prompt, charge_now=False)
+        self._generate_image_for_card(card, charge_now=False)
 
     def _generate_image_for_current_card(self, prompt: str | None = None, charge_now: bool = True) -> None:
         if not self.current_draft_batch or not self.current_draft_batch.cards:
             messagebox.showinfo("Черновик", "Сначала создайте карточку")
             return
         card = self.current_draft_batch.cards[self.draft_index]
-        final_prompt = prompt or card.front or card.back
-        self._generate_image_for_card(card, final_prompt, charge_now=charge_now)
+        if prompt and prompt.strip() and not card.image_prompt:
+            card.image_prompt = self.generate_image_prompt_only(card.front, card.back, prompt)
+        self._generate_image_for_card(card, charge_now=charge_now)
 
-    def _generate_image_for_card(self, card: DraftCard, prompt: str, charge_now: bool) -> None:
+    def _generate_image_for_card(self, card: DraftCard, charge_now: bool) -> None:
         if not self.sd_enabled.get():
             return
         if charge_now:
@@ -1955,8 +2075,11 @@ class ChatBotTab(ttk.Frame):
             try:
                 sd = SDAPIClient(api_url)
                 sd.set_checkpoint(checkpoint)
+                if not card.image_prompt or is_generic_image_prompt(card.image_prompt):
+                    card.image_prompt = self.generate_image_prompt_only(card.front, card.back, card.back)
+                prompt_for_sd = self.build_sd_prompt(card)
                 png_bytes = sd.txt2img(
-                    prompt=prompt,
+                    prompt=prompt_for_sd,
                     negative_prompt=self.SD_NEGATIVE_PROMPT_DEFAULT,
                     width=1024,
                     height=1024,
@@ -2054,9 +2177,10 @@ class ChatBotTab(ttk.Frame):
                         front, back = ensure_question(str(item.get('front') or ''), str(item.get('back') or ''), chunk_text)
                         if not mode_native:
                             back = mask_unknown_words(back, lang, known_words)
-                        image_prompt = str(item.get('image_prompt') or '').strip()
-                        tags = item.get('tags') if isinstance(item.get('tags'), list) else []
-                        cards.append(DraftCard(front=front, back=back, image_path=None, tags=[str(t) for t in tags], media={'source': 'pdf_ingest'}, meta={'image_prompt': image_prompt, 'lang': lang}, created_by_ai=True, image_paid=False))
+                        normalized = self.normalize_card_fields(chunk_text, item, summary)
+                        image_prompt = str(normalized.get('image_prompt') or '').strip()
+                        tags = normalized.get('tags') if isinstance(normalized.get('tags'), list) else []
+                        cards.append(DraftCard(front=normalized.get('front') or front, back=normalized.get('back') or back, image_path=None, image_prompt=image_prompt, tags=[str(t) for t in tags], media={'source': 'pdf_ingest'}, meta={'image_prompt': image_prompt, 'lang': lang}, created_by_ai=True, image_paid=False))
                 batch = DraftBatch(
                     draft_id=str(uuid.uuid4()),
                     deck_id=deck_id,
@@ -2090,12 +2214,12 @@ class ChatBotTab(ttk.Frame):
                 sd = SDAPIClient(api_url)
                 sd.set_checkpoint(checkpoint)
                 for card in cards:
-                    prompt = str((card.meta or {}).get('image_prompt') or card.front or card.back).strip()
-                    if not prompt:
-                        continue
+                    if not card.image_prompt or is_generic_image_prompt(card.image_prompt):
+                        card.image_prompt = self.generate_image_prompt_only(card.front, card.back, card.back)
+                    prompt_for_sd = self.build_sd_prompt(card)
                     try:
                         png_bytes = sd.txt2img(
-                            prompt=prompt,
+                            prompt=prompt_for_sd,
                             negative_prompt=self.SD_NEGATIVE_PROMPT_DEFAULT,
                             width=1024,
                             height=1024,

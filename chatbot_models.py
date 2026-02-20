@@ -24,6 +24,8 @@ class DraftCard:
     front: str
     back: str
     image_path: str | None = None
+    image_prompt: str = ""
+    image_style: str = "educational illustration, clean background"
     tags: list[str] = field(default_factory=list)
     media: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
