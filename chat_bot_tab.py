@@ -396,18 +396,25 @@ class CardPreviewWidget(ttk.Frame):
 def draft_to_card(draft: DraftCard) -> dict:
     media = getattr(draft, "media", {}) or {}
     meta = getattr(draft, "meta", {}) or {}
+    image_path = getattr(draft, "image_path", None) or media.get("image_path") or media.get("image")
     return {
         "id": meta.get("id") or meta.get("temp_id") or -1,
         "deck_id": meta.get("deck_id"),
+        "mode": meta.get("mode") or "chatbot_generated",
+        "prompt": meta.get("prompt") or "",
+        "title": meta.get("title") or (getattr(draft, "front", "") or "")[:120],
+        "current_side": meta.get("current_side") or "front",
+        "created_at": meta.get("created_at") or meta.get("ts"),
+        "source": meta.get("source") or media.get("source") or "chatbot",
         "front": getattr(draft, "front", "") or "",
         "back": getattr(draft, "back", "") or "",
         "front_rich": meta.get("front_rich"),
         "back_rich": meta.get("back_rich"),
         "front_html": meta.get("front_html"),
         "back_html": meta.get("back_html"),
-        "front_image_path": media.get("front_image_path"),
+        "front_image_path": media.get("front_image_path") or image_path,
         "back_image_path": media.get("back_image_path"),
-        "image_path": getattr(draft, "image_path", None) or media.get("image_path") or media.get("image"),
+        "image_path": image_path,
         "audio_path": media.get("audio_path"),
         "video_path": media.get("video_path"),
         "audio_entries": media.get("audio_entries"),
@@ -456,6 +463,11 @@ def _parse_card_from_llm(text: str) -> tuple[str, str] | None:
         if front and back:
             return front, back
     return None
+
+
+def _extract_trigger_prompt(text: str, trigger_regex: str) -> str:
+    cleaned = re.sub(trigger_regex, "", (text or "").strip(), count=1, flags=re.IGNORECASE)
+    return cleaned.strip(" :,-\t")
 
 
 class ChatBotTab(ttk.Frame):
@@ -740,8 +752,8 @@ class ChatBotTab(ttk.Frame):
 
         draft_actions = ttk.Frame(render_area, style="Surface.TFrame")
         draft_actions.pack(fill=tk.X, padx=6, pady=(4, 0))
-        ttk.Button(draft_actions, text="Передняя", command=self._show_front).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(draft_actions, text="Обратная", command=self._show_back).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(draft_actions, text="Передняя сторона", command=self._show_front).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(draft_actions, text="Обратная сторона", command=self._show_back).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(draft_actions, text="Удалить карточку", command=self._delete_current_draft).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(draft_actions, text="Сгенерировать картинку", command=self._generate_image_for_current_card).pack(side=tk.RIGHT)
 
@@ -1773,25 +1785,39 @@ class ChatBotTab(ttk.Frame):
 
     def _on_chat_success(self, response_text: str, draft: DraftBatch | None, user_message: str) -> None:
         self._remove_temporary_message()
-        if response_text:
-            self._append_message("assistant", response_text)
-        else:
-            self._append_message("assistant", "...")
-        if "сгенерируй карточку" in user_message.lower():
+        is_card_command, card_prompt = self._extract_card_prompt(user_message)
+        if not is_card_command:
+            if response_text:
+                self._append_message("assistant", response_text)
+            else:
+                self._append_message("assistant", "...")
+        if is_card_command:
             parsed = _parse_card_from_llm(response_text)
             if parsed:
                 front, back = parsed
                 self._ensure_draft_batch_exists()
                 normalized = self.normalize_card_fields(user_message, {"front": front, "back": back, "image_prompt": "", "tags": []}, user_message)
                 front, back = ensure_question(normalized["front"], normalized["back"], user_message)
+                prompt = (card_prompt or user_message).strip()
+                image_prompt = normalized.get("image_prompt", "") or self.generate_image_prompt_only(front, back, prompt)
                 card = DraftCard(
                     front=front,
                     back=back,
                     image_path=None,
-                    image_prompt=normalized.get("image_prompt", ""),
-                    tags=[],
-                    media={"source": "llm"},
-                    meta={"ts": int(time.time()), "image_prompt": normalized.get("image_prompt", "")},
+                    image_prompt=image_prompt,
+                    tags=[str(tag) for tag in (normalized.get("tags") or []) if str(tag).strip()],
+                    media={"source": "chatbot_generated", "image_path": None},
+                    meta={
+                        "id": str(uuid.uuid4()),
+                        "mode": "chatbot_generated",
+                        "prompt": prompt,
+                        "title": front[:120],
+                        "current_side": "front",
+                        "created_at": int(time.time()),
+                        "source": "chatbot_generated",
+                        "ts": int(time.time()),
+                        "image_prompt": image_prompt,
+                    },
                     created_by_ai=True,
                 )
                 self.current_draft_batch.cards.append(card)
@@ -1800,13 +1826,17 @@ class ChatBotTab(ttk.Frame):
                 self._render_side = "front"
                 self.refresh_render()
                 self.update_save_button_price()
+                self._append_message("assistant", "Карточка сгенерирована и добавлена в предпросмотр.")
+                if self.sd_enabled.get() and image_prompt:
+                    self._append_temporary_message("Генерация изображения...", role="assistant")
+                    self._generate_image_for_card(card, charge_now=False)
             else:
                 self._append_message(
                     "system",
                     "Не удалось распарсить карточку из ответа. Ответ должен содержать JSON {front, back}.",
                 )
 
-        if draft:
+        if draft and not is_card_command:
             self._on_generation_success(draft)
         else:
             self._set_sending_state(False)
@@ -1896,19 +1926,22 @@ class ChatBotTab(ttk.Frame):
             return False, False, ""
         slash_match = re.match(r"^/img\s*(.*)$", normalized, flags=re.IGNORECASE)
         if slash_match:
-            return True, False, slash_match.group(1).strip()
+            return True, False, slash_match.group(1).strip(" :,-")
 
-        trigger_patterns = (
-            r"\bнарисуй\b",
-            r"\bсгенерируй\s+картинк(?:у|и|а)\b",
-            r"\bdraw\s+image\b",
-        )
-        if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in trigger_patterns):
-            prompt = re.sub(r"(?i)\bнарисуй\b", "", normalized)
-            prompt = re.sub(r"(?i)\bсгенерируй\s+картинк(?:у|и|а)\b", "", prompt)
-            prompt = re.sub(r"(?i)\bdraw\s+image\b", "", prompt)
-            return True, True, prompt.strip(" :,-")
+        image_trigger = r"^\s*(?:нарисуй\s+картинку|сгенерируй\s+картинку)\b"
+        if re.match(image_trigger, normalized, flags=re.IGNORECASE):
+            prompt = _extract_trigger_prompt(normalized, image_trigger)
+            return True, False, prompt
         return False, False, ""
+
+    def _extract_card_prompt(self, text: str) -> tuple[bool, str]:
+        normalized = (text or "").strip()
+        if not normalized:
+            return False, ""
+        card_trigger = r"^\s*сгенерируй\s+карточку\b"
+        if re.match(card_trigger, normalized, flags=re.IGNORECASE):
+            return True, _extract_trigger_prompt(normalized, card_trigger)
+        return False, ""
 
     def _resolve_sd_prompt_fallback(self, base_prompt: str) -> str:
         prompt = (base_prompt or "").strip()
@@ -1950,20 +1983,36 @@ class ChatBotTab(ttk.Frame):
         self._resize_input_text()
         self._append_message("user", text, attachments)
 
-        is_sd_command, send_to_llm, parsed_prompt = self._extract_sd_prompt(text)
+        is_sd_command, _, parsed_prompt = self._extract_sd_prompt(text)
         if is_sd_command:
+            prompt = (parsed_prompt or "").strip(" :,-")
+            if not prompt:
+                self._append_message("system", "Укажите описание после команды «сгенерируй картинку».")
+                return
             cost = 2 if self.app.has_pro() else 4
             if not self.app.try_spend_credits(cost, "SD image generation"):
                 self._append_message("system", "Недостаточно кредитов")
-                if not send_to_llm:
-                    return
-            else:
-                prompt = self._resolve_sd_prompt_fallback(parsed_prompt)
-                card = self._get_or_create_current_draft_card(prompt)
-                card.image_prompt = self.generate_image_prompt_only(card.front, card.back or prompt, prompt)
-                self._generate_image_for_card(card, charge_now=False)
-            if not send_to_llm:
                 return
+            card = self._create_draft_from_text(prompt)
+            card.created_by_ai = True
+            card.meta.update({"mode": "chatbot_generated", "prompt": prompt, "source": "chatbot"})
+            card.image_prompt = prompt
+            self._render_side = "front"
+            self.refresh_render()
+            self._append_temporary_message("Генерация изображения...", role="assistant")
+            self._generate_image_for_card(card, charge_now=False)
+            return
+
+        is_card_command, card_prompt = self._extract_card_prompt(text)
+        if is_card_command:
+            cleaned_prompt = card_prompt.strip()
+            if not cleaned_prompt:
+                self._append_message("system", "Укажите тему после команды «сгенерируй карточку».")
+                return
+            self._set_sending_state(True)
+            self._append_temporary_message("Генерация карточки...", role="assistant")
+            self._start_generation(text, attachments)
+            return
 
         self._set_sending_state(True)
         self._append_temporary_message("Думаю...", role="assistant")
@@ -2021,10 +2070,14 @@ class ChatBotTab(ttk.Frame):
 
     def _show_front(self) -> None:
         self._render_side = "front"
+        if self.current_draft_batch and self.current_draft_batch.cards:
+            self.current_draft_batch.cards[self.draft_index].meta["current_side"] = "front"
         self.refresh_render()
 
     def _show_back(self) -> None:
         self._render_side = "back"
+        if self.current_draft_batch and self.current_draft_batch.cards:
+            self.current_draft_batch.cards[self.draft_index].meta["current_side"] = "back"
         self.refresh_render()
 
     def _delete_current_draft(self) -> None:
@@ -2063,10 +2116,13 @@ class ChatBotTab(ttk.Frame):
 
     def _generate_image_for_card(self, card: DraftCard, charge_now: bool) -> None:
         if not self.sd_enabled.get():
+            self._remove_temporary_message()
             return
         if charge_now:
             cost = 2 if self.app.has_pro() else 4
             if not self.app.try_spend_credits(cost, "SD image generation"):
+                self._append_message("system", "Недостаточно кредитов")
+                self._remove_temporary_message()
                 return
         api_url = self.sd_api_url_var.get().strip() or self.SD_API_URL_DEFAULT
         checkpoint = self.sd_checkpoint_var.get().strip() or self.SD_CHECKPOINT_DEFAULT
@@ -2091,10 +2147,10 @@ class ChatBotTab(ttk.Frame):
                 img_path = sd.save_image_bytes(png_bytes)
                 self.after(0, lambda: self._apply_sd_image(card, img_path))
             except SDAPIError as exc:
-                self.after(0, lambda: messagebox.showerror("Stable Diffusion", str(exc)))
+                self.after(0, lambda: self._on_chat_error(f"Ошибка генерации изображения: {exc}"))
             except Exception as exc:  # noqa: BLE001
                 logging.exception("SD generation failed")
-                self.after(0, lambda: messagebox.showerror("Stable Diffusion", str(exc)))
+                self.after(0, lambda: self._on_chat_error(f"Ошибка генерации изображения: {exc}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2104,8 +2160,13 @@ class ChatBotTab(ttk.Frame):
         if not card.media:
             card.media = {}
         card.media["image_path"] = img_path
+        if not card.meta:
+            card.meta = {}
+        card.meta["image_path"] = img_path
+        card.meta["current_side"] = self._render_side
         self.refresh_render()
         self.update_save_button_price()
+        self._remove_temporary_message()
 
     def _rebalance_chunks(self, sentences: list[str], mode_native: bool) -> list[list[str]]:
         target = self.native_sentences_var.get() if mode_native else self.foreign_sentences_var.get()
@@ -2483,6 +2544,7 @@ class ChatBotTab(ttk.Frame):
         saved = 0
         now_ts = int(time.time())
         for card in cards:
+            image_path = card.image_path or (card.media or {}).get("image_path")
             fields = {
                 "word": card.front,
                 "translation": card.back,
@@ -2490,6 +2552,8 @@ class ChatBotTab(ttk.Frame):
                 "example": "",
                 "front": card.front,
                 "back": card.back,
+                "image": image_path,
+                "front_image_path": image_path,
             }
             srs_defaults = {
                 "state": "new",
@@ -2505,7 +2569,7 @@ class ChatBotTab(ttk.Frame):
                 "skip_existing": False,
                 "reset_srs": False,
                 "state": "new",
-                "source": "chatbot",
+                "source": "chatbot_generated",
             }
             tags_value = " ".join(card.tags)
             upsert_note_and_cards(conn, deck_id, None, fields, tags_value, srs_defaults, mode)
