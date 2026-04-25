@@ -69,11 +69,11 @@ def extract_text_from_path(path: str) -> str:
             reader = PdfReader(path)
             return "\n".join((page.extract_text() or "") for page in reader.pages)
     if ext in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
-        raise RuntimeError("OCR adapter placeholder: распознавание изображения пока не подключено")
+        raise RuntimeError("DeepSeekOCR adapter пока не подключён")
     if ext in {".mp3", ".wav", ".m4a", ".ogg"}:
-        raise RuntimeError("STT adapter placeholder: распознавание аудио пока не подключено")
+        raise RuntimeError("STT adapter пока не подключён")
     if ext in {".mp4", ".mkv", ".mov", ".avi", ".webm"}:
-        raise RuntimeError("Video adapter placeholder: извлечение текста из видео пока не подключено")
+        raise RuntimeError("Video/STT adapter пока не подключён")
 
     raise RuntimeError(f"Неподдерживаемый тип файла: {ext or 'без расширения'}")
 
