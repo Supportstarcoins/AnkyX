@@ -17,36 +17,40 @@ class _Strip(HTMLParser):
             self.buf.append(s)
 
 
-def _fetch(url: str, timeout: int = 10) -> str:
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0 AnkyX/1.0"})
-    with urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        return resp.read().decode("utf-8", errors="ignore")
+class RagWebSearch:
+    def _fetch(self, url: str, timeout: int = 10) -> str:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0 AnkyX/1.0"})
+        with urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            return resp.read().decode("utf-8", errors="ignore")
+
+    def search_and_extract(self, query: str) -> str:
+        q = (query or "").strip()
+        if not q:
+            raise RuntimeError("Пустой поисковый запрос")
+
+        url = f"https://duckduckgo.com/html/?q={quote_plus(q)}"
+        try:
+            html = self._fetch(url)
+        except Exception as exc:
+            raise RuntimeError("Интернет недоступен или поиск не ответил") from exc
+
+        parser = _Strip()
+        parser.feed(html)
+        cleaned = []
+        seen = set()
+        for line in parser.buf:
+            s = re.sub(r"\s+", " ", line).strip()
+            if len(s) < 20 or s in seen:
+                continue
+            seen.add(s)
+            cleaned.append(s)
+            if len(cleaned) >= 120:
+                break
+        if not cleaned:
+            raise RuntimeError("Не удалось получить текст из веб-поиска")
+        return "\n".join(cleaned)
 
 
 def search_text(query: str, max_pages: int = 1) -> str:
-    q = (query or "").strip()
-    if not q:
-        raise RuntimeError("Пустой поисковый запрос")
-
-    # Минимальный безопасный вариант без внешних SDK.
-    url = f"https://duckduckgo.com/html/?q={quote_plus(q)}"
-    html = _fetch(url)
-    parser = _Strip()
-    parser.feed(html)
-
-    cleaned = []
-    seen = set()
-    for line in parser.buf:
-        s = re.sub(r"\s+", " ", line).strip()
-        if len(s) < 20:
-            continue
-        if s in seen:
-            continue
-        seen.add(s)
-        cleaned.append(s)
-        if len(cleaned) >= 120:
-            break
-
-    if not cleaned:
-        raise RuntimeError("Не удалось получить текст из веб-поиска")
-    return "\n".join(cleaned)
+    _ = max_pages
+    return RagWebSearch().search_and_extract(query)

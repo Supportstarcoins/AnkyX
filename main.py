@@ -291,8 +291,26 @@ from audio_player_widget import AudioPlayerWidget
 from sdxl_provider import SDXLProvider, SDXLProviderError
 try:
     from ai_add_card_workspace import AIAddCardWorkspace
-except Exception:
+    AI_ADD_CARD_IMPORT_ERROR = None
+except Exception as e:
     AIAddCardWorkspace = None
+    AI_ADD_CARD_IMPORT_ERROR = e
+    try:
+        logging.exception("Не удалось импортировать AIAddCardWorkspace")
+    except Exception:
+        pass
+
+try:
+    from ai_review_mode import AIReviewPanel, AIReviewController
+    AI_REVIEW_IMPORT_ERROR = None
+except Exception as e:
+    AIReviewPanel = None
+    AIReviewController = None
+    AI_REVIEW_IMPORT_ERROR = e
+    try:
+        logging.exception("Не удалось импортировать AIReviewMode")
+    except Exception:
+        pass
 # ui_theme: в разных версиях проекта функции темы могут называться иначе.
 # Нельзя падать на ImportError — интерфейс должен запускаться даже без темы.
 try:
@@ -3671,7 +3689,7 @@ def get_overview_cards(deck_id):
                audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
-          AND COALESCE(overview_added, 0) = 1
+          AND overview_added = 1
         ORDER BY id;
     """, (deck_id,))
     cards = ensure_notes_for_cards(cur.fetchall())
@@ -16976,7 +16994,7 @@ class AnkiApp(tk.Tk):
     def open_ai_add_card_workspace(self):
         try:
             if AIAddCardWorkspace is None:
-                raise RuntimeError("AIAddCardWorkspace недоступен")
+                raise RuntimeError(f"AIAddCardWorkspace недоступен: {AI_ADD_CARD_IMPORT_ERROR!r}")
             AIAddCardWorkspace(self)
         except Exception as e:
             logging.exception("Не удалось открыть AI-экран добавления карточки")
@@ -22655,6 +22673,23 @@ class RepeatWindow(tk.Toplevel):
             self.btn_remember,
             self.btn_translation,
         ]
+        self.ai_review_panel = None
+        if AIReviewPanel is not None:
+            try:
+                self.ai_review_panel = AIReviewPanel(
+                    frame_main,
+                    app=self.master,
+                    on_next_card=self.goto_next_card,
+                    on_show_answer=self.toggle_front_back,
+                )
+                self.ai_review_panel.pack(fill=tk.X, pady=(8, 0))
+                if self.current_card:
+                    self.ai_review_panel.set_card(dict(self.current_card))
+            except Exception:
+                logging.exception("Не удалось встроить AIReviewPanel")
+                self.ai_review_panel = None
+        elif AI_REVIEW_IMPORT_ERROR is not None:
+            logging.warning("AIReviewPanel недоступен: %r", AI_REVIEW_IMPORT_ERROR)
 
     def update_audio_player(self):
         """Обновить аудио-плеер для текущей карточки"""
@@ -23158,6 +23193,11 @@ class RepeatWindow(tk.Toplevel):
             )
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
+        if self.ai_review_panel is not None:
+            try:
+                self.ai_review_panel.set_card(dict(c))
+            except Exception:
+                logging.exception("AIReviewPanel set_card failed")
 
         # Обновляем аудио/видео
         self.update_audio_player()
@@ -23275,6 +23315,8 @@ class RepeatWindow(tk.Toplevel):
         self.save_current_media_state()
         self.current_card = self.session.next_card()
         self.show_back = False
+        if self.ai_review_panel is not None:
+            self.ai_review_panel.clear_chat()
         if not self.current_card:
             self.show_end_state()
             return
@@ -23291,6 +23333,8 @@ class RepeatWindow(tk.Toplevel):
         self.save_current_media_state()
         self.current_card = self.session.prev_card()
         self.show_back = False
+        if self.ai_review_panel is not None:
+            self.ai_review_panel.clear_chat()
         self.load_checkpoint_state()
         self.update_view()
         self.reset_timer_for_card()
