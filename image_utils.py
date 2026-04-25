@@ -4,12 +4,20 @@ import datetime
 import traceback
 from pathlib import Path
 
-from PIL import Image, ImageOps
+try:
+    from PIL import Image, ImageOps
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    ImageOps = None
+    PIL_AVAILABLE = False
 
 MAX_PREVIEW_PIXELS = 25_000_000
 
 
 def _pil_lanczos():
+    if Image is None:
+        return 1
     try:
         return Image.Resampling.LANCZOS
     except Exception:
@@ -47,6 +55,8 @@ def load_preview_image(
     max_dimension: int | None = None,
     log_path: str = "image_load_error.log",
 ) -> tuple[Image.Image, bool]:
+    if not PIL_AVAILABLE or Image is None or ImageOps is None:
+        raise RuntimeError("Pillow не установлен")
     try:
         img = Image.open(path)
         img = ImageOps.exif_transpose(img)

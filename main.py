@@ -26,7 +26,16 @@ import webbrowser
 import urllib.parse
 import urllib.request
 import copy
-from PIL import Image, ImageOps, ImageDraw, ImageEnhance
+try:
+    from PIL import Image, ImageOps, ImageDraw, ImageEnhance
+except Exception:
+    class _ImageStub:
+        Image = object
+
+    Image = _ImageStub()
+    ImageOps = None
+    ImageDraw = None
+    ImageEnhance = None
 from pathlib import Path
 from uuid import uuid4
 csv.field_size_limit(10 * 1024 * 1024)
@@ -280,6 +289,10 @@ from video_tools import (
 )
 from audio_player_widget import AudioPlayerWidget
 from sdxl_provider import SDXLProvider, SDXLProviderError
+try:
+    from ai_add_card_workspace import AIAddCardWorkspace
+except Exception:
+    AIAddCardWorkspace = None
 # ui_theme: в разных версиях проекта функции темы могут называться иначе.
 # Нельзя падать на ImportError — интерфейс должен запускаться даже без темы.
 try:
@@ -3658,6 +3671,7 @@ def get_overview_cards(deck_id):
                audio_path, progress, translation_shown, note_id, template_ord
         FROM cards
         WHERE deck_id = ?
+          AND COALESCE(overview_added, 0) = 1
         ORDER BY id;
     """, (deck_id,))
     cards = ensure_notes_for_cards(cur.fetchall())
@@ -3674,6 +3688,32 @@ def mark_card_for_overview(card_id: int):
         SET overview_added = 1
         WHERE id = ?;
     """, (card_id,))
+    conn.commit()
+    conn.close()
+
+
+def move_overview_card_to_review(card_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    now_ts = int(time.time())
+    next_review = datetime.now().isoformat()
+    cur.execute("PRAGMA table_info(cards);")
+    columns = {row[1] for row in cur.fetchall()}
+    set_parts = ["overview_added = 0", "leitner_level = 1", "next_review = ?"]
+    params = [next_review]
+    if "state" in columns:
+        set_parts.append("state = 'review'")
+    if "phase" in columns:
+        set_parts.append("phase = 1")
+    if "due" in columns:
+        set_parts.append("due = ?")
+        params.append(now_ts)
+    if "reps" in columns:
+        set_parts.append("reps = 0")
+    if "lapses" in columns:
+        set_parts.append("lapses = 0")
+    params.append(card_id)
+    cur.execute(f"UPDATE cards SET {', '.join(set_parts)} WHERE id = ?;", tuple(params))
     conn.commit()
     conn.close()
 
@@ -14447,7 +14487,7 @@ class AnkiApp(tk.Tk):
             ("Новая колода", self.add_deck_window, "Primary.TButton"),
             ("Редактировать", self.edit_deck_window, "Secondary.TButton"),
             ("Удалить", self.delete_selected_deck, "Secondary.TButton"),
-            ("Добавить карточку", self.add_card_window, "Secondary.TButton"),
+            ("Добавить карточку", self.open_ai_add_card_workspace, "Secondary.TButton"),
             ("Режим повторения", self.mode_actions.get("repeat", self.start_repeat_mode), "Ghost.TButton"),
         ]
 
@@ -16932,6 +16972,22 @@ class AnkiApp(tk.Tk):
             messagebox.showinfo("Готово", "Колода удалена.")
         finally:
             conn.close()
+
+    def open_ai_add_card_workspace(self):
+        try:
+            if AIAddCardWorkspace is None:
+                raise RuntimeError("AIAddCardWorkspace недоступен")
+            AIAddCardWorkspace(self)
+        except Exception as e:
+            logging.exception("Не удалось открыть AI-экран добавления карточки")
+            try:
+                messagebox.showerror(
+                    "AI-экран недоступен",
+                    f"Не удалось открыть AI-экран добавления карточки:\n{e}\n\nОткроется старый ручной редактор."
+                )
+            except Exception:
+                pass
+            return self.add_card_window()
 
     # --------- ручная карточка ---------
 
@@ -21633,15 +21689,11 @@ class OverviewWindow(tk.Toplevel):
         card_id = self.current_card["id"]
         update_card_progress(card_id, 100)
         self.current_card["progress"] = 100
-        
-        # Переместить на более высокий уровень
-        current_level = self.current_card["leitner_level"]
-        if current_level < 10:
-            new_level = min(10, current_level + 2)
-            update_card_leitner(card_id, new_level)
-            self.current_card["leitner_level"] = new_level
-        
-        messagebox.showinfo("Успех", "Карточка отмечена как изученная и переведена на более высокий уровень.")
+        move_overview_card_to_review(card_id)
+        self.current_card["leitner_level"] = 1
+        self.current_card["state"] = "review"
+        self.current_card["overview_added"] = 0
+        messagebox.showinfo("Успех", "Карточка отмечена как изученная и отправлена в режим повторения.")
         self.next_card()
     
     def repeat_card(self):
