@@ -47,6 +47,9 @@ class CardPreviewWidget(ttk.Frame):
         self.render()
 
     def set_card(self, card: dict | None) -> None:
+        self.update_preview(card)
+
+    def update_preview(self, card: dict | None) -> None:
         self._card = card or {}
         self.render()
 
@@ -60,12 +63,20 @@ class CardPreviewWidget(ttk.Frame):
         self.text.insert("1.0", text_value)
 
         path = self._card.get("image_path") if isinstance(self._card, dict) else None
+        status = ""
+        if isinstance(self._card, dict):
+            status = ((self._card.get("metadata") or {}).get("image_status") or "").strip()
         if not path:
-            self.image_label.configure(text="Нет изображения (placeholder)", image="")
+            placeholder = "Нет изображения (placeholder)"
+            if not self._card:
+                placeholder = "Карточка ещё не создана"
+            if status:
+                placeholder = f"{placeholder}\n{status}"
+            self.image_label.configure(text=placeholder, image="")
             self._image_ref = None
             return
         if not os.path.exists(path):
-            self.image_label.configure(text="Файл изображения не найден", image="")
+            self.image_label.configure(text=f"Файл изображения не найден:\n{path}", image="")
             self._image_ref = None
             return
         if Image is None or ImageTk is None:

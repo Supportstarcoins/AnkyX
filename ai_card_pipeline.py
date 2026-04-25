@@ -60,6 +60,18 @@ class AICardPipeline:
                 cards.append(self._build_card(front, back, block))
         return cards
 
+    def generate_cards_from_text(self, text: str) -> list[dict]:
+        cleaned = self.clean_text(text)
+        chunks = self.split_into_chunks(cleaned)
+        blocks = self.split_into_semantic_blocks(chunks)
+        facts = self.extract_key_facts_terms_dates_formulas(blocks)
+        cards = self.generate_card_candidates(facts)
+        cards = self.filter_and_improve_cards(cards)
+        for card in cards:
+            if not card.get("image_prompt"):
+                card["image_prompt"] = self.generate_image_prompt(card)
+        return cards
+
     def filter_and_improve_cards(self, cards: list[dict]) -> list[dict]:
         seen = set()
         filtered = []

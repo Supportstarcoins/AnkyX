@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -28,7 +29,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.deck_id = getattr(app, "selected_deck_id", None)
         self.pipeline = AICardPipeline(app=app, deck_id=self.deck_id)
         self.source_path: str | None = None
-        self.cards: list[dict] = []
+        self.generated_cards: list[dict] = []
         self.current_card_index = 0
         self._busy = False
         self._last_chat_answer = ""
@@ -74,10 +75,10 @@ class AIAddCardWorkspace(tk.Toplevel):
 
         ttk.Button(actions_wrap, text="Загрузить файл", command=self._pick_file).grid(row=0, column=0, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Извлечь текст", command=self._extract_text).grid(row=0, column=1, sticky="ew", padx=3, pady=3)
-        ttk.Button(actions_wrap, text="Сгенерировать карточки", command=self._generate_cards).grid(row=0, column=2, sticky="ew", padx=3, pady=3)
+        ttk.Button(actions_wrap, text="Сгенерировать карточки", command=self.generate_cards_from_input).grid(row=0, column=2, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="🔍 Найти материалы", command=self._search_web).grid(row=0, column=3, sticky="ew", padx=3, pady=3)
 
-        ttk.Button(actions_wrap, text="Сгенерировать картинку", command=self._generate_image).grid(row=1, column=0, sticky="ew", padx=3, pady=3)
+        ttk.Button(actions_wrap, text="Сгенерировать картинку", command=self.generate_image_for_current_card).grid(row=1, column=0, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Сохранить в ознакомление", command=self._save_cards).grid(row=1, column=1, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Ручной редактор", command=self._open_manual_editor).grid(row=1, column=2, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Очистить", command=self._clear).grid(row=1, column=3, sticky="ew", padx=3, pady=3)
@@ -231,55 +232,64 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.prompt_text.insert("1.0", text[:12000])
         self.status_var.set("Материалы получены")
 
-    def _generate_cards(self) -> None:
+    def generate_cards_from_input(self, auto_generate_image: bool = False) -> None:
         text = self.prompt_text.get("1.0", "end-1c").strip()
         if not text:
             messagebox.showwarning("Пусто", "Нет текста для генерации карточек", parent=self)
             return
 
-        def task():
-            cleaned = self.pipeline.clean_text(text)
-            chunks = self.pipeline.split_into_chunks(cleaned)
-            blocks = self.pipeline.split_into_semantic_blocks(chunks)
-            facts = self.pipeline.extract_key_facts_terms_dates_formulas(blocks)
-            cards = self.pipeline.generate_card_candidates(facts)
-            cards = self.pipeline.filter_and_improve_cards(cards)
-            for c in cards:
-                c["image_prompt"] = self.pipeline.generate_image_prompt(c)
-            return cards
+        self._run_bg(
+            "Генерирую карточки...",
+            lambda: self.pipeline.generate_cards_from_text(text),
+            on_success=lambda cards: self._on_cards_generated(cards, auto_generate_image=auto_generate_image),
+        )
 
-        self._run_bg("Генерирую карточки...", task, on_success=self._on_cards_ready)
-
-    def _on_cards_ready(self, cards: list[dict]) -> None:
-        self.cards = cards
+    def _on_cards_generated(self, cards: list[dict], auto_generate_image: bool = False) -> None:
+        self.generated_cards = cards or []
         self.current_card_index = 0
         self._refresh_cards_ui()
-        self.status_var.set(f"Сгенерировано карточек: {len(cards)}")
+        if self.generated_cards:
+            self.preview.update_preview(self.generated_cards[0])
+            self.status_var.set(f"Сгенерировано карточек: {len(self.generated_cards)}")
+            if auto_generate_image:
+                self.generate_image_for_current_card()
+            return
+        self.preview.update_preview(None)
+        self.status_var.set("Карточки не сгенерированы. Попробуйте уточнить тему.")
 
-    def _generate_image(self) -> None:
-        if not self.cards:
+    def generate_image_for_current_card(self) -> None:
+        if not self.generated_cards:
             messagebox.showwarning("Нет карточек", "Сначала сгенерируйте карточки", parent=self)
             return
 
-        def task():
-            updated = []
-            for card in self.cards:
-                updated.append(self.pipeline.generate_card_image(card))
-            return updated
+        card_index = self.current_card_index
+        card = self.generated_cards[card_index]
 
-        self._run_bg("Генерирую изображения...", task, on_success=self._on_images_ready)
+        def task() -> dict:
+            if not card.get("image_prompt"):
+                card["image_prompt"] = self.pipeline.generate_image_prompt(card)
+            return self.pipeline.generate_card_image(card)
 
-    def _on_images_ready(self, cards: list[dict]) -> None:
-        self.cards = cards
+        self._run_bg("Генерирую изображение...", task, on_success=self._on_image_ready)
+
+    def _on_image_ready(self, updated_card: dict) -> None:
+        if self.generated_cards:
+            self.generated_cards[self.current_card_index] = updated_card
         self._refresh_cards_ui()
-        self.status_var.set("Генерация изображений завершена")
+        image_status = ((updated_card.get("metadata") or {}).get("image_status") or "").strip()
+        self.status_var.set(image_status or "Генерация изображения завершена")
 
     def _save_cards(self) -> None:
-        if not self.cards:
+        if not self.generated_cards:
             messagebox.showwarning("Нет карточек", "Сначала сгенерируйте карточки", parent=self)
             return
         self.pipeline.deck_id = getattr(self.app, "selected_deck_id", None)
-        self._run_bg("Сохраняю карточки...", lambda: self.pipeline.save_cards_to_overview(self.cards), on_success=self._on_saved)
+        current_card = self.generated_cards[self.current_card_index]
+        self._run_bg(
+            "Сохраняю карточку...",
+            lambda: self.pipeline.save_cards_to_overview([current_card]),
+            on_success=self._on_saved,
+        )
 
     def _on_saved(self, saved_count: int) -> None:
         self.status_var.set(f"Сохранено в ознакомление: {saved_count}")
@@ -296,7 +306,7 @@ class AIAddCardWorkspace(tk.Toplevel):
             self.destroy()
 
     def _clear(self) -> None:
-        self.cards = []
+        self.generated_cards = []
         self.current_card_index = 0
         self.source_path = None
         self.prompt_text.delete("1.0", tk.END)
@@ -311,6 +321,14 @@ class AIAddCardWorkspace(tk.Toplevel):
             return
         self.chat_input.delete("1.0", tk.END)
         self._chat_append("Вы", text)
+        command = self._parse_generate_command(text)
+        if command is not None:
+            topic, need_image = command
+            self.prompt_text.delete("1.0", tk.END)
+            self.prompt_text.insert("1.0", topic)
+            self.status_var.set("Распознана команда генерации карточки")
+            self.generate_cards_from_input(auto_generate_image=need_image)
+            return
 
         def task() -> str:
             hint = search_text(text)
@@ -341,15 +359,15 @@ class AIAddCardWorkspace(tk.Toplevel):
 
     def _refresh_cards_ui(self) -> None:
         self.cards_listbox.delete(0, tk.END)
-        for idx, card in enumerate(self.cards, start=1):
+        for idx, card in enumerate(self.generated_cards, start=1):
             front = (card.get("front") or "").strip().replace("\n", " ")
             label = f"{idx}. {front[:90]}" if front else f"{idx}. (без вопроса)"
             self.cards_listbox.insert(tk.END, label)
 
-        total = len(self.cards)
+        total = len(self.generated_cards)
         self.cards_counter_var.set(f"Карточек: {total}")
         if total == 0:
-            self.preview.set_card(None)
+            self.preview.update_preview(None)
             self.current_front_text.delete("1.0", tk.END)
             self.current_back_text.delete("1.0", tk.END)
             return
@@ -361,10 +379,10 @@ class AIAddCardWorkspace(tk.Toplevel):
         self._show_current_card()
 
     def _show_current_card(self) -> None:
-        if not self.cards:
+        if not self.generated_cards:
             return
-        card = self.cards[self.current_card_index]
-        self.preview.set_card(card)
+        card = self.generated_cards[self.current_card_index]
+        self.preview.update_preview(card)
 
         self.current_front_text.delete("1.0", tk.END)
         self.current_front_text.insert("1.0", card.get("front", ""))
@@ -373,7 +391,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.current_back_text.insert("1.0", card.get("back", ""))
 
     def _on_card_select(self, _event=None) -> None:
-        if not self.cards:
+        if not self.generated_cards:
             return
         selection = self.cards_listbox.curselection()
         if not selection:
@@ -382,22 +400,35 @@ class AIAddCardWorkspace(tk.Toplevel):
         self._show_current_card()
 
     def _prev_card(self) -> None:
-        if not self.cards:
+        if not self.generated_cards:
             return
-        self.current_card_index = (self.current_card_index - 1) % len(self.cards)
+        self.current_card_index = (self.current_card_index - 1) % len(self.generated_cards)
         self._refresh_cards_ui()
 
     def _next_card(self) -> None:
-        if not self.cards:
+        if not self.generated_cards:
             return
-        self.current_card_index = (self.current_card_index + 1) % len(self.cards)
+        self.current_card_index = (self.current_card_index + 1) % len(self.generated_cards)
         self._refresh_cards_ui()
 
     def _delete_current_card(self) -> None:
-        if not self.cards:
+        if not self.generated_cards:
             return
-        self.cards.pop(self.current_card_index)
-        if self.current_card_index >= len(self.cards):
-            self.current_card_index = max(0, len(self.cards) - 1)
+        self.generated_cards.pop(self.current_card_index)
+        if self.current_card_index >= len(self.generated_cards):
+            self.current_card_index = max(0, len(self.generated_cards) - 1)
         self._refresh_cards_ui()
         self.status_var.set("Текущая карточка удалена")
+
+    def _parse_generate_command(self, text: str) -> tuple[str, bool] | None:
+        cleaned = (text or "").strip()
+        lowered = cleaned.lower()
+        trigger = "сгенерируй карточку"
+        if not lowered.startswith(trigger):
+            return None
+        need_image = "с картинкой" in lowered
+        topic = cleaned[len(trigger) :].strip(" :,-")
+        topic = re.sub(r"(?i)^с картинкой\b", "", topic).strip(" :,-")
+        if not topic:
+            topic = "Сгенерируй карточку по выбранной теме"
+        return topic, need_image
