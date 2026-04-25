@@ -81,6 +81,18 @@ class AICardPipeline:
             card["back"] = back
             card["quality_score"] = 0.7
             filtered.append(card)
+        if not filtered and cards:
+            fallback = dict(cards[0])
+            front = re.sub(r"\s+", " ", (fallback.get("front") or "")).strip()[:140]
+            back = re.sub(r"\s+", " ", (fallback.get("back") or "")).strip()[:600]
+            if len(front) < 12:
+                front = "Ключевая идея"
+            if len(back) < 25:
+                back = (fallback.get("back") or fallback.get("front") or "Недостаточно данных").strip()
+            fallback["front"] = front
+            fallback["back"] = back
+            fallback["quality_score"] = 0.4
+            filtered.append(fallback)
         return filtered
 
     def generate_image_prompt(self, card: dict) -> str:
