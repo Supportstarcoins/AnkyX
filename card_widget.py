@@ -3,13 +3,19 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from ui_theme import get_card_surface_colors, style_card_surface, style_card_surface_text
-from PIL import Image, ImageTk
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    ImageTk = None
+    PIL_AVAILABLE = False
 from image_utils import MAX_PREVIEW_PIXELS, load_preview_image, log_image_error
-
-PIL_AVAILABLE = True
 
 
 def _pil_lanczos():
+    if Image is None:
+        return 1
     try:
         return Image.Resampling.LANCZOS
     except Exception:
