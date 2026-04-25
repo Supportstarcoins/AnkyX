@@ -16,19 +16,35 @@ class CardPreviewWidget(ttk.Frame):
         super().__init__(master, **kwargs)
         self.side_var = tk.StringVar(value="front")
         self._image_ref = None
+        self._card: dict = {}
+
+        self.columnconfigure(0, weight=3)
+        self.columnconfigure(1, weight=2)
+        self.rowconfigure(1, weight=1)
 
         top = ttk.Frame(self)
-        top.pack(fill=tk.X, pady=(0, 6))
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         ttk.Radiobutton(top, text="Лицевая", value="front", variable=self.side_var, command=self.render).pack(side=tk.LEFT)
         ttk.Radiobutton(top, text="Обратная", value="back", variable=self.side_var, command=self.render).pack(side=tk.LEFT, padx=(8, 0))
 
         self.text = tk.Text(self, height=8, wrap=tk.WORD)
-        self.text.pack(fill=tk.BOTH, expand=True)
+        self.text.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
 
-        self.image_label = ttk.Label(self, text="Изображение не выбрано")
-        self.image_label.pack(fill=tk.X, pady=(6, 0))
+        image_frame = ttk.Frame(self)
+        image_frame.grid(row=1, column=1, sticky="nsew")
+        image_frame.columnconfigure(0, weight=1)
+        image_frame.rowconfigure(0, weight=1)
 
-        self._card: dict = {}
+        self.image_label = ttk.Label(
+            image_frame,
+            text="Пока карточка не создана. Введите тему или загрузите источник.",
+            anchor="center",
+            justify="center",
+            relief="groove",
+        )
+        self.image_label.grid(row=0, column=0, sticky="nsew")
+
+        self.render()
 
     def set_card(self, card: dict | None) -> None:
         self._card = card or {}
@@ -37,6 +53,9 @@ class CardPreviewWidget(ttk.Frame):
     def render(self) -> None:
         side = self.side_var.get()
         text_value = self._card.get(side, "") if isinstance(self._card, dict) else ""
+        if not text_value and not self._card:
+            text_value = "Пока карточка не создана. Введите тему или загрузите источник."
+
         self.text.delete("1.0", tk.END)
         self.text.insert("1.0", text_value)
 
@@ -56,7 +75,7 @@ class CardPreviewWidget(ttk.Frame):
 
         try:
             img = Image.open(path)
-            img.thumbnail((360, 240))
+            img.thumbnail((330, 210))
             tk_img = ImageTk.PhotoImage(img)
         except Exception as exc:
             self.image_label.configure(text=f"Не удалось отрисовать изображение: {exc}", image="")
