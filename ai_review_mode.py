@@ -171,10 +171,10 @@ class AIReviewPanel(ttk.Frame):
         self.last_grade_result = result
         msg = (
             f"Стало лучше: {'да' if result.get('improved') else 'нет'}\n"
+            f"Что улучшилось: {result.get('short_feedback')}\n"
+            f"Что ещё не точно: {result.get('remaining_gap')}\n"
+            f"Как сказать ближе к карточке: {result.get('final_hint')}\n"
             f"Изменение балла: {result.get('score_delta')}\n"
-            f"Комментарий: {result.get('short_feedback')}\n"
-            f"Что ещё не хватает: {result.get('remaining_gap')}\n"
-            f"Финальная подсказка: {result.get('final_hint')}\n"
         )
         self._append("AI", msg)
         self.answer_input.delete("1.0", tk.END)
