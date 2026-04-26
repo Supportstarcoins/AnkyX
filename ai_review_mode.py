@@ -26,9 +26,10 @@ class AIReviewController:
         card_id = (card or {}).get("id")
         if card_id is not None:
             try:
-                self.srs.apply_ai_grade_to_card(card_id, result, self.app)
+                return self.srs.apply_ai_grade_to_card(card_id, result, self.app)
             except Exception:
-                pass
+                return None
+        return None
 
 
 class AIReviewPanel(ttk.Frame):
@@ -166,14 +167,19 @@ class AIReviewPanel(ttk.Frame):
     def _on_answer_graded(self, result):
         self.progress.stop()
         self.last_grade_result = result
-        grade = result.get("grade", "unknown")
+        score = float(result.get("score") or 0.0)
+        grade = str(result.get("grade", "unknown")).strip().lower()
+        answer_time_quality = str(result.get("answer_time_quality") or "normal").strip().lower()
+        confident_correct = score >= 0.85 and (grade == "correct" or (grade == "slow_correct") or (grade == "correct" and answer_time_quality in {"slow", "too_slow"}))
+        is_partial = (grade == "partial") or (0.5 <= score < 0.85)
+        is_wrongish = (grade == "wrong") or (score < 0.5) or (grade == "uncertain")
         answer_time_ms = int(result.get("answer_time_ms") or 0)
         matched_text = self._first_point(self._pick_points_for_ui(result, "matched_points"))
         missing_text = self._first_point(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
         unsupported_text = self._first_point(self._pick_points_for_ui(result, "unsupported_points"))
         lines = [
             f"Оценка: {grade}",
-            f"Балл: {result.get('score')}",
+            f"Балл: {round(score, 3)}",
         ]
         if matched_text:
             lines.append(f"Что уже верно: {matched_text}")
@@ -193,13 +199,44 @@ class AIReviewPanel(ttk.Frame):
         self._append("AI", msg)
         self.status_var.set("Ответ проверен")
         follow_up_question = self._sanitize_ui_text((result or {}).get("follow_up_question", "").strip())
-        self.awaiting_follow_up = bool(follow_up_question)
-        self.last_follow_up_question = follow_up_question
-        if self.awaiting_follow_up:
-            self.submit_btn.configure(text="Ответить на уточняющий вопрос")
-        else:
+        self.awaiting_follow_up = False
+        self.last_follow_up_question = ""
+
+        if confident_correct:
+            srs_outcome = self._apply_srs_once()
+            level = None
+            due_human = None
+            if isinstance(srs_outcome, dict):
+                level = srs_outcome.get("leitner_level") or srs_outcome.get("phase")
+                due_human = srs_outcome.get("due_human")
+            if grade == "slow_correct" or answer_time_quality in {"slow", "too_slow"}:
+                self._append("AI", "Верно, но ответ был медленным. Карточка повышена осторожно.")
+            else:
+                moved_text = "Верно. Карточка перенесена в следующую подколоду."
+                if level:
+                    moved_text = f"Верно. Карточка перенесена в подколоду {level}."
+                self._append("AI", moved_text)
+            if due_human:
+                self._append("AI", f"Следующее повторение: {due_human}")
+            self.submit_btn.configure(text="Проверить ответ")
+            self.status_var.set("Верно — переход к следующей карточке…")
+            if not self.awaiting_follow_up and callable(self.on_next_card):
+                self.after(1000, self.go_next_card)
+        elif is_partial:
+            self.awaiting_follow_up = bool(follow_up_question)
+            self.last_follow_up_question = follow_up_question
+            if self.awaiting_follow_up:
+                self.submit_btn.configure(text="Ответить на уточняющий вопрос")
+            else:
+                self.submit_btn.configure(text="Проверить ответ")
+            self.status_var.set("Ответ частичный — уточните ответ")
+        elif is_wrongish:
             self.submit_btn.configure(text="Проверить ответ")
             self._apply_srs_once()
+            self.status_var.set("Ответ неверный")
+        else:
+            self.submit_btn.configure(text="Проверить ответ")
+            self.status_var.set("Ответ проверен")
         if callable(self.on_show_answer):
             try:
                 self.on_show_answer()
@@ -315,7 +352,16 @@ class AIReviewPanel(ttk.Frame):
             self.last_follow_up_question = ""
             self.submit_btn.configure(text="Проверить ответ")
             self.status_var.set("Уточнение обработано")
-            self._apply_srs_once()
+            srs_outcome = self._apply_srs_once()
+            try:
+                grade = str((self.last_grade_result or {}).get("grade") or "").strip().lower()
+                score = float((self.last_grade_result or {}).get("score") or 0.0)
+                if grade in {"correct", "slow_correct"} and score >= 0.85 and callable(self.on_next_card):
+                    if isinstance(srs_outcome, dict) and srs_outcome.get("due_human"):
+                        self._append("AI", f"Следующее повторение: {srs_outcome.get('due_human')}")
+                    self.after(1000, self.go_next_card)
+            except Exception:
+                pass
 
     def _is_clarification_request(self, text: str) -> bool:
         raw = (text or "").strip().lower()
@@ -391,11 +437,12 @@ class AIReviewPanel(ttk.Frame):
 
     def _apply_srs_once(self):
         if self.srs_applied_for_current_card:
-            return
+            return None
         if not self.current_card or not self.last_grade_result:
-            return
-        self.controller.apply_srs(self.current_card, self.last_grade_result)
+            return None
+        srs_result = self.controller.apply_srs(self.current_card, self.last_grade_result)
         self.srs_applied_for_current_card = True
+        return srs_result
 
     def _append(self, role, text):
         self.history.configure(state=tk.NORMAL)
