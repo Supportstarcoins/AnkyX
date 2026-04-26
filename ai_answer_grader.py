@@ -70,3 +70,4 @@ class AIAnswerGrader:
             "card_action": "keep",
             "suggested_rewrite": {"front": "", "back": ""},
         }
+
