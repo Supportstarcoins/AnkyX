@@ -116,6 +116,13 @@ class AIAnswerGrader:
     )
     METAPHOR_MARKERS = ("представ", "как ", "словно", "будто", "это как")
     INTERNAL_LABELS = {"ordinary", "quickly", "rare", "serious", "complications", "effects", "reaction"}
+    QUESTION_LIKE_PATTERNS = (
+        "что нужно добавить",
+        "какой",
+        "какая",
+        "какие",
+        "уточняющий вопрос",
+    )
 
 
     def _contains_internal_labels(self, points: list[str] | None) -> bool:
@@ -229,6 +236,20 @@ class AIAnswerGrader:
         if "медлен" in user_l and "медлен" not in back_l:
             unsupported_human.append('"медленнее" не указано в карточке; лучше сказать: "более редкие и серьёзные осложнения".')
 
+        if ("обыч" in user_l and "серьез" in user_l) or ("обыч" in user_l and "серьёз" in user_l):
+            matched_human = ["вы разделили реакции на обычные и серьёзные", *matched_human]
+
+        if re.search(r"не\s+вызывающ[а-яё]*\s+серь[её]зн", user_l):
+            unsupported_human.append(
+                '"не вызывающих серьёзных осложнений" лучше заменить на формулировку карточки: "обычные реакции проходят быстро".'
+            )
+
+        if "проход" in back_l and "быстр" in back_l and not ("проход" in user_l and "быстр" in user_l):
+            missing_human = ["нужно добавить, что обычные реакции проходят быстро", *missing_human]
+        if "редк" in back_l and "редк" not in user_l:
+            missing_human = ["нужно добавить, что другая группа реакций бывает более редкой", *missing_human]
+        missing_human = [x for x in missing_human if not str(x).lower().startswith("вы указали")]
+
         if missing_human and not any("другая группа" in x.lower() for x in missing_human):
             if "редк" in back_l and has_serious_in_back:
                 missing_human.insert(0, "нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
@@ -247,7 +268,34 @@ class AIAnswerGrader:
                 out.append(x)
             return out[:6]
 
-        return dedupe(matched_human), dedupe(missing_human), dedupe(unsupported_human)
+        return dedupe(matched_human), self._remove_question_like_missing_points(dedupe(missing_human)), dedupe(unsupported_human)
+
+    def _remove_question_like_missing_points(self, points: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in points or []:
+            line = str(raw or "").strip()
+            if not line:
+                continue
+            low = line.lower()
+            if "?" in low:
+                continue
+            if any(pattern in low for pattern in self.QUESTION_LIKE_PATTERNS):
+                continue
+            cleaned.append(line)
+        return cleaned[:6]
+
+    def _has_improvement(self, result: dict) -> bool:
+        if bool((result or {}).get("improved")):
+            return True
+        try:
+            if float((result or {}).get("score_delta") or 0.0) > 0.05:
+                return True
+        except Exception:
+            pass
+        matched_human = result.get("matched_points_human") or []
+        if isinstance(matched_human, list) and any(str(x).strip() for x in matched_human):
+            return True
+        return False
 
     def _normalize_token(self, token: str) -> str:
         for ending in self.ENDINGS:
@@ -1057,7 +1105,7 @@ class AIAnswerGrader:
         new_score = float(new_semantic["coverage"])
         score_delta = round(new_score - previous_score, 3)
         newly_closed = {p.get("id") for p in previous_semantic["missing"]} & {p.get("id") for p in new_semantic["matched"]}
-        improved = bool(newly_closed) or score_delta > 0.03
+        improved = bool(newly_closed) or score_delta > 0.05
         if "ordinary_pass_quickly" in newly_closed and score_delta < 0.2:
             score_delta = 0.2
             improved = True
@@ -1116,9 +1164,16 @@ class AIAnswerGrader:
         if matched_human:
             safe_result["matched_points_human"] = matched_human
         if missing_human:
-            safe_result["missing_points_human"] = missing_human
+            safe_result["missing_points_human"] = self._remove_question_like_missing_points(missing_human)
         if unsupported_human:
             safe_result["unsupported_points_human"] = unsupported_human
+
+        safe_result["improved"] = self._has_improvement(safe_result)
+        remaining_gap = str(safe_result.get("remaining_gap") or "").strip()
+        if remaining_gap:
+            low = remaining_gap.lower()
+            if "?" in low or any(pattern in low for pattern in self.QUESTION_LIKE_PATTERNS):
+                safe_result["remaining_gap"] = ""
 
         if "медлен" in answer_l and "медлен" not in back_l:
             safe_result["improved"] = True

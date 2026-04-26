@@ -109,6 +109,19 @@ class AIReviewPanel(ttk.Frame):
     def _join_points(self, points: list[str]) -> str:
         return "; ".join(points) if points else ""
 
+    def _filter_missing_points_for_ui(self, points: list[str]) -> list[str]:
+        bad_markers = ("что нужно добавить", "какой", "какая", "какие", "уточняющий вопрос")
+        cleaned: list[str] = []
+        for raw in points or []:
+            line = str(raw or "").strip()
+            if not line:
+                continue
+            low = line.lower()
+            if "?" in low or any(marker in low for marker in bad_markers):
+                continue
+            cleaned.append(line)
+        return cleaned
+
     def _on_answer_graded(self, result):
         self.progress.stop()
         self.last_grade_result = result
@@ -117,7 +130,7 @@ class AIReviewPanel(ttk.Frame):
         source = (result.get('source') or 'fallback').lower()
         source_label = 'LLM' if source == 'llm' else 'fallback'
         matched_text = self._join_points(self._pick_points_for_ui(result, "matched_points"))
-        missing_text = self._join_points(self._pick_points_for_ui(result, "missing_points"))
+        missing_text = self._join_points(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
         unsupported_text = self._join_points(self._pick_points_for_ui(result, "unsupported_points"))
         lines = [
             f"Оценка: {grade}",
@@ -193,13 +206,29 @@ class AIReviewPanel(ttk.Frame):
             previous_grade_result=self.last_grade_result,
         )
         self.last_grade_result = result
-        follow_missing = self._join_points(self._pick_points_for_ui(result, "missing_points"))
+        follow_missing = self._join_points(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
         follow_unsupported = self._join_points(self._pick_points_for_ui(result, "unsupported_points"))
+        score_delta = float(result.get("score_delta") or 0.0)
+        improved_flag = bool(result.get("improved")) or score_delta > 0.05
+        still_gap = bool(follow_missing or str(result.get("remaining_gap") or "").strip())
+        if improved_flag and still_gap:
+            improved_text = "Стало немного лучше"
+        elif improved_flag:
+            improved_text = "Стало лучше: да"
+        else:
+            improved_text = "Стало лучше: нет"
         lines = [
-            f"Стало лучше: {'да' if result.get('improved') else 'нет'}",
-            f"Что улучшилось: {result.get('short_feedback')}",
+            improved_text,
         ]
+        short_feedback = str(result.get("short_feedback") or "").strip()
+        matched_text = self._join_points(self._pick_points_for_ui(result, "matched_points"))
+        if short_feedback and short_feedback.lower() != matched_text.lower():
+            lines.append(f"Разбор: {short_feedback}")
+        elif matched_text:
+            lines.append(f"Что уже верно: {matched_text}")
         remaining_gap = str(result.get('remaining_gap') or '').strip()
+        if "?" in remaining_gap:
+            remaining_gap = ""
         if follow_missing:
             lines.append(f"Чего не хватает: {follow_missing}")
         elif remaining_gap:
