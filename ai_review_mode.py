@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -103,7 +104,14 @@ class AIReviewPanel(ttk.Frame):
         human = result.get(f"{base_key}_human") or []
         raw = result.get(base_key) or []
         items = human if human else raw
+        if not human and base_key in {"matched_points", "missing_points", "unsupported_points"}:
+            back = str((self.current_card or {}).get("back") or "")
+            items = self.controller.grader._humanize_points(raw, back, self.last_user_answer or "")
         cleaned = [str(x).strip() for x in items if str(x).strip()]
+        if base_key == "matched_points":
+            if any(len(x.split()) <= 2 for x in cleaned):
+                back = str((self.current_card or {}).get("back") or "")
+                cleaned = self.controller.grader._humanize_points(cleaned, back, self.last_user_answer or "")
         return cleaned[:4]
 
     def _join_points(self, points: list[str]) -> str:
@@ -164,6 +172,8 @@ class AIReviewPanel(ttk.Frame):
         follow_up = (result.get('follow_up_question') or '').strip()
         if follow_up:
             lines.append(f"Уточняющий вопрос: {follow_up}")
+        if self._is_debug_mode() and result.get("source"):
+            lines.append(f"Источник проверки: {result.get('source')}")
         msg = "\n".join(line for line in lines if str(line).strip()) + "\n"
         self._append("AI", msg)
         self.status_var.set("Ответ проверен")
@@ -375,6 +385,10 @@ class AIReviewPanel(ttk.Frame):
     def _on_ctrl_enter(self, _event=None):
         self.submit_answer()
         return "break"
+
+    def _is_debug_mode(self) -> bool:
+        value = os.getenv("AI_REVIEW_DEBUG", "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
 
 
 def attach_ai_review_panel(parent, app=None, callbacks=None):
