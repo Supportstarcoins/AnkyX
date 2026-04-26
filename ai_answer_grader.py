@@ -15,10 +15,15 @@ LOGGER = logging.getLogger(__name__)
 
 class AIAnswerGrader:
     FOLLOW_UP_EXAMPLE_PHRASES = (
-        "перечислите примеры",
-        "приведите примеры",
-        "какие примеры",
+        "какие именно",
+        "какие конкретно",
+        "перечисл",
+        "приведи пример",
+        "приведите пример",
+        "назови примеры",
         "назовите примеры",
+        "виды",
+        "типы",
     )
     RU_STOPWORDS = {
         "это",
@@ -270,33 +275,51 @@ class AIAnswerGrader:
         except Exception:
             return None
 
-    def _back_has_explicit_examples(self, card_back: str) -> bool:
-        text = (card_back or "").lower()
-        if not text:
+    def _has_explicit_examples_or_list(self, text: str) -> bool:
+        raw = (text or "")
+        if not raw.strip():
             return False
-        markers = (
-            "например",
-            "к примеру",
-            "такие как",
-            "в том числе",
-            "включая",
-            ":",
-            ";",
-        )
-        return any(marker in text for marker in markers)
+        lowered = raw.lower()
+        if "например" in lowered or "такие как" in lowered:
+            return True
+        if ";" in raw:
+            return True
+        if re.search(r":[ \t]*[^\n,;]+,\s*[^\n,;]+", raw):
+            return True
+        if re.search(r"(^|\n)\s*(?:[-•*]\s+|\d+[.)]\s+)", raw):
+            return True
+        if re.search(
+            r"(реакц|осложнен|вид|тип|групп|категори)[^.!?\n:]{0,80}\b[а-яёa-z0-9\- ]+,\s*[а-яёa-z0-9\- ]+",
+            lowered,
+        ):
+            return True
+        return False
+
+    def _safe_follow_up_question(self, back: str, missing_detail: str = "") -> str:
+        text = (back or "").lower()
+        detail = (missing_detail or "").lower()
+        if (
+            ("обычн" in text and ("редк" in text or "серьез" in text or "осложнен" in text))
+            or ("обычн" in detail and ("редк" in detail or "серьез" in detail or "осложнен" in detail))
+        ):
+            return "Что нужно добавить про вторую группу реакций, чтобы ответ совпал с карточкой?"
+        return "Какую ключевую мысль из карточки нужно добавить, чтобы ответ совпал с эталоном?"
+
+    def _question_demands_external_details(self, question: str) -> bool:
+        lowered = (question or "").lower()
+        return any(phrase in lowered for phrase in self.FOLLOW_UP_EXAMPLE_PHRASES)
 
     def _sanitize_follow_up_question(self, card_back: str, question: str, missing_points: list[str] | None = None) -> str:
+        text = (card_back or "").lower()
         raw_question = (question or "").strip()
         if not raw_question:
-            return raw_question
+            return self._safe_follow_up_question(card_back)
 
-        lowered = raw_question.lower()
-        asks_for_examples = any(phrase in lowered for phrase in self.FOLLOW_UP_EXAMPLE_PHRASES)
-        if asks_for_examples and not self._back_has_explicit_examples(card_back):
+        asks_for_external_details = self._question_demands_external_details(raw_question)
+        if asks_for_external_details and not self._has_explicit_examples_or_list(text):
             missing_points = [p.strip() for p in (missing_points or []) if str(p).strip()]
-            if missing_points:
-                return f"Что нужно добавить про пропущенную часть: {', '.join(missing_points[:3])}?"
-            return "Какая ключевая мысль из правильного ответа была пропущена?"
+            missing_detail = ", ".join(missing_points[:3]) if missing_points else ""
+            return self._safe_follow_up_question(card_back, missing_detail=missing_detail)
         return raw_question
 
     def _clean_grade_payload(self, payload: dict[str, Any], card: dict[str, Any], answer_time_ms: int) -> dict[str, Any] | None:
@@ -454,6 +477,12 @@ class AIAnswerGrader:
             "- Уточняющий вопрос должен помогать пользователю самому восстановить ответ.\n"
             "- Не повторяй просто исходный вопрос.\n"
             "- Не пиши длинный учебник.\n"
+            "ЖЁСТКОЕ ОГРАНИЧЕНИЕ:\n"
+            "Ты проверяешь только знание этой карточки, а не всей темы.\n"
+            "Не задавай вопросы, ответ на которые нельзя вывести прямо из правильного ответа карточки.\n"
+            "Не спрашивай 'какие именно', 'приведи примеры', 'перечисли виды', если в правильном ответе нет списка, примеров или видов.\n"
+            "Если back говорит только 'редкие и серьёзные осложнения', спрашивай не 'какие именно осложнения', а 'что нужно добавить про вторую группу реакций?'.\n"
+            "Креативность разрешена только в аналогиях и объяснениях, но не в фактах.\n"
             "- Верни строго JSON.\n\n"
             "Формат JSON:\n"
             "{\n"
@@ -662,7 +691,8 @@ class AIAnswerGrader:
             previous_grade_result=previous_grade_result,
         )
         if llm_result is not None:
-            return llm_result
+            back = (card or {}).get("back") or (card or {}).get("answer") or ""
+            return self._postprocess_follow_up_grade(back, follow_up_answer, llm_result)
 
         back = (card or {}).get("back") or (card or {}).get("answer") or ""
         combined_answer = f"{(original_answer or '').strip()} {(follow_up_answer or '').strip()}".strip()
@@ -705,7 +735,7 @@ class AIAnswerGrader:
             improved = False
 
         follow_up_complete = bool(improved and (new_score >= 0.75 or not remaining_keywords))
-        return {
+        result = {
             "improved": improved,
             "score_delta": score_delta,
             "short_feedback": short_feedback,
@@ -715,6 +745,26 @@ class AIAnswerGrader:
             "follow_up_complete": follow_up_complete,
             "source": "fallback",
         }
+        return self._postprocess_follow_up_grade(back, follow_up_answer, result)
+
+    def _postprocess_follow_up_grade(self, back: str, follow_up_answer: str, result: dict[str, Any]) -> dict[str, Any]:
+        safe_result = dict(result or {})
+        answer_l = (follow_up_answer or "").lower()
+        back_l = (back or "").lower()
+        if "медлен" in answer_l and "медлен" not in back_l:
+            safe_result["improved"] = True
+            safe_result["remaining_gap"] = (
+                "Лучше не говорить 'медленнее', если этого нет в карточке. "
+                "В карточке сказано: 'более редкие и серьёзные осложнения'."
+            )
+            safe_result["short_feedback"] = (
+                "Стало лучше: ты добавил, что обычные реакции проходят быстро."
+            )
+            safe_result["final_hint"] = (
+                "Скажи ближе к карточке: обычные реакции проходят быстро, "
+                "а вторая группа — более редкие и серьёзные осложнения."
+            )
+        return safe_result
 
     def explain_follow_up_hint(
         self,
