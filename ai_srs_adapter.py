@@ -6,13 +6,15 @@ import time
 
 class AISRSAdapter:
     def apply_ai_grade_to_card(self, card_id, grade_result, db_connection_or_app):
+        if card_id is None:
+            return None
         conn = self._resolve_connection(db_connection_or_app)
         own_conn = not isinstance(db_connection_or_app, sqlite3.Connection)
         try:
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(cards)")
             columns = {row[1] for row in cur.fetchall()}
-            cur.execute("SELECT interval, reps, lapses, phase, leitner_level FROM cards WHERE id = ?", (card_id,))
+            cur.execute("SELECT interval, reps, lapses, phase, leitner_level FROM cards WHERE id = ?", (int(card_id),))
             row = cur.fetchone()
             if not row:
                 return None
@@ -65,7 +67,7 @@ class AISRSAdapter:
                 params.append(card_id)
                 cur.execute(f"UPDATE cards SET {', '.join(sets)} WHERE id = ?", tuple(params))
                 conn.commit()
-            return {"interval": interval, "phase": phase, "leitner_level": level}
+            return {"interval": interval, "phase": phase, "leitner_level": level, "applied": bool(sets)}
         finally:
             if own_conn:
                 conn.close()
