@@ -158,7 +158,10 @@ class AIReviewPanel(ttk.Frame):
         if not line:
             return ""
         back = str((self.current_card or {}).get("back") or "")
-        return self.controller.grader._sanitize_human_language(line, back)
+        cleaned = self.controller.grader._sanitize_human_language(line, back)
+        if cleaned and self.controller.grader._is_meta_feedback_phrase(cleaned):
+            return ""
+        return cleaned
 
     def _on_answer_graded(self, result):
         self.progress.stop()
@@ -181,7 +184,7 @@ class AIReviewPanel(ttk.Frame):
         analogy = self._pick_analogy_for_ui(result, warning_text=unsupported_text, missing_text=missing_text)
         if analogy:
             lines.append(f"Аналогия: {analogy}")
-        follow_up = (result.get('follow_up_question') or '').strip()
+        follow_up = self._sanitize_ui_text((result.get('follow_up_question') or '').strip())
         if follow_up:
             lines.append(f"Уточняющий вопрос: {follow_up}")
         if self._is_debug_mode() and result.get("source"):
@@ -189,7 +192,7 @@ class AIReviewPanel(ttk.Frame):
         msg = "\n".join(line for line in lines if str(line).strip()) + "\n"
         self._append("AI", msg)
         self.status_var.set("Ответ проверен")
-        follow_up_question = (result or {}).get("follow_up_question", "").strip()
+        follow_up_question = self._sanitize_ui_text((result or {}).get("follow_up_question", "").strip())
         self.awaiting_follow_up = bool(follow_up_question)
         self.last_follow_up_question = follow_up_question
         if self.awaiting_follow_up:

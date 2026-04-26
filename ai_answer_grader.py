@@ -14,6 +14,49 @@ LOGGER = logging.getLogger(__name__)
 
 
 class AIAnswerGrader:
+    META_FEEDBACK_MARKERS = (
+        "ответ частично совпадает",
+        "часть правильной мысли",
+        "правильный ответ",
+        "ключевая мысль",
+        "нужно добавить ключевую мысль",
+        "ответ содержит деталь",
+        "вы указали часть",
+        "совпадает с правильным ответом",
+        "не хватает части ответа",
+        "карточка говорит",
+        "по карточке",
+    )
+    UNIT_ALIASES = {
+        "мм": "mm",
+        "миллиметр": "mm",
+        "миллиметра": "mm",
+        "миллиметров": "mm",
+        "см": "cm",
+        "сантиметр": "cm",
+        "сантиметра": "cm",
+        "сантиметров": "cm",
+        "м": "m",
+        "метр": "m",
+        "метра": "m",
+        "метров": "m",
+        "г": "g",
+        "гр": "g",
+        "грамм": "g",
+        "грамма": "g",
+        "граммов": "g",
+        "кг": "kg",
+        "килограмм": "kg",
+        "килограмма": "kg",
+        "килограммов": "kg",
+        "%": "percent",
+        "процент": "percent",
+        "процента": "percent",
+        "процентов": "percent",
+        "год": "year",
+        "года": "year",
+        "лет": "year",
+    }
     FOLLOW_UP_EXAMPLE_PHRASES = (
         "какие именно",
         "какие конкретно",
@@ -175,6 +218,74 @@ class AIAnswerGrader:
             return self._humanize_raw_stem_phrase(line)
         return line
 
+    def _is_meta_feedback_phrase(self, text: str) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return False
+        return any(marker in low for marker in self.META_FEEDBACK_MARKERS)
+
+    def _normalize_numeric_fragment(self, fragment: str) -> str:
+        raw = re.sub(r"\s+", " ", str(fragment or "").lower()).strip(" ,.;:!?")
+        if not raw:
+            return ""
+        few_match = re.search(
+            r"(нескольк\w*|несколько|пару|около|примерно)\s*"
+            r"(мм|миллиметр\w*|см|сантиметр\w*|м(?![а-яё])|метр\w*|г(?![а-яё])|гр|грамм\w*|кг|килограмм\w*|%|процент\w*|года?|лет)",
+            raw,
+        )
+        if few_match:
+            unit_raw = few_match.group(2)
+            unit = self.UNIT_ALIASES.get(unit_raw, unit_raw)
+            return f"few:{unit}"
+        num_match = re.search(
+            r"(\d+(?:[.,]\d+)?)\s*"
+            r"(мм|миллиметр\w*|см|сантиметр\w*|м(?![а-яё])|метр\w*|г(?![а-яё])|гр|грамм\w*|кг|килограмм\w*|%|процент\w*|года?|лет)?",
+            raw,
+        )
+        if not num_match:
+            return ""
+        number = num_match.group(1).replace(",", ".")
+        try:
+            number = ("%g" % float(number))
+        except Exception:
+            pass
+        unit_raw = (num_match.group(2) or "").strip()
+        unit = self.UNIT_ALIASES.get(unit_raw, unit_raw)
+        return f"{number}{unit}" if unit else number
+
+    def _extract_numeric_facts(self, text: str) -> set[str]:
+        raw = str(text or "").lower()
+        if not raw:
+            return set()
+        normalized = re.sub(r"(\d)\s*(мм|см|м|г|гр|кг|%)\b", r"\1 \2", raw)
+        facts: set[str] = set()
+        for match in re.finditer(
+            r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4})",
+            normalized,
+        ):
+            facts.add(f"date:{match.group(1).replace('/', '.').replace('-', '.')}")
+        for match in re.finditer(
+            r"(нескольк\w*|несколько|пару|около|примерно)\s*"
+            r"(мм|миллиметр\w*|см|сантиметр\w*|м(?![а-яё])|метр\w*|г(?![а-яё])|гр|грамм\w*|кг|килограмм\w*|%|процент\w*|года?|лет)",
+            normalized,
+        ):
+            unit = self.UNIT_ALIASES.get(match.group(2), match.group(2))
+            facts.add(f"few:{unit}")
+        for match in re.finditer(
+            r"(\d+(?:[.,]\d+)?)\s*"
+            r"(мм|миллиметр\w*|см|сантиметр\w*|м(?![а-яё])|метр\w*|г(?![а-яё])|гр|грамм\w*|кг|килограмм\w*|%|процент\w*|года?|лет)?",
+            normalized,
+        ):
+            token = self._normalize_numeric_fragment(match.group(0))
+            if token:
+                facts.add(token)
+        for match in re.finditer(r"от\s+([^,.!?;]{1,40})\s+до\s+([^,.!?;]{1,40})", normalized):
+            left = self._normalize_numeric_fragment(match.group(1))
+            right = self._normalize_numeric_fragment(match.group(2))
+            if left and right:
+                facts.add(f"range:{left}-{right}")
+        return facts
+
     def _extract_back_key_phrases(self, back: str) -> list[str]:
         text = str(back or "").strip()
         if not text:
@@ -217,12 +328,14 @@ class AIAnswerGrader:
         line = self._sanitize_human_text(str(text or "")).strip()
         if not line:
             return ""
+        if self._is_meta_feedback_phrase(line):
+            return ""
         if self._contains_latin_or_labels(line):
-            if self._keywords(line) & self._keywords(back):
-                return "вы указали часть правильной мысли"
-            return "ответ частично совпадает с правильным ответом"
+            return ""
         line = re.sub(r"\b(?:label|id|stems?|tokens?|semantic|debug)\s*[:=]\s*[^,.;]+", "", line, flags=re.IGNORECASE)
         line = re.sub(r"\s+", " ", line).strip(" ,.;")
+        if self._is_meta_feedback_phrase(line):
+            return ""
         return line
 
     def _make_generic_missing_feedback(self, back: str, user_answer: str, missing_points: list[str]) -> str:
@@ -232,8 +345,8 @@ class AIAnswerGrader:
         missing = [m for m in missing if m]
         focus = missing[0] if missing else (key_phrases[0] if key_phrases else "")
         if focus:
-            return f"Нужно добавить ключевую мысль из правильного ответа: {focus}."
-        return "Не хватает части ответа. Скажите ближе к карточке."
+            return focus
+        return ""
 
     def _make_generic_follow_up_question(self, back: str, missing_points: list[str]) -> str:
         clean_back = str(back or "").strip().rstrip(".!?")
@@ -241,16 +354,16 @@ class AIAnswerGrader:
         parts = [p for p in parts if p]
         key_phrases = self._extract_back_key_phrases(back)
         target = parts[0] if parts else (key_phrases[0] if key_phrases else "")
+        if self._is_meta_feedback_phrase(target):
+            target = ""
         if clean_back and re.search(r"\bделит[а-яё]*\b.*\bна\b", clean_back.lower()):
             return clean_back[0].upper() + clean_back[1:] + "?"
         if clean_back and re.search(r"\bзащищ[а-яё]*\b.*\bот\b", clean_back.lower()):
             subject = clean_back.split()[0] if clean_back.split() else "Это"
             return f"От чего именно защищает {subject.lower()}?"
         if target:
-            return f"Что в правильном ответе сказано про {target}?"
-        if len(clean_back) < 45:
-            return "Какую ключевую мысль из правильного ответа нужно добавить?"
-        return "Какую ключевую часть правильного ответа нужно добавить?"
+            return f"Что именно в ответе относится к: {target}?"
+        return ""
 
     def _sanitize_human_list(self, items: list[str] | None) -> list[str]:
         cleaned: list[str] = []
@@ -258,6 +371,8 @@ class AIAnswerGrader:
         for raw in items or []:
             line = self._sanitize_human_text(str(raw or ""))
             if not line:
+                continue
+            if self._is_meta_feedback_phrase(line):
                 continue
             key = line.lower()
             if key in seen:
@@ -342,9 +457,9 @@ class AIAnswerGrader:
         matched_tokens = token_union(matched_points)
         missing_tokens = token_union(missing_points)
         if matched_tokens and not matched_human:
-            matched_human = ["вы указали часть правильной мысли"]
+            matched_human = []
         if missing_tokens and not missing_human:
-            missing_human = [self._make_generic_missing_feedback(back, user_answer, missing_points)]
+            missing_human = []
 
         user_l = (user_answer or "").lower()
         back_l = (back or "").lower()
@@ -352,8 +467,7 @@ class AIAnswerGrader:
             unsupported_human.append("ответ содержит деталь, которой нет в карточке.")
 
         missing_human = [x for x in missing_human if not str(x).lower().startswith("вы указали")]
-        if not missing_human and missing_points:
-            missing_human = [self._make_generic_missing_feedback(back, user_answer, missing_points)]
+        missing_human = [x for x in missing_human if not self._is_meta_feedback_phrase(x)]
 
         def dedupe(items):
             out=[]
@@ -613,7 +727,10 @@ class AIAnswerGrader:
             return ""
         top = missing_points[0]
         label = top.get("label") or "пропущенную мысль"
-        return f"Что в правильном ответе сказано про «{label}»?"
+        label_text = self._sanitize_human_text(str(label))
+        if not label_text or self._is_meta_feedback_phrase(label_text):
+            return ""
+        return f"Что именно не хватает про «{label_text}»?"
 
     def _extract_json_object(self, raw_text: str) -> dict[str, Any] | None:
         text = (raw_text or "").strip()
@@ -656,8 +773,9 @@ class AIAnswerGrader:
         return False
 
     def _safe_follow_up_question(self, back: str, missing_detail: str = "") -> str:
-        _ = missing_detail
-        return self._make_generic_follow_up_question(back, [])
+        if missing_detail and not self._is_meta_feedback_phrase(missing_detail):
+            return f"Уточните: {missing_detail}."
+        return "Попробуйте повторить ответ ещё раз одной точной фразой."
 
     def _question_demands_external_details(self, question: str) -> bool:
         lowered = (question or "").lower()
@@ -667,14 +785,17 @@ class AIAnswerGrader:
         text = (card_back or "").lower()
         raw_question = (question or "").strip()
         if not raw_question:
-            return self._safe_follow_up_question(card_back)
+            return ""
 
         asks_for_external_details = self._question_demands_external_details(raw_question)
         if asks_for_external_details and not self._has_explicit_examples_or_list(text):
-            return "Какую ключевую часть правильного ответа нужно добавить?"
+            return self._safe_follow_up_question(card_back)
         if self._contains_latin_or_labels(raw_question):
-            return self._make_generic_follow_up_question(card_back, missing_points or [])
-        return self._sanitize_human_language(raw_question, card_back) or self._make_generic_follow_up_question(card_back, missing_points or [])
+            return ""
+        sanitized = self._sanitize_human_language(raw_question, card_back)
+        if not sanitized or self._is_meta_feedback_phrase(sanitized):
+            return ""
+        return sanitized
 
     def _safe_final_hint(self, back: str) -> str:
         return "Скажите ближе к карточке и повторите формулировку из правильного ответа без новых деталей."
@@ -1164,6 +1285,13 @@ class AIAnswerGrader:
     def grade_answer(self, card, user_answer, answer_time_ms, provider="auto"):
         back = (card or {}).get("back", "")
         local_score, local_matched, local_missing, local_unsupported = self._semantic_overlap_score(back, user_answer or "")
+        back_numeric = self._extract_numeric_facts(back)
+        answer_numeric = self._extract_numeric_facts(user_answer or "")
+        numeric_overlap = (
+            len(back_numeric & answer_numeric) / max(1, len(back_numeric))
+            if back_numeric
+            else 0.0
+        )
         llm_result = self._try_llm_grade_answer(card, user_answer, answer_time_ms, provider=provider)
         if llm_result is not None:
             llm_result = self._sanitize_llm_result_against_back(llm_result, back)
@@ -1178,6 +1306,13 @@ class AIAnswerGrader:
             if len(local_matched) >= 2 and llm_grade == "wrong" and float(llm_result.get("score") or 0.0) == 0.0:
                 llm_result["grade"] = "partial"
                 llm_result["score"] = round(max(0.35, local_score), 3)
+            if numeric_overlap >= 0.6:
+                llm_result["score"] = round(max(float(llm_result.get("score") or 0.0), 0.88), 3)
+                llm_result["grade"] = "correct" if str(llm_result.get("answer_time_quality")) not in {"slow", "too_slow"} else "slow_correct"
+            elif numeric_overlap >= 0.4:
+                llm_result["score"] = round(max(float(llm_result.get("score") or 0.0), 0.85), 3)
+                if str(llm_result.get("grade")) in {"wrong", "uncertain"}:
+                    llm_result["grade"] = "partial"
             llm_result["matched_points"] = llm_result.get("matched_points") or local_matched
             llm_result["missing_points"] = llm_result.get("missing_points") or local_missing
             llm_result["unsupported_points"] = llm_result.get("unsupported_points") or local_unsupported
@@ -1204,8 +1339,15 @@ class AIAnswerGrader:
             llm_result["missing_points_human"] = missing_human
             llm_result["unsupported_points_human"] = unsupported_human
             llm_result = self._compress_human_feedback(llm_result, back, user_answer or "")
-            if str(llm_result.get("grade")) == "partial" and float(llm_result.get("score") or 0.0) >= 0.65:
+            if (
+                str(llm_result.get("grade")) == "partial"
+                and float(llm_result.get("score") or 0.0) >= 0.65
+                and (llm_result.get("missing_points_human") or llm_result.get("missing_points"))
+                and numeric_overlap < 0.6
+            ):
                 llm_result["follow_up_question"] = self._make_generic_follow_up_question(back, llm_result.get("missing_points") or [])
+            elif numeric_overlap >= 0.6:
+                llm_result["follow_up_question"] = ""
             llm_result = self._sanitize_analogy_only(llm_result, back)
             return llm_result
 
@@ -1246,6 +1388,11 @@ class AIAnswerGrader:
 
         if grade == "correct" and t_quality in {"slow", "too_slow"}:
             grade, action = "slow_correct", "slight_increase"
+        if numeric_overlap >= 0.6:
+            coverage = max(coverage, 0.88)
+            grade, action = ("slow_correct", "slight_increase") if t_quality in {"slow", "too_slow"} else ("correct", "increase")
+        elif numeric_overlap >= 0.4:
+            coverage = max(coverage, 0.85)
 
         mistake_type = "none" if grade in {"correct", "slow_correct"} else "missing_key_point"
         missing = local_missing or [str(item.get("label") or "").strip() for item in semantic["missing"] if str(item.get("label") or "").strip()][:5]
@@ -1280,7 +1427,7 @@ class AIAnswerGrader:
         result["unsupported_points_human"] = unsupported_human
         result["srs_action"] = action
         result["error_explanation"] = error_explanation
-        result["follow_up_question"] = self._make_generic_follow_up_question(back, missing)
+        result["follow_up_question"] = "" if numeric_overlap >= 0.6 else self._make_generic_follow_up_question(back, missing)
         result["analogy"] = "Это как кратко описать фильм: важно назвать главный конфликт, а не случайные детали."
         result["card_action"] = "keep" if coverage >= 0.55 else "simplify"
         result["short_feedback"] = self._make_short_feedback(grade)
