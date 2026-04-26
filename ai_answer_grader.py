@@ -203,6 +203,62 @@ class AIAnswerGrader:
         }
         return result
 
+    def grade_follow_up_answer(
+        self,
+        card,
+        original_answer,
+        follow_up_question,
+        follow_up_answer,
+        previous_grade_result=None,
+    ):
+        back = (card or {}).get("back") or (card or {}).get("answer") or ""
+        original_keywords = self._keywords(original_answer or "")
+        follow_up_keywords = self._keywords(follow_up_answer or "")
+        expected_keywords = self._keywords(back)
+
+        new_keywords = follow_up_keywords - original_keywords
+        new_expected_keywords = new_keywords & expected_keywords
+        all_covered = (original_keywords | follow_up_keywords) & expected_keywords
+        previous_score = float((previous_grade_result or {}).get("score") or 0.0)
+        new_score = len(all_covered) / max(1, len(expected_keywords))
+        score_delta = round(new_score - previous_score, 3)
+        improved = bool(new_expected_keywords) or score_delta > 0.03
+
+        remaining_keywords = sorted(list(expected_keywords - all_covered))
+        remaining_gap = (
+            f"Не хватает смысловых опор: {', '.join(remaining_keywords[:5])}."
+            if remaining_keywords
+            else "Ключевые смысловые опоры покрыты."
+        )
+        short_feedback = (
+            "Стало лучше: в уточнении добавлены важные элементы."
+            if improved
+            else "Пока прирост небольшой: добавьте точнее ключевую мысль."
+        )
+
+        if remaining_keywords:
+            final_hint = (
+                "Соберите один короткий ответ, где явно названы: "
+                + ", ".join(remaining_keywords[:3])
+                + "."
+            )
+        else:
+            final_hint = "Ответ стал полнее, закрепите формулировку одной фразой."
+
+        if follow_up_question and len((follow_up_answer or "").strip()) < 6:
+            short_feedback = "Ответ слишком короткий для уверенного улучшения."
+            improved = False
+
+        follow_up_complete = bool(improved and (new_score >= 0.75 or not remaining_keywords))
+        return {
+            "improved": improved,
+            "score_delta": score_delta,
+            "short_feedback": short_feedback,
+            "remaining_gap": remaining_gap,
+            "final_hint": final_hint,
+            "follow_up_complete": follow_up_complete,
+        }
+
     def _result(self, grade, score, answer_time_quality, mistake_type):
         return {
             "grade": grade,

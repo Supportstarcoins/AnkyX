@@ -35,6 +35,9 @@ class AIReviewPanel(ttk.Frame):
 
         self.current_card = None
         self.answer_started_at = None
+        self.awaiting_follow_up = False
+        self.last_follow_up_question = ""
+        self.last_user_answer = ""
         self.last_grade_result = None
 
         self.columnconfigure(0, weight=1)
@@ -52,13 +55,16 @@ class AIReviewPanel(ttk.Frame):
 
         btns = ttk.Frame(self)
         btns.grid(row=3, column=0, sticky="ew", pady=(4, 0))
-        ttk.Button(btns, text="Проверить ответ", command=self.submit_answer).pack(side=tk.LEFT)
+        self.submit_btn = ttk.Button(btns, text="Проверить ответ", command=self.submit_answer)
+        self.submit_btn.pack(side=tk.LEFT)
         ttk.Button(btns, text="Показать ответ", command=self.show_correct_answer).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="Следующая карточка", command=self.go_next_card).pack(side=tk.LEFT)
 
         ttk.Label(self, textvariable=self.status_var).grid(row=4, column=0, sticky="w", pady=(4, 0))
         self.progress = ttk.Progressbar(self, mode="indeterminate")
         self.progress.grid(row=5, column=0, sticky="ew", pady=(2, 0))
+        self.answer_input.bind("<Control-Return>", self._on_ctrl_enter)
+        self.answer_input.bind("<Control-KP_Enter>", self._on_ctrl_enter)
 
     def set_card(self, card_data):
         self.current_card = dict(card_data or {})
@@ -71,7 +77,13 @@ class AIReviewPanel(ttk.Frame):
     def submit_answer(self):
         if not self.current_card:
             return
+        if self.awaiting_follow_up:
+            return self.submit_follow_up_answer()
         user_answer = self.answer_input.get("1.0", "end-1c").strip()
+        if not user_answer:
+            self.status_var.set("Введите ответ перед проверкой")
+            return
+        self.last_user_answer = user_answer
         self._append("Вы", user_answer or "—")
         started = self.answer_started_at or time.time()
         elapsed_ms = int((time.time() - started) * 1000)
@@ -97,11 +109,53 @@ class AIReviewPanel(ttk.Frame):
         )
         self._append("AI", msg)
         self.status_var.set("Ответ проверен")
+        follow_up_question = (result or {}).get("follow_up_question", "").strip()
+        self.awaiting_follow_up = bool(follow_up_question)
+        self.last_follow_up_question = follow_up_question
+        if self.awaiting_follow_up:
+            self.submit_btn.configure(text="Ответить на уточняющий вопрос")
+        else:
+            self.submit_btn.configure(text="Проверить ответ")
         if callable(self.on_show_answer):
             try:
                 self.on_show_answer()
             except Exception:
                 pass
+
+    def submit_follow_up_answer(self):
+        if not self.current_card:
+            return
+        follow_up_answer = self.answer_input.get("1.0", "end-1c").strip()
+        if not follow_up_answer:
+            self.status_var.set("Введите ответ на уточняющий вопрос")
+            return
+        self._append("Вы на уточняющий вопрос", follow_up_answer)
+        result = self.controller.grader.grade_follow_up_answer(
+            self.current_card,
+            self.last_user_answer,
+            self.last_follow_up_question,
+            follow_up_answer,
+            previous_grade_result=self.last_grade_result,
+        )
+        self.last_grade_result = result
+        msg = (
+            f"Стало лучше: {'да' if result.get('improved') else 'нет'}\n"
+            f"Изменение балла: {result.get('score_delta')}\n"
+            f"Короткий фидбек: {result.get('short_feedback')}\n"
+            f"Что ещё не хватает: {result.get('remaining_gap')}\n"
+            f"Финальная подсказка: {result.get('final_hint')}\n"
+        )
+        self._append("AI", msg)
+        self.answer_input.delete("1.0", tk.END)
+        follow_up_complete = bool(result.get("follow_up_complete", True))
+        self.awaiting_follow_up = not follow_up_complete
+        if self.awaiting_follow_up:
+            self.submit_btn.configure(text="Ответить на уточняющий вопрос")
+            self.status_var.set("Нужно уточнить ответ ещё раз")
+        else:
+            self.last_follow_up_question = ""
+            self.submit_btn.configure(text="Проверить ответ")
+            self.status_var.set("Уточнение обработано")
 
     def show_correct_answer(self):
         if not self.current_card:
@@ -118,7 +172,11 @@ class AIReviewPanel(ttk.Frame):
         self.history.configure(state=tk.NORMAL)
         self.history.delete("1.0", tk.END)
         self.history.configure(state=tk.DISABLED)
+        self.awaiting_follow_up = False
+        self.last_follow_up_question = ""
+        self.last_user_answer = ""
         self.last_grade_result = None
+        self.submit_btn.configure(text="Проверить ответ")
         self.status_var.set("Введите ответ...")
 
     def go_next_card(self):
@@ -131,6 +189,10 @@ class AIReviewPanel(ttk.Frame):
         self.history.insert(tk.END, f"{role}:\n{text}\n\n")
         self.history.see(tk.END)
         self.history.configure(state=tk.DISABLED)
+
+    def _on_ctrl_enter(self, _event=None):
+        self.submit_answer()
+        return "break"
 
 
 def attach_ai_review_panel(parent, app=None, callbacks=None):
