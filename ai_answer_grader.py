@@ -575,15 +575,68 @@ class AIAnswerGrader:
         lowered = (text or "").lower()
         return any(marker in lowered for marker in self.METAPHOR_MARKERS)
 
-    def _make_bounded_metaphor(self, back: str) -> str:
+    def _make_bounded_metaphor(self, back: str, user_answer: str = "") -> str:
         back_l = (back or "").lower()
         has_ordinary = "обыч" in back_l
         has_rare = "редк" in back_l
         has_quick = "быстр" in back_l or "проход" in back_l
         has_serious = ("серьез" in back_l) or ("серьёз" in back_l) or ("осложнен" in back_l)
         if has_ordinary and has_rare and has_quick and has_serious:
-            return "Это как два сигнала на панели: один обычный и быстро гаснет, другой редкий, но важный и требует внимания."
+            return "Это как два сигнала: один быстро погас, другой редкий, но важный."
         return "Это как собрать короткую карту: нужно отметить именно те ориентиры, которые есть в карточке, не добавляя новые."
+
+    def _compress_human_feedback(self, result: dict, back: str, user_answer: str) -> dict:
+        payload = dict(result or {})
+
+        def _truncate(line: str, max_len: int = 180) -> str:
+            text = " ".join(str(line or "").strip().split())
+            if len(text) <= max_len:
+                return text
+            return text[: max_len - 1].rstrip(" ,;:.") + "…"
+
+        def _normalize(line: str) -> str:
+            text = _truncate(line).strip(" .")
+            low = text.lower()
+            if low in {"тяжел", "тяжёл", "редкие", "легкие", "лёгкие"}:
+                return ""
+            if "тяжел" in low or "тяжёл" in low:
+                return '"тяжёлые последствия" лучше заменить на "серьёзные осложнения".'
+            if low.startswith("серьёзные осложнения") and "лучше заменить" not in low:
+                return '"тяжёлые последствия" лучше заменить на "серьёзные осложнения".'
+            if low.startswith("нужно добавить, что другая группа реакций бывает более редкой и серьёзной"):
+                return "нужно сказать ближе к карточке, что другая группа бывает более редкой."
+            return text
+
+        def _compact(items: list[str], max_items: int = 2, strip_questions: bool = False) -> list[str]:
+            out: list[str] = []
+            seen: set[str] = set()
+            for raw in items or []:
+                line = _normalize(str(raw or ""))
+                if not line:
+                    continue
+                low = line.lower()
+                if strip_questions and ("?" in low or any(p in low for p in self.QUESTION_LIKE_PATTERNS)):
+                    continue
+                key = re.sub(r"\s+", " ", low)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(line)
+                if len(out) >= max_items:
+                    break
+            return out
+
+        matched_h = _compact(payload.get("matched_points_human") or [], max_items=2)
+        missing_h = _compact(payload.get("missing_points_human") or [], max_items=2, strip_questions=True)
+        unsupported_h = _compact(payload.get("unsupported_points_human") or [], max_items=2)
+
+        if not unsupported_h and re.search(r"\bтяжел[а-яё]*|\bтяжёл[а-яё]*", (user_answer or "").lower()):
+            unsupported_h = ['"тяжёлые последствия" лучше заменить на "серьёзные осложнения".']
+
+        payload["matched_points_human"] = matched_h[:2]
+        payload["missing_points_human"] = missing_h[:2]
+        payload["unsupported_points_human"] = unsupported_h[:2]
+        return payload
 
     def _sanitize_llm_result_against_back(self, result: dict, back: str) -> dict:
         safe = dict(result or {})
@@ -650,6 +703,9 @@ class AIAnswerGrader:
         else:
             safe["analogy"] = ""
 
+        analogy_l = (safe.get("analogy") or "").lower()
+        if any(token in analogy_l for token in ("карты", "фильм", "важная информация")):
+            safe["analogy"] = ""
         safe["analogy_human"] = safe["analogy"] or self._make_bounded_metaphor(back)
 
         safe["unsupported_points"] = [str(x).strip() for x in unsupported if str(x).strip()][:8]
@@ -733,7 +789,8 @@ class AIAnswerGrader:
         cleaned["matched_points_human"] = matched_human
         cleaned["missing_points_human"] = missing_human
         cleaned["unsupported_points_human"] = unsupported_human
-        return self._sanitize_llm_result_against_back(cleaned, card_back)
+        cleaned = self._sanitize_llm_result_against_back(cleaned, card_back)
+        return self._compress_human_feedback(cleaned, card_back, "")
 
     def _get_llm_settings(self, provider: str = "auto") -> dict[str, Any]:
         settings: dict[str, Any] = {
@@ -1010,6 +1067,10 @@ class AIAnswerGrader:
             llm_result["matched_points_human"] = matched_human
             llm_result["missing_points_human"] = missing_human
             llm_result["unsupported_points_human"] = unsupported_human
+            llm_result = self._compress_human_feedback(llm_result, back, user_answer or "")
+            if str(llm_result.get("grade")) == "partial" and float(llm_result.get("score") or 0.0) >= 0.65:
+                llm_result["follow_up_question"] = "Что нужно добавить про вторую группу реакций?"
+            llm_result["analogy_human"] = self._make_bounded_metaphor(back, user_answer or "")
             return llm_result
 
         LOGGER.info("LLM недоступна, используется fallback-проверка.")

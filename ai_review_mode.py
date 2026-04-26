@@ -133,20 +133,24 @@ class AIReviewPanel(ttk.Frame):
             return ""
         return analogy
 
+    def _first_point(self, points: list[str]) -> str:
+        for p in points or []:
+            line = str(p or "").strip()
+            if line:
+                return line
+        return ""
+
     def _on_answer_graded(self, result):
         self.progress.stop()
         self.last_grade_result = result
         grade = result.get("grade", "unknown")
         answer_time_ms = int(result.get("answer_time_ms") or 0)
-        source = (result.get('source') or 'fallback').lower()
-        source_label = 'LLM' if source == 'llm' else 'fallback'
-        matched_text = self._join_points(self._pick_points_for_ui(result, "matched_points"))
-        missing_text = self._join_points(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
-        unsupported_text = self._join_points(self._pick_points_for_ui(result, "unsupported_points"))
+        matched_text = self._first_point(self._pick_points_for_ui(result, "matched_points"))
+        missing_text = self._first_point(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
+        unsupported_text = self._first_point(self._pick_points_for_ui(result, "unsupported_points"))
         lines = [
             f"Оценка: {grade}",
             f"Балл: {result.get('score')}",
-            f"Время ответа: {answer_time_ms} мс ({result.get('answer_time_quality')})",
         ]
         if matched_text:
             lines.append(f"Что уже верно: {matched_text}")
@@ -154,18 +158,13 @@ class AIReviewPanel(ttk.Frame):
             lines.append(f"Чего не хватает: {missing_text}")
         if unsupported_text:
             lines.append(f"Что не точно: {unsupported_text}")
-        breakdown = (result.get('error_explanation') or result.get('short_feedback') or '').strip()
-        if breakdown:
-            lines.append(f"Разбор: {breakdown}")
         analogy = self._pick_analogy_for_ui(result, warning_text=unsupported_text, missing_text=missing_text)
         if analogy:
-            label = "Метафора" if "метафор" in analogy.lower() else "Аналогия"
-            lines.append(f"{label}: {analogy}")
+            lines.append(f"Аналогия: {analogy}")
         follow_up = (result.get('follow_up_question') or '').strip()
         if follow_up:
             lines.append(f"Уточняющий вопрос: {follow_up}")
-        lines.append(f"Источник проверки: {source_label}")
-        msg = "\n".join(lines) + "\n"
+        msg = "\n".join(line for line in lines if str(line).strip()) + "\n"
         self._append("AI", msg)
         self.status_var.set("Ответ проверен")
         follow_up_question = (result or {}).get("follow_up_question", "").strip()
@@ -230,45 +229,50 @@ class AIReviewPanel(ttk.Frame):
             follow_up_answer,
             previous_grade_result=self.last_grade_result,
         )
+        previous_score = float((self.last_grade_result or {}).get("score") or 0.0)
         self.last_grade_result = result
-        follow_missing = self._join_points(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
-        follow_unsupported = self._join_points(self._pick_points_for_ui(result, "unsupported_points"))
+        follow_missing = self._first_point(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
+        follow_unsupported = self._first_point(self._pick_points_for_ui(result, "unsupported_points"))
         score_delta = float(result.get("score_delta") or 0.0)
         improved_flag = bool(result.get("improved")) or score_delta > 0.05
         still_gap = bool(follow_missing or str(result.get("remaining_gap") or "").strip())
         if improved_flag and still_gap:
-            improved_text = "Стало немного лучше"
+            improved_text = "Стало лучше: немного"
         elif improved_flag:
             improved_text = "Стало лучше: да"
         else:
-            improved_text = "Стало лучше: нет"
+            now_score = float(result.get("score") or 0.0)
+            if previous_score >= 0.65 or now_score >= 0.65:
+                improved_text = "Почти. Осталось уточнить одну деталь."
+            else:
+                improved_text = "Стало лучше: нет"
         lines = [
             improved_text,
         ]
         short_feedback = str(result.get("short_feedback") or "").strip()
-        matched_text = self._join_points(self._pick_points_for_ui(result, "matched_points"))
-        if short_feedback and short_feedback.lower() != matched_text.lower():
-            lines.append(f"Разбор: {short_feedback}")
+        matched_text = self._first_point(self._pick_points_for_ui(result, "matched_points"))
+        if short_feedback:
+            lines.append(f"Что улучшилось: {short_feedback}")
         elif matched_text:
-            lines.append(f"Что уже верно: {matched_text}")
+            lines.append(f"Что улучшилось: {matched_text}")
         follow_analogy = self._pick_analogy_for_ui(result, warning_text=follow_unsupported, missing_text=follow_missing)
-        if follow_analogy:
-            label = "Метафора" if "метафор" in follow_analogy.lower() else "Аналогия"
-            lines.append(f"{label}: {follow_analogy}")
         remaining_gap = str(result.get('remaining_gap') or '').strip()
         if "?" in remaining_gap:
             remaining_gap = ""
         if follow_missing:
-            lines.append(f"Чего не хватает: {follow_missing}")
+            lines.append(f"Что ещё не точно: {follow_missing}")
         elif remaining_gap:
             lines.append(f"Что ещё не точно: {remaining_gap}")
         if follow_unsupported:
-            lines.append(f"Что не точно: {follow_unsupported}")
+            lines.append(f"Что ещё не точно: {follow_unsupported}")
         final_hint = str(result.get('final_hint') or '').strip()
         if final_hint:
             lines.append(f"Как сказать ближе к карточке: {final_hint}")
-        lines.append(f"Изменение балла: {result.get('score_delta')}")
-        msg = "\n".join(lines) + "\n"
+        if follow_analogy:
+            lines.append(f"Следующий шаг: {follow_analogy}")
+        else:
+            lines.append("Следующий шаг: добавьте недостающую деталь про вторую группу реакций.")
+        msg = "\n".join(line for line in lines if str(line).strip()) + "\n"
         self._append("AI", msg)
         self.answer_input.delete("1.0", tk.END)
         follow_up_complete = bool(result.get("follow_up_complete", True))
