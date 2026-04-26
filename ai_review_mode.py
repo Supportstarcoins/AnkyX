@@ -107,10 +107,15 @@ class AIReviewPanel(ttk.Frame):
         if not human and base_key in {"matched_points", "missing_points", "unsupported_points"}:
             back = str((self.current_card or {}).get("back") or "")
             items = self.controller.grader._humanize_points(raw, back, self.last_user_answer or "")
-        cleaned = [str(x).strip() for x in items if str(x).strip()]
+        back = str((self.current_card or {}).get("back") or "")
+        cleaned = [
+            self.controller.grader._sanitize_human_language(str(x).strip(), back)
+            for x in items
+            if str(x).strip()
+        ]
+        cleaned = [x for x in cleaned if x]
         if base_key == "matched_points":
             if any(len(x.split()) <= 2 for x in cleaned):
-                back = str((self.current_card or {}).get("back") or "")
                 cleaned = self.controller.grader._humanize_points(cleaned, back, self.last_user_answer or "")
         return cleaned[:4]
 
@@ -152,7 +157,8 @@ class AIReviewPanel(ttk.Frame):
         line = str(text or "").strip()
         if not line:
             return ""
-        return self.controller.grader._sanitize_human_text(line)
+        back = str((self.current_card or {}).get("back") or "")
+        return self.controller.grader._sanitize_human_language(line, back)
 
     def _on_answer_graded(self, result):
         self.progress.stop()
@@ -256,7 +262,7 @@ class AIReviewPanel(ttk.Frame):
         short_feedback = self._sanitize_ui_text(str(result.get("short_feedback") or "").strip())
         still_gap = bool(follow_missing or str(result.get("remaining_gap") or "").strip())
         forced_improved_text = ""
-        if "Вы добавили недостающую деталь: вторая группа реакций бывает более редкой." in short_feedback:
+        if "Вы добавили недостающую деталь из карточки." in short_feedback:
             improved_text = "Стало лучше: да"
             forced_improved_text = improved_text
         elif "Теперь ответ близок к карточке." in short_feedback:
