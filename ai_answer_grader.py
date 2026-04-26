@@ -101,6 +101,13 @@ class AIAnswerGrader:
         "ая",
         "ое",
         "ые",
+        "ает",
+        "яет",
+        "ают",
+        "яют",
+        "ить",
+        "ать",
+        "ены",
     )
     DANGEROUS_OUT_OF_BACK_PHRASES = (
         "медленнее",
@@ -124,12 +131,13 @@ class AIAnswerGrader:
         "уточняющий вопрос",
     )
     STEM_TO_HUMAN_REPLACEMENTS = (
-        (re.compile(r"\bсерь[её]зн\b|\bтяжел\b|\bтяжёл\b", flags=re.IGNORECASE), "серьёзные осложнения"),
-        (re.compile(r"\bпобочн\b.*\bэффект", flags=re.IGNORECASE), "реакции на прививку"),
-        (re.compile(r"\bобычн\b", flags=re.IGNORECASE), "обычные реакции"),
-        (re.compile(r"\bредк\b", flags=re.IGNORECASE), "более редкие реакции"),
-        (re.compile(r"\bбыстр\b", flags=re.IGNORECASE), "проходят быстро"),
-        (re.compile(r"\bосложнен\b", flags=re.IGNORECASE), "осложнения"),
+        (re.compile(r"\bсерь[её]зн\b", flags=re.IGNORECASE), "серьёзн"),
+        (re.compile(r"\bтяжел\b|\bтяжёл\b", flags=re.IGNORECASE), "тяжёл"),
+        (re.compile(r"\bпобочн\b.*\bэффект", flags=re.IGNORECASE), "побочные эффекты"),
+        (re.compile(r"\bобычн\b", flags=re.IGNORECASE), "обычн"),
+        (re.compile(r"\bредк\b", flags=re.IGNORECASE), "редк"),
+        (re.compile(r"\bбыстр\b", flags=re.IGNORECASE), "быстр"),
+        (re.compile(r"\bосложнен\b", flags=re.IGNORECASE), "осложнен"),
     )
     RAW_STEM_TOKENS = ("серьезн", "серьёзн", "побочн", "обычн", "редк", "реакц", "осложнен", "быстр", "возникнуть")
     RAW_STEM_TOKEN_RE = re.compile(
@@ -167,6 +175,83 @@ class AIAnswerGrader:
             return self._humanize_raw_stem_phrase(line)
         return line
 
+    def _extract_back_key_phrases(self, back: str) -> list[str]:
+        text = str(back or "").strip()
+        if not text:
+            return []
+        chunks = [
+            chunk.strip(" -–—\t\r\n,.;:!?")
+            for chunk in self.CLAUSE_SPLIT_RE.split(text)
+            if chunk and chunk.strip(" -–—\t\r\n,.;:!?")
+        ]
+        phrases: list[str] = []
+        for chunk in chunks:
+            words = re.findall(r"[a-zа-яё0-9\-]+", chunk.lower(), flags=re.IGNORECASE)
+            filtered = [w for w in words if len(w) >= 4 and w not in self.RU_STOPWORDS and w not in self.EN_STOPWORDS]
+            if not filtered:
+                continue
+            phrase = " ".join(filtered[:8]).strip()
+            if phrase:
+                phrases.append(phrase)
+        if not phrases:
+            phrases = self._extract_semantic_points(text)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for phrase in phrases:
+            key = phrase.lower().strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(phrase)
+        return deduped[:6]
+
+    def _contains_latin_or_labels(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        if re.search(r"[a-z]{2,}", lowered):
+            return True
+        if any(token in lowered for token in ("label:", "id:", "stem_", "semantic", "debug", "ordinary", "quickly", "rare")):
+            return True
+        return False
+
+    def _sanitize_human_language(self, text: str, back: str) -> str:
+        line = self._sanitize_human_text(str(text or "")).strip()
+        if not line:
+            return ""
+        if self._contains_latin_or_labels(line):
+            if self._keywords(line) & self._keywords(back):
+                return "вы указали часть правильной мысли"
+            return "ответ частично совпадает с правильным ответом"
+        line = re.sub(r"\b(?:label|id|stems?|tokens?|semantic|debug)\s*[:=]\s*[^,.;]+", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"\s+", " ", line).strip(" ,.;")
+        return line
+
+    def _make_generic_missing_feedback(self, back: str, user_answer: str, missing_points: list[str]) -> str:
+        _ = user_answer
+        key_phrases = self._extract_back_key_phrases(back)
+        missing = [self._sanitize_human_language(x, back) for x in (missing_points or [])]
+        missing = [m for m in missing if m]
+        focus = missing[0] if missing else (key_phrases[0] if key_phrases else "")
+        if focus:
+            return f"Нужно добавить ключевую мысль из правильного ответа: {focus}."
+        return "Не хватает части ответа. Скажите ближе к карточке."
+
+    def _make_generic_follow_up_question(self, back: str, missing_points: list[str]) -> str:
+        clean_back = str(back or "").strip().rstrip(".!?")
+        parts = [self._sanitize_human_language(x, back) for x in (missing_points or [])]
+        parts = [p for p in parts if p]
+        key_phrases = self._extract_back_key_phrases(back)
+        target = parts[0] if parts else (key_phrases[0] if key_phrases else "")
+        if clean_back and re.search(r"\bделит[а-яё]*\b.*\bна\b", clean_back.lower()):
+            return clean_back[0].upper() + clean_back[1:] + "?"
+        if clean_back and re.search(r"\bзащищ[а-яё]*\b.*\bот\b", clean_back.lower()):
+            subject = clean_back.split()[0] if clean_back.split() else "Это"
+            return f"От чего именно защищает {subject.lower()}?"
+        if target:
+            return f"Что в правильном ответе сказано про {target}?"
+        if len(clean_back) < 45:
+            return "Какую ключевую мысль из правильного ответа нужно добавить?"
+        return "Какую ключевую часть правильного ответа нужно добавить?"
+
     def _sanitize_human_list(self, items: list[str] | None) -> list[str]:
         cleaned: list[str] = []
         seen: set[str] = set()
@@ -195,16 +280,16 @@ class AIAnswerGrader:
             return result
 
         mapping = {
-            "ordinary": "обычные реакции",
-            "quickly": "проходят быстро",
-            "rare": "более редкие реакции",
-            "serious": "серьёзные осложнения",
-            "complications": "осложнения",
-            "effects": "реакции/эффекты",
-            "reaction": "реакции на прививку",
+            "ordinary": "одна из ключевых частей ответа",
+            "quickly": "уточнение из правильного ответа",
+            "rare": "другая ключевая часть ответа",
+            "serious": "важное уточнение по карточке",
+            "complications": "важная деталь правильного ответа",
+            "effects": "часть формулировки из карточки",
+            "reaction": "часть формулировки из карточки",
         }
+        back_keys = self._extract_back_key_phrases(back)
         back_l = (back or "").lower()
-        user_l = (user_answer or "").lower()
 
         for raw in points:
             item = str(raw or "").strip()
@@ -213,38 +298,12 @@ class AIAnswerGrader:
             lowered = item.lower()
             tokens = {t for t in re.findall(r"[a-z]+", lowered) if t in self.INTERNAL_LABELS}
 
-            if {"ordinary", "quickly"}.issubset(tokens):
-                result.append("вы указали, что обычные реакции проходят быстро")
-                continue
-            if {"rare", "serious"}.issubset(tokens):
-                result.append("вы упомянули более редкие и серьёзные осложнения")
-                continue
-            if {"serious", "complications"}.issubset(tokens):
-                result.append("вы упомянули серьёзные осложнения")
-                continue
-
             if tokens:
-                if tokens == {"serious"}:
-                    result.append("вы упомянули серьёзные осложнения")
-                elif tokens == {"rare"}:
-                    result.append("вы упомянули, что вторая группа реакций более редкая")
-                elif tokens == {"quickly"}:
-                    result.append("вы указали, что обычные реакции проходят быстро")
-                elif tokens == {"ordinary"}:
-                    result.append("вы упомянули обычные реакции")
+                if back_keys:
+                    result.append(f"часть из карточки: {back_keys[0]}")
                 else:
                     phrase = "; ".join(mapping[t] for t in sorted(tokens))
                     result.append(phrase)
-                continue
-
-            if "ordinary_pass_quickly" in lowered or "проход" in lowered and "быстр" in lowered:
-                result.append("вы указали, что обычные реакции проходят быстро")
-                continue
-            if "rare_reactions" in lowered or ("редк" in lowered and "серь" in lowered):
-                result.append("нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
-                continue
-            if "serious_complications" in lowered:
-                result.append("вы упомянули серьёзные осложнения")
                 continue
 
             cleaned = item.rstrip(" .")
@@ -252,10 +311,10 @@ class AIAnswerGrader:
                 result.append(cleaned)
 
         if not result and self._contains_internal_labels(points):
-            if "обыч" in user_l and "быстр" in user_l and "обыч" in back_l:
-                result.append("вы указали, что обычные реакции проходят быстро")
-            elif "редк" in back_l or "серь" in back_l or "ослож" in back_l:
-                result.append("нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
+            if back_keys:
+                result.append(f"часть из карточки: {back_keys[0]}")
+            else:
+                result.append("вы указали часть правильной мысли")
 
         deduped: list[str] = []
         seen: set[str] = set()
@@ -282,43 +341,19 @@ class AIAnswerGrader:
 
         matched_tokens = token_union(matched_points)
         missing_tokens = token_union(missing_points)
-        if {"ordinary", "quickly"}.issubset(matched_tokens):
-            matched_human = [
-                "вы указали, что обычные реакции проходят быстро",
-                *[x for x in matched_human if x not in {"обычные реакции", "проходят быстро"}],
-            ]
-        if {"rare", "serious"}.issubset(missing_tokens):
-            missing_human = [
-                "нужно добавить, что другая группа реакций бывает более редкой и серьёзной",
-                *[x for x in missing_human if x not in {"более редкие реакции", "серьёзные осложнения"}],
-            ]
+        if matched_tokens and not matched_human:
+            matched_human = ["вы указали часть правильной мысли"]
+        if missing_tokens and not missing_human:
+            missing_human = [self._make_generic_missing_feedback(back, user_answer, missing_points)]
 
         user_l = (user_answer or "").lower()
         back_l = (back or "").lower()
-        has_serious_in_back = ("серьез" in back_l) or ("серьёз" in back_l)
-        if has_serious_in_back and re.search(r"\bтяжел[а-яё]*|\bтяжёл[а-яё]*", user_l):
-            unsupported_human.append('"тяжёлые" лучше заменить на формулировку карточки: "серьёзные осложнения".')
-
         if "медлен" in user_l and "медлен" not in back_l:
-            unsupported_human.append('"медленнее" не указано в карточке; лучше сказать: "более редкие и серьёзные осложнения".')
+            unsupported_human.append("ответ содержит деталь, которой нет в карточке.")
 
-        if ("обыч" in user_l and "серьез" in user_l) or ("обыч" in user_l and "серьёз" in user_l):
-            matched_human = ["вы разделили реакции на обычные и серьёзные", *matched_human]
-
-        if re.search(r"не\s+вызывающ[а-яё]*\s+серь[её]зн", user_l):
-            unsupported_human.append(
-                '"не вызывающих серьёзных осложнений" лучше заменить на формулировку карточки: "обычные реакции проходят быстро".'
-            )
-
-        if "проход" in back_l and "быстр" in back_l and not ("проход" in user_l and "быстр" in user_l):
-            missing_human = ["нужно добавить, что обычные реакции проходят быстро", *missing_human]
-        if "редк" in back_l and "редк" not in user_l:
-            missing_human = ["нужно добавить, что другая группа реакций бывает более редкой", *missing_human]
         missing_human = [x for x in missing_human if not str(x).lower().startswith("вы указали")]
-
-        if missing_human and not any("другая группа" in x.lower() for x in missing_human):
-            if "редк" in back_l and has_serious_in_back:
-                missing_human.insert(0, "нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
+        if not missing_human and missing_points:
+            missing_human = [self._make_generic_missing_feedback(back, user_answer, missing_points)]
 
         def dedupe(items):
             out=[]
@@ -334,10 +369,22 @@ class AIAnswerGrader:
                 out.append(x)
             return out[:6]
 
+        back_kw = self._keywords(back)
+        sanitized_unsupported: list[str] = []
+        for item in dedupe(unsupported_human):
+            item_kw = self._keywords(item)
+            overlap = len(item_kw & back_kw) / max(1, len(item_kw)) if item_kw else 0.0
+            if overlap < 0.25:
+                sanitized_unsupported.append("ответ содержит деталь, которой нет в карточке.")
+            else:
+                sanitized_unsupported.append(item)
+
         return (
-            self._sanitize_human_list(dedupe(matched_human)),
-            self._sanitize_human_list(self._remove_question_like_missing_points(dedupe(missing_human))),
-            self._sanitize_human_list(dedupe(unsupported_human)),
+            self._sanitize_human_list([self._sanitize_human_language(x, back) for x in dedupe(matched_human)]),
+            self._sanitize_human_list(
+                [self._sanitize_human_language(x, back) for x in self._remove_question_like_missing_points(dedupe(missing_human))]
+            ),
+            self._sanitize_human_list([self._sanitize_human_language(x, back) for x in sanitized_unsupported]),
         )
 
     def _remove_question_like_missing_points(self, points: list[str]) -> list[str]:
@@ -368,6 +415,8 @@ class AIAnswerGrader:
         return False
 
     def _normalize_token(self, token: str) -> str:
+        if token.startswith("защищ") or token.startswith("защит"):
+            return "защит"
         for ending in self.ENDINGS:
             if token.endswith(ending) and len(token) - len(ending) >= 4:
                 return token[: -len(ending)]
@@ -460,15 +509,15 @@ class AIAnswerGrader:
         text = (card_back or "").lower()
         specs: list[dict[str, Any]] = []
         if re.search(r"обычн|реакц|эффект", text):
-            specs.append({"id": "ordinary_reactions", "label": "упомянуты реакции/эффекты", "stems_any": {"обычн", "реакц", "эффект"}})
+            specs.append({"id": "ordinary_reactions", "label": "первая ключевая часть ответа", "stems_any": {"обычн", "реакц", "эффект"}})
         if re.search(r"проход|быстр", text):
-            specs.append({"id": "ordinary_pass_quickly", "label": "упомянуто, что часть проходит быстро", "stems_all": {"проход", "быстр"}})
+            specs.append({"id": "ordinary_pass_quickly", "label": "уточнение о скорости/длительности", "stems_all": {"проход", "быстр"}})
         if re.search(r"\bдруг", text):
-            specs.append({"id": "other_group", "label": "упомянута вторая группа реакций", "stems_any": {"друг"}})
+            specs.append({"id": "other_group", "label": "вторая ключевая часть ответа", "stems_any": {"друг"}})
         if re.search(r"редк", text):
-            specs.append({"id": "rare_reactions", "label": "не указано, что другие осложнения более редкие", "stems_any": {"редк"}})
+            specs.append({"id": "rare_reactions", "label": "указана редкость/частота", "stems_any": {"редк"}})
         if re.search(r"серьез|осложнен", text):
-            specs.append({"id": "serious_complications", "label": "упомянуты серьезные осложнения", "stems_any": {"серьез", "осложнен"}})
+            specs.append({"id": "serious_complications", "label": "важное качественное уточнение", "stems_any": {"серьез", "осложнен"}})
         if not specs:
             for idx, point in enumerate(self._extract_semantic_points(card_back), start=1):
                 specs.append({"id": f"generic_{idx}", "label": point, "stems_any": set(self._keywords(point))})
@@ -564,9 +613,7 @@ class AIAnswerGrader:
             return ""
         top = missing_points[0]
         label = top.get("label") or "пропущенную мысль"
-        if "проходят быстро" in label:
-            return "Что в карточке сказано о том, как быстро проходят обычные реакции?"
-        return f"Какую особенность нужно добавить про «{label}», чтобы ответ совпал с карточкой?"
+        return f"Что в правильном ответе сказано про «{label}»?"
 
     def _extract_json_object(self, raw_text: str) -> dict[str, Any] | None:
         text = (raw_text or "").strip()
@@ -609,14 +656,8 @@ class AIAnswerGrader:
         return False
 
     def _safe_follow_up_question(self, back: str, missing_detail: str = "") -> str:
-        text = (back or "").lower()
-        detail = (missing_detail or "").lower()
-        if (
-            ("обычн" in text and ("редк" in text or "серьез" in text or "осложнен" in text))
-            or ("обычн" in detail and ("редк" in detail or "серьез" in detail or "осложнен" in detail))
-        ):
-            return "Что нужно добавить про вторую группу реакций, чтобы ответ совпал с карточкой?"
-        return "Какую ключевую мысль из карточки нужно добавить, чтобы ответ совпал с эталоном?"
+        _ = missing_detail
+        return self._make_generic_follow_up_question(back, [])
 
     def _question_demands_external_details(self, question: str) -> bool:
         lowered = (question or "").lower()
@@ -630,15 +671,12 @@ class AIAnswerGrader:
 
         asks_for_external_details = self._question_demands_external_details(raw_question)
         if asks_for_external_details and not self._has_explicit_examples_or_list(text):
-            missing_points = [p.strip() for p in (missing_points or []) if str(p).strip()]
-            missing_detail = ", ".join(missing_points[:3]) if missing_points else ""
-            return self._safe_follow_up_question(card_back, missing_detail=missing_detail)
-        return raw_question
+            return "Какую ключевую часть правильного ответа нужно добавить?"
+        if self._contains_latin_or_labels(raw_question):
+            return self._make_generic_follow_up_question(card_back, missing_points or [])
+        return self._sanitize_human_language(raw_question, card_back) or self._make_generic_follow_up_question(card_back, missing_points or [])
 
     def _safe_final_hint(self, back: str) -> str:
-        text = (back or "").lower()
-        if "обыч" in text and "проход" in text and "быстр" in text and ("редк" in text or "серьез" in text or "осложнен" in text):
-            return "Скажите ближе к карточке: обычные реакции проходят быстро, а другие реакции более редкие и серьёзные."
         return "Скажите ближе к карточке и повторите формулировку из правильного ответа без новых деталей."
 
     def _looks_like_metaphor(self, text: str) -> bool:
@@ -670,11 +708,7 @@ class AIAnswerGrader:
             if low in {"тяжел", "тяжёл", "редкие", "легкие", "лёгкие"}:
                 return ""
             if "тяжел" in low or "тяжёл" in low:
-                return '"тяжёлые последствия" лучше заменить на "серьёзные осложнения".'
-            if low.startswith("серьёзные осложнения") and "лучше заменить" not in low:
-                return '"тяжёлые последствия" лучше заменить на "серьёзные осложнения".'
-            if low.startswith("нужно добавить, что другая группа реакций бывает более редкой и серьёзной"):
-                return "нужно сказать ближе к карточке, что другая группа бывает более редкой."
+                return "ответ содержит деталь, которой нет в карточке."
             return text
 
         def _compact(items: list[str], max_items: int = 2, strip_questions: bool = False) -> list[str]:
@@ -701,7 +735,7 @@ class AIAnswerGrader:
         unsupported_h = _compact(payload.get("unsupported_points_human") or [], max_items=2)
 
         if not unsupported_h and re.search(r"\bтяжел[а-яё]*|\bтяжёл[а-яё]*", (user_answer or "").lower()):
-            unsupported_h = ['"тяжёлые последствия" лучше заменить на "серьёзные осложнения".']
+            unsupported_h = ["ответ содержит деталь, которой нет в карточке."]
 
         payload["matched_points_human"] = matched_h[:2]
         payload["missing_points_human"] = missing_h[:2]
@@ -994,7 +1028,7 @@ class AIAnswerGrader:
             "Ты проверяешь только знание этой карточки, а не всей темы.\n"
             "Не задавай вопросы, ответ на которые нельзя вывести прямо из правильного ответа карточки.\n"
             "Не спрашивай 'какие именно', 'приведи примеры', 'перечисли виды', если в правильном ответе нет списка, примеров или видов.\n"
-            "Если back говорит только 'редкие и серьёзные осложнения', спрашивай не 'какие именно осложнения', а 'что нужно добавить про вторую группу реакций?'.\n"
+            "Если back не содержит примеров, задавай универсальный уточняющий вопрос только по ключевой пропущенной мысли.\n"
             "Креативность разрешена только в аналогиях и объяснениях, но не в фактах.\n"
             "КРЕАТИВНОСТЬ В РАМКАХ ФАКТА:\n"
             "Ты можешь использовать яркие аналогии и метафоры, но только чтобы объяснить факты из правильного ответа.\n"
@@ -1151,7 +1185,7 @@ class AIAnswerGrader:
             for phrase in self.DANGEROUS_OUT_OF_BACK_PHRASES:
                 if phrase in answer_l and phrase not in (back or "").lower():
                     llm_result["unsupported_points"] = (llm_result.get("unsupported_points") or []) + [
-                        f"«{phrase}» — не точная формулировка карточки"
+                        "ответ содержит деталь, которой нет в карточке."
                     ]
             if local_unsupported and not llm_result.get("error_explanation"):
                 llm_result["error_explanation"] = (
@@ -1171,7 +1205,7 @@ class AIAnswerGrader:
             llm_result["unsupported_points_human"] = unsupported_human
             llm_result = self._compress_human_feedback(llm_result, back, user_answer or "")
             if str(llm_result.get("grade")) == "partial" and float(llm_result.get("score") or 0.0) >= 0.65:
-                llm_result["follow_up_question"] = "Что нужно добавить про вторую группу реакций?"
+                llm_result["follow_up_question"] = self._make_generic_follow_up_question(back, llm_result.get("missing_points") or [])
             llm_result = self._sanitize_analogy_only(llm_result, back)
             return llm_result
 
@@ -1201,12 +1235,14 @@ class AIAnswerGrader:
 
         if coverage >= 0.9:
             grade, action = "correct", "increase"
-        elif coverage >= 0.6:
+        elif coverage >= 0.45:
             grade, action = "partial", "repeat_soon"
         elif coverage >= 0.3:
             grade, action = "uncertain", "repeat_soon"
         else:
             grade, action = "wrong", "reset"
+        if grade == "uncertain" and len(local_matched) >= 2:
+            grade, action = "partial", "repeat_soon"
 
         if grade == "correct" and t_quality in {"slow", "too_slow"}:
             grade, action = "slow_correct", "slight_increase"
@@ -1244,7 +1280,7 @@ class AIAnswerGrader:
         result["unsupported_points_human"] = unsupported_human
         result["srs_action"] = action
         result["error_explanation"] = error_explanation
-        result["follow_up_question"] = self._build_follow_up_from_missing(semantic["missing"]) or self._make_follow_up_question(back)
+        result["follow_up_question"] = self._make_generic_follow_up_question(back, missing)
         result["analogy"] = "Это как кратко описать фильм: важно назвать главный конфликт, а не случайные детали."
         result["card_action"] = "keep" if coverage >= 0.55 else "simplify"
         result["short_feedback"] = self._make_short_feedback(grade)
@@ -1300,7 +1336,7 @@ class AIAnswerGrader:
             else "Пока прирост небольшой: добавьте точнее ключевую мысль."
         )
         if "ordinary_pass_quickly" in newly_closed:
-            short_feedback = "Да, теперь ты добавил недостающую деталь: обычные реакции проходят быстро."
+            short_feedback = "Да, теперь ты добавил недостающую деталь из карточки."
 
         if remaining_keywords:
             final_hint = (
@@ -1359,23 +1395,15 @@ class AIAnswerGrader:
 
         if "медлен" in answer_l and "медлен" not in back_l:
             safe_result["improved"] = True
-            safe_result["remaining_gap"] = (
-                "Лучше не говорить 'медленнее', если этого нет в карточке. "
-                "В карточке сказано: 'более редкие и серьёзные осложнения'."
-            )
-            safe_result["short_feedback"] = (
-                "Стало лучше: ты добавил, что обычные реакции проходят быстро."
-            )
-            safe_result["final_hint"] = (
-                "Скажи ближе к карточке: обычные реакции проходят быстро, "
-                "а вторая группа — более редкие и серьёзные осложнения."
-            )
+            safe_result["remaining_gap"] = "Ответ содержит деталь, которой нет в карточке."
+            safe_result["short_feedback"] = "Стало лучше, но формулировка пока не полностью совпадает с карточкой."
+            safe_result["final_hint"] = self._make_generic_missing_feedback(back, follow_up_answer, safe_result.get("missing_points") or [])
 
         if has_rare_in_back and added_rare:
             safe_result["improved"] = True
-            safe_result["short_feedback"] = "Вы добавили недостающую деталь: вторая группа реакций бывает более редкой."
+            safe_result["short_feedback"] = "Вы добавили недостающую деталь из карточки."
             if needs_serious and not added_serious:
-                safe_result["remaining_gap"] = "Осталось добавить, что речь именно о серьёзных осложнениях."
+                safe_result["remaining_gap"] = self._make_generic_missing_feedback(back, follow_up_answer, safe_result.get("missing_points") or [])
             if added_serious:
                 safe_result["short_feedback"] = "Теперь ответ близок к карточке."
                 safe_result["remaining_gap"] = ""
