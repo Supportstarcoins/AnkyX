@@ -14,6 +14,12 @@ LOGGER = logging.getLogger(__name__)
 
 
 class AIAnswerGrader:
+    FOLLOW_UP_EXAMPLE_PHRASES = (
+        "перечислите примеры",
+        "приведите примеры",
+        "какие примеры",
+        "назовите примеры",
+    )
     RU_STOPWORDS = {
         "это",
         "этот",
@@ -176,6 +182,35 @@ class AIAnswerGrader:
         except Exception:
             return None
 
+    def _back_has_explicit_examples(self, card_back: str) -> bool:
+        text = (card_back or "").lower()
+        if not text:
+            return False
+        markers = (
+            "например",
+            "к примеру",
+            "такие как",
+            "в том числе",
+            "включая",
+            ":",
+            ";",
+        )
+        return any(marker in text for marker in markers)
+
+    def _sanitize_follow_up_question(self, card_back: str, question: str, missing_points: list[str] | None = None) -> str:
+        raw_question = (question or "").strip()
+        if not raw_question:
+            return raw_question
+
+        lowered = raw_question.lower()
+        asks_for_examples = any(phrase in lowered for phrase in self.FOLLOW_UP_EXAMPLE_PHRASES)
+        if asks_for_examples and not self._back_has_explicit_examples(card_back):
+            missing_points = [p.strip() for p in (missing_points or []) if str(p).strip()]
+            if missing_points:
+                return f"Что нужно добавить про пропущенную часть: {', '.join(missing_points[:3])}?"
+            return "Какая ключевая мысль из правильного ответа была пропущена?"
+        return raw_question
+
     def _clean_grade_payload(self, payload: dict[str, Any], card: dict[str, Any], answer_time_ms: int) -> dict[str, Any] | None:
         allowed_grades = {"correct", "partial", "wrong", "uncertain", "slow_correct", "confused"}
         grade = str(payload.get("grade") or "").strip().lower()
@@ -204,6 +239,7 @@ class AIAnswerGrader:
         if not isinstance(missing_points, list):
             missing_points = []
         missing_points = [str(x).strip() for x in missing_points if str(x).strip()][:8]
+        card_back = str((card or {}).get("back") or "")
 
         suggested_rewrite = payload.get("suggested_rewrite")
         if not isinstance(suggested_rewrite, dict):
@@ -219,7 +255,11 @@ class AIAnswerGrader:
             "short_feedback": str(payload.get("short_feedback") or self._make_short_feedback(grade)).strip(),
             "error_explanation": str(payload.get("error_explanation") or "").strip(),
             "analogy": str(payload.get("analogy") or "").strip(),
-            "follow_up_question": str(payload.get("follow_up_question") or "").strip(),
+            "follow_up_question": self._sanitize_follow_up_question(
+                card_back,
+                str(payload.get("follow_up_question") or "").strip(),
+                missing_points=missing_points,
+            ),
             "srs_action": str(payload.get("srs_action") or "repeat_soon").strip(),
             "card_action": str(payload.get("card_action") or "keep").strip(),
             "suggested_rewrite": {
@@ -317,6 +357,9 @@ class AIAnswerGrader:
             "- Не используй одну и ту же аналогию каждый раз.\n"
             "- Объясняй ошибку дружелюбно, но честно.\n"
             "- Если ответ частичный, скажи, какая главная мысль потеряна.\n"
+            "- Оценивай ответ только по эталонному ответу карточки. Не требуй от пользователя фактов, примеров, дат или деталей, которых нет в правильном ответе. Уточняющий вопрос должен помогать восстановить именно missing часть из back, а не расширять тему.\n"
+            "- Если правильный ответ говорит об общей категории, не требуй конкретных примеров. Если в back нет примеров, не спрашивай 'перечислите примеры'.\n"
+            "- Уточняющий вопрос строй только по пропущенной части back.\n"
             "- Уточняющий вопрос должен помогать пользователю самому восстановить ответ.\n"
             "- Не повторяй просто исходный вопрос.\n"
             "- Не пиши длинный учебник.\n"
@@ -359,6 +402,7 @@ class AIAnswerGrader:
         prompt = (
             "Ты — AI-репетитор. Пользователь ответил на уточняющий вопрос.\n"
             "Оцени, стало ли понимание лучше.\n"
+            "Не оценивай пользователя по знаниям вне карточки.\n"
             "Не повторяй шаблонно.\n"
             "Объясни коротко и живо.\n"
             "Верни строго JSON:\n\n"
@@ -403,6 +447,7 @@ class AIAnswerGrader:
             "Ты — AI-репетитор. Пользователь не понял твой уточняющий вопрос и просит подсказку.\n"
             "Объясни живо и понятно, какую именно деталь нужно добавить.\n"
             "Не оценивай это как ответ.\n"
+            "Не добавляй фактов извне. Подсказка должна опираться только на back карточки.\n"
             "Дай креативную короткую метафору.\n"
             "Дай пример ответа одной фразой.\n"
             "Верни строго JSON:\n\n"
