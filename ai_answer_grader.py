@@ -115,6 +115,139 @@ class AIAnswerGrader:
         "перечисли",
     )
     METAPHOR_MARKERS = ("представ", "как ", "словно", "будто", "это как")
+    INTERNAL_LABELS = {"ordinary", "quickly", "rare", "serious", "complications", "effects", "reaction"}
+
+
+    def _contains_internal_labels(self, points: list[str] | None) -> bool:
+        for item in points or []:
+            for token in re.findall(r"[a-z]+", str(item).lower()):
+                if token in self.INTERNAL_LABELS:
+                    return True
+        return False
+
+    def _humanize_points(self, points, back: str, user_answer: str = "") -> list[str]:
+        result: list[str] = []
+        if not isinstance(points, list):
+            return result
+
+        mapping = {
+            "ordinary": "обычные реакции",
+            "quickly": "проходят быстро",
+            "rare": "более редкие реакции",
+            "serious": "серьёзные осложнения",
+            "complications": "осложнения",
+            "effects": "реакции/эффекты",
+            "reaction": "реакции на прививку",
+        }
+        back_l = (back or "").lower()
+        user_l = (user_answer or "").lower()
+
+        for raw in points:
+            item = str(raw or "").strip()
+            if not item:
+                continue
+            lowered = item.lower()
+            tokens = {t for t in re.findall(r"[a-z]+", lowered) if t in self.INTERNAL_LABELS}
+
+            if {"ordinary", "quickly"}.issubset(tokens):
+                result.append("вы указали, что обычные реакции проходят быстро")
+                continue
+            if {"rare", "serious"}.issubset(tokens):
+                result.append("нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
+                continue
+            if {"serious", "complications"}.issubset(tokens):
+                result.append("серьёзные осложнения")
+                continue
+
+            if tokens:
+                phrase = "; ".join(mapping[t] for t in sorted(tokens))
+                result.append(phrase)
+                continue
+
+            if "ordinary_pass_quickly" in lowered or "проход" in lowered and "быстр" in lowered:
+                result.append("вы указали, что обычные реакции проходят быстро")
+                continue
+            if "rare_reactions" in lowered or ("редк" in lowered and "серь" in lowered):
+                result.append("нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
+                continue
+            if "serious_complications" in lowered:
+                result.append("серьёзные осложнения")
+                continue
+
+            cleaned = item.rstrip(" .")
+            if cleaned:
+                result.append(cleaned)
+
+        if not result and self._contains_internal_labels(points):
+            if "обыч" in user_l and "быстр" in user_l and "обыч" in back_l:
+                result.append("вы указали, что обычные реакции проходят быстро")
+            elif "редк" in back_l or "серь" in back_l or "ослож" in back_l:
+                result.append("нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for line in result:
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(line)
+        return deduped[:6]
+
+    def _build_human_fields(self, matched_points, missing_points, unsupported_points, back: str, user_answer: str = "") -> tuple[list[str], list[str], list[str]]:
+        matched_human = self._humanize_points(matched_points, back, user_answer)
+        missing_human = self._humanize_points(missing_points, back, user_answer)
+        unsupported_human = self._humanize_points(unsupported_points, back, user_answer)
+
+        def token_union(items) -> set[str]:
+            bag: set[str] = set()
+            for item in items or []:
+                for token in re.findall(r"[a-z]+", str(item).lower()):
+                    if token in self.INTERNAL_LABELS:
+                        bag.add(token)
+            return bag
+
+        matched_tokens = token_union(matched_points)
+        missing_tokens = token_union(missing_points)
+        if {"ordinary", "quickly"}.issubset(matched_tokens):
+            matched_human = [
+                "вы указали, что обычные реакции проходят быстро",
+                *[x for x in matched_human if x not in {"обычные реакции", "проходят быстро"}],
+            ]
+        if {"rare", "serious"}.issubset(missing_tokens):
+            missing_human = [
+                "нужно добавить, что другая группа реакций бывает более редкой и серьёзной",
+                *[x for x in missing_human if x not in {"более редкие реакции", "серьёзные осложнения"}],
+            ]
+
+        user_l = (user_answer or "").lower()
+        back_l = (back or "").lower()
+        has_serious_in_back = ("серьез" in back_l) or ("серьёз" in back_l)
+        if has_serious_in_back and re.search(r"\bтяжел[а-яё]*|\bтяжёл[а-яё]*", user_l):
+            unsupported_human.append('"тяжёлые" лучше заменить на формулировку карточки: "серьёзные осложнения".')
+
+        if "медлен" in user_l and "медлен" not in back_l:
+            unsupported_human.append('"медленнее" не указано в карточке; лучше сказать: "более редкие и серьёзные осложнения".')
+
+        if missing_human and not any("другая группа" in x.lower() for x in missing_human):
+            if "редк" in back_l and has_serious_in_back:
+                missing_human.insert(0, "нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
+
+        def dedupe(items):
+            out=[]
+            seen=set()
+            for x in items:
+                x=str(x or "").strip()
+                if not x:
+                    continue
+                k=x.lower()
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(x)
+            return out[:6]
+
+        return dedupe(matched_human), dedupe(missing_human), dedupe(unsupported_human)
 
     def _normalize_token(self, token: str) -> str:
         for ending in self.ENDINGS:
@@ -527,6 +660,16 @@ class AIAnswerGrader:
             "source": "llm",
             "answer_time_ms": int(answer_time_ms or 0),
         }
+        matched_human, missing_human, unsupported_human = self._build_human_fields(
+            cleaned.get("matched_points") or [],
+            cleaned.get("missing_points") or [],
+            cleaned.get("unsupported_points") or [],
+            card_back,
+            "",
+        )
+        cleaned["matched_points_human"] = matched_human
+        cleaned["missing_points_human"] = missing_human
+        cleaned["unsupported_points_human"] = unsupported_human
         return self._sanitize_llm_result_against_back(cleaned, card_back)
 
     def _get_llm_settings(self, provider: str = "auto") -> dict[str, Any]:
@@ -794,6 +937,16 @@ class AIAnswerGrader:
                     f"Но фраза «{local_unsupported[0]}» не указана в карточке."
                 )
             llm_result["unsupported_points"] = [str(x).strip() for x in (llm_result.get("unsupported_points") or []) if str(x).strip()][:8]
+            matched_human, missing_human, unsupported_human = self._build_human_fields(
+                llm_result.get("matched_points") or [],
+                llm_result.get("missing_points") or [],
+                llm_result.get("unsupported_points") or [],
+                back,
+                user_answer or "",
+            )
+            llm_result["matched_points_human"] = matched_human
+            llm_result["missing_points_human"] = missing_human
+            llm_result["unsupported_points_human"] = unsupported_human
             return llm_result
 
         LOGGER.info("LLM недоступна, используется fallback-проверка.")
@@ -853,6 +1006,16 @@ class AIAnswerGrader:
         result["missing_points"] = missing
         result["matched_points"] = matched
         result["unsupported_points"] = local_unsupported
+        matched_human, missing_human, unsupported_human = self._build_human_fields(
+            matched,
+            missing,
+            local_unsupported,
+            back,
+            answer,
+        )
+        result["matched_points_human"] = matched_human
+        result["missing_points_human"] = missing_human
+        result["unsupported_points_human"] = unsupported_human
         result["srs_action"] = action
         result["error_explanation"] = error_explanation
         result["follow_up_question"] = self._build_follow_up_from_missing(semantic["missing"]) or self._make_follow_up_question(back)
@@ -943,6 +1106,20 @@ class AIAnswerGrader:
         safe_result = dict(result or {})
         answer_l = (follow_up_answer or "").lower()
         back_l = (back or "").lower()
+        matched_human, missing_human, unsupported_human = self._build_human_fields(
+            (safe_result.get("matched_points") or []),
+            (safe_result.get("missing_points") or []),
+            (safe_result.get("unsupported_points") or []),
+            back,
+            follow_up_answer or "",
+        )
+        if matched_human:
+            safe_result["matched_points_human"] = matched_human
+        if missing_human:
+            safe_result["missing_points_human"] = missing_human
+        if unsupported_human:
+            safe_result["unsupported_points_human"] = unsupported_human
+
         if "медлен" in answer_l and "медлен" not in back_l:
             safe_result["improved"] = True
             safe_result["remaining_gap"] = (
@@ -1022,6 +1199,9 @@ class AIAnswerGrader:
             "missing_points": [],
             "matched_points": [],
             "unsupported_points": [],
+            "matched_points_human": [],
+            "missing_points_human": [],
+            "unsupported_points_human": [],
             "short_feedback": self._make_short_feedback(grade),
             "error_explanation": "",
             "analogy": "",

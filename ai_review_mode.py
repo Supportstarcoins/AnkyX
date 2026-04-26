@@ -99,6 +99,16 @@ class AIReviewPanel(ttk.Frame):
         result = self.controller.grade(self.current_card, user_answer, elapsed_ms, apply_srs=False)
         self._on_answer_graded(result)
 
+    def _pick_points_for_ui(self, result: dict, base_key: str) -> list[str]:
+        human = result.get(f"{base_key}_human") or []
+        raw = result.get(base_key) or []
+        items = human if human else raw
+        cleaned = [str(x).strip() for x in items if str(x).strip()]
+        return cleaned[:4]
+
+    def _join_points(self, points: list[str]) -> str:
+        return "; ".join(points) if points else ""
+
     def _on_answer_graded(self, result):
         self.progress.stop()
         self.last_grade_result = result
@@ -106,23 +116,28 @@ class AIReviewPanel(ttk.Frame):
         answer_time_ms = int(result.get("answer_time_ms") or 0)
         source = (result.get('source') or 'fallback').lower()
         source_label = 'LLM' if source == 'llm' else 'fallback'
-        matched_points = result.get("matched_points") or []
-        missing_points = result.get("missing_points") or []
-        unsupported_points = result.get("unsupported_points") or []
-        matched_text = "; ".join(matched_points[:4]) if matched_points else "—"
-        missing_text = "; ".join(missing_points[:4]) if missing_points else "—"
-        unsupported_text = "; ".join(unsupported_points[:4]) if unsupported_points else "—"
-        msg = (
-            f"Оценка: {grade}\n"
-            f"Балл: {result.get('score')}\n"
-            f"Время ответа: {answer_time_ms} мс ({result.get('answer_time_quality')})\n"
-            f"Что уже верно: {matched_text}\n"
-            f"Чего не хватает: {missing_text}\n"
-            f"Что не точно: {unsupported_text}\n"
-            f"Разбор: {result.get('error_explanation') or result.get('short_feedback')}\n"
-            f"Уточняющий вопрос: {result.get('follow_up_question')}\n"
-            f"Источник проверки: {source_label}\n"
-        )
+        matched_text = self._join_points(self._pick_points_for_ui(result, "matched_points"))
+        missing_text = self._join_points(self._pick_points_for_ui(result, "missing_points"))
+        unsupported_text = self._join_points(self._pick_points_for_ui(result, "unsupported_points"))
+        lines = [
+            f"Оценка: {grade}",
+            f"Балл: {result.get('score')}",
+            f"Время ответа: {answer_time_ms} мс ({result.get('answer_time_quality')})",
+        ]
+        if matched_text:
+            lines.append(f"Что уже верно: {matched_text}")
+        if missing_text:
+            lines.append(f"Чего не хватает: {missing_text}")
+        if unsupported_text:
+            lines.append(f"Что не точно: {unsupported_text}")
+        breakdown = (result.get('error_explanation') or result.get('short_feedback') or '').strip()
+        if breakdown:
+            lines.append(f"Разбор: {breakdown}")
+        follow_up = (result.get('follow_up_question') or '').strip()
+        if follow_up:
+            lines.append(f"Уточняющий вопрос: {follow_up}")
+        lines.append(f"Источник проверки: {source_label}")
+        msg = "\n".join(lines) + "\n"
         self._append("AI", msg)
         self.status_var.set("Ответ проверен")
         follow_up_question = (result or {}).get("follow_up_question", "").strip()
@@ -178,13 +193,24 @@ class AIReviewPanel(ttk.Frame):
             previous_grade_result=self.last_grade_result,
         )
         self.last_grade_result = result
-        msg = (
-            f"Стало лучше: {'да' if result.get('improved') else 'нет'}\n"
-            f"Что улучшилось: {result.get('short_feedback')}\n"
-            f"Что ещё не точно: {result.get('remaining_gap')}\n"
-            f"Как сказать ближе к карточке: {result.get('final_hint')}\n"
-            f"Изменение балла: {result.get('score_delta')}\n"
-        )
+        follow_missing = self._join_points(self._pick_points_for_ui(result, "missing_points"))
+        follow_unsupported = self._join_points(self._pick_points_for_ui(result, "unsupported_points"))
+        lines = [
+            f"Стало лучше: {'да' if result.get('improved') else 'нет'}",
+            f"Что улучшилось: {result.get('short_feedback')}",
+        ]
+        remaining_gap = str(result.get('remaining_gap') or '').strip()
+        if follow_missing:
+            lines.append(f"Чего не хватает: {follow_missing}")
+        elif remaining_gap:
+            lines.append(f"Что ещё не точно: {remaining_gap}")
+        if follow_unsupported:
+            lines.append(f"Что не точно: {follow_unsupported}")
+        final_hint = str(result.get('final_hint') or '').strip()
+        if final_hint:
+            lines.append(f"Как сказать ближе к карточке: {final_hint}")
+        lines.append(f"Изменение балла: {result.get('score_delta')}")
+        msg = "\n".join(lines) + "\n"
         self._append("AI", msg)
         self.answer_input.delete("1.0", tk.END)
         follow_up_complete = bool(result.get("follow_up_complete", True))
