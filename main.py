@@ -3858,6 +3858,47 @@ def count_overdue_for_deck(deck_id: int) -> int:
     return counts.total
 
 
+def _card_phase_expr(columns: set[str]) -> str:
+    if "phase" in columns and "leitner_level" in columns:
+        return "COALESCE(NULLIF(phase, 0), NULLIF(leitner_level, 0), 1)"
+    if "phase" in columns:
+        return "COALESCE(NULLIF(phase, 0), 1)"
+    if "leitner_level" in columns:
+        return "COALESCE(NULLIF(leitner_level, 0), 1)"
+    return "1"
+
+
+def get_unreviewed_count(deck_id: int | None = None) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(cards);")
+    columns = {row[1] for row in cur.fetchall()}
+    phase_expr = _card_phase_expr(columns)
+
+    where_parts = []
+    params: list = []
+    if deck_id is not None:
+        where_parts.append("deck_id = ?")
+        params.append(deck_id)
+
+    conditions = []
+    if "overview_added" in columns:
+        conditions.append("COALESCE(overview_added, 0) = 1")
+    if "state" in columns:
+        conditions.append("LOWER(COALESCE(state, '')) IN ('overview', 'new')")
+    reps_expr = "COALESCE(reps, 0)" if "reps" in columns else "0"
+    lapses_expr = "COALESCE(lapses, 0)" if "lapses" in columns else "0"
+    conditions.append(f"({reps_expr} = 0 AND {lapses_expr} = 0 AND {phase_expr} = 1)")
+    if "due" in columns:
+        conditions.append("(due IS NULL OR due = '' OR due = 0)")
+
+    where_parts.append("(" + " OR ".join(conditions) + ")")
+    cur.execute(f"SELECT COUNT(*) FROM cards WHERE {' AND '.join(where_parts)};", tuple(params))
+    count = int(cur.fetchone()[0] or 0)
+    conn.close()
+    return count
+
+
 def get_deck_stats(deck_id: int):
     """
     Получить статистику по колоде:
@@ -3867,6 +3908,9 @@ def get_deck_stats(deck_id: int):
     """
     conn = get_connection()
     cur = conn.cursor()
+    cur.execute("PRAGMA table_info(cards);")
+    columns = {row[1] for row in cur.fetchall()}
+    phase_expr = _card_phase_expr(columns)
     
     # Общее количество карточек
     cur.execute("SELECT COUNT(*) FROM cards WHERE deck_id = ?", (deck_id,))
@@ -3876,7 +3920,7 @@ def get_deck_stats(deck_id: int):
     phase_stats = {}
     for phase in range(1, 11):
         cur.execute(
-            "SELECT COUNT(*) FROM cards WHERE deck_id = ? AND leitner_level = ?",
+            f"SELECT COUNT(*) FROM cards WHERE deck_id = ? AND {phase_expr} = ?",
             (deck_id, phase)
         )
         phase_stats[phase] = cur.fetchone()[0]
@@ -3906,7 +3950,8 @@ def get_deck_stats(deck_id: int):
         "phase_stats": phase_stats,
         "learned_percent": learned_percent,
         "learned_count": learned_count,
-        "total_overview": total_overview
+        "total_overview": total_overview,
+        "unreviewed_count": get_unreviewed_count(deck_id),
     }
 
 
@@ -4181,10 +4226,10 @@ def get_repeated_word_flag(word: str) -> str:
     try:
         cur.execute("PRAGMA table_info(cards);")
         columns = {row[1] for row in cur.fetchall()}
-        phase_expr = "phase" if "phase" in columns else "leitner_level"
+        phase_expr = _card_phase_expr(columns)
         cur.execute(
             f"""
-            SELECT MAX(COALESCE({phase_expr}, leitner_level, 1)) as phase_level
+            SELECT MAX({phase_expr}) as phase_level
             FROM cards
             WHERE lower(front) = ?
                OR lower(back) = ?
@@ -16174,8 +16219,7 @@ class AnkiApp(tk.Tk):
 
             self.selected_deck_id = None
             self.selected_phase = None
-            self.after(50, self.update_overdue_badge)
-            self.update_deck_preview()
+            self.after(50, self.refresh_deck_counters_and_phase_tree)
             if self.chatbot_tab:
                 self.chatbot_tab.refresh_deck_options()
             self._refresh_in_progress = False
@@ -16185,6 +16229,30 @@ class AnkiApp(tk.Tk):
             self._refresh_in_progress = False
 
         self.run_task("Загрузка колод", "determinate", task, on_success, on_error)
+
+    def refresh_deck_counters_and_phase_tree(self):
+        for method_name in (
+            "refresh_deck_tree",
+            "update_deck_tree",
+            "render_deck_tree",
+            "load_decks",
+            "update_deck_stats",
+            "refresh_phase_list",
+            "update_phase_counts",
+        ):
+            method = getattr(self, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    logging.exception("refresh helper failed: %s", method_name)
+        for method_name in ("update_deck_preview", "update_overdue_badge"):
+            method = getattr(self, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    logging.exception("refresh helper failed: %s", method_name)
 
     def update_deck_preview(self):
         """Обновить превью выбранной колоды."""
@@ -16283,8 +16351,7 @@ class AnkiApp(tk.Tk):
             return counts_by_deck
 
         def on_success(counts_by_deck: dict[int | None, PhaseOverdueBadges]):
-            selected_counts = counts_by_deck.get(self.selected_deck_id)
-            total_count = selected_counts.total if selected_counts else 0
+            total_count = get_unreviewed_count(self.selected_deck_id)
 
             if self.overdue_canvas is not None:
                 self.overdue_canvas.delete("all")
@@ -22683,6 +22750,7 @@ class RepeatWindow(tk.Toplevel):
                     on_next_card=self.goto_next_card,
                     on_show_answer=self.show_answer_side,
                     on_card_updated=self._on_ai_card_updated,
+                    on_deck_stats_changed=self.master.refresh_deck_counters_and_phase_tree,
                 )
                 self.ai_review_panel.pack(fill=tk.X, pady=(8, 0))
                 if self.current_card:

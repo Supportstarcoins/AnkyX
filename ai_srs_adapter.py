@@ -105,7 +105,10 @@ class AISRSAdapter:
                     params.append(val)
             if "state" in columns:
                 sets.append("state = ?")
-                params.append("learning" if normalized_grade in {"wrong", "uncertain"} else "review")
+                params.append("review")
+            if "overview_added" in columns:
+                sets.append("overview_added = ?")
+                params.append(0)
             if "ease" in columns:
                 current_ease = float(current_data.get("ease") or 2.5)
                 if normalized_grade in {"correct", "slow_correct"}:
