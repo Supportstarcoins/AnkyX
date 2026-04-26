@@ -38,13 +38,14 @@ class AIReviewController:
 
 
 class AIReviewPanel(ttk.Frame):
-    def __init__(self, parent, app=None, on_next_card=None, on_show_answer=None, on_card_updated=None):
+    def __init__(self, parent, app=None, on_next_card=None, on_show_answer=None, on_card_updated=None, on_deck_stats_changed=None):
         super().__init__(parent)
         self.controller = AIReviewController(app=app)
         self.app = app
         self.on_next_card = on_next_card
         self.on_show_answer = on_show_answer
         self.on_card_updated = on_card_updated
+        self.on_deck_stats_changed = on_deck_stats_changed
 
         self.current_card = None
         self.answer_started_at = None
@@ -522,6 +523,24 @@ class AIReviewPanel(ttk.Frame):
                     except Exception:
                         continue
 
+    def _notify_deck_stats_changed(self):
+        if callable(self.on_deck_stats_changed):
+            try:
+                self.on_deck_stats_changed()
+                return
+            except Exception:
+                pass
+        for target in (self.app, self.master, self.winfo_toplevel()):
+            if target is None:
+                continue
+            fn = getattr(target, "refresh_deck_counters_and_phase_tree", None)
+            if callable(fn):
+                try:
+                    fn()
+                    return
+                except Exception:
+                    continue
+
     def _append_ai_message(self, text):
         self._append("AI", text)
 
@@ -574,6 +593,7 @@ class AIReviewPanel(ttk.Frame):
         if payload.get("applied"):
             self._update_current_card_from_srs_result(payload)
             self._refresh_card_ui(payload)
+            self._notify_deck_stats_changed()
             if grade == "slow_correct":
                 self._append_ai_message(f"{prefix_message}, но ответ был медленным. Карточка повышена осторожно.")
             else:
@@ -610,6 +630,7 @@ def attach_ai_review_panel(parent, app=None, callbacks=None):
         on_next_card=callbacks.get("on_next_card"),
         on_show_answer=callbacks.get("on_show_answer"),
         on_card_updated=callbacks.get("on_card_updated"),
+        on_deck_stats_changed=callbacks.get("on_deck_stats_changed"),
     )
     panel.pack(fill=tk.X)
     return panel
