@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import importlib
+import json
+import logging
+import os
 import re
+from typing import Any
+
+import requests
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AIAnswerGrader:
@@ -136,6 +146,7 @@ class AIAnswerGrader:
             "wrong": "Ответ не совпадает с ключевым смыслом карточки.",
             "slow_correct": "Ответ верный, но дался медленно — интервал лучше увеличивать осторожно.",
             "uncertain": "Есть попадание в тему, но ответ пока недостаточно точный.",
+            "confused": "Похоже на путаницу терминов — давайте уточним ключевое различие.",
         }
         return mapping.get(grade, "Нужна дополнительная проверка ответа.")
 
@@ -145,14 +156,301 @@ class AIAnswerGrader:
             return "Какая деталь из полного ответа чаще всего теряется в сокращённой версии?"
         return "Какую одну ключевую деталь стоит добавить, чтобы ответ стал полным?"
 
+    def _extract_json_object(self, raw_text: str) -> dict[str, Any] | None:
+        text = (raw_text or "").strip()
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            pass
+
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            return None
+        chunk = match.group(0)
+        try:
+            payload = json.loads(chunk)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    def _clean_grade_payload(self, payload: dict[str, Any], card: dict[str, Any], answer_time_ms: int) -> dict[str, Any] | None:
+        allowed_grades = {"correct", "partial", "wrong", "uncertain", "slow_correct", "confused"}
+        grade = str(payload.get("grade") or "").strip().lower()
+        if grade not in allowed_grades:
+            return None
+
+        score = float(payload.get("score") or 0.0)
+        confidence = float(payload.get("confidence") or 0.0)
+        answer_time_quality = str(payload.get("answer_time_quality") or "normal").strip().lower()
+        if answer_time_quality not in {"fast", "normal", "slow", "too_slow"}:
+            answer_time_quality = "normal"
+
+        mistake_type = str(payload.get("mistake_type") or "missing_key_point").strip().lower()
+        allowed_mistake = {
+            "none",
+            "missing_key_point",
+            "confused_similar_terms",
+            "too_general",
+            "wrong_fact",
+            "no_answer",
+        }
+        if mistake_type not in allowed_mistake:
+            mistake_type = "missing_key_point"
+
+        missing_points = payload.get("missing_points")
+        if not isinstance(missing_points, list):
+            missing_points = []
+        missing_points = [str(x).strip() for x in missing_points if str(x).strip()][:8]
+
+        suggested_rewrite = payload.get("suggested_rewrite")
+        if not isinstance(suggested_rewrite, dict):
+            suggested_rewrite = {}
+
+        cleaned = {
+            "grade": grade,
+            "score": max(0.0, min(1.0, score)),
+            "confidence": max(0.0, min(1.0, confidence)),
+            "answer_time_quality": answer_time_quality,
+            "mistake_type": mistake_type,
+            "missing_points": missing_points,
+            "short_feedback": str(payload.get("short_feedback") or self._make_short_feedback(grade)).strip(),
+            "error_explanation": str(payload.get("error_explanation") or "").strip(),
+            "analogy": str(payload.get("analogy") or "").strip(),
+            "follow_up_question": str(payload.get("follow_up_question") or "").strip(),
+            "srs_action": str(payload.get("srs_action") or "repeat_soon").strip(),
+            "card_action": str(payload.get("card_action") or "keep").strip(),
+            "suggested_rewrite": {
+                "front": str(suggested_rewrite.get("front") or (card or {}).get("front", "")),
+                "back": str(suggested_rewrite.get("back") or (card or {}).get("back", "")),
+            },
+            "source": "llm",
+            "answer_time_ms": int(answer_time_ms or 0),
+        }
+        return cleaned
+
+    def _get_llm_settings(self, provider: str = "auto") -> dict[str, Any]:
+        settings: dict[str, Any] = {
+            "provider": provider or "auto",
+            "model": os.getenv("XFLASH_OLLAMA_MODEL", "").strip() or "xflash-llama31",
+            "base_url": os.getenv("XFLASH_OLLAMA_URL", "").strip() or "http://127.0.0.1:11434",
+            "api_key": os.getenv("OPENAI_API_KEY", "").strip(),
+            "timeout": 45,
+        }
+        path = os.path.join(os.getcwd(), "chatbot_settings.json")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle) or {}
+                settings["provider"] = provider if provider != "auto" else str(data.get("llm_provider") or data.get("provider") or "auto")
+                settings["model"] = str(data.get("ollama_model") or settings["model"])
+                settings["base_url"] = str(data.get("ollama_url") or settings["base_url"])
+                settings["api_key"] = str(data.get("api_key") or settings["api_key"])
+            except Exception:
+                LOGGER.debug("Failed to load chatbot_settings.json", exc_info=True)
+        return settings
+
+    def _call_via_project_providers(self, messages: list[dict[str, str]], provider: str = "auto") -> dict[str, Any] | None:
+        try:
+            module = importlib.import_module("llm_providers")
+            router_cls = getattr(module, "LLMRouter", None)
+            ollama_cls = getattr(module, "OllamaProvider", None)
+            openai_cls = getattr(module, "OpenAIProvider", None)
+            if not router_cls or not ollama_cls:
+                return None
+            settings = self._get_llm_settings(provider=provider)
+            preferred = str(settings.get("provider") or "auto").lower()
+            primary = None
+            fallback = None
+            if preferred in {"openai", "chatgpt", "cloud"} and openai_cls:
+                primary = openai_cls()
+                fallback = ollama_cls()
+            else:
+                primary = ollama_cls()
+                if openai_cls and settings.get("api_key"):
+                    fallback = openai_cls()
+            router = router_cls(primary=primary, fallback=fallback)
+            text = router.chat(messages, settings)
+            return self._extract_json_object(text)
+        except Exception:
+            return None
+
+    def _call_ollama_direct(self, messages: list[dict[str, str]], provider: str = "auto") -> dict[str, Any] | None:
+        settings = self._get_llm_settings(provider=provider)
+        model = settings.get("model") or "xflash-llama31"
+        base_url = str(settings.get("base_url") or "http://127.0.0.1:11434").rstrip("/")
+        try:
+            resp = requests.post(
+                f"{base_url}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": "\n\n".join(m.get("content", "") for m in messages),
+                    "stream": False,
+                    "options": {"temperature": 0.35},
+                },
+                timeout=float(settings.get("timeout") or 45),
+            )
+            if not resp.ok:
+                return None
+            data = resp.json() or {}
+            return self._extract_json_object(str(data.get("response") or ""))
+        except Exception:
+            return None
+
+    def _llm_json(self, messages: list[dict[str, str]], provider: str = "auto") -> dict[str, Any] | None:
+        payload = self._call_via_project_providers(messages, provider=provider)
+        if payload is not None:
+            return payload
+        return self._call_ollama_direct(messages, provider=provider)
+
+    def _try_llm_grade_answer(self, card, user_answer, answer_time_ms, provider="auto"):
+        prompt = (
+            "Ты — живой AI-репетитор в приложении флэш-карточек.\n"
+            "Твоя задача — не просто поставить оценку, а помочь пользователю понять ошибку.\n\n"
+            "Правила:\n"
+            "- Оцени смысл, а не точное совпадение слов.\n"
+            "- Не будь сухим шаблоном.\n"
+            "- Давай живую, образную, но короткую аналогию.\n"
+            "- Аналогия должна быть связана с темой карточки или с повседневной ситуацией.\n"
+            "- Не используй одну и ту же аналогию каждый раз.\n"
+            "- Объясняй ошибку дружелюбно, но честно.\n"
+            "- Если ответ частичный, скажи, какая главная мысль потеряна.\n"
+            "- Уточняющий вопрос должен помогать пользователю самому восстановить ответ.\n"
+            "- Не повторяй просто исходный вопрос.\n"
+            "- Не пиши длинный учебник.\n"
+            "- Верни строго JSON.\n\n"
+            "Формат JSON:\n"
+            "{\n"
+            '  "grade": "correct|partial|wrong|uncertain|slow_correct|confused",\n'
+            '  "score": 0.0,\n'
+            '  "confidence": 0.0,\n'
+            '  "answer_time_quality": "fast|normal|slow|too_slow",\n'
+            '  "mistake_type": "none|missing_key_point|confused_similar_terms|too_general|wrong_fact|no_answer",\n'
+            '  "missing_points": [],\n'
+            '  "short_feedback": "...",\n'
+            '  "error_explanation": "...",\n'
+            '  "analogy": "...",\n'
+            '  "follow_up_question": "...",\n'
+            '  "srs_action": "increase|slight_increase|repeat_soon|reset",\n'
+            '  "card_action": "keep|simplify|split|rewrite|merge_duplicate",\n'
+            '  "suggested_rewrite": {\n'
+            '    "front": "...",\n'
+            '    "back": "..."\n'
+            "  }\n"
+            "}\n\n"
+            "Данные:\n"
+            f"Вопрос карточки:\n{(card or {}).get('front', '')}\n\n"
+            f"Правильный ответ:\n{(card or {}).get('back', '')}\n\n"
+            f"Ответ пользователя:\n{(user_answer or '').strip()}\n\n"
+            f"Время ответа:\n{int(answer_time_ms or 0)} мс"
+        )
+        messages = [
+            {"role": "system", "content": "Верни только JSON-объект без markdown и комментариев."},
+            {"role": "user", "content": prompt},
+        ]
+        payload = self._llm_json(messages, provider=provider)
+        if payload is None:
+            return None
+        return self._clean_grade_payload(payload, card or {}, int(answer_time_ms or 0))
+
+    def _try_llm_follow_up(self, card, original_answer, follow_up_question, follow_up_answer, previous_grade_result=None):
+        prompt = (
+            "Ты — AI-репетитор. Пользователь ответил на уточняющий вопрос.\n"
+            "Оцени, стало ли понимание лучше.\n"
+            "Не повторяй шаблонно.\n"
+            "Объясни коротко и живо.\n"
+            "Верни строго JSON:\n\n"
+            "{\n"
+            '  "improved": true,\n'
+            '  "score_delta": 0.0,\n'
+            '  "short_feedback": "...",\n'
+            '  "remaining_gap": "...",\n'
+            '  "analogy": "...",\n'
+            '  "final_hint": "...",\n'
+            '  "follow_up_complete": true\n'
+            "}\n\n"
+            f"Вопрос карточки:\n{(card or {}).get('front', '')}\n\n"
+            f"Правильный ответ:\n{(card or {}).get('back', '')}\n\n"
+            f"Первичный ответ пользователя:\n{original_answer or ''}\n\n"
+            f"Уточняющий вопрос AI:\n{follow_up_question or ''}\n\n"
+            f"Ответ пользователя на уточнение:\n{follow_up_answer or ''}\n\n"
+            f"Предыдущая оценка:\n{json.dumps(previous_grade_result or {}, ensure_ascii=False)}"
+        )
+        payload = self._llm_json([
+            {"role": "system", "content": "Верни только JSON-объект без markdown и комментариев."},
+            {"role": "user", "content": prompt},
+        ])
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return {
+                "improved": bool(payload.get("improved")),
+                "score_delta": float(payload.get("score_delta") or 0.0),
+                "short_feedback": str(payload.get("short_feedback") or "").strip(),
+                "remaining_gap": str(payload.get("remaining_gap") or "").strip(),
+                "analogy": str(payload.get("analogy") or "").strip(),
+                "final_hint": str(payload.get("final_hint") or "").strip(),
+                "follow_up_complete": bool(payload.get("follow_up_complete", True)),
+                "source": "llm",
+            }
+        except Exception:
+            return None
+
+    def _try_llm_hint(self, card, original_answer, follow_up_question, previous_grade_result=None):
+        prompt = (
+            "Ты — AI-репетитор. Пользователь не понял твой уточняющий вопрос и просит подсказку.\n"
+            "Объясни живо и понятно, какую именно деталь нужно добавить.\n"
+            "Не оценивай это как ответ.\n"
+            "Дай креативную короткую метафору.\n"
+            "Дай пример ответа одной фразой.\n"
+            "Верни строго JSON:\n\n"
+            "{\n"
+            '  "type": "hint",\n'
+            '  "short_explanation": "...",\n'
+            '  "missing_detail": "...",\n'
+            '  "analogy": "...",\n'
+            '  "example_answer": "...",\n'
+            '  "next_prompt": "..."\n'
+            "}\n\n"
+            "Данные:\n"
+            f"Вопрос карточки:\n{(card or {}).get('front', '')}\n\n"
+            f"Правильный ответ:\n{(card or {}).get('back', '')}\n\n"
+            f"Первичный ответ пользователя:\n{original_answer or ''}\n\n"
+            f"Уточняющий вопрос AI:\n{follow_up_question or ''}\n\n"
+            f"Предыдущая оценка:\n{json.dumps(previous_grade_result or {}, ensure_ascii=False)}"
+        )
+        payload = self._llm_json([
+            {"role": "system", "content": "Верни только JSON-объект без markdown и комментариев."},
+            {"role": "user", "content": prompt},
+        ])
+        if not isinstance(payload, dict):
+            return None
+        return {
+            "type": "hint",
+            "short_explanation": str(payload.get("short_explanation") or "").strip(),
+            "missing_detail": str(payload.get("missing_detail") or "").strip(),
+            "analogy": str(payload.get("analogy") or "").strip(),
+            "example_answer": str(payload.get("example_answer") or "").strip(),
+            "next_prompt": str(payload.get("next_prompt") or "").strip(),
+            "source": "llm",
+        }
+
     def grade_answer(self, card, user_answer, answer_time_ms, provider="auto"):
-        _ = provider
+        llm_result = self._try_llm_grade_answer(card, user_answer, answer_time_ms, provider=provider)
+        if llm_result is not None:
+            return llm_result
+
+        LOGGER.info("LLM недоступна, используется fallback-проверка.")
         back = (card or {}).get("back", "")
         answer = (user_answer or "").strip()
         if not answer:
             result = self._result("wrong", 0.0, "too_slow", "no_answer")
             result["srs_action"] = "reset"
             result["error_explanation"] = "В ответе нет содержательной части для проверки."
+            result["source"] = "fallback"
+            result["answer_time_ms"] = int(answer_time_ms or 0)
             return result
 
         expected = self._keywords(back)
@@ -201,6 +499,8 @@ class AIAnswerGrader:
             "front": (card or {}).get("front", ""),
             "back": (back[:200] + "...") if len(back) > 220 else back,
         }
+        result["source"] = "fallback"
+        result["answer_time_ms"] = int(answer_time_ms or 0)
         return result
 
     def grade_follow_up_answer(
@@ -211,6 +511,16 @@ class AIAnswerGrader:
         follow_up_answer,
         previous_grade_result=None,
     ):
+        llm_result = self._try_llm_follow_up(
+            card,
+            original_answer,
+            follow_up_question,
+            follow_up_answer,
+            previous_grade_result=previous_grade_result,
+        )
+        if llm_result is not None:
+            return llm_result
+
         back = (card or {}).get("back") or (card or {}).get("answer") or ""
         original_keywords = self._keywords(original_answer or "")
         follow_up_keywords = self._keywords(follow_up_answer or "")
@@ -255,8 +565,10 @@ class AIAnswerGrader:
             "score_delta": score_delta,
             "short_feedback": short_feedback,
             "remaining_gap": remaining_gap,
+            "analogy": "Это как чинить цепочку: добавили одно звено, но нужно замкнуть весь контур.",
             "final_hint": final_hint,
             "follow_up_complete": follow_up_complete,
+            "source": "fallback",
         }
 
     def explain_follow_up_hint(
@@ -266,6 +578,15 @@ class AIAnswerGrader:
         follow_up_question,
         previous_grade_result=None,
     ):
+        llm_result = self._try_llm_hint(
+            card,
+            original_answer,
+            follow_up_question,
+            previous_grade_result=previous_grade_result,
+        )
+        if llm_result is not None:
+            return llm_result
+
         _ = follow_up_question
         back = ((card or {}).get("back") or (card or {}).get("answer") or "").strip()
         previous = previous_grade_result or {}
@@ -298,8 +619,10 @@ class AIAnswerGrader:
             "type": "hint",
             "short_explanation": short_explanation,
             "missing_detail": missing_detail,
+            "analogy": "Это как пазл: не хватает одной детали в центре, и картинка не складывается.",
             "example_answer": example_answer,
             "next_prompt": "Попробуйте теперь ответить одной короткой фразой.",
+            "source": "fallback",
         }
 
     def _result(self, grade, score, answer_time_quality, mistake_type):
@@ -317,4 +640,5 @@ class AIAnswerGrader:
             "srs_action": "repeat_soon",
             "card_action": "keep",
             "suggested_rewrite": {"front": "", "back": ""},
+            "source": "fallback",
         }
