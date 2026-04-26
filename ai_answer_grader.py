@@ -102,6 +102,19 @@ class AIAnswerGrader:
         "ое",
         "ые",
     )
+    DANGEROUS_OUT_OF_BACK_PHRASES = (
+        "медленнее",
+        "температура",
+        "боль",
+        "слабость",
+        "головная боль",
+        "тяжёлые эффекты",
+        "тяжелые эффекты",
+        "какие именно",
+        "примеры",
+        "перечисли",
+    )
+    METAPHOR_MARKERS = ("представ", "как ", "словно", "будто", "это как")
 
     def _normalize_token(self, token: str) -> str:
         for ending in self.ENDINGS:
@@ -371,6 +384,81 @@ class AIAnswerGrader:
             return self._safe_follow_up_question(card_back, missing_detail=missing_detail)
         return raw_question
 
+    def _safe_final_hint(self, back: str) -> str:
+        text = (back or "").lower()
+        if "обыч" in text and "проход" in text and "быстр" in text and ("редк" in text or "серьез" in text or "осложнен" in text):
+            return "Скажите ближе к карточке: обычные реакции проходят быстро, а другие реакции более редкие и серьёзные."
+        return "Скажите ближе к карточке и повторите формулировку из правильного ответа без новых деталей."
+
+    def _looks_like_metaphor(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(marker in lowered for marker in self.METAPHOR_MARKERS)
+
+    def _sanitize_llm_result_against_back(self, result: dict, back: str) -> dict:
+        safe = dict(result or {})
+        back_l = (back or "").lower()
+
+        unsupported = safe.get("unsupported_points")
+        if not isinstance(unsupported, list):
+            unsupported = []
+
+        def has_out_of_back_phrase(text: str) -> list[str]:
+            lowered = (text or "").lower()
+            hits: list[str] = []
+            for phrase in self.DANGEROUS_OUT_OF_BACK_PHRASES:
+                if phrase in lowered and phrase not in back_l:
+                    hits.append(phrase)
+            return hits
+
+        for key in ("matched_points", "missing_points"):
+            items = safe.get(key)
+            if not isinstance(items, list):
+                continue
+            filtered_items: list[str] = []
+            for item in items:
+                item_s = str(item).strip()
+                if not item_s:
+                    continue
+                bad = has_out_of_back_phrase(item_s)
+                if bad:
+                    unsupported.append(f"формулировка «{item_s}» не из карточки")
+                    continue
+                filtered_items.append(item_s)
+            safe[key] = filtered_items[:8]
+
+        for key in ("short_feedback", "error_explanation", "remaining_gap"):
+            value = str(safe.get(key) or "").strip()
+            if not value:
+                continue
+            bad = has_out_of_back_phrase(value)
+            if bad:
+                unsupported.extend([f"добавлена лишняя деталь: {phrase}" for phrase in bad])
+                safe[key] = "Формулируйте ответ ближе к карточке, без добавления новых фактов."
+
+        follow_q = str(safe.get("follow_up_question") or "").strip()
+        if follow_q:
+            bad = has_out_of_back_phrase(follow_q)
+            if bad or self._question_demands_external_details(follow_q):
+                unsupported.extend([f"уточняющий вопрос требует лишние детали: {phrase}" for phrase in bad] or ["уточняющий вопрос требует лишние детали"])
+                safe["follow_up_question"] = self._safe_follow_up_question(back, ", ".join(safe.get("missing_points") or []))
+
+        final_hint = str(safe.get("final_hint") or "").strip()
+        if final_hint:
+            bad = has_out_of_back_phrase(final_hint)
+            if bad:
+                unsupported.extend([f"лишняя подсказка: {phrase}" for phrase in bad])
+                safe["final_hint"] = self._safe_final_hint(back)
+
+        analogy = str(safe.get("analogy") or "").strip()
+        if analogy:
+            bad = has_out_of_back_phrase(analogy)
+            if bad and not self._looks_like_metaphor(analogy):
+                unsupported.extend([f"аналогия добавляет лишний факт: {phrase}" for phrase in bad])
+                safe["analogy"] = "Представьте это как две зоны: одна быстро проходит, другая более редкая и серьёзная."
+
+        safe["unsupported_points"] = [str(x).strip() for x in unsupported if str(x).strip()][:8]
+        return safe
+
     def _clean_grade_payload(self, payload: dict[str, Any], card: dict[str, Any], answer_time_ms: int) -> dict[str, Any] | None:
         allowed_grades = {"correct", "partial", "wrong", "uncertain", "slow_correct", "confused"}
         grade = str(payload.get("grade") or "").strip().lower()
@@ -439,7 +527,7 @@ class AIAnswerGrader:
             "source": "llm",
             "answer_time_ms": int(answer_time_ms or 0),
         }
-        return cleaned
+        return self._sanitize_llm_result_against_back(cleaned, card_back)
 
     def _get_llm_settings(self, provider: str = "auto") -> dict[str, Any]:
         settings: dict[str, Any] = {
@@ -543,6 +631,15 @@ class AIAnswerGrader:
             "Не спрашивай 'какие именно', 'приведи примеры', 'перечисли виды', если в правильном ответе нет списка, примеров или видов.\n"
             "Если back говорит только 'редкие и серьёзные осложнения', спрашивай не 'какие именно осложнения', а 'что нужно добавить про вторую группу реакций?'.\n"
             "Креативность разрешена только в аналогиях и объяснениях, но не в фактах.\n"
+            "КРЕАТИВНОСТЬ В РАМКАХ ФАКТА:\n"
+            "Ты можешь использовать яркие аналогии и метафоры, но только чтобы объяснить факты из правильного ответа.\n"
+            "Не добавляй в проверку новые сведения.\n"
+            "Если хочешь привести пример или образ, он должен быть явно метафорой, а не новым медицинским фактом.\n"
+            "Не называй конкретные примеры осложнений, если их нет в правильном ответе.\n"
+            "Не заменяй «более редкие и серьёзные осложнения» на «медленные» или «тяжёлые», если таких слов нет в back.\n"
+            "Если пользователь использовал слово, которого нет в back, оцени это осторожно:\n"
+            "- если слово не меняет смысл, можно принять частично;\n"
+            "- если слово добавляет новый факт, пометь как «не точно».\n"
             "- Верни строго JSON.\n\n"
             "Формат JSON:\n"
             "{\n"
@@ -611,7 +708,7 @@ class AIAnswerGrader:
         if not isinstance(payload, dict):
             return None
         try:
-            return {
+            cleaned = {
                 "improved": bool(payload.get("improved")),
                 "score_delta": float(payload.get("score_delta") or 0.0),
                 "short_feedback": str(payload.get("short_feedback") or "").strip(),
@@ -621,6 +718,7 @@ class AIAnswerGrader:
                 "follow_up_complete": bool(payload.get("follow_up_complete", True)),
                 "source": "llm",
             }
+            return self._sanitize_llm_result_against_back(cleaned, (card or {}).get("back") or "")
         except Exception:
             return None
 
@@ -669,6 +767,7 @@ class AIAnswerGrader:
         local_score, local_matched, local_missing, local_unsupported = self._semantic_overlap_score(back, user_answer or "")
         llm_result = self._try_llm_grade_answer(card, user_answer, answer_time_ms, provider=provider)
         if llm_result is not None:
+            llm_result = self._sanitize_llm_result_against_back(llm_result, back)
             llm_score = float(llm_result.get("score") or 0.0)
             llm_grade = str(llm_result.get("grade") or "wrong")
             if local_score >= 0.55 and llm_score < 0.5:
@@ -683,11 +782,18 @@ class AIAnswerGrader:
             llm_result["matched_points"] = llm_result.get("matched_points") or local_matched
             llm_result["missing_points"] = llm_result.get("missing_points") or local_missing
             llm_result["unsupported_points"] = llm_result.get("unsupported_points") or local_unsupported
+            answer_l = (user_answer or "").lower()
+            for phrase in self.DANGEROUS_OUT_OF_BACK_PHRASES:
+                if phrase in answer_l and phrase not in (back or "").lower():
+                    llm_result["unsupported_points"] = (llm_result.get("unsupported_points") or []) + [
+                        f"«{phrase}» — не точная формулировка карточки"
+                    ]
             if local_unsupported and not llm_result.get("error_explanation"):
                 llm_result["error_explanation"] = (
                     f"Вы правильно упомянули: {', '.join(local_matched[:3])}. "
                     f"Но фраза «{local_unsupported[0]}» не указана в карточке."
                 )
+            llm_result["unsupported_points"] = [str(x).strip() for x in (llm_result.get("unsupported_points") or []) if str(x).strip()][:8]
             return llm_result
 
         LOGGER.info("LLM недоступна, используется fallback-проверка.")
