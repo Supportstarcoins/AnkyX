@@ -86,8 +86,11 @@ class AIReviewPanel(ttk.Frame):
         self.progress.stop()
         self.last_grade_result = result
         grade = result.get("grade", "unknown")
+        answer_time_ms = int(result.get("answer_time_ms") or 0)
         msg = (
-            f"Оценка: {grade} | score={result.get('score')}\n"
+            f"Оценка: {grade}\n"
+            f"Балл: {result.get('score')}\n"
+            f"Время ответа: {answer_time_ms} мс ({result.get('answer_time_quality')})\n"
             f"Объяснение ошибки: {result.get('error_explanation') or result.get('short_feedback')}\n"
             f"Аналогия: {result.get('analogy')}\n"
             f"Уточняющий вопрос: {result.get('follow_up_question')}\n"
