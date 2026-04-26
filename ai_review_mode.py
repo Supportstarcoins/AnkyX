@@ -129,7 +129,29 @@ class AIReviewPanel(ttk.Frame):
         if not follow_up_answer:
             self.status_var.set("Введите ответ на уточняющий вопрос")
             return
-        self._append("Вы на уточняющий вопрос", follow_up_answer)
+        is_clarification_request = self._is_clarification_request(follow_up_answer)
+        self._append("Вы", follow_up_answer) if is_clarification_request else self._append(
+            "Вы на уточняющий вопрос", follow_up_answer
+        )
+        if is_clarification_request:
+            hint = self.controller.grader.explain_follow_up_hint(
+                self.current_card,
+                self.last_user_answer,
+                self.last_follow_up_question,
+                previous_grade_result=self.last_grade_result,
+            )
+            msg = (
+                f"{hint.get('short_explanation')}\n"
+                f"Что добавить: {hint.get('missing_detail')}\n"
+                f"Пример: {hint.get('example_answer')}\n"
+                f"{hint.get('next_prompt')}\n"
+            )
+            self._append("AI-подсказка", msg)
+            self.answer_input.delete("1.0", tk.END)
+            self.awaiting_follow_up = True
+            self.submit_btn.configure(text="Ответить на уточняющий вопрос")
+            self.status_var.set("Подсказка показана — попробуйте ответить на уточняющий вопрос")
+            return
         result = self.controller.grader.grade_follow_up_answer(
             self.current_card,
             self.last_user_answer,
@@ -156,6 +178,49 @@ class AIReviewPanel(ttk.Frame):
             self.last_follow_up_question = ""
             self.submit_btn.configure(text="Проверить ответ")
             self.status_var.set("Уточнение обработано")
+
+    def _is_clarification_request(self, text: str) -> bool:
+        raw = (text or "").strip().lower()
+        if not raw:
+            return False
+        normalized = " ".join(raw.split())
+        normalized = normalized.replace("ё", "е")
+        normalized = normalized.rstrip("?.!,:;")
+        normalized = " ".join(normalized.split())
+
+        patterns = {
+            "какую",
+            "какой",
+            "что именно",
+            "не понял",
+            "подскажи",
+            "обьясни",
+            "объясни",
+            "как ответить",
+            "какая деталь",
+            "какую деталь",
+            "поясни",
+            "можно подсказку",
+        }
+        if normalized in patterns:
+            return True
+
+        if len(normalized.split()) <= 5:
+            starters = (
+                "какую",
+                "какой",
+                "какая",
+                "что именно",
+                "не понял",
+                "подскажи",
+                "обьясни",
+                "объясни",
+                "как ответить",
+                "поясни",
+                "можно подсказку",
+            )
+            return any(normalized.startswith(prefix) for prefix in starters)
+        return False
 
     def show_correct_answer(self):
         if not self.current_card:

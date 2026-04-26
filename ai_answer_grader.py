@@ -259,6 +259,49 @@ class AIAnswerGrader:
             "follow_up_complete": follow_up_complete,
         }
 
+    def explain_follow_up_hint(
+        self,
+        card,
+        original_answer,
+        follow_up_question,
+        previous_grade_result=None,
+    ):
+        _ = follow_up_question
+        back = ((card or {}).get("back") or (card or {}).get("answer") or "").strip()
+        previous = previous_grade_result or {}
+        missing_points = previous.get("missing_points") or []
+        raw_error = (previous.get("error_explanation") or "").strip()
+
+        if missing_points:
+            missing_detail = "Добавьте смысловые опоры: " + ", ".join(missing_points[:4]) + "."
+        elif raw_error:
+            missing_detail = raw_error
+        elif back:
+            missing_detail = self._make_missing_explanation(back, sorted(list(self._keywords(back)))[:5])
+        else:
+            missing_detail = "Добавьте одну конкретную деталь из правильного ответа."
+
+        short_explanation = (
+            "Нужно добавить недостающую ключевую деталь, а не просто перефразировать предыдущий ответ."
+        )
+        if raw_error:
+            short_explanation = "Нужно уточнить ключевую мысль, которой не хватило в ответе."
+
+        example_source = back if back else missing_detail
+        example_answer = re.sub(r"\s+", " ", example_source).strip()
+        if len(example_answer) > 180:
+            example_answer = example_answer[:177].rstrip() + "..."
+        if not example_answer:
+            example_answer = "Добавьте ключевую деталь короткой фразой."
+
+        return {
+            "type": "hint",
+            "short_explanation": short_explanation,
+            "missing_detail": missing_detail,
+            "example_answer": example_answer,
+            "next_prompt": "Попробуйте теперь ответить одной короткой фразой.",
+        }
+
     def _result(self, grade, score, answer_time_quality, mistake_type):
         return {
             "grade": grade,
