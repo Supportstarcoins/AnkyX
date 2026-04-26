@@ -16,6 +16,127 @@ try:
 except Exception:
     ChatBotTab = None
 
+class BlackOutlineScrollbar(tk.Canvas):
+    """Canvas-based vertical scrollbar with a black thumb and white outline.
+
+    This version maps the thumb position to Canvas.yview_moveto correctly in
+    both directions. It also supports page jumps when the user clicks above or
+    below the thumb.
+    """
+
+    def __init__(self, master, command=None, width: int = 18, **kwargs) -> None:
+        super().__init__(
+            master,
+            width=width,
+            highlightthickness=1,
+            highlightbackground="#ffffff",
+            highlightcolor="#ffffff",
+            bd=0,
+            bg="#050505",
+            cursor="hand2",
+            **kwargs,
+        )
+        self.command = command
+        self._first = 0.0
+        self._last = 1.0
+        self._drag_offset = 0
+        self._is_dragging = False
+        self._thumb_id = self.create_rectangle(
+            3,
+            3,
+            width - 4,
+            48,
+            fill="#050505",
+            outline="#ffffff",
+            width=1,
+        )
+        self.bind("<Configure>", lambda _event: self._redraw())
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<MouseWheel>", self._on_wheel)
+        self.bind("<Button-4>", self._on_wheel)
+        self.bind("<Button-5>", self._on_wheel)
+
+    def set(self, first, last) -> None:
+        try:
+            self._first = max(0.0, min(1.0, float(first)))
+            self._last = max(self._first, min(1.0, float(last)))
+        except Exception:
+            self._first, self._last = 0.0, 1.0
+        self._redraw()
+
+    def _visible_fraction(self) -> float:
+        return max(0.0, min(1.0, self._last - self._first))
+
+    def _max_first(self) -> float:
+        return max(0.0, 1.0 - self._visible_fraction())
+
+    def _track_height(self) -> int:
+        return max(1, int(self.winfo_height()) - 8)
+
+    def _thumb_bounds(self) -> tuple[int, int]:
+        track_h = self._track_height()
+        visible = self._visible_fraction()
+        if visible >= 0.999:
+            return 4, max(40, int(self.winfo_height()) - 4)
+        thumb_h = max(42, int(track_h * max(0.05, visible)))
+        thumb_h = min(track_h, thumb_h)
+        usable = max(1, track_h - thumb_h)
+        ratio = self._first / max(0.0001, self._max_first())
+        y1 = 4 + int(usable * ratio)
+        y1 = max(4, min(4 + usable, y1))
+        return y1, y1 + thumb_h
+
+    def _redraw(self) -> None:
+        w = max(10, int(self.winfo_width()))
+        h = max(10, int(self.winfo_height()))
+        self.configure(bg="#050505")
+        y1, y2 = self._thumb_bounds()
+        self.coords(self._thumb_id, 3, y1, w - 4, min(h - 4, y2))
+        self.itemconfigure(self._thumb_id, fill="#050505", outline="#ffffff", width=1)
+
+    def _moveto_from_y(self, y: int) -> None:
+        if not self.command:
+            return
+        y1, y2 = self._thumb_bounds()
+        thumb_h = max(1, y2 - y1)
+        track_h = self._track_height()
+        usable = max(1, track_h - thumb_h)
+        ratio = max(0.0, min(1.0, (y - 4 - self._drag_offset) / usable))
+        target_first = ratio * self._max_first()
+        self.command("moveto", target_first)
+
+    def _on_click(self, event) -> str:
+        y1, y2 = self._thumb_bounds()
+        if y1 <= event.y <= y2:
+            self._is_dragging = True
+            self._drag_offset = event.y - y1
+            return "break"
+        # Click on the track: page up/down. This makes it easy to move back.
+        if self.command:
+            self.command("scroll", -1 if event.y < y1 else 1, "pages")
+        return "break"
+
+    def _on_drag(self, event) -> str:
+        if self._is_dragging:
+            self._moveto_from_y(event.y)
+        return "break"
+
+    def _on_release(self, _event) -> str:
+        self._is_dragging = False
+        self._drag_offset = 0
+        return "break"
+
+    def _on_wheel(self, event) -> str:
+        if not self.command:
+            return "break"
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            self.command("scroll", -4, "units")
+        else:
+            self.command("scroll", 4, "units")
+        return "break"
+
 
 class AIAddCardWorkspace(tk.Toplevel):
     def __init__(self, app: tk.Misc) -> None:
@@ -36,9 +157,10 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.auto_generate_image_after_card = False
         self._busy = False
         self._last_chat_answer = ""
+        self._max_rag_chars = 30000
+        self._text_context_menu = None
 
-        root = ttk.Frame(self, padding=10)
-        root.pack(fill=tk.BOTH, expand=True)
+        root = self._create_scrollable_root()
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -47,11 +169,245 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.notebook.add(workspace_tab, text="AI Workspace")
         self._build_workspace_tab(workspace_tab)
         self._build_advanced_chat_tab()
+        self.bind("<FocusIn>", self._sync_deck_selector_from_app, add="+")
+
+
+    def _create_scrollable_root(self) -> ttk.Frame:
+        shell = ttk.Frame(self)
+        shell.pack(fill=tk.BOTH, expand=True)
+
+        self._scroll_canvas = tk.Canvas(
+            shell,
+            bg="#0b0f19",
+            highlightthickness=0,
+            bd=0,
+            yscrollincrement=24,
+        )
+        self._scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._workspace_scrollbar = BlackOutlineScrollbar(
+            shell,
+            command=self._scroll_canvas.yview,
+            width=18,
+        )
+        self._workspace_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(4, 6), pady=6)
+        self._scroll_canvas.configure(yscrollcommand=self._workspace_scrollbar.set)
+
+        root = ttk.Frame(self._scroll_canvas, padding=10)
+        self._scroll_window = self._scroll_canvas.create_window((0, 0), window=root, anchor="nw")
+
+        root.bind("<Configure>", self._update_scroll_region)
+        self._scroll_canvas.bind("<Configure>", self._on_scroll_canvas_configure)
+
+        # Bind the wheel to the whole AI window while the cursor is inside it.
+        # This fixes the case when wheel scrolling down works, but scrolling back
+        # up is swallowed by inner Text/Listbox widgets.
+        self._mousewheel_active = False
+        shell.bind("<Enter>", self._activate_workspace_mousewheel, add="+")
+        shell.bind("<Leave>", self._deactivate_workspace_mousewheel, add="+")
+        self.bind("<Prior>", lambda _e: (self._scroll_canvas.yview_scroll(-1, "pages"), "break"))
+        self.bind("<Next>", lambda _e: (self._scroll_canvas.yview_scroll(1, "pages"), "break"))
+        self.bind("<Home>", lambda _e: (self._scroll_canvas.yview_moveto(0), "break"))
+        self.bind("<End>", lambda _e: (self._scroll_canvas.yview_moveto(1), "break"))
+        return root
+
+    def _update_scroll_region(self, _event=None) -> None:
+        try:
+            self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+            if hasattr(self, "_workspace_scrollbar"):
+                self._workspace_scrollbar.set(*self._scroll_canvas.yview())
+        except Exception:
+            logging.exception("AI workspace scrollregion update failed")
+
+    def _on_scroll_canvas_configure(self, event) -> None:
+        try:
+            self._scroll_canvas.itemconfigure(self._scroll_window, width=event.width)
+            self._update_scroll_region()
+        except Exception:
+            logging.exception("AI workspace canvas resize failed")
+
+    def _activate_workspace_mousewheel(self, _event=None) -> None:
+        if getattr(self, "_mousewheel_active", False):
+            return
+        self._mousewheel_active = True
+        self.bind_all("<MouseWheel>", self._on_workspace_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_workspace_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_workspace_mousewheel, add="+")
+
+    def _deactivate_workspace_mousewheel(self, _event=None) -> None:
+        if not getattr(self, "_mousewheel_active", False):
+            return
+        self._mousewheel_active = False
+        try:
+            self.unbind_all("<MouseWheel>")
+            self.unbind_all("<Button-4>")
+            self.unbind_all("<Button-5>")
+        except Exception:
+            pass
+
+    def _on_workspace_mousewheel(self, event) -> str:
+        try:
+            if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                units = -4
+            else:
+                units = 4
+            self._scroll_canvas.yview_scroll(units, "units")
+            if hasattr(self, "_workspace_scrollbar"):
+                self._workspace_scrollbar.set(*self._scroll_canvas.yview())
+        except Exception:
+            logging.exception("AI workspace mousewheel scroll failed")
+        return "break"
+
+    def _deck_row_value(self, row, key: str, index: int = 0, default=None):
+        try:
+            if isinstance(row, dict):
+                return row.get(key, default)
+            return row[key]
+        except Exception:
+            try:
+                return row[index]
+            except Exception:
+                return default
+
+    def _load_deck_options(self) -> list[tuple[int, str]]:
+        """Return [(deck_id, deck_name), ...] from the main window state.
+
+        The workspace intentionally does not import main.py to avoid circular
+        imports. It mirrors the already loaded deck list from app.decks.
+        """
+        options: list[tuple[int, str]] = []
+        for row in getattr(self.app, "decks", []) or []:
+            deck_id = self._deck_row_value(row, "id", 0)
+            name = self._deck_row_value(row, "name", 1, "")
+            try:
+                deck_id = int(deck_id)
+            except Exception:
+                continue
+            name = str(name or f"Колода {deck_id}").strip() or f"Колода {deck_id}"
+            options.append((deck_id, name))
+        return options
+
+    def _deck_label(self, deck_id: int, name: str) -> str:
+        return f"{deck_id}: {name}"
+
+    def _deck_id_from_label(self, label: str) -> int | None:
+        try:
+            value = (label or "").split(":", 1)[0].strip()
+            return int(value) if value else None
+        except Exception:
+            return None
+
+    def _build_deck_selector(self, parent: ttk.Frame) -> None:
+        deck_wrap = ttk.LabelFrame(parent, text="Колода для сохранения", padding=8)
+        deck_wrap.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        deck_wrap.columnconfigure(1, weight=1)
+
+        ttk.Label(deck_wrap, text="Колода:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.deck_var = tk.StringVar()
+        self.deck_combo = ttk.Combobox(deck_wrap, textvariable=self.deck_var, state="readonly")
+        self.deck_combo.grid(row=0, column=1, sticky="ew")
+        self.deck_combo.bind("<<ComboboxSelected>>", self._on_deck_selected)
+        ttk.Button(deck_wrap, text="↻", width=3, command=self.refresh_deck_selector).grid(row=0, column=2, padx=(6, 0))
+
+        self.deck_status_var = tk.StringVar(value="")
+        ttk.Label(deck_wrap, textvariable=self.deck_status_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.refresh_deck_selector(sync_from_app=True)
+
+    def refresh_deck_selector(self, sync_from_app: bool = True) -> None:
+        self.deck_options = self._load_deck_options()
+        labels = [self._deck_label(deck_id, name) for deck_id, name in self.deck_options]
+        if hasattr(self, "deck_combo"):
+            self.deck_combo.configure(values=labels)
+
+        target_id = getattr(self.app, "selected_deck_id", None) if sync_from_app else self.deck_id
+        if target_id is None and self.deck_id is not None:
+            target_id = self.deck_id
+
+        selected_label = ""
+        for deck_id, name in self.deck_options:
+            if int(deck_id) == target_id:
+                selected_label = self._deck_label(deck_id, name)
+                break
+
+        if not selected_label and self.deck_options:
+            deck_id, name = self.deck_options[0]
+            selected_label = self._deck_label(deck_id, name)
+            if target_id is None:
+                target_id = deck_id
+
+        if hasattr(self, "deck_var"):
+            self.deck_var.set(selected_label)
+        self._set_active_deck(target_id, update_main=False)
+
+    def _set_active_deck(self, deck_id: int | None, update_main: bool = True) -> None:
+        self.deck_id = deck_id
+        try:
+            self.pipeline.deck_id = deck_id
+        except Exception:
+            pass
+
+        if update_main:
+            try:
+                self.app.selected_deck_id = deck_id
+                if hasattr(self.app, "selected_phase"):
+                    self.app.selected_phase = None
+                self._select_deck_in_main_tree(deck_id)
+                if hasattr(self.app, "load_templates_for_selected_deck"):
+                    self.app.load_templates_for_selected_deck()
+                if hasattr(self.app, "update_deck_preview"):
+                    self.app.update_deck_preview()
+                if hasattr(self.app, "update_overdue_badge"):
+                    self.app.update_overdue_badge()
+            except Exception:
+                logging.exception("AI workspace deck sync with main window failed")
+
+        if hasattr(self, "deck_status_var"):
+            if deck_id is None:
+                self.deck_status_var.set("Колода не выбрана. Карточки нельзя будет сохранить в ознакомление.")
+            else:
+                name = next((name for did, name in getattr(self, "deck_options", []) if did == deck_id), "")
+                self.deck_status_var.set(f"Активная колода: {name or deck_id}")
+
+    def _on_deck_selected(self, _event=None) -> None:
+        deck_id = self._deck_id_from_label(self.deck_var.get() if hasattr(self, "deck_var") else "")
+        self._set_active_deck(deck_id, update_main=True)
+        self.status_var.set(f"Выбрана колода: {deck_id if deck_id is not None else '—'}")
+
+    def _sync_deck_selector_from_app(self, _event=None) -> None:
+        app_deck_id = getattr(self.app, "selected_deck_id", None)
+        if app_deck_id == self.deck_id:
+            return
+        self.refresh_deck_selector(sync_from_app=True)
+
+    def _select_deck_in_main_tree(self, deck_id: int | None) -> None:
+        tree = getattr(self.app, "decks_tree", None)
+        deck_items = getattr(self.app, "deck_items", {}) or {}
+        if tree is None or deck_id is None:
+            return
+        try:
+            for item_id, pair in deck_items.items():
+                try:
+                    item_deck_id, phase = pair
+                except Exception:
+                    continue
+                if item_deck_id == deck_id and phase is None:
+                    tree.selection_set(item_id)
+                    tree.see(item_id)
+                    break
+        except Exception:
+            logging.exception("AI workspace main deck tree selection failed")
+
+    def _get_selected_deck_id(self) -> int | None:
+        deck_id = self._deck_id_from_label(self.deck_var.get() if hasattr(self, "deck_var") else "")
+        if deck_id is None:
+            deck_id = self.deck_id or getattr(self.app, "selected_deck_id", None)
+        self._set_active_deck(deck_id, update_main=False)
+        return deck_id
 
     def _build_workspace_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=3)
         parent.columnconfigure(1, weight=2)
-        parent.rowconfigure(4, weight=1)
+        parent.rowconfigure(5, weight=1)
 
         preview_wrap = ttk.LabelFrame(parent, text="Предпросмотр карточки", padding=8)
         preview_wrap.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
@@ -63,15 +419,41 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.preview = CardPreviewWidget(preview_wrap)
         self.preview.grid(row=0, column=0, sticky="nsew")
 
-        source_wrap = ttk.LabelFrame(parent, text="Источник / промт", padding=8)
-        source_wrap.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        source_wrap.columnconfigure(0, weight=1)
+        self._build_deck_selector(parent)
 
-        self.prompt_text = tk.Text(source_wrap, height=7, wrap=tk.WORD)
-        self.prompt_text.grid(row=0, column=0, sticky="ew")
+        source_wrap = ttk.LabelFrame(parent, text="Источник / промт", padding=8)
+        source_wrap.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        source_wrap.columnconfigure(0, weight=1)
+        source_wrap.rowconfigure(0, weight=1)
+
+        self.prompt_text = tk.Text(
+            source_wrap,
+            height=7,
+            wrap=tk.WORD,
+            bg="#0f1420",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            selectbackground="#2b5f9e",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#6b7280",
+            highlightcolor="#ffffff",
+        )
+        self.prompt_text.grid(row=0, column=0, sticky="nsew")
+        self.prompt_scrollbar = BlackOutlineScrollbar(
+            source_wrap,
+            command=self.prompt_text.yview,
+            width=16,
+        )
+        self.prompt_scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.prompt_text.configure(yscrollcommand=self.prompt_scrollbar.set)
+        self.prompt_text.bind("<MouseWheel>", self._on_prompt_text_mousewheel, add="+")
+        self.prompt_text.bind("<Button-4>", self._on_prompt_text_mousewheel, add="+")
+        self.prompt_text.bind("<Button-5>", self._on_prompt_text_mousewheel, add="+")
+        self._install_text_edit_bindings(self.prompt_text)
 
         actions_wrap = ttk.LabelFrame(parent, text="Действия", padding=8)
-        actions_wrap.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        actions_wrap.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         for col in range(5):
             actions_wrap.columnconfigure(col, weight=1)
 
@@ -87,7 +469,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         ttk.Button(actions_wrap, text="Отмена", command=self.destroy).grid(row=1, column=4, sticky="ew", padx=3, pady=3)
 
         status_row = ttk.Frame(parent)
-        status_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        status_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         status_row.columnconfigure(1, weight=1)
         self.status_var = tk.StringVar(value="Готово")
         ttk.Label(status_row, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
@@ -95,7 +477,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.progress.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
         cards_wrap = ttk.LabelFrame(parent, text="Сгенерированные карточки", padding=8)
-        cards_wrap.grid(row=4, column=0, sticky="nsew", padx=(0, 6))
+        cards_wrap.grid(row=5, column=0, sticky="nsew", padx=(0, 6))
         cards_wrap.columnconfigure(0, weight=1)
         cards_wrap.rowconfigure(2, weight=1)
 
@@ -107,9 +489,35 @@ class AIAddCardWorkspace(tk.Toplevel):
         ttk.Label(nav_row, textvariable=self.cards_counter_var).grid(row=0, column=1, sticky="w")
         ttk.Button(nav_row, text="→", width=4, command=self.next_card).grid(row=0, column=2, padx=(6, 0))
 
-        self.cards_listbox = tk.Listbox(cards_wrap, height=6, exportselection=False)
-        self.cards_listbox.grid(row=1, column=0, sticky="ew", pady=(6, 6))
+        cards_list_row = ttk.Frame(cards_wrap)
+        cards_list_row.grid(row=1, column=0, sticky="ew", pady=(6, 6))
+        cards_list_row.columnconfigure(0, weight=1)
+
+        self.cards_listbox = tk.Listbox(
+            cards_list_row,
+            height=7,
+            exportselection=False,
+            bg="#0f1420",
+            fg="#ffffff",
+            selectbackground="#0b79d0",
+            selectforeground="#ffffff",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#ffffff",
+            highlightcolor="#ffffff",
+        )
+        self.cards_listbox.grid(row=0, column=0, sticky="ew")
+        self.cards_list_scrollbar = BlackOutlineScrollbar(
+            cards_list_row,
+            command=self.cards_listbox.yview,
+            width=16,
+        )
+        self.cards_list_scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.cards_listbox.configure(yscrollcommand=self.cards_list_scrollbar.set)
         self.cards_listbox.bind("<<ListboxSelect>>", self._on_card_select)
+        self.cards_listbox.bind("<MouseWheel>", self._on_cards_listbox_mousewheel, add="+")
+        self.cards_listbox.bind("<Button-4>", self._on_cards_listbox_mousewheel, add="+")
+        self.cards_listbox.bind("<Button-5>", self._on_cards_listbox_mousewheel, add="+")
 
         details = ttk.Frame(cards_wrap)
         details.grid(row=2, column=0, sticky="nsew")
@@ -118,10 +526,12 @@ class AIAddCardWorkspace(tk.Toplevel):
         ttk.Label(details, text="Текущий вопрос:").grid(row=0, column=0, sticky="w")
         self.current_front_text = tk.Text(details, height=3, wrap=tk.WORD)
         self.current_front_text.grid(row=1, column=0, sticky="ew")
+        self._install_text_edit_bindings(self.current_front_text)
 
         ttk.Label(details, text="Текущий ответ:").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.current_back_text = tk.Text(details, height=4, wrap=tk.WORD)
         self.current_back_text.grid(row=3, column=0, sticky="ew")
+        self._install_text_edit_bindings(self.current_back_text)
 
         action_row = ttk.Frame(details)
         action_row.grid(row=4, column=0, sticky="e", pady=(6, 0))
@@ -129,20 +539,102 @@ class AIAddCardWorkspace(tk.Toplevel):
         ttk.Button(action_row, text="Сохранить все", command=self.save_all_cards_to_overview).pack(side=tk.RIGHT, padx=(0, 6))
 
         chat_wrap = ttk.LabelFrame(parent, text="Компактный чат", padding=8)
-        chat_wrap.grid(row=4, column=1, sticky="nsew")
+        chat_wrap.grid(row=5, column=1, sticky="nsew")
         chat_wrap.columnconfigure(0, weight=1)
         chat_wrap.rowconfigure(0, weight=1)
 
         self.chat_history = tk.Text(chat_wrap, height=12, wrap=tk.WORD, state=tk.DISABLED)
         self.chat_history.grid(row=0, column=0, sticky="nsew")
+        self._install_text_edit_bindings(self.chat_history, read_only=True)
 
         chat_input_row = ttk.Frame(chat_wrap)
         chat_input_row.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         chat_input_row.columnconfigure(0, weight=1)
         self.chat_input = tk.Text(chat_input_row, height=3, wrap=tk.WORD)
         self.chat_input.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._install_text_edit_bindings(self.chat_input)
         ttk.Button(chat_input_row, text="Отправить", command=self._chat_send).grid(row=0, column=1, sticky="ns")
         ttk.Button(chat_wrap, text="Использовать ответ как источник", command=self._use_chat_answer_as_source).grid(row=2, column=0, sticky="e", pady=(6, 0))
+
+    def _install_text_edit_bindings(self, widget: tk.Text, read_only: bool = False) -> None:
+        """Add predictable Ctrl+C/Ctrl+V and right-click menu to Tk Text widgets.
+
+        Some custom mousewheel/global bindings can make normal text editing feel
+        inconsistent on Windows. These bindings keep copy/paste/select-all
+        available in the prompt, generated-card fields and compact chat.
+        """
+        try:
+            widget.bind("<Control-c>", lambda e, w=widget: self._text_copy(w), add="+")
+            widget.bind("<Control-C>", lambda e, w=widget: self._text_copy(w), add="+")
+            widget.bind("<Control-a>", lambda e, w=widget: self._text_select_all(w), add="+")
+            widget.bind("<Control-A>", lambda e, w=widget: self._text_select_all(w), add="+")
+            if not read_only:
+                widget.bind("<Control-v>", lambda e, w=widget: self._text_paste(w), add="+")
+                widget.bind("<Control-V>", lambda e, w=widget: self._text_paste(w), add="+")
+                widget.bind("<Control-x>", lambda e, w=widget: self._text_cut(w), add="+")
+                widget.bind("<Control-X>", lambda e, w=widget: self._text_cut(w), add="+")
+            widget.bind("<Button-3>", lambda e, w=widget, ro=read_only: self._show_text_context_menu(e, w, ro), add="+")
+        except Exception:
+            logging.exception("Text edit bindings install failed")
+
+    def _text_copy(self, widget: tk.Text) -> str:
+        try:
+            text = widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except Exception:
+            pass
+        return "break"
+
+    def _text_cut(self, widget: tk.Text) -> str:
+        try:
+            text = widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        except Exception:
+            pass
+        return "break"
+
+    def _text_paste(self, widget: tk.Text) -> str:
+        try:
+            text = self.clipboard_get()
+            try:
+                widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            except Exception:
+                pass
+            widget.insert(tk.INSERT, text)
+        except Exception:
+            pass
+        return "break"
+
+    def _text_select_all(self, widget: tk.Text) -> str:
+        try:
+            widget.tag_add(tk.SEL, "1.0", tk.END)
+            widget.mark_set(tk.INSERT, "1.0")
+            widget.see(tk.INSERT)
+        except Exception:
+            pass
+        return "break"
+
+    def _show_text_context_menu(self, event, widget: tk.Text, read_only: bool = False) -> str:
+        try:
+            menu = tk.Menu(self, tearoff=0, bg="#050505", fg="#ffffff", activebackground="#1f2937", activeforeground="#ffffff")
+            menu.add_command(label="Копировать", command=lambda: self._text_copy(widget))
+            if not read_only:
+                menu.add_command(label="Вырезать", command=lambda: self._text_cut(widget))
+                menu.add_command(label="Вставить", command=lambda: self._text_paste(widget))
+            menu.add_separator()
+            menu.add_command(label="Выделить всё", command=lambda: self._text_select_all(widget))
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            logging.exception("Text context menu failed")
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+        return "break"
 
     def _build_advanced_chat_tab(self) -> None:
         advanced_chat_tab = ttk.Frame(self.notebook, padding=6)
@@ -213,18 +705,87 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.prompt_text.insert("1.0", text[:12000])
         self.status_var.set("Текст извлечён")
 
+    def _on_cards_listbox_mousewheel(self, event) -> str:
+        try:
+            if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                units = -3
+            else:
+                units = 3
+            self.cards_listbox.yview_scroll(units, "units")
+            if hasattr(self, "cards_list_scrollbar"):
+                self.cards_list_scrollbar.set(*self.cards_listbox.yview())
+        except Exception:
+            logging.exception("Cards listbox mousewheel scroll failed")
+        return "break"
+
+    def _on_prompt_text_mousewheel(self, event) -> str:
+        """Scroll only the source/prompt text box when the cursor is over it."""
+        try:
+            if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                self.prompt_text.yview_scroll(-3, "units")
+            else:
+                self.prompt_text.yview_scroll(3, "units")
+            if hasattr(self, "prompt_scrollbar"):
+                self.prompt_scrollbar.set(*self.prompt_text.yview())
+        except Exception:
+            logging.exception("Prompt text mousewheel scroll failed")
+        return "break"
+
+    def _get_source_query_text(self) -> str:
+        try:
+            return self.prompt_text.get(tk.SEL_FIRST, tk.SEL_LAST).strip()
+        except Exception:
+            return self.prompt_text.get("1.0", "end-1c").strip()
+
+    def _normalize_web_query(self, raw: str) -> str:
+        """Turn a long prompt/source dump into a usable web search query."""
+        text = (raw or "").strip()
+        text = re.sub(r"https?://\S+", " ", text)
+        text = re.sub(r"(?i)\b(сгенерируй|создай)\s+карточк[ауи]\b", " ", text)
+        text = re.sub(r"(?i)\b(с\s+картинкой|с\s+изображением|нарисуй|найди материалы|про)\b", " ", text)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines:
+            # Prefer a short human-readable line over a pasted article/search dump.
+            short_lines = [line for line in lines if 5 <= len(line) <= 180]
+            text = short_lines[0] if short_lines else " ".join(lines[:2])
+        text = re.sub(r"\s+", " ", text).strip(" :-,.;")
+        return text[:240]
+
     def _search_web(self) -> None:
-        query = self.prompt_text.get("1.0", "end-1c").strip()
+        query = self._normalize_web_query(self._get_source_query_text())
         if not query:
-            messagebox.showwarning("Поиск", "Введите тему или вопрос", parent=self)
+            messagebox.showwarning("Поиск", "Введите короткую тему или выделите текст для поиска", parent=self)
             return
-        self.status_var.set("Ищу материалы...")
-        self.run_in_background(lambda: self.web_search.search_and_extract(query), on_success=self._on_web_text)
+        self.status_var.set(f"Ищу материалы: {query[:80]}")
+        self.run_in_background(
+            lambda: self.web_search.search_and_extract(query),
+            on_success=self._on_web_text,
+            on_error=self._on_web_error,
+        )
 
     def _on_web_text(self, text: str) -> None:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            self.status_var.set("RAG не вернул текст. Уточните запрос.")
+            return
         self.prompt_text.delete("1.0", tk.END)
-        self.prompt_text.insert("1.0", text[:12000])
-        self.status_var.set("Материалы получены")
+        self.prompt_text.insert("1.0", cleaned[: self._max_rag_chars])
+        self.status_var.set(f"Материалы получены: {len(cleaned)} символов; вставлено {min(len(cleaned), self._max_rag_chars)}")
+
+    def _on_web_error(self, exc: Exception) -> None:
+        logging.exception("AI workspace RAG search failed")
+        self.status_var.set("RAG-поиск не сработал")
+        try:
+            messagebox.showerror(
+                "RAG-поиск",
+                "Не удалось получить материалы из интернета.\n\n"
+                f"Причина: {exc}\n\n"
+                "Проверьте интернет, rag_web_search.py и не отправляйте в поиск слишком длинный текст.\n"
+                "Лучше выделите короткую тему и нажмите 🔍.",
+                parent=self,
+            )
+        except Exception:
+            pass
 
     def generate_cards_from_input(self) -> None:
         text = self.prompt_text.get("1.0", "end-1c").strip()
@@ -305,10 +866,119 @@ class AIAddCardWorkspace(tk.Toplevel):
             card = dict(self.generated_cards[idx])
             if not card.get("image_prompt"):
                 card["image_prompt"] = self.pipeline.generate_image_prompt(card)
-            return self.pipeline.generate_card_image(card)
+            return self._generate_card_image_with_diagnostics(card)
 
         self.status_var.set("Генерирую изображение...")
-        self.run_in_background(worker, on_success=self._on_image_generated)
+        self.run_in_background(worker, on_success=self._on_image_generated, on_error=self._on_image_error)
+
+    def _get_app_setting(self, *names, default=None):
+        for name in names:
+            for owner in (self.app, getattr(self.app, "settings", None), getattr(self.app, "llm_settings", None)):
+                if owner is None:
+                    continue
+                try:
+                    if isinstance(owner, dict) and name in owner:
+                        value = owner.get(name)
+                    elif hasattr(owner, name):
+                        value = getattr(owner, name)
+                    else:
+                        continue
+                    if hasattr(value, "get") and callable(value.get):
+                        value = value.get()
+                    if value not in (None, ""):
+                        return value
+                except Exception:
+                    continue
+        return default
+
+    def _normalize_sd_model_name(self, model: str | None) -> str:
+        model = (model or "sd_xl_base_1.0.safetensors").strip()
+        # Common typo from the settings field: .safetenso -> .safetensors
+        if model.endswith(".safetenso"):
+            model += "rs"
+        return model
+
+    def _generate_card_image_with_diagnostics(self, card: dict) -> dict:
+        """Generate an image and keep a useful status in card['metadata'].
+
+        First use the normal pipeline. If it only returns a placeholder/no image,
+        try a direct SDXLProvider call with the URL/model from settings or sane
+        defaults. This makes the AI workspace behave like the old manual editor.
+        """
+        metadata = dict(card.get("metadata") or {})
+        try:
+            result = self.pipeline.generate_card_image(dict(card))
+            if result and result.get("image_path"):
+                return result
+            if result:
+                card = result
+                metadata = dict(card.get("metadata") or {})
+        except Exception as exc:
+            metadata["image_status"] = f"Pipeline SD ошибка: {exc}"
+            card["metadata"] = metadata
+
+        prompt = (card.get("image_prompt") or card.get("back") or card.get("front") or "").strip()
+        if not prompt:
+            metadata["image_status"] = "Нет image_prompt для Stable Diffusion"
+            card["metadata"] = metadata
+            return card
+
+        try:
+            from sdxl_provider import SDXLProvider  # type: ignore
+        except Exception as exc:
+            metadata["image_status"] = (
+                "Stable Diffusion недоступен: sdxl_provider.py не найден или не импортируется. "
+                f"{exc}"
+            )
+            card["metadata"] = metadata
+            return card
+
+        sd_url = self._get_app_setting(
+            "sd_api_url",
+            "sd_url",
+            "stable_diffusion_url",
+            "stable_diffusion_api_url",
+            default="http://127.0.0.1:7860",
+        )
+        sd_model = self._normalize_sd_model_name(
+            self._get_app_setting(
+                "sd_model",
+                "sd_checkpoint",
+                "sd_model_checkpoint",
+                "stable_diffusion_model",
+                default="sd_xl_base_1.0.safetensors",
+            )
+        )
+        negative = card.get("negative_prompt") or "text, watermark, logo, blurry, low quality, bad anatomy, extra letters"
+
+        try:
+            provider = SDXLProvider(str(sd_url))
+            try:
+                provider.ensure_model(sd_model)
+            except Exception as exc:
+                # Continue: some providers can generate with the already selected model.
+                metadata["sd_model_warning"] = f"Не удалось переключить модель {sd_model}: {exc}"
+            path = provider.txt2img(
+                prompt=prompt,
+                negative_prompt=negative,
+                width=1024,
+                height=1024,
+                steps=28,
+                cfg=7,
+                sampler="Euler a",
+                seed=None,
+            )
+            card["image_path"] = path
+            metadata["image_status"] = f"SD: изображение создано ({os.path.basename(path)})"
+            metadata["sd_url"] = str(sd_url)
+            metadata["sd_model"] = sd_model
+        except Exception as exc:
+            metadata["image_status"] = (
+                "Stable Diffusion не сработал. Проверьте, что AUTOMATIC1111 запущен с --api, "
+                f"URL={sd_url}, модель={sd_model}. Ошибка: {exc}"
+            )
+        card["metadata"] = metadata
+        return card
 
     def _on_image_generated(self, card) -> None:
         if self.generated_cards:
@@ -317,11 +987,29 @@ class AIAddCardWorkspace(tk.Toplevel):
         status = ((card.get("metadata") or {}).get("image_status") or "").strip()
         self.status_var.set(status or "Генерация изображения завершена")
 
+    def _on_image_error(self, exc: Exception) -> None:
+        logging.exception("AI workspace image generation failed")
+        self.status_var.set("Stable Diffusion ошибка")
+        try:
+            messagebox.showerror(
+                "Stable Diffusion",
+                "Не удалось сгенерировать изображение.\n\n"
+                f"Причина: {exc}\n\n"
+                "Проверьте: AUTOMATIC1111 запущен с --api, URL http://127.0.0.1:7860 доступен, "
+                "модель называется .safetensors, а не .safetenso.",
+                parent=self,
+            )
+        except Exception:
+            pass
+
     def save_current_card_to_overview(self) -> None:
         if not self.generated_cards:
             messagebox.showwarning("Нет карточек", "Сначала сгенерируйте карточки", parent=self)
             return
-        self.pipeline.deck_id = getattr(self.app, "selected_deck_id", None)
+        deck_id = self._get_selected_deck_id()
+        if deck_id is None:
+            messagebox.showwarning("Колода", "Выберите колоду для сохранения карточки", parent=self)
+            return
         current_card = self.generated_cards[self.current_card_index]
         self.status_var.set("Сохраняю карточку...")
         self.run_in_background(lambda: self.pipeline.save_cards_to_overview([current_card]), on_success=self._on_saved)
@@ -330,7 +1018,10 @@ class AIAddCardWorkspace(tk.Toplevel):
         if not self.generated_cards:
             messagebox.showwarning("Нет карточек", "Сначала сгенерируйте карточки", parent=self)
             return
-        self.pipeline.deck_id = getattr(self.app, "selected_deck_id", None)
+        deck_id = self._get_selected_deck_id()
+        if deck_id is None:
+            messagebox.showwarning("Колода", "Выберите колоду для сохранения карточек", parent=self)
+            return
         self.status_var.set("Сохраняю все карточки...")
         self.run_in_background(lambda: self.pipeline.save_cards_to_overview(self.generated_cards), on_success=self._on_saved)
 
