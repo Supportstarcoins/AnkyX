@@ -106,11 +106,20 @@ class AIReviewPanel(ttk.Frame):
         answer_time_ms = int(result.get("answer_time_ms") or 0)
         source = (result.get('source') or 'fallback').lower()
         source_label = 'LLM' if source == 'llm' else 'fallback'
+        matched_points = result.get("matched_points") or []
+        missing_points = result.get("missing_points") or []
+        unsupported_points = result.get("unsupported_points") or []
+        matched_text = "; ".join(matched_points[:4]) if matched_points else "—"
+        missing_text = "; ".join(missing_points[:4]) if missing_points else "—"
+        unsupported_text = "; ".join(unsupported_points[:4]) if unsupported_points else "—"
         msg = (
             f"Оценка: {grade}\n"
             f"Балл: {result.get('score')}\n"
             f"Время ответа: {answer_time_ms} мс ({result.get('answer_time_quality')})\n"
-            f"Что уже верно / что не хватает: {result.get('error_explanation') or result.get('short_feedback')}\n"
+            f"Что уже верно: {matched_text}\n"
+            f"Чего не хватает: {missing_text}\n"
+            f"Что не точно: {unsupported_text}\n"
+            f"Разбор: {result.get('error_explanation') or result.get('short_feedback')}\n"
             f"Уточняющий вопрос: {result.get('follow_up_question')}\n"
             f"Источник проверки: {source_label}\n"
         )

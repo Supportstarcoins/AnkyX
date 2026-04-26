@@ -83,6 +83,7 @@ class AIAnswerGrader:
         "ли",
     }
     EN_STOPWORDS = {"the", "and", "with", "this", "that", "from", "into", "for"}
+    CLAUSE_SPLIT_RE = re.compile(r"(?:[,;:.!?]+|\bа\b|\bно\b|\bи\b|\bчто\b)", flags=re.IGNORECASE)
     ENDINGS = (
         "ыми",
         "ими",
@@ -166,47 +167,95 @@ class AIAnswerGrader:
             return "Какая деталь из полного ответа чаще всего теряется в сокращённой версии?"
         return "Какую одну ключевую деталь стоит добавить, чтобы ответ стал полным?"
 
-    def _extract_semantic_points(self, card_back: str) -> list[dict[str, Any]]:
-        text = (card_back or "").lower()
-        points: list[dict[str, Any]] = []
+    def _extract_semantic_points(self, text: str) -> list[str]:
+        raw = (text or "").strip().lower()
+        if not raw:
+            return []
 
-        if re.search(r"обычн", text):
-            points.append({"id": "ordinary_reactions", "label": "есть обычные реакции", "stems_any": {"обычн"}})
-        if re.search(r"проход|быстр", text):
-            points.append(
-                {
-                    "id": "ordinary_pass_quickly",
-                    "label": "обычные реакции проходят быстро",
-                    "stems_all": {"проход", "быстр"},
-                }
-            )
-        if re.search(r"\bдруг", text):
-            points.append({"id": "other_group", "label": "есть и другие реакции", "stems_any": {"друг"}})
-        if re.search(r"редк", text):
-            points.append({"id": "rare_reactions", "label": "эти реакции более редкие", "stems_any": {"редк"}})
-        if re.search(r"серьез|осложнен", text):
-            points.append(
-                {
-                    "id": "serious_complications",
-                    "label": "они могут быть серьёзными осложнениями",
-                    "stems_any": {"серьез", "осложнен"},
-                }
-            )
+        chunks = [chunk.strip(" -–—\t\r\n") for chunk in self.CLAUSE_SPLIT_RE.split(raw) if chunk.strip()]
+        points: list[str] = []
+        for chunk in chunks:
+            words = []
+            for word in re.findall(r"[a-zа-яё]+", chunk, flags=re.IGNORECASE):
+                normalized = self._normalize_token(word)
+                if normalized in self.RU_STOPWORDS or normalized in self.EN_STOPWORDS:
+                    continue
+                if len(normalized) < 4:
+                    continue
+                words.append(normalized)
+            if words:
+                points.append(" ".join(words[:6]))
 
         if not points:
-            fallback_keywords = sorted(self._keywords(card_back))[:4]
-            if fallback_keywords:
-                points.append(
-                    {
-                        "id": "generic_key_point",
-                        "label": "ключевая мысль карточки",
-                        "stems_any": set(fallback_keywords),
-                    }
-                )
-        return points
+            fallback = sorted(self._keywords(raw))
+            if fallback:
+                points = [" ".join(fallback[:4])]
+        return points[:8]
+
+    def _build_semantic_specs(self, card_back: str) -> list[dict[str, Any]]:
+        text = (card_back or "").lower()
+        specs: list[dict[str, Any]] = []
+        if re.search(r"обычн|реакц|эффект", text):
+            specs.append({"id": "ordinary_reactions", "label": "упомянуты реакции/эффекты", "stems_any": {"обычн", "реакц", "эффект"}})
+        if re.search(r"проход|быстр", text):
+            specs.append({"id": "ordinary_pass_quickly", "label": "упомянуто, что часть проходит быстро", "stems_all": {"проход", "быстр"}})
+        if re.search(r"\bдруг", text):
+            specs.append({"id": "other_group", "label": "упомянута вторая группа реакций", "stems_any": {"друг"}})
+        if re.search(r"редк", text):
+            specs.append({"id": "rare_reactions", "label": "не указано, что другие осложнения более редкие", "stems_any": {"редк"}})
+        if re.search(r"серьез|осложнен", text):
+            specs.append({"id": "serious_complications", "label": "упомянуты серьезные осложнения", "stems_any": {"серьез", "осложнен"}})
+        if not specs:
+            for idx, point in enumerate(self._extract_semantic_points(card_back), start=1):
+                specs.append({"id": f"generic_{idx}", "label": point, "stems_any": set(self._keywords(point))})
+        return specs
+
+    def _semantic_overlap_score(self, back: str, user_answer: str) -> tuple[float, list[str], list[str], list[str]]:
+        specs = self._build_semantic_specs(back)
+        answer_keywords = self._keywords(user_answer)
+        answer_l = (user_answer or "").lower()
+        matched_points: list[str] = []
+        missing_points: list[str] = []
+
+        for spec in specs:
+            stems_all = set(spec.get("stems_all") or set())
+            stems_any = set(spec.get("stems_any") or set())
+            has_all = all(any(token.startswith(stem) for token in answer_keywords) for stem in stems_all) if stems_all else True
+            has_any = any(any(token.startswith(stem) for token in answer_keywords) for stem in stems_any) if stems_any else True
+            matched = has_all and has_any
+            if spec.get("id") == "other_group" and not matched:
+                matched = ("обыч" in answer_l and ("редк" in answer_l or "серьез" in answer_l or "ослож" in answer_l))
+            if matched:
+                matched_points.append(str(spec.get("label") or "").strip())
+            else:
+                missing_points.append(str(spec.get("label") or "").strip())
+
+        back_points = self._extract_semantic_points(back)
+        answer_points = self._extract_semantic_points(user_answer)
+        back_keywords = [self._keywords(point) for point in back_points] or [self._keywords(back)]
+        unsupported_points: list[str] = []
+        for point in answer_points:
+            point_kw = self._keywords(point)
+            if not point_kw:
+                continue
+            best_overlap = 0.0
+            for expected_kw in back_keywords:
+                if not expected_kw:
+                    continue
+                overlap = len(point_kw & expected_kw) / max(1, len(point_kw))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+            if best_overlap < 0.34:
+                unsupported_points.append(point)
+        back_l = (back or "").lower()
+        if re.search(r"\bне\s+проход", answer_l) and ("проход" in back_l and "быстр" in back_l):
+            unsupported_points.append("фраза 'быстро не проходят' не указана в карточке")
+
+        score = round(max(0.0, min(1.0, len(matched_points) / max(1, len(specs)))), 3)
+        return score, matched_points[:6], missing_points[:6], unsupported_points[:4]
 
     def _semantic_coverage(self, card_back: str, answer_text: str) -> dict[str, Any]:
-        points = self._extract_semantic_points(card_back)
+        points = self._build_semantic_specs(card_back)
         answer_keywords = self._keywords(answer_text)
         matched: list[dict[str, Any]] = []
         missing: list[dict[str, Any]] = []
@@ -350,6 +399,14 @@ class AIAnswerGrader:
         if not isinstance(missing_points, list):
             missing_points = []
         missing_points = [str(x).strip() for x in missing_points if str(x).strip()][:8]
+        matched_points = payload.get("matched_points")
+        if not isinstance(matched_points, list):
+            matched_points = []
+        matched_points = [str(x).strip() for x in matched_points if str(x).strip()][:8]
+        unsupported_points = payload.get("unsupported_points")
+        if not isinstance(unsupported_points, list):
+            unsupported_points = []
+        unsupported_points = [str(x).strip() for x in unsupported_points if str(x).strip()][:8]
         card_back = str((card or {}).get("back") or "")
 
         suggested_rewrite = payload.get("suggested_rewrite")
@@ -363,6 +420,8 @@ class AIAnswerGrader:
             "answer_time_quality": answer_time_quality,
             "mistake_type": mistake_type,
             "missing_points": missing_points,
+            "matched_points": matched_points,
+            "unsupported_points": unsupported_points,
             "short_feedback": str(payload.get("short_feedback") or self._make_short_feedback(grade)).strip(),
             "error_explanation": str(payload.get("error_explanation") or "").strip(),
             "analogy": str(payload.get("analogy") or "").strip(),
@@ -472,6 +531,7 @@ class AIAnswerGrader:
             "- Если правильный ответ говорит об общей категории, не требуй конкретных примеров. Если в back нет примеров, не спрашивай 'перечислите примеры'.\n"
             "- Выдели смысловые пункты из back и сравни ответ именно по ним.\n"
             "- Если ученик назвал основные группы (например, обычные и редкие/серьёзные), но упустил одну уточняющую деталь, ставь partial примерно 0.65-0.75, а не wrong.\n"
+            "- Не ставь wrong/0.0, если пользователь назвал хотя бы часть ключевых смысловых пунктов из правильного ответа. В таком случае используй partial.\n"
             "- В short_feedback сначала скажи, что уже верно, затем что конкретно отсутствует.\n"
             "- Уточняющий вопрос строй только по пропущенной части back.\n"
             "- Уточняющий вопрос должен помогать пользователю самому восстановить ответ.\n"
@@ -492,6 +552,8 @@ class AIAnswerGrader:
             '  "answer_time_quality": "fast|normal|slow|too_slow",\n'
             '  "mistake_type": "none|missing_key_point|confused_similar_terms|too_general|wrong_fact|no_answer",\n'
             '  "missing_points": [],\n'
+            '  "matched_points": [],\n'
+            '  "unsupported_points": [],\n'
             '  "short_feedback": "...",\n'
             '  "error_explanation": "...",\n'
             '  "analogy": "...",\n'
@@ -603,12 +665,32 @@ class AIAnswerGrader:
         }
 
     def grade_answer(self, card, user_answer, answer_time_ms, provider="auto"):
+        back = (card or {}).get("back", "")
+        local_score, local_matched, local_missing, local_unsupported = self._semantic_overlap_score(back, user_answer or "")
         llm_result = self._try_llm_grade_answer(card, user_answer, answer_time_ms, provider=provider)
         if llm_result is not None:
+            llm_score = float(llm_result.get("score") or 0.0)
+            llm_grade = str(llm_result.get("grade") or "wrong")
+            if local_score >= 0.55 and llm_score < 0.5:
+                llm_result["grade"] = "partial"
+                llm_result["score"] = round(max(llm_score, local_score), 3)
+            if local_score >= 0.75 and llm_grade == "wrong":
+                llm_result["grade"] = "partial"
+                llm_result["score"] = round(max(float(llm_result.get("score") or 0.0), local_score), 3)
+            if len(local_matched) >= 2 and llm_grade == "wrong" and float(llm_result.get("score") or 0.0) == 0.0:
+                llm_result["grade"] = "partial"
+                llm_result["score"] = round(max(0.35, local_score), 3)
+            llm_result["matched_points"] = llm_result.get("matched_points") or local_matched
+            llm_result["missing_points"] = llm_result.get("missing_points") or local_missing
+            llm_result["unsupported_points"] = llm_result.get("unsupported_points") or local_unsupported
+            if local_unsupported and not llm_result.get("error_explanation"):
+                llm_result["error_explanation"] = (
+                    f"Вы правильно упомянули: {', '.join(local_matched[:3])}. "
+                    f"Но фраза «{local_unsupported[0]}» не указана в карточке."
+                )
             return llm_result
 
         LOGGER.info("LLM недоступна, используется fallback-проверка.")
-        back = (card or {}).get("back", "")
         answer = (user_answer or "").strip()
         if not answer:
             result = self._result("wrong", 0.0, "too_slow", "no_answer")
@@ -621,7 +703,7 @@ class AIAnswerGrader:
         expected = self._keywords(back)
         actual = self._keywords(answer)
         semantic = self._semantic_coverage(back, answer)
-        coverage = float(semantic["coverage"])
+        coverage = max(float(semantic["coverage"]), float(local_score))
 
         if answer_time_ms < 4000:
             t_quality = "fast"
@@ -645,8 +727,8 @@ class AIAnswerGrader:
             grade, action = "slow_correct", "slight_increase"
 
         mistake_type = "none" if grade in {"correct", "slow_correct"} else "missing_key_point"
-        missing = [str(item.get("label") or "").strip() for item in semantic["missing"] if str(item.get("label") or "").strip()][:5]
-        matched = [str(item.get("label") or "").strip() for item in semantic["matched"] if str(item.get("label") or "").strip()][:4]
+        missing = local_missing or [str(item.get("label") or "").strip() for item in semantic["missing"] if str(item.get("label") or "").strip()][:5]
+        matched = local_matched or [str(item.get("label") or "").strip() for item in semantic["matched"] if str(item.get("label") or "").strip()][:4]
 
         if grade in {"correct", "slow_correct"}:
             error_explanation = "Существенных смысловых ошибок не найдено."
@@ -658,9 +740,13 @@ class AIAnswerGrader:
                 )
             else:
                 error_explanation = self._make_missing_explanation(back, missing)
+        if local_unsupported:
+            error_explanation += f" Фраза «{local_unsupported[0]}» не указана в карточке."
 
         result = self._result(grade, round(coverage, 3), t_quality, mistake_type)
         result["missing_points"] = missing
+        result["matched_points"] = matched
+        result["unsupported_points"] = local_unsupported
         result["srs_action"] = action
         result["error_explanation"] = error_explanation
         result["follow_up_question"] = self._build_follow_up_from_missing(semantic["missing"]) or self._make_follow_up_question(back)
@@ -828,6 +914,8 @@ class AIAnswerGrader:
             "answer_time_quality": answer_time_quality,
             "mistake_type": mistake_type,
             "missing_points": [],
+            "matched_points": [],
+            "unsupported_points": [],
             "short_feedback": self._make_short_feedback(grade),
             "error_explanation": "",
             "analogy": "",
