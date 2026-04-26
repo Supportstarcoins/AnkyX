@@ -160,15 +160,24 @@ class AIAnswerGrader:
                 result.append("вы указали, что обычные реакции проходят быстро")
                 continue
             if {"rare", "serious"}.issubset(tokens):
-                result.append("нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
+                result.append("вы упомянули более редкие и серьёзные осложнения")
                 continue
             if {"serious", "complications"}.issubset(tokens):
-                result.append("серьёзные осложнения")
+                result.append("вы упомянули серьёзные осложнения")
                 continue
 
             if tokens:
-                phrase = "; ".join(mapping[t] for t in sorted(tokens))
-                result.append(phrase)
+                if tokens == {"serious"}:
+                    result.append("вы упомянули серьёзные осложнения")
+                elif tokens == {"rare"}:
+                    result.append("вы упомянули, что вторая группа реакций более редкая")
+                elif tokens == {"quickly"}:
+                    result.append("вы указали, что обычные реакции проходят быстро")
+                elif tokens == {"ordinary"}:
+                    result.append("вы упомянули обычные реакции")
+                else:
+                    phrase = "; ".join(mapping[t] for t in sorted(tokens))
+                    result.append(phrase)
                 continue
 
             if "ordinary_pass_quickly" in lowered or "проход" in lowered and "быстр" in lowered:
@@ -178,7 +187,7 @@ class AIAnswerGrader:
                 result.append("нужно добавить, что другая группа реакций бывает более редкой и серьёзной")
                 continue
             if "serious_complications" in lowered:
-                result.append("серьёзные осложнения")
+                result.append("вы упомянули серьёзные осложнения")
                 continue
 
             cleaned = item.rstrip(" .")
@@ -641,6 +650,7 @@ class AIAnswerGrader:
     def _sanitize_llm_result_against_back(self, result: dict, back: str) -> dict:
         safe = dict(result or {})
         back_l = (back or "").lower()
+        debug_notes = list(safe.get("debug_notes") or [])
 
         unsupported = safe.get("unsupported_points")
         if not isinstance(unsupported, list):
@@ -665,7 +675,7 @@ class AIAnswerGrader:
                     continue
                 bad = has_out_of_back_phrase(item_s)
                 if bad:
-                    unsupported.append(f"формулировка «{item_s}» не из карточки")
+                    debug_notes.append(f"{key}: removed out-of-back point: {item_s}")
                     continue
                 filtered_items.append(item_s)
             safe[key] = filtered_items[:8]
@@ -676,39 +686,59 @@ class AIAnswerGrader:
                 continue
             bad = has_out_of_back_phrase(value)
             if bad:
-                unsupported.extend([f"добавлена лишняя деталь: {phrase}" for phrase in bad])
+                debug_notes.append(f"{key}: replaced out-of-back content ({', '.join(bad)})")
                 safe[key] = "Формулируйте ответ ближе к карточке, без добавления новых фактов."
 
         follow_q = str(safe.get("follow_up_question") or "").strip()
         if follow_q:
             bad = has_out_of_back_phrase(follow_q)
             if bad or self._question_demands_external_details(follow_q):
-                unsupported.extend([f"уточняющий вопрос требует лишние детали: {phrase}" for phrase in bad] or ["уточняющий вопрос требует лишние детали"])
+                debug_notes.append("follow_up_question sanitized due to out-of-back/external details")
                 safe["follow_up_question"] = self._safe_follow_up_question(back, ", ".join(safe.get("missing_points") or []))
 
         final_hint = str(safe.get("final_hint") or "").strip()
         if final_hint:
             bad = has_out_of_back_phrase(final_hint)
             if bad:
-                unsupported.extend([f"лишняя подсказка: {phrase}" for phrase in bad])
+                debug_notes.append(f"final_hint sanitized ({', '.join(bad)})")
                 safe["final_hint"] = self._safe_final_hint(back)
 
-        analogy = str(safe.get("analogy") or "").strip()
-        if analogy:
-            bad = has_out_of_back_phrase(analogy)
-            if bad or self._has_explicit_examples_or_list(analogy):
-                unsupported.extend([f"аналогия добавляет лишний факт: {phrase}" for phrase in bad] or ["аналогия добавляет лишние конкретные примеры"])
-                analogy = ""
-            safe["analogy"] = analogy
-        else:
-            safe["analogy"] = ""
-
-        analogy_l = (safe.get("analogy") or "").lower()
-        if any(token in analogy_l for token in ("карты", "фильм", "важная информация")):
-            safe["analogy"] = ""
-        safe["analogy_human"] = safe["analogy"] or self._make_bounded_metaphor(back)
-
         safe["unsupported_points"] = [str(x).strip() for x in unsupported if str(x).strip()][:8]
+        safe["debug_notes"] = debug_notes[:20]
+        safe = self._sanitize_analogy_only(safe, back)
+        return safe
+
+    def _sanitize_analogy_only(self, result: dict, back: str) -> dict:
+        safe = dict(result or {})
+        back_l = (back or "").lower()
+        debug_notes = list(safe.get("debug_notes") or [])
+
+        def _contains_out_of_back_phrase(text: str) -> bool:
+            lowered = (text or "").lower()
+            return any(phrase in lowered and phrase not in back_l for phrase in self.DANGEROUS_OUT_OF_BACK_PHRASES)
+
+        raw_analogy = str(safe.get("analogy_human") or safe.get("analogy") or "").strip()
+        is_bad = False
+        if raw_analogy:
+            if _contains_out_of_back_phrase(raw_analogy):
+                is_bad = True
+            if self._has_explicit_examples_or_list(raw_analogy):
+                is_bad = True
+            if any(token in raw_analogy.lower() for token in ("карты", "фильм", "важная информация")):
+                is_bad = True
+        else:
+            is_bad = True
+
+        if is_bad:
+            safe_analogy = self._make_bounded_metaphor(back)
+            safe["analogy"] = safe_analogy
+            safe["analogy_human"] = safe_analogy
+            debug_notes.append("analogy sanitized to bounded metaphor")
+            LOGGER.debug("Analogy sanitized and replaced with bounded metaphor.")
+        else:
+            safe["analogy"] = raw_analogy
+            safe["analogy_human"] = raw_analogy
+        safe["debug_notes"] = debug_notes[:20]
         return safe
 
     def _clean_grade_payload(self, payload: dict[str, Any], card: dict[str, Any], answer_time_ms: int) -> dict[str, Any] | None:
@@ -1070,7 +1100,7 @@ class AIAnswerGrader:
             llm_result = self._compress_human_feedback(llm_result, back, user_answer or "")
             if str(llm_result.get("grade")) == "partial" and float(llm_result.get("score") or 0.0) >= 0.65:
                 llm_result["follow_up_question"] = "Что нужно добавить про вторую группу реакций?"
-            llm_result["analogy_human"] = self._make_bounded_metaphor(back, user_answer or "")
+            llm_result = self._sanitize_analogy_only(llm_result, back)
             return llm_result
 
         LOGGER.info("LLM недоступна, используется fallback-проверка.")
