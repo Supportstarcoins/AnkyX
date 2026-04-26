@@ -26,7 +26,11 @@ class AIReviewController:
         card_id = (card or {}).get("id")
         if card_id is not None:
             try:
-                return self.srs.apply_ai_grade_to_card(card_id, result, self.app)
+                safe_result = dict(result or {})
+                score = float(safe_result.get("score") or 0.0)
+                if score < 0.5:
+                    safe_result["grade"] = "wrong"
+                return self.srs.apply_ai_grade_to_card(card_id, safe_result, self.app)
             except Exception:
                 return None
         return None

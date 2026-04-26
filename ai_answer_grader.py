@@ -14,6 +14,13 @@ LOGGER = logging.getLogger(__name__)
 
 
 class AIAnswerGrader:
+    SERVICE_LIST_TAIL_PATTERNS = (
+        re.compile(r"^(?:и\s+)?т\s*\.?\s*д\.?$", flags=re.IGNORECASE),
+        re.compile(r"^(?:и\s+)?т\s*\.?\s*п\.?$", flags=re.IGNORECASE),
+        re.compile(r"^(?:and\s+)?etc\.?$", flags=re.IGNORECASE),
+        re.compile(r"^(?:и\s+)?друг(?:ое|ие)$", flags=re.IGNORECASE),
+        re.compile(r"^проч(?:ее|ие)$", flags=re.IGNORECASE),
+    )
     META_FEEDBACK_MARKERS = (
         "ответ частично совпадает",
         "часть правильной мысли",
@@ -216,6 +223,28 @@ class AIAnswerGrader:
             return ""
         if self._looks_like_raw_stem_phrase(line):
             return self._humanize_raw_stem_phrase(line)
+        if self._is_service_list_tail(line):
+            return ""
+        return line
+
+    def _is_service_list_tail(self, text: str) -> bool:
+        line = re.sub(r"\s+", " ", str(text or "").strip().lower()).strip(" ,.;:!?")
+        if not line:
+            return False
+        return any(pattern.match(line) for pattern in self.SERVICE_LIST_TAIL_PATTERNS)
+
+    def _strip_service_list_tails(self, text: str) -> str:
+        line = re.sub(r"\s+", " ", str(text or "").strip())
+        if not line:
+            return ""
+        for pattern in self.SERVICE_LIST_TAIL_PATTERNS:
+            line = pattern.sub("", line).strip(" ,.;:!?")
+        line = re.sub(
+            r"(?:,?\s*)?(?:и\s+)?(?:т\s*\.?\s*д\.?|т\s*\.?\s*п\.?|etc\.?|и\s+друг(?:ое|ие)|проч(?:ее|ие))\s*$",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip(" ,.;:!?")
         return line
 
     def _is_meta_feedback_phrase(self, text: str) -> bool:
@@ -602,6 +631,9 @@ class AIAnswerGrader:
         chunks = [chunk.strip(" -–—\t\r\n") for chunk in self.CLAUSE_SPLIT_RE.split(raw) if chunk.strip()]
         points: list[str] = []
         for chunk in chunks:
+            chunk = self._strip_service_list_tails(chunk)
+            if not chunk or self._is_service_list_tail(chunk):
+                continue
             words = []
             for word in re.findall(r"[a-zа-яё]+", chunk, flags=re.IGNORECASE):
                 normalized = self._normalize_token(word)
@@ -618,6 +650,126 @@ class AIAnswerGrader:
             if fallback:
                 points = [" ".join(fallback[:4])]
         return points[:8]
+
+    def _extract_list_items_from_back(self, back: str) -> list[str]:
+        raw = str(back or "").strip()
+        if not raw:
+            return []
+        text = raw.replace("ё", "е")
+        lowered = text.lower()
+        has_markers = bool(re.search(r"(^|\n)\s*(?:[-•*]\s+|\d+[.)]\s+)", text))
+        has_separators = "," in text or ";" in text
+        has_example_markers = any(marker in lowered for marker in ("например", "такие как"))
+        has_colon_list = bool(re.search(r":[ \t]*[^\n,;]+,\s*[^\n,;]+", text))
+        if not (has_markers or has_separators or has_example_markers or has_colon_list):
+            return []
+
+        candidate = text
+        for marker in ("например", "такие как"):
+            idx = lowered.find(marker)
+            if idx >= 0:
+                candidate = text[idx + len(marker) :]
+                break
+        if ":" in candidate and has_colon_list:
+            candidate = candidate.split(":", 1)[1]
+        candidate = re.sub(r"(^|\n)\s*(?:[-•*]\s+|\d+[.)]\s+)", ", ", candidate)
+        candidate = candidate.replace(";", ",")
+        parts = [p.strip(" \t\r\n-–—.,;:!?") for p in re.split(r",|\n", candidate) if p.strip(" \t\r\n-–—.,;:!?")]
+
+        items: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            cleaned = re.sub(
+                r"^(?:к\s+\w+\s+относятся|относятся|включают|включает|причины|признаки|симптомы)\s+",
+                "",
+                part,
+                flags=re.IGNORECASE,
+            ).strip(" ,.;:!?")
+            cleaned = self._strip_service_list_tails(cleaned)
+            if not cleaned or self._is_service_list_tail(cleaned):
+                continue
+            norm = cleaned.lower()
+            if norm in seen:
+                continue
+            if len(self._keywords(cleaned)) == 0:
+                continue
+            seen.add(norm)
+            items.append(cleaned)
+        return items[:8]
+
+    def _match_list_item(self, item: str, answer_text: str, answer_keywords: set[str]) -> bool:
+        item_clean = str(item or "").strip()
+        if not item_clean:
+            return False
+        item_low = item_clean.lower()
+        answer_low = (answer_text or "").lower()
+        if item_low and item_low in answer_low:
+            return True
+        item_kw = self._keywords(item_low)
+        if not item_kw:
+            return False
+        def _close(a: str, b: str) -> bool:
+            if a.startswith(b) or b.startswith(a):
+                return True
+            min_len = min(len(a), len(b))
+            if min_len >= 5 and a[:5] == b[:5]:
+                return True
+            return False
+
+        matched_kw = {ik for ik in item_kw if any(_close(ak, ik) for ak in answer_keywords)}
+        if not matched_kw:
+            return False
+        ratio = len(matched_kw) / max(1, len(item_kw))
+        longest = max(item_kw, key=len)
+        longest_hit = longest in matched_kw or any(_close(ak, longest) for ak in answer_keywords)
+        return ratio >= 0.6 or (ratio >= 0.5 and longest_hit)
+
+    def _evaluate_back_list_overlap(self, back: str, user_answer: str) -> dict[str, Any] | None:
+        items = self._extract_list_items_from_back(back)
+        if len(items) < 2:
+            return None
+        answer_kw = self._keywords(user_answer)
+        matched = [item for item in items if self._match_list_item(item, user_answer, answer_kw)]
+        missing = [item for item in items if item not in matched]
+        ratio = len(matched) / max(1, len(items))
+        if ratio <= 0.0:
+            score = 0.2
+        elif ratio < 0.5:
+            score = 0.45 + 0.15 * (ratio / 0.5)
+        elif ratio < 1.0:
+            score = 0.65 + 0.15 * ((ratio - 0.5) / 0.5)
+        else:
+            score = 0.95
+        score = round(max(0.0, min(1.0, score)), 3)
+        if score >= 0.9:
+            grade = "correct"
+        elif score >= 0.5:
+            grade = "partial"
+        elif score > 0.3:
+            grade = "uncertain"
+        else:
+            grade = "wrong"
+        unsupported: list[str] = []
+        if not matched and self._keywords(user_answer):
+            unsupported.append("ответ описывает другую мысль и не перечисляет признаки из карточки.")
+        if not missing:
+            follow_up = ""
+        elif not matched:
+            follow_up = "Какие примеры перечислены в карточке?"
+        elif len(missing) == 1:
+            follow_up = "Какой ещё пункт из списка нужно добавить?"
+        else:
+            follow_up = "Какие признаки нужно назвать?"
+        return {
+            "is_list_back": True,
+            "items": items,
+            "matched": matched,
+            "missing": missing,
+            "unsupported": unsupported,
+            "score": score,
+            "grade": grade,
+            "follow_up_question": follow_up,
+        }
 
     def _build_semantic_specs(self, card_back: str) -> list[dict[str, Any]]:
         text = (card_back or "").lower()
@@ -638,6 +790,14 @@ class AIAnswerGrader:
         return specs
 
     def _semantic_overlap_score(self, back: str, user_answer: str) -> tuple[float, list[str], list[str], list[str]]:
+        list_eval = self._evaluate_back_list_overlap(back, user_answer)
+        if list_eval:
+            return (
+                float(list_eval["score"]),
+                list(list_eval["matched"])[:6],
+                list(list_eval["missing"])[:6],
+                list(list_eval["unsupported"])[:4],
+            )
         specs = self._build_semantic_specs(back)
         answer_keywords = self._keywords(user_answer)
         answer_l = (user_answer or "").lower()
@@ -731,6 +891,39 @@ class AIAnswerGrader:
         if not label_text or self._is_meta_feedback_phrase(label_text):
             return ""
         return f"Что именно не хватает про «{label_text}»?"
+
+    def _apply_list_feedback(self, result: dict[str, Any], list_eval: dict[str, Any], user_answer: str) -> dict[str, Any]:
+        safe = dict(result or {})
+        matched = list(list_eval.get("matched") or [])
+        missing = list(list_eval.get("missing") or [])
+        items = list(list_eval.get("items") or [])
+        safe["is_list_back"] = True
+        safe["list_items"] = items[:8]
+        safe["matched_points"] = matched[:6]
+        safe["missing_points"] = missing[:6]
+        safe["unsupported_points"] = list(list_eval.get("unsupported") or [])[:4]
+        safe["score"] = float(list_eval.get("score") or 0.0)
+        safe["grade"] = str(list_eval.get("grade") or "wrong")
+        safe["follow_up_question"] = str(list_eval.get("follow_up_question") or "")
+        if matched:
+            if len(matched) == 1:
+                safe["matched_points_human"] = [f"вы назвали {matched[0]}."]
+            else:
+                safe["matched_points_human"] = [f"вы назвали {', '.join(matched)}."]
+        else:
+            safe["matched_points_human"] = []
+        if missing:
+            if len(missing) == len(items):
+                safe["missing_points_human"] = [f"нужно назвать примеры из карточки: {', '.join(items)}."]
+            elif len(missing) == 1:
+                safe["missing_points_human"] = [f"нужно добавить {missing[0]}."]
+            else:
+                safe["missing_points_human"] = [f"нужно добавить пункты из списка: {', '.join(missing)}."]
+        else:
+            safe["missing_points_human"] = []
+        if not matched and self._keywords(user_answer):
+            safe["unsupported_points_human"] = ["ответ описывает другую мысль и не перечисляет признаки из карточки."]
+        return safe
 
     def _extract_json_object(self, raw_text: str) -> dict[str, Any] | None:
         text = (raw_text or "").strip()
@@ -890,6 +1083,8 @@ class AIAnswerGrader:
             for item in items:
                 item_s = str(item).strip()
                 if not item_s:
+                    continue
+                if self._is_service_list_tail(item_s):
                     continue
                 bad = has_out_of_back_phrase(item_s)
                 if bad:
@@ -1284,6 +1479,7 @@ class AIAnswerGrader:
 
     def grade_answer(self, card, user_answer, answer_time_ms, provider="auto"):
         back = (card or {}).get("back", "")
+        list_eval = self._evaluate_back_list_overlap(back, user_answer or "")
         local_score, local_matched, local_missing, local_unsupported = self._semantic_overlap_score(back, user_answer or "")
         back_numeric = self._extract_numeric_facts(back)
         answer_numeric = self._extract_numeric_facts(user_answer or "")
@@ -1313,6 +1509,11 @@ class AIAnswerGrader:
                 llm_result["score"] = round(max(float(llm_result.get("score") or 0.0), 0.85), 3)
                 if str(llm_result.get("grade")) in {"wrong", "uncertain"}:
                     llm_result["grade"] = "partial"
+            if list_eval:
+                llm_result = self._apply_list_feedback(llm_result, list_eval, user_answer or "")
+                if not list_eval.get("matched"):
+                    llm_result["score"] = min(float(llm_result.get("score") or 0.0), 0.3)
+                    llm_result["grade"] = "wrong" if float(llm_result["score"]) <= 0.25 else "uncertain"
             llm_result["matched_points"] = llm_result.get("matched_points") or local_matched
             llm_result["missing_points"] = llm_result.get("missing_points") or local_missing
             llm_result["unsupported_points"] = llm_result.get("unsupported_points") or local_unsupported
@@ -1339,6 +1540,8 @@ class AIAnswerGrader:
             llm_result["missing_points_human"] = missing_human
             llm_result["unsupported_points_human"] = unsupported_human
             llm_result = self._compress_human_feedback(llm_result, back, user_answer or "")
+            if list_eval:
+                llm_result = self._apply_list_feedback(llm_result, list_eval, user_answer or "")
             if (
                 str(llm_result.get("grade")) == "partial"
                 and float(llm_result.get("score") or 0.0) >= 0.65
@@ -1346,9 +1549,13 @@ class AIAnswerGrader:
                 and numeric_overlap < 0.6
             ):
                 llm_result["follow_up_question"] = self._make_generic_follow_up_question(back, llm_result.get("missing_points") or [])
+            if list_eval:
+                llm_result["follow_up_question"] = str(list_eval.get("follow_up_question") or "")
             elif numeric_overlap >= 0.6:
                 llm_result["follow_up_question"] = ""
             llm_result = self._sanitize_analogy_only(llm_result, back)
+            if list_eval:
+                llm_result = self._apply_list_feedback(llm_result, list_eval, user_answer or "")
             return llm_result
 
         LOGGER.info("LLM недоступна, используется fallback-проверка.")
@@ -1365,6 +1572,8 @@ class AIAnswerGrader:
         actual = self._keywords(answer)
         semantic = self._semantic_coverage(back, answer)
         coverage = max(float(semantic["coverage"]), float(local_score))
+        if list_eval:
+            coverage = float(list_eval.get("score") or coverage)
 
         if answer_time_ms < 4000:
             t_quality = "fast"
@@ -1385,6 +1594,9 @@ class AIAnswerGrader:
             grade, action = "wrong", "reset"
         if grade == "uncertain" and len(local_matched) >= 2:
             grade, action = "partial", "repeat_soon"
+        if list_eval:
+            grade = str(list_eval.get("grade") or grade)
+            action = "increase" if grade == "correct" else ("repeat_soon" if grade == "partial" else "reset")
 
         if grade == "correct" and t_quality in {"slow", "too_slow"}:
             grade, action = "slow_correct", "slight_increase"
@@ -1437,6 +1649,8 @@ class AIAnswerGrader:
         }
         result["source"] = "fallback"
         result["answer_time_ms"] = int(answer_time_ms or 0)
+        if list_eval:
+            result = self._apply_list_feedback(result, list_eval, answer)
         return result
 
     def grade_follow_up_answer(
