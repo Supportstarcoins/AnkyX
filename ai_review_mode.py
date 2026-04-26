@@ -16,7 +16,7 @@ class AIReviewController:
 
     def grade(self, card, user_answer, answer_time_ms):
         result = self.grader.grade_answer(card, user_answer, answer_time_ms)
-        result["answer_time_ms"] = int(answer_time_ms or 0)
+        result["answer_time_ms"] = int(result.get("answer_time_ms") or answer_time_ms or 0)
         card_id = (card or {}).get("id")
         if card_id is not None:
             try:
@@ -99,6 +99,8 @@ class AIReviewPanel(ttk.Frame):
         self.last_grade_result = result
         grade = result.get("grade", "unknown")
         answer_time_ms = int(result.get("answer_time_ms") or 0)
+        source = (result.get('source') or 'fallback').lower()
+        source_label = 'LLM' if source == 'llm' else 'fallback'
         msg = (
             f"Оценка: {grade}\n"
             f"Балл: {result.get('score')}\n"
@@ -106,6 +108,7 @@ class AIReviewPanel(ttk.Frame):
             f"Объяснение ошибки: {result.get('error_explanation') or result.get('short_feedback')}\n"
             f"Аналогия: {result.get('analogy')}\n"
             f"Уточняющий вопрос: {result.get('follow_up_question')}\n"
+            f"Источник проверки: {source_label}\n"
         )
         self._append("AI", msg)
         self.status_var.set("Ответ проверен")
@@ -143,6 +146,7 @@ class AIReviewPanel(ttk.Frame):
             msg = (
                 f"{hint.get('short_explanation')}\n"
                 f"Что добавить: {hint.get('missing_detail')}\n"
+                f"Аналогия: {hint.get('analogy')}\n"
                 f"Пример: {hint.get('example_answer')}\n"
                 f"{hint.get('next_prompt')}\n"
             )
@@ -165,6 +169,7 @@ class AIReviewPanel(ttk.Frame):
             f"Изменение балла: {result.get('score_delta')}\n"
             f"Короткий фидбек: {result.get('short_feedback')}\n"
             f"Что ещё не хватает: {result.get('remaining_gap')}\n"
+            f"Аналогия: {result.get('analogy')}\n"
             f"Финальная подсказка: {result.get('final_hint')}\n"
         )
         self._append("AI", msg)
