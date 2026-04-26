@@ -34,7 +34,6 @@ class AIAnswerGrader:
         "оно",
         "более",
         "менее",
-        "быстро",
         "медленно",
         "обычный",
         "обычные",
@@ -161,6 +160,95 @@ class AIAnswerGrader:
         if len(sentences) >= 2:
             return "Какая деталь из полного ответа чаще всего теряется в сокращённой версии?"
         return "Какую одну ключевую деталь стоит добавить, чтобы ответ стал полным?"
+
+    def _extract_semantic_points(self, card_back: str) -> list[dict[str, Any]]:
+        text = (card_back or "").lower()
+        points: list[dict[str, Any]] = []
+
+        if re.search(r"обычн", text):
+            points.append({"id": "ordinary_reactions", "label": "есть обычные реакции", "stems_any": {"обычн"}})
+        if re.search(r"проход|быстр", text):
+            points.append(
+                {
+                    "id": "ordinary_pass_quickly",
+                    "label": "обычные реакции проходят быстро",
+                    "stems_all": {"проход", "быстр"},
+                }
+            )
+        if re.search(r"\bдруг", text):
+            points.append({"id": "other_group", "label": "есть и другие реакции", "stems_any": {"друг"}})
+        if re.search(r"редк", text):
+            points.append({"id": "rare_reactions", "label": "эти реакции более редкие", "stems_any": {"редк"}})
+        if re.search(r"серьез|осложнен", text):
+            points.append(
+                {
+                    "id": "serious_complications",
+                    "label": "они могут быть серьёзными осложнениями",
+                    "stems_any": {"серьез", "осложнен"},
+                }
+            )
+
+        if not points:
+            fallback_keywords = sorted(self._keywords(card_back))[:4]
+            if fallback_keywords:
+                points.append(
+                    {
+                        "id": "generic_key_point",
+                        "label": "ключевая мысль карточки",
+                        "stems_any": set(fallback_keywords),
+                    }
+                )
+        return points
+
+    def _semantic_coverage(self, card_back: str, answer_text: str) -> dict[str, Any]:
+        points = self._extract_semantic_points(card_back)
+        answer_keywords = self._keywords(answer_text)
+        matched: list[dict[str, Any]] = []
+        missing: list[dict[str, Any]] = []
+        score = 0.0
+        weights = {
+            "ordinary_reactions": 0.2,
+            "ordinary_pass_quickly": 0.3,
+            "other_group": 0.1,
+            "rare_reactions": 0.2,
+            "serious_complications": 0.2,
+        }
+        total_weight = 0.0
+        answer_l = (answer_text or "").lower()
+
+        for point in points:
+            pid = point.get("id")
+            weight = float(weights.get(pid, 1.0))
+            total_weight += weight
+            stems_all = set(point.get("stems_all") or set())
+            stems_any = set(point.get("stems_any") or set())
+            has_all = all(any(token.startswith(stem) for token in answer_keywords) for stem in stems_all) if stems_all else True
+            has_any = any(any(token.startswith(stem) for token in answer_keywords) for stem in stems_any) if stems_any else True
+            matched_point = has_all and has_any
+            if pid == "other_group" and not matched_point:
+                matched_point = ("обыч" in answer_l and ("редк" in answer_l or "серьез" in answer_l or "ослож" in answer_l))
+            if matched_point:
+                score += weight
+                matched.append(point)
+            else:
+                missing.append(point)
+
+        coverage = score / max(0.001, total_weight)
+        return {
+            "coverage": round(max(0.0, min(1.0, coverage)), 3),
+            "matched": matched,
+            "missing": missing,
+            "points": points,
+        }
+
+    def _build_follow_up_from_missing(self, missing_points: list[dict[str, Any]]) -> str:
+        if not missing_points:
+            return ""
+        top = missing_points[0]
+        label = top.get("label") or "пропущенную мысль"
+        if "проходят быстро" in label:
+            return "Что в карточке сказано о том, как быстро проходят обычные реакции?"
+        return f"Какую особенность нужно добавить про «{label}», чтобы ответ совпал с карточкой?"
 
     def _extract_json_object(self, raw_text: str) -> dict[str, Any] | None:
         text = (raw_text or "").strip()
@@ -359,6 +447,9 @@ class AIAnswerGrader:
             "- Если ответ частичный, скажи, какая главная мысль потеряна.\n"
             "- Оценивай ответ только по эталонному ответу карточки. Не требуй от пользователя фактов, примеров, дат или деталей, которых нет в правильном ответе. Уточняющий вопрос должен помогать восстановить именно missing часть из back, а не расширять тему.\n"
             "- Если правильный ответ говорит об общей категории, не требуй конкретных примеров. Если в back нет примеров, не спрашивай 'перечислите примеры'.\n"
+            "- Выдели смысловые пункты из back и сравни ответ именно по ним.\n"
+            "- Если ученик назвал основные группы (например, обычные и редкие/серьёзные), но упустил одну уточняющую деталь, ставь partial примерно 0.65-0.75, а не wrong.\n"
+            "- В short_feedback сначала скажи, что уже верно, затем что конкретно отсутствует.\n"
             "- Уточняющий вопрос строй только по пропущенной части back.\n"
             "- Уточняющий вопрос должен помогать пользователю самому восстановить ответ.\n"
             "- Не повторяй просто исходный вопрос.\n"
@@ -500,8 +591,8 @@ class AIAnswerGrader:
 
         expected = self._keywords(back)
         actual = self._keywords(answer)
-        overlap = len(expected & actual)
-        coverage = overlap / max(1, len(expected))
+        semantic = self._semantic_coverage(back, answer)
+        coverage = float(semantic["coverage"])
 
         if answer_time_ms < 4000:
             t_quality = "fast"
@@ -512,11 +603,11 @@ class AIAnswerGrader:
         else:
             t_quality = "too_slow"
 
-        if coverage >= 0.85:
+        if coverage >= 0.9:
             grade, action = "correct", "increase"
-        elif coverage >= 0.55:
+        elif coverage >= 0.6:
             grade, action = "partial", "repeat_soon"
-        elif coverage >= 0.25:
+        elif coverage >= 0.3:
             grade, action = "uncertain", "repeat_soon"
         else:
             grade, action = "wrong", "reset"
@@ -525,18 +616,25 @@ class AIAnswerGrader:
             grade, action = "slow_correct", "slight_increase"
 
         mistake_type = "none" if grade in {"correct", "slow_correct"} else "missing_key_point"
-        missing = sorted(list(expected - actual))[:5]
+        missing = [str(item.get("label") or "").strip() for item in semantic["missing"] if str(item.get("label") or "").strip()][:5]
+        matched = [str(item.get("label") or "").strip() for item in semantic["matched"] if str(item.get("label") or "").strip()][:4]
 
         if grade in {"correct", "slow_correct"}:
             error_explanation = "Существенных смысловых ошибок не найдено."
         else:
-            error_explanation = self._make_missing_explanation(back, missing)
+            if matched and missing:
+                error_explanation = (
+                    f"Уже верно: {', '.join(matched[:3])}. "
+                    f"Не хватает: {missing[0]}."
+                )
+            else:
+                error_explanation = self._make_missing_explanation(back, missing)
 
         result = self._result(grade, round(coverage, 3), t_quality, mistake_type)
         result["missing_points"] = missing
         result["srs_action"] = action
         result["error_explanation"] = error_explanation
-        result["follow_up_question"] = self._make_follow_up_question(back)
+        result["follow_up_question"] = self._build_follow_up_from_missing(semantic["missing"]) or self._make_follow_up_question(back)
         result["analogy"] = "Это как кратко описать фильм: важно назвать главный конфликт, а не случайные детали."
         result["card_action"] = "keep" if coverage >= 0.55 else "simplify"
         result["short_feedback"] = self._make_short_feedback(grade)
@@ -567,29 +665,31 @@ class AIAnswerGrader:
             return llm_result
 
         back = (card or {}).get("back") or (card or {}).get("answer") or ""
-        original_keywords = self._keywords(original_answer or "")
-        follow_up_keywords = self._keywords(follow_up_answer or "")
-        expected_keywords = self._keywords(back)
-
-        new_keywords = follow_up_keywords - original_keywords
-        new_expected_keywords = new_keywords & expected_keywords
-        all_covered = (original_keywords | follow_up_keywords) & expected_keywords
-        previous_score = float((previous_grade_result or {}).get("score") or 0.0)
-        new_score = len(all_covered) / max(1, len(expected_keywords))
+        combined_answer = f"{(original_answer or '').strip()} {(follow_up_answer or '').strip()}".strip()
+        previous_semantic = self._semantic_coverage(back, original_answer or "")
+        new_semantic = self._semantic_coverage(back, combined_answer)
+        previous_score = float((previous_grade_result or {}).get("score") or previous_semantic["coverage"] or 0.0)
+        new_score = float(new_semantic["coverage"])
         score_delta = round(new_score - previous_score, 3)
-        improved = bool(new_expected_keywords) or score_delta > 0.03
+        newly_closed = {p.get("id") for p in previous_semantic["missing"]} & {p.get("id") for p in new_semantic["matched"]}
+        improved = bool(newly_closed) or score_delta > 0.03
+        if "ordinary_pass_quickly" in newly_closed and score_delta < 0.2:
+            score_delta = 0.2
+            improved = True
 
-        remaining_keywords = sorted(list(expected_keywords - all_covered))
+        remaining_keywords = [str(item.get("label") or "").strip() for item in new_semantic["missing"] if str(item.get("label") or "").strip()]
         remaining_gap = (
             f"Не хватает смысловых опор: {', '.join(remaining_keywords[:5])}."
             if remaining_keywords
             else "Ключевые смысловые опоры покрыты."
         )
         short_feedback = (
-            "Стало лучше: в уточнении добавлены важные элементы."
+            "Да, теперь ты добавил недостающую деталь."
             if improved
             else "Пока прирост небольшой: добавьте точнее ключевую мысль."
         )
+        if "ordinary_pass_quickly" in newly_closed:
+            short_feedback = "Да, теперь ты добавил недостающую деталь: обычные реакции проходят быстро."
 
         if remaining_keywords:
             final_hint = (
