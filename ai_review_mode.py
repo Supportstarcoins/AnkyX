@@ -122,6 +122,17 @@ class AIReviewPanel(ttk.Frame):
             cleaned.append(line)
         return cleaned
 
+    def _pick_analogy_for_ui(self, result: dict, warning_text: str = "", missing_text: str = "") -> str:
+        analogy = str((result or {}).get("analogy_human") or (result or {}).get("analogy") or "").strip()
+        if not analogy:
+            return ""
+        analogy_l = analogy.lower()
+        if warning_text and analogy_l == warning_text.lower().strip():
+            return ""
+        if missing_text and analogy_l == missing_text.lower().strip():
+            return ""
+        return analogy
+
     def _on_answer_graded(self, result):
         self.progress.stop()
         self.last_grade_result = result
@@ -146,6 +157,10 @@ class AIReviewPanel(ttk.Frame):
         breakdown = (result.get('error_explanation') or result.get('short_feedback') or '').strip()
         if breakdown:
             lines.append(f"Разбор: {breakdown}")
+        analogy = self._pick_analogy_for_ui(result, warning_text=unsupported_text, missing_text=missing_text)
+        if analogy:
+            label = "Метафора" if "метафор" in analogy.lower() else "Аналогия"
+            lines.append(f"{label}: {analogy}")
         follow_up = (result.get('follow_up_question') or '').strip()
         if follow_up:
             lines.append(f"Уточняющий вопрос: {follow_up}")
@@ -185,13 +200,23 @@ class AIReviewPanel(ttk.Frame):
                 self.last_follow_up_question,
                 previous_grade_result=self.last_grade_result,
             )
-            msg = (
-                f"{hint.get('short_explanation')}\n"
-                f"Что добавить: {hint.get('missing_detail')}\n"
-                f"Аналогия: {hint.get('analogy')}\n"
-                f"Пример: {hint.get('example_answer')}\n"
-                f"{hint.get('next_prompt')}\n"
-            )
+            hint_lines = []
+            short_explanation = str(hint.get("short_explanation") or "").strip()
+            missing_detail = str(hint.get("missing_detail") or "").strip()
+            analogy = str(hint.get("analogy") or "").strip()
+            example_answer = str(hint.get("example_answer") or "").strip()
+            next_prompt = str(hint.get("next_prompt") or "").strip()
+            if short_explanation:
+                hint_lines.append(short_explanation)
+            if missing_detail:
+                hint_lines.append(f"Что добавить: {missing_detail}")
+            if analogy:
+                hint_lines.append(f"Аналогия: {analogy}")
+            if example_answer:
+                hint_lines.append(f"Пример: {example_answer}")
+            if next_prompt:
+                hint_lines.append(next_prompt)
+            msg = "\n".join(hint_lines)
             self._append("AI-подсказка", msg)
             self.answer_input.delete("1.0", tk.END)
             self.awaiting_follow_up = True
@@ -226,6 +251,10 @@ class AIReviewPanel(ttk.Frame):
             lines.append(f"Разбор: {short_feedback}")
         elif matched_text:
             lines.append(f"Что уже верно: {matched_text}")
+        follow_analogy = self._pick_analogy_for_ui(result, warning_text=follow_unsupported, missing_text=follow_missing)
+        if follow_analogy:
+            label = "Метафора" if "метафор" in follow_analogy.lower() else "Аналогия"
+            lines.append(f"{label}: {follow_analogy}")
         remaining_gap = str(result.get('remaining_gap') or '').strip()
         if "?" in remaining_gap:
             remaining_gap = ""
