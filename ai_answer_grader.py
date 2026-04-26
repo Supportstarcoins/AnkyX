@@ -575,6 +575,16 @@ class AIAnswerGrader:
         lowered = (text or "").lower()
         return any(marker in lowered for marker in self.METAPHOR_MARKERS)
 
+    def _make_bounded_metaphor(self, back: str) -> str:
+        back_l = (back or "").lower()
+        has_ordinary = "обыч" in back_l
+        has_rare = "редк" in back_l
+        has_quick = "быстр" in back_l or "проход" in back_l
+        has_serious = ("серьез" in back_l) or ("серьёз" in back_l) or ("осложнен" in back_l)
+        if has_ordinary and has_rare and has_quick and has_serious:
+            return "Это как два сигнала на панели: один обычный и быстро гаснет, другой редкий, но важный и требует внимания."
+        return "Это как собрать короткую карту: нужно отметить именно те ориентиры, которые есть в карточке, не добавляя новые."
+
     def _sanitize_llm_result_against_back(self, result: dict, back: str) -> dict:
         safe = dict(result or {})
         back_l = (back or "").lower()
@@ -633,9 +643,14 @@ class AIAnswerGrader:
         analogy = str(safe.get("analogy") or "").strip()
         if analogy:
             bad = has_out_of_back_phrase(analogy)
-            if bad and not self._looks_like_metaphor(analogy):
-                unsupported.extend([f"аналогия добавляет лишний факт: {phrase}" for phrase in bad])
-                safe["analogy"] = "Представьте это как две зоны: одна быстро проходит, другая более редкая и серьёзная."
+            if bad or self._has_explicit_examples_or_list(analogy):
+                unsupported.extend([f"аналогия добавляет лишний факт: {phrase}" for phrase in bad] or ["аналогия добавляет лишние конкретные примеры"])
+                analogy = ""
+            safe["analogy"] = analogy
+        else:
+            safe["analogy"] = ""
+
+        safe["analogy_human"] = safe["analogy"] or self._make_bounded_metaphor(back)
 
         safe["unsupported_points"] = [str(x).strip() for x in unsupported if str(x).strip()][:8]
         return safe
