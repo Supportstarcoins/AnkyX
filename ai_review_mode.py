@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import logging
 import tkinter as tk
 from tkinter import ttk
 
@@ -37,11 +38,13 @@ class AIReviewController:
 
 
 class AIReviewPanel(ttk.Frame):
-    def __init__(self, parent, app=None, on_next_card=None, on_show_answer=None):
+    def __init__(self, parent, app=None, on_next_card=None, on_show_answer=None, on_card_updated=None):
         super().__init__(parent)
         self.controller = AIReviewController(app=app)
+        self.app = app
         self.on_next_card = on_next_card
         self.on_show_answer = on_show_answer
+        self.on_card_updated = on_card_updated
 
         self.current_card = None
         self.answer_started_at = None
@@ -51,6 +54,7 @@ class AIReviewPanel(ttk.Frame):
         self.last_grade_result = None
         self.current_final_grade_result = None
         self.srs_applied_for_current_card = False
+        self._auto_next_job = None
 
         self.columnconfigure(0, weight=1)
         self.status_var = tk.StringVar(value="AI-проверка готова")
@@ -361,9 +365,8 @@ class AIReviewPanel(ttk.Frame):
             self.last_follow_up_question = ""
             self.submit_btn.configure(text="Проверить ответ")
             self.status_var.set("Уточнение обработано")
-            if should_auto_next and callable(self.on_next_card):
+            if should_auto_next:
                 self.status_var.set("Теперь верно — переход к следующей карточке…")
-                self.after(1000, self.go_next_card)
 
     def _is_clarification_request(self, text: str) -> bool:
         raw = (text or "").strip().lower()
@@ -419,6 +422,12 @@ class AIReviewPanel(ttk.Frame):
                 pass
 
     def clear_chat(self):
+        if self._auto_next_job is not None:
+            try:
+                self.after_cancel(self._auto_next_job)
+            except Exception:
+                pass
+            self._auto_next_job = None
         self.answer_input.delete("1.0", tk.END)
         self.history.configure(state=tk.NORMAL)
         self.history.delete("1.0", tk.END)
@@ -450,6 +459,107 @@ class AIReviewPanel(ttk.Frame):
             self.srs_applied_for_current_card = bool(srs_result)
         return srs_result
 
+    def _card_to_mutable_dict(self, card):
+        if isinstance(card, dict):
+            return card
+        if card is None:
+            return {}
+        if hasattr(card, "_asdict"):
+            try:
+                return dict(card._asdict())
+            except Exception:
+                pass
+        keys = getattr(card, "keys", None)
+        if callable(keys):
+            try:
+                return {k: card[k] for k in keys()}
+            except Exception:
+                pass
+        try:
+            return dict(card)
+        except Exception:
+            return {}
+
+    def _update_current_card_from_srs_result(self, srs_result):
+        if not isinstance(srs_result, dict) or not self.current_card:
+            return
+        card = self._card_to_mutable_dict(self.current_card)
+        if card is not self.current_card:
+            self.current_card = card
+        due_value = srs_result.get("due")
+        if due_value is not None:
+            self.current_card["due"] = due_value
+            self.current_card["next_review"] = srs_result.get("due_human") or due_value
+        new_level = srs_result.get("new_level")
+        if new_level is not None:
+            self.current_card["leitner_level"] = new_level
+            self.current_card["phase"] = new_level
+        if srs_result.get("interval") is not None:
+            self.current_card["interval"] = srs_result.get("interval")
+
+    def _refresh_card_ui(self, srs_result):
+        if callable(self.on_card_updated):
+            try:
+                self.on_card_updated(self.current_card, srs_result)
+                return
+            except Exception:
+                pass
+        for target in (self.app, self.master, self.winfo_toplevel()):
+            if target is None:
+                continue
+            for method_name in (
+                "refresh_current_card",
+                "update_card_display",
+                "render_current_card",
+                "show_current_card",
+                "update_view",
+            ):
+                fn = getattr(target, method_name, None)
+                if callable(fn):
+                    try:
+                        fn()
+                        return
+                    except Exception:
+                        continue
+
+    def _append_ai_message(self, text):
+        self._append("AI", text)
+
+    def _schedule_auto_next_card(self, delay_ms=1000):
+        grade_result = self.current_final_grade_result or self.last_grade_result or {}
+        grade = str((grade_result or {}).get("grade") or "").strip().lower()
+        score = float((grade_result or {}).get("score") or 0.0)
+        final_correct = grade in {"correct", "slow_correct"} and score >= 0.85
+        if self.awaiting_follow_up and not final_correct:
+            return
+        if self._auto_next_job is not None:
+            try:
+                self.after_cancel(self._auto_next_job)
+            except Exception:
+                pass
+            self._auto_next_job = None
+        self._auto_next_job = self.after(int(delay_ms), self._call_next_card_safely)
+
+    def _call_next_card_safely(self):
+        self._auto_next_job = None
+        try:
+            self.clear_chat()
+            if callable(self.on_next_card):
+                self.on_next_card()
+                return
+            for target in (self.app, self.master, self.winfo_toplevel()):
+                if target is None:
+                    continue
+                for name in ("next_card", "show_next_card", "go_next_card", "_next_card"):
+                    fn = getattr(target, name, None)
+                    if callable(fn):
+                        fn()
+                        return
+            self._append_ai_message("Не удалось автоматически перейти к следующей карточке: callback next_card не найден.")
+        except Exception:
+            logging.exception("AI auto next card failed")
+            self._append_ai_message("Ошибка автоперехода к следующей карточке.")
+
     def _merge_follow_up_result(self, previous_grade, follow_result) -> dict:
         return self.controller.grader.merge_follow_up_grade(previous_grade or {}, follow_result or {})
 
@@ -462,16 +572,19 @@ class AIReviewPanel(ttk.Frame):
         srs_outcome = self._apply_srs_once()
         payload = srs_outcome if isinstance(srs_outcome, dict) else {"applied": bool(srs_outcome)}
         if payload.get("applied"):
+            self._update_current_card_from_srs_result(payload)
+            self._refresh_card_ui(payload)
             if grade == "slow_correct":
-                self._append("AI", f"{prefix_message}, но ответ был медленным. Карточка повышена осторожно.")
+                self._append_ai_message(f"{prefix_message}, но ответ был медленным. Карточка повышена осторожно.")
             else:
                 level = payload.get("new_level") or payload.get("leitner_level") or payload.get("phase")
                 if level:
-                    self._append("AI", f"{prefix_message}. Карточка перенесена в подколоду {level}.")
+                    self._append_ai_message(f"{prefix_message}. Карточка перенесена в подколоду {level}.")
                 else:
-                    self._append("AI", f"{prefix_message}. Карточка перенесена в следующую подколоду.")
+                    self._append_ai_message(f"{prefix_message}. Карточка перенесена в следующую подколоду.")
             if payload.get("due_human"):
-                self._append("AI", f"Следующее повторение: {payload.get('due_human')}")
+                self._append_ai_message(f"Следующее повторение: {payload.get('due_human')}")
+            self._schedule_auto_next_card(1000)
         return payload
 
     def _append(self, role, text):
@@ -496,6 +609,7 @@ def attach_ai_review_panel(parent, app=None, callbacks=None):
         app=app,
         on_next_card=callbacks.get("on_next_card"),
         on_show_answer=callbacks.get("on_show_answer"),
+        on_card_updated=callbacks.get("on_card_updated"),
     )
     panel.pack(fill=tk.X)
     return panel

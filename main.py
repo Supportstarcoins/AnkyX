@@ -22682,6 +22682,7 @@ class RepeatWindow(tk.Toplevel):
                     app=self.master,
                     on_next_card=self.goto_next_card,
                     on_show_answer=self.show_answer_side,
+                    on_card_updated=self._on_ai_card_updated,
                 )
                 self.ai_review_panel.pack(fill=tk.X, pady=(8, 0))
                 if self.current_card:
@@ -23204,6 +23205,36 @@ class RepeatWindow(tk.Toplevel):
 
         # Обновляем аудио/видео
         self.update_audio_player()
+
+    def _on_ai_card_updated(self, updated_card=None, srs_result=None):
+        try:
+            if not self.current_card:
+                return
+            card_id = self.current_card.get("id")
+            patch = {}
+            if isinstance(updated_card, dict):
+                for key in ("due", "next_review", "leitner_level", "phase", "interval"):
+                    if key in updated_card:
+                        patch[key] = updated_card.get(key)
+            if isinstance(srs_result, dict):
+                if srs_result.get("due") is not None:
+                    patch["due"] = srs_result.get("due")
+                    patch["next_review"] = srs_result.get("due_human") or srs_result.get("due")
+                if srs_result.get("new_level") is not None:
+                    patch["leitner_level"] = srs_result.get("new_level")
+                    patch["phase"] = srs_result.get("new_level")
+                if srs_result.get("interval") is not None:
+                    patch["interval"] = srs_result.get("interval")
+            if not patch:
+                return
+            self.current_card.update(patch)
+            for i, card in enumerate(self.session.cards):
+                if card.get("id") == card_id:
+                    self.session.cards[i].update(patch)
+                    break
+            self.update_view()
+        except Exception:
+            logging.exception("AI card UI refresh failed")
 
     def show_end_state(self):
         self.stop_timer()
