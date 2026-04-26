@@ -49,6 +49,7 @@ class AIReviewPanel(ttk.Frame):
         self.last_follow_up_question = ""
         self.last_user_answer = ""
         self.last_grade_result = None
+        self.current_final_grade_result = None
         self.srs_applied_for_current_card = False
 
         self.columnconfigure(0, weight=1)
@@ -171,6 +172,7 @@ class AIReviewPanel(ttk.Frame):
     def _on_answer_graded(self, result):
         self.progress.stop()
         self.last_grade_result = result
+        self.current_final_grade_result = result
         score = float(result.get("score") or 0.0)
         grade = str(result.get("grade", "unknown")).strip().lower()
         answer_time_quality = str(result.get("answer_time_quality") or "normal").strip().lower()
@@ -207,25 +209,9 @@ class AIReviewPanel(ttk.Frame):
         self.last_follow_up_question = ""
 
         if confident_correct:
-            srs_outcome = self._apply_srs_once()
-            level = None
-            due_human = None
-            if isinstance(srs_outcome, dict):
-                level = srs_outcome.get("leitner_level") or srs_outcome.get("phase")
-                due_human = srs_outcome.get("due_human")
-            if grade == "slow_correct" or answer_time_quality in {"slow", "too_slow"}:
-                self._append("AI", "Верно, но ответ был медленным. Карточка повышена осторожно.")
-            else:
-                moved_text = "Верно. Карточка перенесена в следующую подколоду."
-                if level:
-                    moved_text = f"Верно. Карточка перенесена в подколоду {level}."
-                self._append("AI", moved_text)
-            if due_human:
-                self._append("AI", f"Следующее повторение: {due_human}")
+            self._maybe_apply_srs_and_auto_advance(result, prefix_message="Верно")
             self.submit_btn.configure(text="Проверить ответ")
             self.status_var.set("Верно — переход к следующей карточке…")
-            if not self.awaiting_follow_up and callable(self.on_next_card):
-                self.after(1000, self.go_next_card)
         elif is_partial:
             self.awaiting_follow_up = bool(follow_up_question)
             self.last_follow_up_question = follow_up_question
@@ -295,15 +281,17 @@ class AIReviewPanel(ttk.Frame):
             follow_up_answer,
             previous_grade_result=self.last_grade_result,
         )
+        merged_result = self._merge_follow_up_result(self.last_grade_result, result)
         previous_score = float((self.last_grade_result or {}).get("score") or 0.0)
-        self.last_grade_result = result
+        self.current_final_grade_result = merged_result
+        self.last_grade_result = merged_result
         follow_missing = self._sanitize_ui_text(
-            self._first_point(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
+            self._first_point(self._filter_missing_points_for_ui(self._pick_points_for_ui(merged_result, "missing_points")))
         )
-        follow_unsupported = self._sanitize_ui_text(self._first_point(self._pick_points_for_ui(result, "unsupported_points")))
+        follow_unsupported = self._sanitize_ui_text(self._first_point(self._pick_points_for_ui(merged_result, "unsupported_points")))
         score_delta = float(result.get("score_delta") or 0.0)
         improved_flag = bool(result.get("improved")) or score_delta > 0.05
-        short_feedback = self._sanitize_ui_text(str(result.get("short_feedback") or "").strip())
+        short_feedback = self._sanitize_ui_text(str(merged_result.get("short_feedback") or result.get("short_feedback") or "").strip())
         still_gap = bool(follow_missing or str(result.get("remaining_gap") or "").strip())
         forced_improved_text = ""
         if "Вы добавили недостающую деталь из карточки." in short_feedback:
@@ -320,17 +308,17 @@ class AIReviewPanel(ttk.Frame):
         elif improved_flag:
             improved_text = "Стало лучше: да"
         else:
-            now_score = float(result.get("score") or 0.0)
+            now_score = float(merged_result.get("score") or 0.0)
             if previous_score >= 0.65 or now_score >= 0.65:
                 improved_text = "Почти. Осталось уточнить одну деталь."
             else:
                 improved_text = "Стало лучше: нет"
-        matched_text = self._sanitize_ui_text(self._first_point(self._pick_points_for_ui(result, "matched_points")))
-        follow_analogy = self._pick_analogy_for_ui(result, warning_text=follow_unsupported, missing_text=follow_missing)
+        matched_text = self._sanitize_ui_text(self._first_point(self._pick_points_for_ui(merged_result, "matched_points")))
+        follow_analogy = self._pick_analogy_for_ui(merged_result, warning_text=follow_unsupported, missing_text=follow_missing)
         remaining_gap = self._sanitize_ui_text(str(result.get('remaining_gap') or '').strip())
         if "?" in remaining_gap:
             remaining_gap = ""
-        what_improved = short_feedback or matched_text or "Добавлена часть формулировки из карточки."
+        what_improved = self._sanitize_ui_text(str(result.get("what_improved") or "").strip()) or short_feedback or matched_text or "Добавлена часть формулировки из карточки."
         remaining_parts = [part for part in (follow_missing, remaining_gap, follow_unsupported) if part]
         what_left = "; ".join(remaining_parts)
         final_hint = self._sanitize_ui_text(str(result.get('final_hint') or '').strip())
@@ -340,15 +328,32 @@ class AIReviewPanel(ttk.Frame):
             final_hint = self._sanitize_ui_text(follow_analogy) or "Повторите ответ формулировкой карточки одной фразой."
         lines = [
             improved_text,
+            f"Итоговая оценка: {str(merged_result.get('grade') or '').strip().lower()}",
+            f"Итоговый балл: {float(merged_result.get('score') or 0.0):.2f}",
             f"Что улучшилось: {what_improved}",
             f"Что ещё осталось: {what_left}",
             f"Как сказать ближе к карточке: {final_hint}",
         ]
+        srs_auto = self._maybe_apply_srs_and_auto_advance(merged_result, prefix_message="Теперь верно")
+        if srs_auto.get("applied"):
+            level = srs_auto.get("new_level") or srs_auto.get("leitner_level") or srs_auto.get("phase")
+            if level:
+                lines.append(f"Карточка перенесена в подколоду {level}.")
+            else:
+                lines.append("Карточка перенесена в следующую подколоду.")
+            due_human = srs_auto.get("due_human")
+            if due_human:
+                lines.append(f"Следующее повторение: {due_human}")
         msg = "\n".join(line for line in lines if str(line).strip()) + "\n"
         self._append("AI", msg)
         self.answer_input.delete("1.0", tk.END)
         follow_up_complete = bool(result.get("follow_up_complete", True))
         self.awaiting_follow_up = not follow_up_complete
+        merged_grade = str((merged_result or {}).get("grade") or "").strip().lower()
+        merged_score = float((merged_result or {}).get("score") or 0.0)
+        should_auto_next = merged_grade in {"correct", "slow_correct"} and merged_score >= 0.85
+        if should_auto_next:
+            self.awaiting_follow_up = False
         if self.awaiting_follow_up:
             self.submit_btn.configure(text="Ответить на уточняющий вопрос")
             self.status_var.set("Нужно уточнить ответ ещё раз")
@@ -356,16 +361,9 @@ class AIReviewPanel(ttk.Frame):
             self.last_follow_up_question = ""
             self.submit_btn.configure(text="Проверить ответ")
             self.status_var.set("Уточнение обработано")
-            srs_outcome = self._apply_srs_once()
-            try:
-                grade = str((self.last_grade_result or {}).get("grade") or "").strip().lower()
-                score = float((self.last_grade_result or {}).get("score") or 0.0)
-                if grade in {"correct", "slow_correct"} and score >= 0.85 and callable(self.on_next_card):
-                    if isinstance(srs_outcome, dict) and srs_outcome.get("due_human"):
-                        self._append("AI", f"Следующее повторение: {srs_outcome.get('due_human')}")
-                    self.after(1000, self.go_next_card)
-            except Exception:
-                pass
+            if should_auto_next and callable(self.on_next_card):
+                self.status_var.set("Теперь верно — переход к следующей карточке…")
+                self.after(1000, self.go_next_card)
 
     def _is_clarification_request(self, text: str) -> bool:
         raw = (text or "").strip().lower()
@@ -429,6 +427,7 @@ class AIReviewPanel(ttk.Frame):
         self.last_follow_up_question = ""
         self.last_user_answer = ""
         self.last_grade_result = None
+        self.current_final_grade_result = None
         self.srs_applied_for_current_card = False
         self.submit_btn.configure(text="Проверить ответ")
         self.status_var.set("Введите ответ...")
@@ -445,8 +444,35 @@ class AIReviewPanel(ttk.Frame):
         if not self.current_card or not self.last_grade_result:
             return None
         srs_result = self.controller.apply_srs(self.current_card, self.last_grade_result)
-        self.srs_applied_for_current_card = True
+        if isinstance(srs_result, dict):
+            self.srs_applied_for_current_card = bool(srs_result.get("applied", True))
+        else:
+            self.srs_applied_for_current_card = bool(srs_result)
         return srs_result
+
+    def _merge_follow_up_result(self, previous_grade, follow_result) -> dict:
+        return self.controller.grader.merge_follow_up_grade(previous_grade or {}, follow_result or {})
+
+    def _maybe_apply_srs_and_auto_advance(self, grade_result, prefix_message: str = "Верно") -> dict:
+        safe_grade = dict(grade_result or {})
+        grade = str(safe_grade.get("grade") or "").strip().lower()
+        score = float(safe_grade.get("score") or 0.0)
+        if grade not in {"correct", "slow_correct"} or score < 0.85:
+            return {"applied": False}
+        srs_outcome = self._apply_srs_once()
+        payload = srs_outcome if isinstance(srs_outcome, dict) else {"applied": bool(srs_outcome)}
+        if payload.get("applied"):
+            if grade == "slow_correct":
+                self._append("AI", f"{prefix_message}, но ответ был медленным. Карточка повышена осторожно.")
+            else:
+                level = payload.get("new_level") or payload.get("leitner_level") or payload.get("phase")
+                if level:
+                    self._append("AI", f"{prefix_message}. Карточка перенесена в подколоду {level}.")
+                else:
+                    self._append("AI", f"{prefix_message}. Карточка перенесена в следующую подколоду.")
+            if payload.get("due_human"):
+                self._append("AI", f"Следующее повторение: {payload.get('due_human')}")
+        return payload
 
     def _append(self, role, text):
         self.history.configure(state=tk.NORMAL)

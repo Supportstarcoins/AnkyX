@@ -195,6 +195,68 @@ class AIAnswerGrader:
         flags=re.IGNORECASE,
     )
 
+    @staticmethod
+    def _grade_from_score(score: float) -> str:
+        value = float(score or 0.0)
+        if value >= 0.85:
+            return "correct"
+        if value >= 0.65:
+            return "partial"
+        if value >= 0.40:
+            return "uncertain"
+        return "wrong"
+
+    @classmethod
+    def merge_follow_up_grade(cls, previous_grade: dict[str, Any], follow_result: dict[str, Any]) -> dict[str, Any]:
+        prev = dict(previous_grade or {})
+        follow = dict(follow_result or {})
+        previous_score = float(prev.get("score") or 0.0)
+        score_delta = float(follow.get("score_delta") or 0.0)
+        improved = bool(follow.get("improved"))
+        follow_up_complete = bool(follow.get("follow_up_complete"))
+        missing_points = follow.get("missing_points_human") or follow.get("missing_points") or []
+        if missing_points and not isinstance(missing_points, list):
+            missing_points = [str(missing_points)]
+
+        final_score = previous_score
+        if improved:
+            final_score = min(1.0, previous_score + max(score_delta, 0.15))
+        if follow_up_complete or not missing_points:
+            final_score = max(final_score, 0.85)
+        final_score = round(min(1.0, max(0.0, final_score)), 3)
+
+        merged: dict[str, Any] = dict(prev)
+        merged.update(
+            {
+                "grade": cls._grade_from_score(final_score),
+                "score": final_score,
+                "short_feedback": follow.get("short_feedback") or prev.get("short_feedback") or "",
+                "matched_points_human": follow.get("matched_points_human")
+                or follow.get("matched_points")
+                or prev.get("matched_points_human")
+                or prev.get("matched_points")
+                or [],
+                "missing_points_human": follow.get("missing_points_human")
+                or follow.get("missing_points")
+                or prev.get("missing_points_human")
+                or prev.get("missing_points")
+                or [],
+                "unsupported_points_human": follow.get("unsupported_points_human")
+                or follow.get("unsupported_points")
+                or prev.get("unsupported_points_human")
+                or prev.get("unsupported_points")
+                or [],
+                "follow_up_result": follow,
+                "source": prev.get("source") or follow.get("source") or "fallback",
+            }
+        )
+        for keep_field in ("answer_time_ms", "answer_time_quality"):
+            if follow.get(keep_field) is not None:
+                merged[keep_field] = follow.get(keep_field)
+            elif prev.get(keep_field) is not None:
+                merged[keep_field] = prev.get(keep_field)
+        return merged
+
     def _looks_like_raw_stem_phrase(self, text: str) -> bool:
         line = str(text or "").strip().lower()
         if not line:
@@ -1713,10 +1775,12 @@ class AIAnswerGrader:
             improved = False
 
         follow_up_complete = bool(improved and (new_score >= 0.75 or not remaining_keywords))
+        what_improved = "Добавлена часть ключевой формулировки." if improved else ""
         result = {
             "improved": improved,
             "score_delta": score_delta,
             "short_feedback": short_feedback,
+            "what_improved": what_improved,
             "remaining_gap": remaining_gap,
             "analogy": "Это как чинить цепочку: добавили одно звено, но нужно замкнуть весь контур.",
             "final_hint": final_hint,
@@ -1763,6 +1827,7 @@ class AIAnswerGrader:
         if has_rare_in_back and added_rare:
             safe_result["improved"] = True
             safe_result["short_feedback"] = "Вы добавили недостающую деталь из карточки."
+            safe_result["what_improved"] = "Вы добавили недостающую деталь из карточки."
             if needs_serious and not added_serious:
                 safe_result["remaining_gap"] = self._make_generic_missing_feedback(back, follow_up_answer, safe_result.get("missing_points") or [])
             if added_serious:
@@ -1773,6 +1838,13 @@ class AIAnswerGrader:
         for field in ("short_feedback", "remaining_gap", "final_hint", "error_explanation"):
             if field in safe_result:
                 safe_result[field] = self._sanitize_human_text(str(safe_result.get(field) or ""))
+        safe_result["what_improved"] = self._sanitize_human_text(
+            str(safe_result.get("what_improved") or safe_result.get("short_feedback") or "")
+        )
+        if "follow_up_complete" not in safe_result:
+            safe_result["follow_up_complete"] = not bool(safe_result.get("missing_points_human") or safe_result.get("missing_points"))
+        if safe_result.get("improved") and float(safe_result.get("score_delta") or 0.0) < 0.15:
+            safe_result["score_delta"] = 0.15
         for field in ("matched_points_human", "missing_points_human", "unsupported_points_human"):
             if field in safe_result:
                 safe_result[field] = self._sanitize_human_list(safe_result.get(field) or [])

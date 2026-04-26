@@ -146,6 +146,7 @@ class AISRSAdapter:
                 "interval": round(float(interval), 4),
                 "phase": phase,
                 "leitner_level": leitner_level,
+                "new_level": leitner_level,
                 "due": due_value,
                 "due_human": due_dt.strftime("%Y-%m-%d %H:%M"),
                 "grade": normalized_grade,
