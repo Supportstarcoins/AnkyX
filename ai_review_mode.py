@@ -72,6 +72,7 @@ class AIReviewPanel(ttk.Frame):
         if not self.current_card:
             return
         user_answer = self.answer_input.get("1.0", "end-1c").strip()
+        self._append("Вы", user_answer or "—")
         started = self.answer_started_at or time.time()
         elapsed_ms = int((time.time() - started) * 1000)
         self.progress.start(10)
@@ -87,8 +88,7 @@ class AIReviewPanel(ttk.Frame):
         grade = result.get("grade", "unknown")
         msg = (
             f"Оценка: {grade} | score={result.get('score')}\n"
-            f"Комментарий: {result.get('short_feedback')}\n"
-            f"Ошибка: {result.get('mistake_type')}\n"
+            f"Объяснение ошибки: {result.get('error_explanation') or result.get('short_feedback')}\n"
             f"Аналогия: {result.get('analogy')}\n"
             f"Уточняющий вопрос: {result.get('follow_up_question')}\n"
         )

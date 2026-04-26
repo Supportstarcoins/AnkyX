@@ -22673,6 +22673,7 @@ class RepeatWindow(tk.Toplevel):
             self.btn_remember,
             self.btn_translation,
         ]
+        self._ai_panel_card_id = None
         self.ai_review_panel = None
         if AIReviewPanel is not None:
             try:
@@ -22680,11 +22681,12 @@ class RepeatWindow(tk.Toplevel):
                     frame_main,
                     app=self.master,
                     on_next_card=self.goto_next_card,
-                    on_show_answer=self.toggle_front_back,
+                    on_show_answer=self.show_answer_side,
                 )
                 self.ai_review_panel.pack(fill=tk.X, pady=(8, 0))
                 if self.current_card:
                     self.ai_review_panel.set_card(dict(self.current_card))
+                    self._ai_panel_card_id = self.current_card.get("id")
             except Exception:
                 logging.exception("Не удалось встроить AIReviewPanel")
                 self.ai_review_panel = None
@@ -23193,9 +23195,10 @@ class RepeatWindow(tk.Toplevel):
             )
 
         self.btn_show.config(text="Показать ответ" if not self.show_back else "Показать лицевую сторону")
-        if self.ai_review_panel is not None:
+        if self.ai_review_panel is not None and c.get("id") != self._ai_panel_card_id:
             try:
                 self.ai_review_panel.set_card(dict(c))
+                self._ai_panel_card_id = c.get("id")
             except Exception:
                 logging.exception("AIReviewPanel set_card failed")
 
@@ -23205,6 +23208,7 @@ class RepeatWindow(tk.Toplevel):
     def show_end_state(self):
         self.stop_timer()
         self.timer_left = 0
+        self._ai_panel_card_id = None
         self.update_timer_label()
         self.lbl_status.config(text="На сегодня всё")
         if self.card_renderer is not None:
@@ -23226,6 +23230,13 @@ class RepeatWindow(tk.Toplevel):
             return
         self.show_back = not self.show_back
         self.update_view()
+
+    def show_answer_side(self):
+        if self._inline_editing:
+            return
+        if not self.show_back:
+            self.show_back = True
+            self.update_view()
 
     def reset_timer_for_card(self):
         self.stop_timer()
@@ -23317,6 +23328,7 @@ class RepeatWindow(tk.Toplevel):
         self.show_back = False
         if self.ai_review_panel is not None:
             self.ai_review_panel.clear_chat()
+            self._ai_panel_card_id = None
         if not self.current_card:
             self.show_end_state()
             return
@@ -23335,6 +23347,7 @@ class RepeatWindow(tk.Toplevel):
         self.show_back = False
         if self.ai_review_panel is not None:
             self.ai_review_panel.clear_chat()
+            self._ai_panel_card_id = None
         self.load_checkpoint_state()
         self.update_view()
         self.reset_timer_for_card()

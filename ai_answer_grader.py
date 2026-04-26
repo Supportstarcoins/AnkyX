@@ -42,10 +42,18 @@ class AIAnswerGrader:
         mistake_type = "none" if coverage >= 0.75 else "missing_key_point"
         missing = sorted(list(expected - actual))[:5]
         feedback = "Ответ близок к правильному." if coverage >= 0.75 else "В ответе не хватает ключевых пунктов."
+        if coverage >= 0.9:
+            error_explanation = "Существенных ошибок не найдено."
+        elif coverage >= 0.75:
+            error_explanation = "Есть небольшие неточности формулировки, но ключевая идея сохранена."
+        else:
+            missing_text = ", ".join(missing) if missing else "ключевые элементы ответа"
+            error_explanation = f"Пропущены важные части: {missing_text}."
 
         result = self._result(grade, round(coverage, 3), t_quality, mistake_type, feedback)
         result["missing_points"] = missing
         result["srs_action"] = action
+        result["error_explanation"] = error_explanation
         result["follow_up_question"] = f"Как бы вы объяснили это короче: {(card or {}).get('front', 'тему')}?"
         result["analogy"] = "Подумайте об этом как о кратком определении с 2-3 ключевыми признаками."
         result["card_action"] = "keep" if coverage >= 0.75 else "simplify"
@@ -64,10 +72,10 @@ class AIAnswerGrader:
             "mistake_type": mistake_type,
             "missing_points": [],
             "short_feedback": feedback,
+            "error_explanation": "",
             "analogy": "",
             "follow_up_question": "",
             "srs_action": "repeat_soon",
             "card_action": "keep",
             "suggested_rewrite": {"front": "", "back": ""},
         }
-
