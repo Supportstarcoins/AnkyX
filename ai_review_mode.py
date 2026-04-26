@@ -14,16 +14,20 @@ class AIReviewController:
         self.grader = AIAnswerGrader()
         self.srs = AISRSAdapter()
 
-    def grade(self, card, user_answer, answer_time_ms):
+    def grade(self, card, user_answer, answer_time_ms, apply_srs=True):
         result = self.grader.grade_answer(card, user_answer, answer_time_ms)
         result["answer_time_ms"] = int(result.get("answer_time_ms") or answer_time_ms or 0)
+        if apply_srs:
+            self.apply_srs(card, result)
+        return result
+
+    def apply_srs(self, card, result):
         card_id = (card or {}).get("id")
         if card_id is not None:
             try:
                 self.srs.apply_ai_grade_to_card(card_id, result, self.app)
             except Exception:
                 pass
-        return result
 
 
 class AIReviewPanel(ttk.Frame):
@@ -39,6 +43,7 @@ class AIReviewPanel(ttk.Frame):
         self.last_follow_up_question = ""
         self.last_user_answer = ""
         self.last_grade_result = None
+        self.srs_applied_for_current_card = False
 
         self.columnconfigure(0, weight=1)
         self.status_var = tk.StringVar(value="AI-проверка готова")
@@ -91,7 +96,7 @@ class AIReviewPanel(ttk.Frame):
         self.after(10, lambda: self._grade_now(user_answer, elapsed_ms))
 
     def _grade_now(self, user_answer, elapsed_ms):
-        result = self.controller.grade(self.current_card, user_answer, elapsed_ms)
+        result = self.controller.grade(self.current_card, user_answer, elapsed_ms, apply_srs=False)
         self._on_answer_graded(result)
 
     def _on_answer_graded(self, result):
@@ -105,8 +110,7 @@ class AIReviewPanel(ttk.Frame):
             f"Оценка: {grade}\n"
             f"Балл: {result.get('score')}\n"
             f"Время ответа: {answer_time_ms} мс ({result.get('answer_time_quality')})\n"
-            f"Объяснение ошибки: {result.get('error_explanation') or result.get('short_feedback')}\n"
-            f"Аналогия: {result.get('analogy')}\n"
+            f"Что уже верно / что не хватает: {result.get('error_explanation') or result.get('short_feedback')}\n"
             f"Уточняющий вопрос: {result.get('follow_up_question')}\n"
             f"Источник проверки: {source_label}\n"
         )
@@ -119,6 +123,7 @@ class AIReviewPanel(ttk.Frame):
             self.submit_btn.configure(text="Ответить на уточняющий вопрос")
         else:
             self.submit_btn.configure(text="Проверить ответ")
+            self._apply_srs_once()
         if callable(self.on_show_answer):
             try:
                 self.on_show_answer()
@@ -167,9 +172,8 @@ class AIReviewPanel(ttk.Frame):
         msg = (
             f"Стало лучше: {'да' if result.get('improved') else 'нет'}\n"
             f"Изменение балла: {result.get('score_delta')}\n"
-            f"Короткий фидбек: {result.get('short_feedback')}\n"
+            f"Комментарий: {result.get('short_feedback')}\n"
             f"Что ещё не хватает: {result.get('remaining_gap')}\n"
-            f"Аналогия: {result.get('analogy')}\n"
             f"Финальная подсказка: {result.get('final_hint')}\n"
         )
         self._append("AI", msg)
@@ -183,6 +187,7 @@ class AIReviewPanel(ttk.Frame):
             self.last_follow_up_question = ""
             self.submit_btn.configure(text="Проверить ответ")
             self.status_var.set("Уточнение обработано")
+            self._apply_srs_once()
 
     def _is_clarification_request(self, text: str) -> bool:
         raw = (text or "").strip().lower()
@@ -246,13 +251,23 @@ class AIReviewPanel(ttk.Frame):
         self.last_follow_up_question = ""
         self.last_user_answer = ""
         self.last_grade_result = None
+        self.srs_applied_for_current_card = False
         self.submit_btn.configure(text="Проверить ответ")
         self.status_var.set("Введите ответ...")
 
     def go_next_card(self):
+        self._apply_srs_once()
         self.clear_chat()
         if callable(self.on_next_card):
             self.on_next_card()
+
+    def _apply_srs_once(self):
+        if self.srs_applied_for_current_card:
+            return
+        if not self.current_card or not self.last_grade_result:
+            return
+        self.controller.apply_srs(self.current_card, self.last_grade_result)
+        self.srs_applied_for_current_card = True
 
     def _append(self, role, text):
         self.history.configure(state=tk.NORMAL)
