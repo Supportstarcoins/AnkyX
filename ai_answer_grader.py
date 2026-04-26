@@ -123,6 +123,63 @@ class AIAnswerGrader:
         "какие",
         "уточняющий вопрос",
     )
+    STEM_TO_HUMAN_REPLACEMENTS = (
+        (re.compile(r"\bсерь[её]зн\b|\bтяжел\b|\bтяжёл\b", flags=re.IGNORECASE), "серьёзные осложнения"),
+        (re.compile(r"\bпобочн\b.*\bэффект", flags=re.IGNORECASE), "реакции на прививку"),
+        (re.compile(r"\bобычн\b", flags=re.IGNORECASE), "обычные реакции"),
+        (re.compile(r"\bредк\b", flags=re.IGNORECASE), "более редкие реакции"),
+        (re.compile(r"\bбыстр\b", flags=re.IGNORECASE), "проходят быстро"),
+        (re.compile(r"\bосложнен\b", flags=re.IGNORECASE), "осложнения"),
+    )
+    RAW_STEM_TOKENS = ("серьезн", "серьёзн", "побочн", "обычн", "редк", "реакц", "осложнен", "быстр", "возникнуть")
+    RAW_STEM_TOKEN_RE = re.compile(
+        r"\b(?:серьезн|серьёзн|побочн|обычн|редк|реакц|осложнен|быстр|возникнуть)\b",
+        flags=re.IGNORECASE,
+    )
+
+    def _looks_like_raw_stem_phrase(self, text: str) -> bool:
+        line = str(text or "").strip().lower()
+        if not line:
+            return False
+        tokens = self.RAW_STEM_TOKEN_RE.findall(line)
+        if len(tokens) >= 2:
+            return True
+        return "возникнуть серьезн побочн эффект" in line
+
+    def _humanize_raw_stem_phrase(self, text: str) -> str:
+        line = str(text or "").strip()
+        if not line:
+            return ""
+        low = line.lower()
+        if "возникнуть" in low and "серьезн" in low and "побочн" in low:
+            return "формулировку «серьёзные побочные эффекты» лучше заменить на «серьёзные осложнения»."
+        result = line
+        for pattern, replacement in self.STEM_TO_HUMAN_REPLACEMENTS:
+            result = pattern.sub(replacement, result)
+        result = re.sub(r"\s+", " ", result).strip(" ,.;")
+        return result or "Скажите ближе к карточке человеческой формулировкой, без технических stem-токенов."
+
+    def _sanitize_human_text(self, text: str) -> str:
+        line = str(text or "").strip()
+        if not line:
+            return ""
+        if self._looks_like_raw_stem_phrase(line):
+            return self._humanize_raw_stem_phrase(line)
+        return line
+
+    def _sanitize_human_list(self, items: list[str] | None) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in items or []:
+            line = self._sanitize_human_text(str(raw or ""))
+            if not line:
+                continue
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(line)
+        return cleaned[:6]
 
 
     def _contains_internal_labels(self, points: list[str] | None) -> bool:
@@ -277,7 +334,11 @@ class AIAnswerGrader:
                 out.append(x)
             return out[:6]
 
-        return dedupe(matched_human), self._remove_question_like_missing_points(dedupe(missing_human)), dedupe(unsupported_human)
+        return (
+            self._sanitize_human_list(dedupe(matched_human)),
+            self._sanitize_human_list(self._remove_question_like_missing_points(dedupe(missing_human))),
+            self._sanitize_human_list(dedupe(unsupported_human)),
+        )
 
     def _remove_question_like_missing_points(self, points: list[str]) -> list[str]:
         cleaned: list[str] = []
@@ -604,7 +665,7 @@ class AIAnswerGrader:
             return text[: max_len - 1].rstrip(" ,;:.") + "…"
 
         def _normalize(line: str) -> str:
-            text = _truncate(line).strip(" .")
+            text = self._sanitize_human_text(_truncate(line)).strip(" .")
             low = text.lower()
             if low in {"тяжел", "тяжёл", "редкие", "легкие", "лёгкие"}:
                 return ""
@@ -645,6 +706,8 @@ class AIAnswerGrader:
         payload["matched_points_human"] = matched_h[:2]
         payload["missing_points_human"] = missing_h[:2]
         payload["unsupported_points_human"] = unsupported_h[:2]
+        for field in ("short_feedback", "error_explanation", "remaining_gap", "final_hint"):
+            payload[field] = self._sanitize_human_text(str(payload.get(field) or ""))
         return payload
 
     def _sanitize_llm_result_against_back(self, result: dict, back: str) -> dict:
@@ -688,6 +751,7 @@ class AIAnswerGrader:
             if bad:
                 debug_notes.append(f"{key}: replaced out-of-back content ({', '.join(bad)})")
                 safe[key] = "Формулируйте ответ ближе к карточке, без добавления новых фактов."
+            safe[key] = self._sanitize_human_text(str(safe.get(key) or ""))
 
         follow_q = str(safe.get("follow_up_question") or "").strip()
         if follow_q:
@@ -702,6 +766,14 @@ class AIAnswerGrader:
             if bad:
                 debug_notes.append(f"final_hint sanitized ({', '.join(bad)})")
                 safe["final_hint"] = self._safe_final_hint(back)
+            safe["final_hint"] = self._sanitize_human_text(str(safe.get("final_hint") or ""))
+
+        for human_key in (
+            "matched_points_human",
+            "missing_points_human",
+            "unsupported_points_human",
+        ):
+            safe[human_key] = self._sanitize_human_list(safe.get(human_key) or [])
 
         safe["unsupported_points"] = [str(x).strip() for x in unsupported if str(x).strip()][:8]
         safe["debug_notes"] = debug_notes[:20]
@@ -1260,6 +1332,10 @@ class AIAnswerGrader:
         safe_result = dict(result or {})
         answer_l = (follow_up_answer or "").lower()
         back_l = (back or "").lower()
+        has_rare_in_back = "более редк" in back_l or "редк" in back_l
+        added_rare = bool(re.search(r"\bредк(ие|ая|о|их|ими)?\b|более редк", answer_l))
+        added_serious = bool(re.search(r"\bсерь[её]зн|осложнен", answer_l))
+        needs_serious = ("серьез" in back_l or "серьёз" in back_l or "осложнен" in back_l)
         matched_human, missing_human, unsupported_human = self._build_human_fields(
             (safe_result.get("matched_points") or []),
             (safe_result.get("missing_points") or []),
@@ -1294,6 +1370,23 @@ class AIAnswerGrader:
                 "Скажи ближе к карточке: обычные реакции проходят быстро, "
                 "а вторая группа — более редкие и серьёзные осложнения."
             )
+
+        if has_rare_in_back and added_rare:
+            safe_result["improved"] = True
+            safe_result["short_feedback"] = "Вы добавили недостающую деталь: вторая группа реакций бывает более редкой."
+            if needs_serious and not added_serious:
+                safe_result["remaining_gap"] = "Осталось добавить, что речь именно о серьёзных осложнениях."
+            if added_serious:
+                safe_result["short_feedback"] = "Теперь ответ близок к карточке."
+                safe_result["remaining_gap"] = ""
+                safe_result["follow_up_complete"] = True
+
+        for field in ("short_feedback", "remaining_gap", "final_hint", "error_explanation"):
+            if field in safe_result:
+                safe_result[field] = self._sanitize_human_text(str(safe_result.get(field) or ""))
+        for field in ("matched_points_human", "missing_points_human", "unsupported_points_human"):
+            if field in safe_result:
+                safe_result[field] = self._sanitize_human_list(safe_result.get(field) or [])
         return safe_result
 
     def explain_follow_up_hint(

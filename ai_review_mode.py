@@ -148,6 +148,12 @@ class AIReviewPanel(ttk.Frame):
                 return line
         return ""
 
+    def _sanitize_ui_text(self, text: str) -> str:
+        line = str(text or "").strip()
+        if not line:
+            return ""
+        return self.controller.grader._sanitize_human_text(line)
+
     def _on_answer_graded(self, result):
         self.progress.stop()
         self.last_grade_result = result
@@ -241,12 +247,25 @@ class AIReviewPanel(ttk.Frame):
         )
         previous_score = float((self.last_grade_result or {}).get("score") or 0.0)
         self.last_grade_result = result
-        follow_missing = self._first_point(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
-        follow_unsupported = self._first_point(self._pick_points_for_ui(result, "unsupported_points"))
+        follow_missing = self._sanitize_ui_text(
+            self._first_point(self._filter_missing_points_for_ui(self._pick_points_for_ui(result, "missing_points")))
+        )
+        follow_unsupported = self._sanitize_ui_text(self._first_point(self._pick_points_for_ui(result, "unsupported_points")))
         score_delta = float(result.get("score_delta") or 0.0)
         improved_flag = bool(result.get("improved")) or score_delta > 0.05
+        short_feedback = self._sanitize_ui_text(str(result.get("short_feedback") or "").strip())
         still_gap = bool(follow_missing or str(result.get("remaining_gap") or "").strip())
-        if improved_flag and still_gap:
+        forced_improved_text = ""
+        if "Вы добавили недостающую деталь: вторая группа реакций бывает более редкой." in short_feedback:
+            improved_text = "Стало лучше: да"
+            forced_improved_text = improved_text
+        elif "Теперь ответ близок к карточке." in short_feedback:
+            improved_text = "Стало лучше: да"
+            still_gap = False
+            forced_improved_text = improved_text
+        if forced_improved_text:
+            improved_text = forced_improved_text
+        elif improved_flag and still_gap:
             improved_text = "Стало лучше: немного"
         elif improved_flag:
             improved_text = "Стало лучше: да"
@@ -256,32 +275,25 @@ class AIReviewPanel(ttk.Frame):
                 improved_text = "Почти. Осталось уточнить одну деталь."
             else:
                 improved_text = "Стало лучше: нет"
-        lines = [
-            improved_text,
-        ]
-        short_feedback = str(result.get("short_feedback") or "").strip()
-        matched_text = self._first_point(self._pick_points_for_ui(result, "matched_points"))
-        if short_feedback:
-            lines.append(f"Что улучшилось: {short_feedback}")
-        elif matched_text:
-            lines.append(f"Что улучшилось: {matched_text}")
+        matched_text = self._sanitize_ui_text(self._first_point(self._pick_points_for_ui(result, "matched_points")))
         follow_analogy = self._pick_analogy_for_ui(result, warning_text=follow_unsupported, missing_text=follow_missing)
-        remaining_gap = str(result.get('remaining_gap') or '').strip()
+        remaining_gap = self._sanitize_ui_text(str(result.get('remaining_gap') or '').strip())
         if "?" in remaining_gap:
             remaining_gap = ""
-        if follow_missing:
-            lines.append(f"Что ещё не точно: {follow_missing}")
-        elif remaining_gap:
-            lines.append(f"Что ещё не точно: {remaining_gap}")
-        if follow_unsupported:
-            lines.append(f"Что ещё не точно: {follow_unsupported}")
-        final_hint = str(result.get('final_hint') or '').strip()
-        if final_hint:
-            lines.append(f"Как сказать ближе к карточке: {final_hint}")
-        if follow_analogy:
-            lines.append(f"Следующий шаг: {follow_analogy}")
-        else:
-            lines.append("Следующий шаг: добавьте недостающую деталь про вторую группу реакций.")
+        what_improved = short_feedback or matched_text or "Добавлена часть формулировки из карточки."
+        remaining_parts = [part for part in (follow_missing, remaining_gap, follow_unsupported) if part]
+        what_left = "; ".join(remaining_parts)
+        final_hint = self._sanitize_ui_text(str(result.get('final_hint') or '').strip())
+        if not what_left:
+            what_left = "Критичных расхождений не осталось."
+        if not final_hint:
+            final_hint = self._sanitize_ui_text(follow_analogy) or "Повторите ответ формулировкой карточки одной фразой."
+        lines = [
+            improved_text,
+            f"Что улучшилось: {what_improved}",
+            f"Что ещё осталось: {what_left}",
+            f"Как сказать ближе к карточке: {final_hint}",
+        ]
         msg = "\n".join(line for line in lines if str(line).strip()) + "\n"
         self._append("AI", msg)
         self.answer_input.delete("1.0", tk.END)
