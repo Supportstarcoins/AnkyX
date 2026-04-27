@@ -20,6 +20,9 @@ BANNED_GENERIC_PATTERNS = [
     "что такое это",
     "что такое особенности",
     "какой факт можно выделить",
+    "что конкретно сказано",
+    "что известно про",
+    "что известно о",
 ]
 
 STOP_TERMS = {
@@ -28,8 +31,17 @@ STOP_TERMS = {
     "он", "она", "они", "оно",
 }
 
-KNOWN_TYPES = {"definition", "fact", "cause", "difference", "list", "process", "date", "formula"}
-BOOST_TYPES = {"definition", "fact", "cause", "difference", "list"}
+KNOWN_TYPES = {
+    "definition",
+    "function",
+    "range/quantity",
+    "cause",
+    "difference",
+    "list/classification",
+    "anatomy/composition",
+    "fact",
+}
+BOOST_TYPES = {"definition", "function", "range/quantity", "cause", "difference", "list/classification", "anatomy/composition", "fact"}
 FILLER_TOKENS = {"материал", "материале", "текст", "тексте", "факт", "указан", "указано", "указанная"}
 
 
@@ -49,8 +61,27 @@ def _looks_too_generic(front_low: str) -> bool:
         r"^какой\s+факт\b",
         r"^какой\s+вывод\b",
         r"^почему\s+это\s+важно\b",
+        r"^что\s+конкретно\s+сказано\b",
+        r"^что\s+известно\s+про\b",
+        r"^что\s+известно\s+о\b",
+        r"^что\s+означает\s+термин\s+[«\"]?это\b",
     ]
     return any(re.search(p, front_low) for p in generic_forms)
+
+
+def _looks_like_token_garbage(front: str) -> bool:
+    toks = _tokens(front)
+    if not toks:
+        return True
+    long_toks = [t for t in toks if len(t) >= 3]
+    if len(long_toks) < 2:
+        return True
+    bad_ratio = sum(1 for t in toks if len(t) <= 2) / max(1, len(toks))
+    if bad_ratio > 0.5:
+        return True
+    if re.search(r"[^\w\s?.,!«»\"-]{2,}", front):
+        return True
+    return False
 
 
 def _has_specific_object(front: str, excerpt: str) -> bool:
@@ -95,9 +126,10 @@ def score_card(card: dict) -> dict:
 
     generic = _looks_too_generic(front_low)
     stop_term = _has_stop_term_as_term(front)
+    garbage = _looks_like_token_garbage(front)
     specific = _has_specific_object(front, excerpt)
 
-    if generic or stop_term:
+    if generic or stop_term or garbage:
         score = min(score, 0.2)
 
     if len(front) < 8:
@@ -146,7 +178,7 @@ def score_card(card: dict) -> dict:
         else:
             score -= 0.1
 
-    if generic or stop_term:
+    if generic or stop_term or garbage:
         score = min(score, 0.2)
 
     out = dict(card)
@@ -209,7 +241,14 @@ def polish_card(card: dict) -> dict:
 
 
 def filter_bad_cards(cards: list[dict]) -> list[dict]:
-    scored = [score_card(polish_card(card)) for card in cards]
+    hard = []
+    for card in cards:
+        c = polish_card(card)
+        front = (c.get("front") or "").strip()
+        if _looks_too_generic(front.lower()) or _has_stop_term_as_term(front) or _looks_like_token_garbage(front):
+            continue
+        hard.append(c)
+    scored = [score_card(card) for card in hard]
     deduped = dedupe_cards(scored)
     strong = [c for c in deduped if c.get("back") and c.get("quality_score", 0.0) >= 0.55]
     if len(strong) >= 3:
