@@ -9,9 +9,11 @@ import time
 from datetime import datetime
 from typing import Any
 
-from card_quality_filter import filter_bad_cards, polish_card, score_card
+from card_quality_filter import STOP_TERMS, filter_bad_cards, polish_card, score_card
 from rag_content_pipeline import clean_raw_text
 from semantic_chunker import split_into_semantic_chunks
+
+ALLOWED_CARD_TYPES = {"definition", "fact", "cause", "difference", "list", "process", "date", "formula"}
 
 
 class AICardPipeline:
@@ -40,7 +42,7 @@ class AICardPipeline:
             return []
 
         cleaned = clean_raw_text(html.unescape(raw_text))
-        chunks = split_into_semantic_chunks(cleaned, min_words=120, max_words=500)
+        chunks = split_into_semantic_chunks(cleaned, min_words=90, max_words=320)
         units = self.extract_knowledge_units(chunks)
         candidates = self._generate_candidates(units, source_trace=source_trace or {})
         cards = self._finalize_cards(candidates, mode=mode)
@@ -62,27 +64,29 @@ class AICardPipeline:
         for chunk in chunks:
             text = chunk.get("text", "")
             sentences = re.split(r"(?<=[.!?])\s+", text)
-            facts = [s.strip() for s in sentences if 30 <= len(s.strip()) <= 360]
+            facts = [s.strip() for s in sentences if 25 <= len(s.strip()) <= 360]
             terms = [m.group(1).strip() for m in re.finditer(r"([А-ЯA-Z][^\n:]{2,60})\s*[:\-]\s*", text)]
             dates = re.findall(r"\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}|\d{1,2}\s+[а-яА-Яa-zA-Z]+\s+\d{4})\b", text)
             formulas = re.findall(r"\b[\wА-Яа-я]+\s*=\s*[^\n.,;]{2,80}", text)
-            causes = [s for s in facts if re.search(r"(?i)потому что|из-за|вследствие|поэтому", s)]
-            differences = [s for s in facts if re.search(r"(?i)в отличие от|однако|но\s|чем", s)]
+            causes = [s for s in facts if re.search(r"(?i)потому что|из-за|вследствие|поэтому|приводит к", s)]
+            differences = [s for s in facts if re.search(r"(?i)в отличие от|отличается|тогда как|вместо", s)]
             definitions = [s for s in facts if re.search(r"(?i)\bэто\b|\bназывается\b|\bопределяется\b", s)]
             lists = [s for s in facts if "," in s and len(s.split(",")) >= 3]
+            topic = (chunk.get("topic_title") or self._infer_topic_from_text(text) or "Общая тема").strip()
             units.append(
                 {
                     "chunk_id": chunk.get("chunk_id"),
-                    "concepts": list({t for t in terms[:8]}),
-                    "facts": facts[:12],
-                    "terms": list({t for t in terms[:8]}),
+                    "topic": topic,
+                    "concepts": list({t for t in terms[:10]}),
+                    "facts": facts[:14],
+                    "terms": list({t for t in terms[:10]}),
                     "dates": list(dict.fromkeys(dates))[:6],
                     "formulas": list(dict.fromkeys(formulas))[:6],
                     "causes": causes[:6],
                     "differences": differences[:6],
                     "definitions": definitions[:6],
                     "lists": lists[:6],
-                    "source_excerpt": text[:420],
+                    "source_excerpt": text[:520],
                     "time_start": None,
                     "time_end": None,
                 }
@@ -92,29 +96,114 @@ class AICardPipeline:
     def _generate_candidates(self, units: list[dict], source_trace: dict) -> list[dict]:
         cards: list[dict] = []
         for unit in units:
-            excerpt = unit.get("source_excerpt") or ""
-            chunk_id = unit.get("chunk_id") or ""
-            source_type = source_trace.get("source_type") or "manual"
-            source_url = source_trace.get("source_url") or ""
-            source_title = source_trace.get("source_title") or ""
+            llm_cards = self._generate_cards_with_llm(unit, source_trace)
+            if llm_cards:
+                cards.extend(llm_cards)
+                continue
+            cards.extend(self._generate_candidates_fallback(unit, source_trace))
+        return cards
 
-            for d in unit.get("definitions", [])[:3]:
-                term = self._guess_subject(d)
-                if not term:
-                    continue
-                cards.append(self._make_card(f"Что означает термин «{term}»?", d, "definition", excerpt, chunk_id, source_type, source_url, source_title, unit))
-            for f in unit.get("facts", [])[:4]:
-                q = self._question_from_fact(f)
-                if q:
-                    cards.append(self._make_card(q, f, "fact", excerpt, chunk_id, source_type, source_url, source_title, unit))
-            for c in unit.get("causes", [])[:2]:
-                cards.append(self._make_card("Какова указанная причина явления?", c, "cause", excerpt, chunk_id, source_type, source_url, source_title, unit))
-            for diff in unit.get("differences", [])[:2]:
-                cards.append(self._make_card("В чём ключевое различие, указанное в материале?", diff, "difference", excerpt, chunk_id, source_type, source_url, source_title, unit))
-            for dt in unit.get("dates", [])[:2]:
-                cards.append(self._make_card("Какая дата/год указаны в материале?", dt, "date", excerpt, chunk_id, source_type, source_url, source_title, unit))
-            for fr in unit.get("formulas", [])[:2]:
-                cards.append(self._make_card("Какая формула указана в тексте?", fr, "formula", excerpt, chunk_id, source_type, source_url, source_title, unit))
+    def _generate_cards_with_llm(self, unit: dict, source_trace: dict) -> list[dict]:
+        settings = self._get_llm_settings()
+        if not settings.get("enabled"):
+            return []
+        try:
+            import requests
+        except Exception:
+            return []
+
+        prompt = self._build_llm_prompt(unit)
+        messages = [
+            {"role": "system", "content": "Ты создаёшь флэш-карточки в строгом JSON-массиве без пояснений."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            resp = requests.post(
+                f"{settings['base_url'].rstrip('/')}/api/chat",
+                json={"model": settings["model"], "messages": messages, "stream": False},
+                timeout=settings.get("timeout", 45),
+            )
+            if not resp.ok:
+                return []
+            raw = str(((resp.json() or {}).get("message") or {}).get("content") or "").strip()
+            payload = self._extract_json_array(raw)
+            parsed = json.loads(payload)
+            if not isinstance(parsed, list):
+                return []
+        except Exception:
+            return []
+
+        cards: list[dict] = []
+        for item in parsed[:8]:
+            if not isinstance(item, dict):
+                continue
+            card_type = str(item.get("card_type") or "fact").strip().lower()
+            if card_type not in ALLOWED_CARD_TYPES:
+                card_type = "fact"
+            card = self._make_card(
+                item.get("front") or "",
+                item.get("back") or "",
+                card_type,
+                item.get("source_excerpt") or unit.get("source_excerpt") or "",
+                unit.get("chunk_id") or "",
+                source_trace.get("source_type") or "manual",
+                source_trace.get("source_url") or "",
+                source_trace.get("source_title") or "",
+                unit,
+                topic=item.get("topic") or unit.get("topic") or "",
+            )
+            card["explanation"] = str(item.get("explanation") or card.get("back") or "")[:240]
+            card["difficulty"] = str(item.get("difficulty") or "medium")
+            card["needs_image"] = bool(item.get("needs_image", card.get("needs_image")))
+            card["image_prompt"] = str(item.get("image_prompt") or "").strip() or self.build_image_prompt_for_card(card)
+            cards.append(card)
+        return cards
+
+    def _generate_candidates_fallback(self, unit: dict, source_trace: dict) -> list[dict]:
+        cards: list[dict] = []
+        excerpt = unit.get("source_excerpt") or ""
+        chunk_id = unit.get("chunk_id") or ""
+        topic = unit.get("topic") or ""
+        source_type = source_trace.get("source_type") or "manual"
+        source_url = source_trace.get("source_url") or ""
+        source_title = source_trace.get("source_title") or ""
+
+        for d in unit.get("definitions", [])[:3]:
+            maybe = self._definition_card(d)
+            if maybe:
+                q, a = maybe
+                cards.append(self._make_card(q, a, "definition", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+
+        for c in unit.get("causes", [])[:3]:
+            maybe = self._cause_card(c)
+            if maybe:
+                q, a = maybe
+                cards.append(self._make_card(q, a, "cause", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+
+        for f in unit.get("facts", [])[:6]:
+            maybe = self._function_or_fact_card(f)
+            if maybe:
+                q, a, ctype = maybe
+                cards.append(self._make_card(q, a, ctype, excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+
+        for diff in unit.get("differences", [])[:2]:
+            maybe = self._difference_card(diff)
+            if maybe:
+                q, a = maybe
+                cards.append(self._make_card(q, a, "difference", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+
+        for lst in unit.get("lists", [])[:2]:
+            maybe = self._list_card(lst)
+            if maybe:
+                q, a = maybe
+                cards.append(self._make_card(q, a, "list", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+
+        for dt in unit.get("dates", [])[:1]:
+            if dt:
+                cards.append(self._make_card("Какой год или дата указаны для этого факта?", dt, "date", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+        for fr in unit.get("formulas", [])[:1]:
+            if fr:
+                cards.append(self._make_card("Какая формула упоминается в материале?", fr, "formula", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
         return cards
 
     def _make_card(
@@ -128,11 +217,12 @@ class AICardPipeline:
         source_url: str,
         source_title: str,
         unit: dict,
+        topic: str = "",
     ) -> dict:
         card = {
             "front": self._normalize_question(front),
-            "back": back.strip(),
-            "explanation": back.strip()[:240],
+            "back": (back or "").strip(),
+            "explanation": (back or "").strip()[:240],
             "card_type": card_type,
             "difficulty": "medium",
             "quality_score": 0.0,
@@ -140,6 +230,7 @@ class AICardPipeline:
             "source_url": source_url,
             "source_title": source_title,
             "chunk_id": chunk_id,
+            "topic": (topic or unit.get("topic") or source_title or "Общая тема").strip(),
             "source_excerpt": excerpt,
             "time_start": unit.get("time_start"),
             "time_end": unit.get("time_end"),
@@ -161,10 +252,14 @@ class AICardPipeline:
         return card
 
     def _finalize_cards(self, candidates: list[dict], mode: str = "accurate") -> list[dict]:
+        cleaned = [c for c in candidates if self._is_card_semantically_valid(c)]
         if mode == "fast":
-            pool = [score_card(polish_card(c)) for c in candidates]
+            pool = [score_card(polish_card(c)) for c in cleaned]
+            strong = [c for c in pool if c.get("quality_score", 0.0) >= 0.55]
+            if len(strong) >= 3:
+                return strong
             return [c for c in pool if c.get("quality_score", 0.0) >= 0.45]
-        filtered = filter_bad_cards(candidates)
+        filtered = filter_bad_cards(cleaned)
         if mode == "deep":
             filtered = sorted(filtered, key=lambda x: x.get("quality_score", 0.0), reverse=True)
         return filtered
@@ -173,44 +268,37 @@ class AICardPipeline:
         m = re.match(r"^([А-ЯA-Z][^\s,.;:!?]{2,40})", sentence.strip())
         return (m.group(1) if m else "").strip("-–—:;,. ")
 
-    def _question_from_fact(self, sentence: str) -> str:
-        sent = re.sub(r"\s+", " ", sentence).strip()
-        if not sent:
-            return ""
-        if re.search(r"(?i)делится на|состоит из", sent):
-            subj = self._guess_subject(sent) or "объект"
-            return f"На какие части делится {subj.lower()}?"
-        if re.search(r"(?i)функц|служит|предназначен", sent):
-            return "Какую функцию выполняет описанный объект?"
-        if re.search(r"\b\d+(?:[,.]\d+)?\b", sent):
-            return "Какое числовое значение указано в материале?"
-        return "Какой факт указан в материале?"
-
     def _normalize_question(self, question: str) -> str:
         q = re.sub(r"\s+", " ", (question or "").strip())
+        if not q:
+            return ""
         if not q.endswith("?"):
             q += "?"
-        return q[:150]
+        return q[:170]
 
     def _needs_image(self, card: dict) -> bool:
         low = f"{card.get('front','')} {card.get('back','')} {card.get('card_type','')}".lower()
-        visual = ("анатом", "географ", "процесс", "схем", "сравнен", "устройств", "организм", "строени")
+        visual = ("анатом", "географ", "процесс", "схем", "сравнен", "устройств", "организм", "строени", "хобот", "механизм")
         non_visual = ("дата", "формула", "абстракт", "определение")
         if any(x in low for x in non_visual) and card.get("card_type") in {"date", "formula", "definition"}:
             return False
         return any(x in low for x in visual) or card.get("card_type") in {"difference", "process", "list"}
 
     def build_image_prompt_for_card(self, card: dict) -> str:
-        if not self._needs_image(card):
-            return ""
-        topic = card.get("source_title") or card.get("card_type") or "тема"
+        topic = card.get("topic") or card.get("source_title") or "тема"
+        front = card.get("front") or ""
+        back = card.get("back") or ""
+        if card.get("needs_image"):
+            return (
+                "Обучающая иллюстрация: "
+                f"тема «{topic}». "
+                f"Покажи сцену, которая помогает запомнить факт: {front} Ответ: {back}. "
+                "Стиль: чистый фон, понятная схема, без лишнего текста, высокий контраст, фокус на главном объекте."
+            )[:900]
         return (
-            "Обучающая иллюстрация для флэш-карточки. "
-            f"Тема: {topic}. "
-            f"Вопрос: {card.get('front','')}. "
-            f"Ответ: {card.get('back','')}. "
-            f"Визуально показать: {card.get('explanation','')}. "
-            "Стиль: простая понятная учебная схема, без лишнего текста, без перегруза."
+            "Символическая обучающая иллюстрация для запоминания: "
+            f"тема «{topic}», вопрос: {front}. "
+            "Минималистичная схема или метафора без перегрузки, без текста на изображении."
         )[:900]
 
     def generate_image_prompt(self, card: dict) -> str:
@@ -219,10 +307,6 @@ class AICardPipeline:
     def generate_card_image(self, card: dict) -> dict:
         card = dict(card)
         metadata = dict(card.get("metadata") or {})
-        if not card.get("needs_image", self._needs_image(card)):
-            metadata["image_status"] = "Для этой карточки картинка не обязательна"
-            card["metadata"] = metadata
-            return card
         from image_generation_adapter import StableDiffusionAdapter
 
         try:
@@ -237,6 +321,158 @@ class AICardPipeline:
             metadata["image_status"] = f"Stable Diffusion недоступен: {exc}"
         card["metadata"] = metadata
         return card
+
+    def _definition_card(self, sentence: str) -> tuple[str, str] | None:
+        sent = re.sub(r"\s+", " ", sentence).strip()
+        m = re.match(r"^([А-ЯA-Zа-яa-z0-9\- ]{2,70})\s*[—-]\s*это\s+(.+)$", sent, flags=re.IGNORECASE)
+        if not m:
+            return None
+        term = m.group(1).strip(" .,:;").lower()
+        if term in STOP_TERMS or len(term) < 2:
+            return None
+        term_human = m.group(1).strip(" .,:;")
+        return f"Что такое {term_human}?", m.group(2).strip()
+
+    def _cause_card(self, sentence: str) -> tuple[str, str] | None:
+        sent = re.sub(r"\s+", " ", sentence).strip()
+        m = re.search(r"^(.+?)\s+(?:происходит|возникает|случается|усиливается)\s+из-за\s+(.+)$", sent, flags=re.IGNORECASE)
+        if m:
+            subject = m.group(1).strip(" .,:;")
+            return f"Почему происходит {subject.lower()}?", f"Из-за {m.group(2).strip()}"
+        if re.search(r"(?i)потому что|из-за|вследствие|приводит к", sent):
+            subject = self._guess_subject(sent)
+            if subject and subject.lower() not in STOP_TERMS:
+                return f"Почему {subject.lower()}?", sent
+        return None
+
+    def _difference_card(self, sentence: str) -> tuple[str, str] | None:
+        sent = re.sub(r"\s+", " ", sentence).strip()
+        m = re.search(r"^(.+?)\s+отличается\s+от\s+(.+?)\s+тем,?\s+что\s+(.+)$", sent, flags=re.IGNORECASE)
+        if m:
+            a, b, diff = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+            return f"Чем {a} отличается от {b}?", diff
+        return None
+
+    def _list_card(self, sentence: str) -> tuple[str, str] | None:
+        sent = re.sub(r"\s+", " ", sentence).strip()
+        m = re.match(r"^([А-ЯA-Zа-яa-z0-9\- ]{2,70})\s*:\s*(.+)$", sent)
+        if m and len(m.group(2).split(",")) >= 3:
+            subj = m.group(1).strip()
+            return f"Какие элементы входят в {subj.lower()}?", m.group(2).strip()
+        return None
+
+    def _function_or_fact_card(self, sentence: str) -> tuple[str, str, str] | None:
+        sent = re.sub(r"\s+", " ", sentence).strip()
+        func = re.search(r"^(.+?)\s+(?:используется|применяется|нужен|служит|предназначен)\s+для\s+(.+)$", sent, flags=re.IGNORECASE)
+        if func:
+            subj = func.group(1).strip(" .,:;")
+            if subj.lower() in STOP_TERMS:
+                return None
+            return f"Для чего используется {subj.lower()}?", f"Для {func.group(2).strip()}", "fact"
+        if re.search(r"(?i)в отличие от|отличается", sent):
+            diff = self._difference_card(sent)
+            if diff:
+                return diff[0], diff[1], "difference"
+        subj = self._extract_focus_term(sent)
+        if not subj:
+            return None
+        if re.search(r"\b\d+(?:[,.]\d+)?\b", sent):
+            return f"Какой количественный факт указан про {subj.lower()}?", sent, "fact"
+        return f"Что конкретно сказано о {subj.lower()}?", sent, "fact"
+
+    def _extract_focus_term(self, sentence: str) -> str:
+        tokens = re.findall(r"[А-ЯA-Zа-яa-z][а-яa-z0-9\-]{2,}", sentence)
+        for tok in tokens:
+            low = tok.lower()
+            if low not in STOP_TERMS and low not in {"которые", "который", "которая", "можно", "нужно"}:
+                return tok
+        return ""
+
+    def _is_card_semantically_valid(self, card: dict) -> bool:
+        front = str(card.get("front") or "").lower()
+        back = str(card.get("back") or "").strip()
+        excerpt = str(card.get("source_excerpt") or "").lower()
+        topic = str(card.get("topic") or "").strip()
+        if not front or not back or not excerpt or not topic:
+            return False
+        if any(p in front for p in ("какой факт указан", "что означает термин", "какова указанная причина", "что описано в тексте", "что важно помнить")):
+            return False
+        if re.search(r"термин\s+[«\"]?(это|этот|эта|эти|он|она|они|оно)", front):
+            return False
+        terms = [t for t in re.findall(r"[а-яa-z0-9]{4,}", front) if t not in STOP_TERMS]
+        if not terms or not any(t in excerpt for t in terms[:5]):
+            return False
+        if re.sub(r"\W+", "", front) == re.sub(r"\W+", "", back.lower()):
+            return False
+        return True
+
+    def _infer_topic_from_text(self, text: str) -> str:
+        candidates = re.findall(r"[А-ЯA-Zа-яa-z][а-яa-z0-9\-]{3,}", text)
+        if not candidates:
+            return ""
+        freq: dict[str, int] = {}
+        for tok in candidates:
+            low = tok.lower()
+            if low in STOP_TERMS:
+                continue
+            freq[low] = freq.get(low, 0) + 1
+        if not freq:
+            return ""
+        return max(freq.items(), key=lambda x: x[1])[0].capitalize()
+
+    def _get_llm_settings(self) -> dict:
+        model = self._read_setting("ollama_model", default="llama3.1:8b")
+        base_url = self._read_setting("ollama_url", default="http://127.0.0.1:11434")
+        enabled = bool(base_url and model)
+        return {"enabled": enabled, "model": str(model), "base_url": str(base_url), "timeout": 45}
+
+    def _read_setting(self, name: str, default: str = "") -> str:
+        for owner in (self.app, getattr(self.app, "settings", None), getattr(self.app, "llm_settings", None)):
+            if owner is None:
+                continue
+            try:
+                if isinstance(owner, dict) and name in owner:
+                    value = owner.get(name)
+                elif hasattr(owner, name):
+                    value = getattr(owner, name)
+                else:
+                    continue
+                if hasattr(value, "get") and callable(value.get):
+                    value = value.get()
+                if value not in (None, ""):
+                    return str(value)
+            except Exception:
+                continue
+        return default
+
+    def _build_llm_prompt(self, unit: dict) -> str:
+        return (
+            "Ты создаёшь флэш-карточки для запоминания.\n"
+            "Создавай только конкретные вопросы по фактам из текста.\n"
+            "Запрещено создавать общие вопросы:\n"
+            "- \"Какой факт указан в материале?\"\n"
+            "- \"Что описано в тексте?\"\n"
+            "- \"Что важно помнить?\"\n"
+            "- \"Какова указанная причина явления?\"\n"
+            "- \"Что означает термин «Это»?\"\n"
+            "Каждая карточка: один вопрос, один короткий ответ, ответ строго из source_excerpt, не более 1 факта на карточку.\n"
+            "Вопрос должен содержать конкретное понятие. Нельзя использовать местоимения как термин.\n"
+            "Если фрагмент слабый/рекламный — пропусти его.\n"
+            "Верни ТОЛЬКО JSON-массив такого вида:\n"
+            "[{\"front\":\"...\",\"back\":\"...\",\"explanation\":\"...\",\"card_type\":\"definition|fact|cause|difference|list|process|date|formula\",\"difficulty\":\"easy|medium|hard\",\"source_excerpt\":\"...\",\"topic\":\"...\",\"needs_image\":true,\"image_prompt\":\"...\"}]\n\n"
+            f"topic={unit.get('topic','')}\n"
+            f"chunk_id={unit.get('chunk_id','')}\n"
+            f"source_excerpt={unit.get('source_excerpt','')}"
+        )
+
+    def _extract_json_array(self, raw: str) -> str:
+        raw = (raw or "").strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            return raw
+        m = re.search(r"\[.*\]", raw, flags=re.S)
+        if not m:
+            raise ValueError("JSON array not found")
+        return m.group(0)
 
     def save_cards_to_overview(self, cards: list[dict]) -> int:
         deck_id = self.deck_id or getattr(self.app, "selected_deck_id", None)
@@ -264,6 +500,7 @@ class AICardPipeline:
                         "source_title": card.get("source_title"),
                         "source_type": card.get("source_type"),
                         "chunk_id": card.get("chunk_id"),
+                        "topic": card.get("topic"),
                         "source_excerpt": card.get("source_excerpt"),
                         "time_start": card.get("time_start"),
                         "time_end": card.get("time_end"),
