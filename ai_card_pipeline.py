@@ -10,10 +10,19 @@ from datetime import datetime
 from typing import Any
 
 from card_quality_filter import STOP_TERMS, filter_bad_cards, polish_card, score_card
-from rag_content_pipeline import clean_raw_text
+from rag_content_pipeline import attach_best_source_images, clean_raw_text
 from semantic_chunker import split_into_semantic_chunks
 
-ALLOWED_CARD_TYPES = {"definition", "fact", "cause", "difference", "list", "process", "date", "formula"}
+ALLOWED_CARD_TYPES = {
+    "definition",
+    "function",
+    "range/quantity",
+    "cause",
+    "difference",
+    "list/classification",
+    "anatomy/composition",
+    "fact",
+}
 
 
 class AICardPipeline:
@@ -35,9 +44,11 @@ class AICardPipeline:
         raw_text = (source_text or "").strip()
         if text:
             raw_text = f"{raw_text}\n{text}".strip()
+        extracted_images: list[dict] = list((source_trace or {}).get("images") or [])
         if source:
-            extracted = self.extract_text_from_source(source)
-            raw_text = f"{raw_text}\n{extracted}".strip()
+            bundle = self.extract_source_bundle(source)
+            raw_text = f"{raw_text}\n{bundle.get('text','')}".strip()
+            extracted_images = list(bundle.get("images") or [])
         if not raw_text:
             return []
 
@@ -46,6 +57,8 @@ class AICardPipeline:
         units = self.extract_knowledge_units(chunks)
         candidates = self._generate_candidates(units, source_trace=source_trace or {})
         cards = self._finalize_cards(candidates, mode=mode)
+        cards = attach_best_source_images(cards, extracted_images)
+        cards = [self._ensure_answer_image(card) for card in cards]
         return cards[: self.max_cards]
 
     def generate_cards_from_text(self, text: str) -> list[dict]:
@@ -55,6 +68,11 @@ class AICardPipeline:
         from source_extractors import extract_text_from_source
 
         return extract_text_from_source(source)
+
+    def extract_source_bundle(self, source: str) -> dict:
+        from source_extractors import extract_source_bundle
+
+        return extract_source_bundle(source)
 
     def clean_text(self, text: str | None) -> str:
         return clean_raw_text(text or "")
@@ -72,6 +90,9 @@ class AICardPipeline:
             differences = [s for s in facts if re.search(r"(?i)в отличие от|отличается|тогда как|вместо", s)]
             definitions = [s for s in facts if re.search(r"(?i)\bэто\b|\bназывается\b|\bопределяется\b", s)]
             lists = [s for s in facts if "," in s and len(s.split(",")) >= 3]
+            functions = [s for s in facts if re.search(r"(?i)используется|служит|предназначен|выполняет функцию|нужен для", s)]
+            ranges = [s for s in facts if re.search(r"\b\d+(?:[,.]\d+)?\s*(%|км|м|см|мм|кг|г|л|мл|°c|гр|лет|раз|x)?\b", s.lower())]
+            anatomy = [s for s in facts if re.search(r"(?i)состоит из|включает|част[ьи]|структур|компонент|элемент", s)]
             topic = (chunk.get("topic_title") or self._infer_topic_from_text(text) or "Общая тема").strip()
             units.append(
                 {
@@ -86,6 +107,9 @@ class AICardPipeline:
                     "differences": differences[:6],
                     "definitions": definitions[:6],
                     "lists": lists[:6],
+                    "functions": functions[:6],
+                    "ranges": ranges[:6],
+                    "anatomy": anatomy[:6],
                     "source_excerpt": text[:520],
                     "time_start": None,
                     "time_end": None,
@@ -186,6 +210,18 @@ class AICardPipeline:
                 q, a, ctype = maybe
                 cards.append(self._make_card(q, a, ctype, excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
 
+        for fn in unit.get("functions", [])[:2]:
+            maybe = self._function_card(fn)
+            if maybe:
+                q, a = maybe
+                cards.append(self._make_card(q, a, "function", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+
+        for rg in unit.get("ranges", [])[:2]:
+            maybe = self._range_card(rg)
+            if maybe:
+                q, a = maybe
+                cards.append(self._make_card(q, a, "range/quantity", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+
         for diff in unit.get("differences", [])[:2]:
             maybe = self._difference_card(diff)
             if maybe:
@@ -196,14 +232,13 @@ class AICardPipeline:
             maybe = self._list_card(lst)
             if maybe:
                 q, a = maybe
-                cards.append(self._make_card(q, a, "list", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+                cards.append(self._make_card(q, a, "list/classification", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
 
-        for dt in unit.get("dates", [])[:1]:
-            if dt:
-                cards.append(self._make_card("Какой год или дата указаны для этого факта?", dt, "date", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
-        for fr in unit.get("formulas", [])[:1]:
-            if fr:
-                cards.append(self._make_card("Какая формула упоминается в материале?", fr, "formula", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
+        for an in unit.get("anatomy", [])[:2]:
+            maybe = self._anatomy_card(an)
+            if maybe:
+                q, a = maybe
+                cards.append(self._make_card(q, a, "anatomy/composition", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
         return cards
 
     def _make_card(
@@ -238,6 +273,11 @@ class AICardPipeline:
             "needs_image": False,
             "negative_prompt": "text, watermark, logo, blurry, low quality, extra letters",
             "image_path": "",
+            "answer_image_path": "",
+            "answer_image_url": "",
+            "answer_image_caption": "",
+            "image_source_type": "",
+            "image_relevance_score": 0.0,
             "metadata": {
                 "terms": unit.get("terms", []),
                 "dates": unit.get("dates", []),
@@ -304,6 +344,25 @@ class AICardPipeline:
     def generate_image_prompt(self, card: dict) -> str:
         return self.build_image_prompt_for_card(card)
 
+    def _ensure_answer_image(self, card: dict) -> dict:
+        c = dict(card or {})
+        has_extracted = bool(c.get("answer_image_path") or c.get("answer_image_url"))
+        if has_extracted:
+            c["image_source_type"] = "extracted"
+            return c
+        if not c.get("needs_image"):
+            c["image_source_type"] = c.get("image_source_type") or "none"
+            return c
+        c["image_prompt"] = c.get("image_prompt") or self.build_image_prompt_for_card(c)
+        generated = self.generate_card_image(c)
+        if generated.get("image_path"):
+            generated["answer_image_path"] = generated.get("image_path") or ""
+            generated["image_source_type"] = "generated"
+            generated["answer_image_caption"] = generated.get("answer_image_caption") or "Generated from answer text"
+            return generated
+        c["image_source_type"] = "recommended"
+        return c
+
     def generate_card_image(self, card: dict) -> dict:
         card = dict(card)
         metadata = dict(card.get("metadata") or {})
@@ -316,6 +375,10 @@ class AICardPipeline:
                 card.get("negative_prompt") or "text, watermark, logo, blurry, low quality",
             )
             card["image_path"] = path or ""
+            if path:
+                card["answer_image_path"] = path
+                card["image_source_type"] = "generated"
+                card["image_relevance_score"] = float(card.get("image_relevance_score") or 0.0)
             metadata["image_status"] = status or ("Stable Diffusion недоступен" if not path else "Изображение создано")
         except Exception as exc:
             metadata["image_status"] = f"Stable Diffusion недоступен: {exc}"
@@ -368,7 +431,7 @@ class AICardPipeline:
             subj = func.group(1).strip(" .,:;")
             if subj.lower() in STOP_TERMS:
                 return None
-            return f"Для чего используется {subj.lower()}?", f"Для {func.group(2).strip()}", "fact"
+            return f"Какую функцию выполняет {subj.lower()}?", f"Для {func.group(2).strip()}", "function"
         if re.search(r"(?i)в отличие от|отличается", sent):
             diff = self._difference_card(sent)
             if diff:
@@ -377,8 +440,35 @@ class AICardPipeline:
         if not subj:
             return None
         if re.search(r"\b\d+(?:[,.]\d+)?\b", sent):
-            return f"Какой количественный факт указан про {subj.lower()}?", sent, "fact"
-        return f"Что конкретно сказано о {subj.lower()}?", sent, "fact"
+            return f"Какой диапазон или количество указаны для {subj.lower()}?", sent, "range/quantity"
+        return f"Какой факт о {subj.lower()} подтверждён в источнике?", sent, "fact"
+
+    def _function_card(self, sentence: str) -> tuple[str, str] | None:
+        sent = re.sub(r"\s+", " ", sentence).strip()
+        subj = self._extract_focus_term(sent)
+        if not subj:
+            return None
+        if re.search(r"(?i)используется|служит|предназначен|нужен для|выполняет", sent):
+            return f"Какую функцию выполняет {subj.lower()}?", sent
+        return None
+
+    def _range_card(self, sentence: str) -> tuple[str, str] | None:
+        sent = re.sub(r"\s+", " ", sentence).strip()
+        subj = self._extract_focus_term(sent)
+        if not subj:
+            return None
+        if re.search(r"\d", sent):
+            return f"Какой диапазон или количество связаны с {subj.lower()}?", sent
+        return None
+
+    def _anatomy_card(self, sentence: str) -> tuple[str, str] | None:
+        sent = re.sub(r"\s+", " ", sentence).strip()
+        subj = self._extract_focus_term(sent)
+        if not subj:
+            return None
+        if re.search(r"(?i)состоит из|включает|част[ьи]|компонент|структур", sent):
+            return f"Из каких частей состоит {subj.lower()}?", sent
+        return None
 
     def _extract_focus_term(self, sentence: str) -> str:
         tokens = re.findall(r"[А-ЯA-Zа-яa-z][а-яa-z0-9\-]{2,}", sentence)
@@ -395,7 +485,12 @@ class AICardPipeline:
         topic = str(card.get("topic") or "").strip()
         if not front or not back or not excerpt or not topic:
             return False
-        if any(p in front for p in ("какой факт указан", "что означает термин", "какова указанная причина", "что описано в тексте", "что важно помнить")):
+        if any(p in front for p in ("какой факт указан", "что означает термин", "какова указанная причина", "что описано в тексте", "что важно помнить", "что конкретно сказано", "что известно про")):
+            return False
+        tokens = re.findall(r"[а-яa-z0-9]+", front)
+        if len([t for t in tokens if len(t) >= 3]) < 2:
+            return False
+        if sum(1 for t in tokens if len(t) <= 2) > max(3, len(tokens) // 2):
             return False
         if re.search(r"термин\s+[«\"]?(это|этот|эта|эти|он|она|они|оно)", front):
             return False
@@ -451,6 +546,8 @@ class AICardPipeline:
             "Создавай только конкретные вопросы по фактам из текста.\n"
             "Запрещено создавать общие вопросы:\n"
             "- \"Какой факт указан в материале?\"\n"
+            "- \"Что конкретно сказано...?\"\n"
+            "- \"Что известно про...?\"\n"
             "- \"Что описано в тексте?\"\n"
             "- \"Что важно помнить?\"\n"
             "- \"Какова указанная причина явления?\"\n"
@@ -459,7 +556,7 @@ class AICardPipeline:
             "Вопрос должен содержать конкретное понятие. Нельзя использовать местоимения как термин.\n"
             "Если фрагмент слабый/рекламный — пропусти его.\n"
             "Верни ТОЛЬКО JSON-массив такого вида:\n"
-            "[{\"front\":\"...\",\"back\":\"...\",\"explanation\":\"...\",\"card_type\":\"definition|fact|cause|difference|list|process|date|formula\",\"difficulty\":\"easy|medium|hard\",\"source_excerpt\":\"...\",\"topic\":\"...\",\"needs_image\":true,\"image_prompt\":\"...\"}]\n\n"
+            "[{\"front\":\"...\",\"back\":\"...\",\"explanation\":\"...\",\"card_type\":\"definition|function|range/quantity|cause|difference|list/classification|anatomy/composition|fact\",\"difficulty\":\"easy|medium|hard\",\"source_excerpt\":\"...\",\"topic\":\"...\",\"needs_image\":true,\"image_prompt\":\"...\"}]\n\n"
             f"topic={unit.get('topic','')}\n"
             f"chunk_id={unit.get('chunk_id','')}\n"
             f"source_excerpt={unit.get('source_excerpt','')}"
@@ -505,7 +602,14 @@ class AICardPipeline:
                         "time_start": card.get("time_start"),
                         "time_end": card.get("time_end"),
                     },
-                    "ai": card.get("metadata") or {},
+                    "ai": {
+                        **(card.get("metadata") or {}),
+                        "answer_image_path": card.get("answer_image_path"),
+                        "answer_image_url": card.get("answer_image_url"),
+                        "answer_image_caption": card.get("answer_image_caption"),
+                        "image_source_type": card.get("image_source_type"),
+                        "image_relevance_score": card.get("image_relevance_score"),
+                    },
                 }
                 values = {
                     "deck_id": deck_id,

@@ -706,13 +706,15 @@ class AIAddCardWorkspace(tk.Toplevel):
             return
 
         def worker():
-            raw = self.pipeline.extract_text_from_source(self.source_path)
-            return self.pipeline.clean_text(raw)
+            bundle = self.pipeline.extract_source_bundle(self.source_path or "")
+            return {"text": self.pipeline.clean_text(bundle.get("text", "")), "images": bundle.get("images", [])}
 
         self.status_var.set("Извлекаю текст...")
         self.run_in_background(worker, on_success=self._on_text_ready)
 
-    def _on_text_ready(self, text: str) -> None:
+    def _on_text_ready(self, payload: dict) -> None:
+        text = str((payload or {}).get("text") or "")
+        images = list((payload or {}).get("images") or [])
         self.prompt_text.delete("1.0", tk.END)
         self.prompt_text.insert("1.0", text[:12000])
         self._last_source_trace = {
@@ -720,8 +722,9 @@ class AIAddCardWorkspace(tk.Toplevel):
             "source_url": self.source_path or "",
             "source_title": os.path.basename(self.source_path or ""),
             "sources": [],
+            "images": images,
         }
-        self.status_var.set("Текст извлечён")
+        self.status_var.set(f"Текст извлечён, изображений: {len(images)}")
 
     def _on_cards_listbox_mousewheel(self, event) -> str:
         try:
@@ -793,16 +796,22 @@ class AIAddCardWorkspace(tk.Toplevel):
             err = "; ".join((result or {}).get("errors") or []) if isinstance(result, dict) else ""
             self.status_var.set(err or "RAG не вернул текст. Уточните запрос.")
             return
+        sources = result.get("sources") or []
+        extracted_images: list[dict] = []
+        for src in sources:
+            meta = (src or {}).get("metadata") or {}
+            extracted_images.extend(meta.get("images") or [])
         self._last_source_trace = {
             "source_type": result.get("source_type", "search"),
-            "source_url": ((result.get("sources") or [{}])[0]).get("url", ""),
-            "source_title": ((result.get("sources") or [{}])[0]).get("title", ""),
-            "sources": result.get("sources") or [],
+            "source_url": ((sources or [{}])[0]).get("url", ""),
+            "source_title": ((sources or [{}])[0]).get("title", ""),
+            "sources": sources,
+            "images": extracted_images,
         }
         self.prompt_text.delete("1.0", tk.END)
         self.prompt_text.insert("1.0", cleaned[: self._max_rag_chars])
         self.status_var.set(
-            f"Готово: {len(cleaned)} символов, {len(result.get('sources') or [])} источников"
+            f"Готово: {len(cleaned)} символов, {len(sources)} источников, изображений: {len(extracted_images)}"
         )
 
     def _on_web_error(self, exc: Exception) -> None:
@@ -853,7 +862,7 @@ class AIAddCardWorkspace(tk.Toplevel):
             front = (card.get("front") or "").strip().replace("\n", " ")
             q = float(card.get("quality_score") or 0.0)
             ctype = str(card.get("card_type") or "fact")
-            image_tag = "image recommended" if card.get("needs_image") else "image optional"
+            image_tag = self._card_image_tag(card)
             self.cards_listbox.insert(tk.END, f"{idx}. {front[:62] or '(без вопроса)'} | q {q:.2f} | {ctype} | {image_tag}")
 
         total = len(self.generated_cards)
@@ -873,10 +882,23 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.preview.update_preview(card)
         self.current_front_text.insert("1.0", card.get("front", ""))
         self.current_back_text.insert("1.0", card.get("back", ""))
-        if card.get("needs_image", False):
-            self.status_var.set("Для этой карточки картинка может помочь.")
-        else:
-            self.status_var.set("Для этой карточки картинка не обязательна, но доступна вручную.")
+        self.status_var.set(f"Статус карточки: {self._card_image_tag(card)}")
+
+    def _card_image_tag(self, card: dict) -> str:
+        source_type = str(card.get("image_source_type") or "").strip().lower()
+        if source_type == "extracted":
+            return "image: extracted"
+        if source_type == "generated":
+            return "image: generated"
+        if source_type == "recommended":
+            return "image: recommended"
+        if source_type == "none":
+            return "image: none"
+        if card.get("answer_image_path") or card.get("answer_image_url"):
+            return "image: extracted"
+        if card.get("image_path"):
+            return "image: generated"
+        return "image: recommended" if card.get("needs_image") else "image: none"
 
     def next_card(self) -> None:
         if not self.generated_cards:
@@ -1050,6 +1072,8 @@ class AIAddCardWorkspace(tk.Toplevel):
                 timeout=90,
             )
             card["image_path"] = path
+            card["answer_image_path"] = path
+            card["image_source_type"] = "generated"
             metadata["image_status"] = f"SD: изображение создано ({os.path.basename(path)})"
             metadata["sd_url"] = str(sd_url)
             metadata["sd_model"] = sd_model
