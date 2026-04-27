@@ -9,8 +9,8 @@ import time
 from datetime import datetime
 from typing import Any
 
-from card_quality_filter import STOP_TERMS, filter_bad_cards, polish_card, score_card
-from rag_content_pipeline import attach_best_source_images, clean_raw_text
+from card_quality_filter import STOP_TERMS, filter_bad_cards, polish_card, repair_or_drop_bad_card, score_card
+from rag_content_pipeline import attach_best_source_images, clean_raw_text, normalize_card_image_fields
 from semantic_chunker import split_into_semantic_chunks
 
 ALLOWED_CARD_TYPES = {
@@ -58,6 +58,7 @@ class AICardPipeline:
         candidates = self._generate_candidates(units, source_trace=source_trace or {})
         cards = self._finalize_cards(candidates, mode=mode)
         cards = attach_best_source_images(cards, extracted_images)
+        cards = [normalize_card_image_fields(card) for card in cards]
         cards = [self._ensure_answer_image(card) for card in cards]
         return cards[: self.max_cards]
 
@@ -82,7 +83,7 @@ class AICardPipeline:
         for chunk in chunks:
             text = chunk.get("text", "")
             sentences = re.split(r"(?<=[.!?])\s+", text)
-            facts = [s.strip() for s in sentences if 25 <= len(s.strip()) <= 360]
+            facts = [s.strip() for s in sentences if 10 <= len(s.strip()) <= 360]
             terms = [m.group(1).strip() for m in re.finditer(r"([А-ЯA-Z][^\n:]{2,60})\s*[:\-]\s*", text)]
             dates = re.findall(r"\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}|\d{1,2}\s+[а-яА-Яa-zA-Z]+\s+\d{4})\b", text)
             formulas = re.findall(r"\b[\wА-Яа-я]+\s*=\s*[^\n.,;]{2,80}", text)
@@ -278,6 +279,16 @@ class AICardPipeline:
             "answer_image_caption": "",
             "image_source_type": "",
             "image_relevance_score": 0.0,
+            "front_image_path": "",
+            "front_image_url": "",
+            "front_image_caption": "",
+            "front_image_origin": "none",
+            "front_image_relevance_score": 0.0,
+            "back_image_path": "",
+            "back_image_url": "",
+            "back_image_caption": "",
+            "back_image_origin": "none",
+            "back_image_relevance_score": 0.0,
             "metadata": {
                 "terms": unit.get("terms", []),
                 "dates": unit.get("dates", []),
@@ -292,7 +303,11 @@ class AICardPipeline:
         return card
 
     def _finalize_cards(self, candidates: list[dict], mode: str = "accurate") -> list[dict]:
-        cleaned = [c for c in candidates if self._is_card_semantically_valid(c)]
+        cleaned = []
+        for c in candidates:
+            repaired = repair_or_drop_bad_card(c)
+            if repaired and self._is_card_semantically_valid(repaired):
+                cleaned.append(repaired)
         if mode == "fast":
             pool = [score_card(polish_card(c)) for c in cleaned]
             strong = [c for c in pool if c.get("quality_score", 0.0) >= 0.55]
@@ -325,42 +340,57 @@ class AICardPipeline:
         return any(x in low for x in visual) or card.get("card_type") in {"difference", "process", "list"}
 
     def build_image_prompt_for_card(self, card: dict) -> str:
-        topic = card.get("topic") or card.get("source_title") or "тема"
-        front = card.get("front") or ""
-        back = card.get("back") or ""
-        if card.get("needs_image"):
-            return (
-                "Обучающая иллюстрация: "
-                f"тема «{topic}». "
-                f"Покажи сцену, которая помогает запомнить факт: {front} Ответ: {back}. "
-                "Стиль: чистый фон, понятная схема, без лишнего текста, высокий контраст, фокус на главном объекте."
-            )[:900]
-        return (
-            "Символическая обучающая иллюстрация для запоминания: "
-            f"тема «{topic}», вопрос: {front}. "
-            "Минималистичная схема или метафора без перегрузки, без текста на изображении."
-        )[:900]
+        topic = str(card.get("topic") or card.get("source_title") or "тема").strip()
+        front = str(card.get("front") or "").strip()
+        back = str(card.get("back") or "").strip()
+        excerpt = str(card.get("source_excerpt") or "").strip()[:180]
+        card_type = str(card.get("card_type") or "").lower()
+        style_hint = "clean simple diagram style, one main subject"
+        if "anatom" in card_type:
+            style_hint = "clean educational anatomy diagram, clear body parts, simple labels optional"
+        elif card_type in {"process", "cause"}:
+            style_hint = "step-by-step simple educational diagram"
+        elif "difference" in card_type:
+            style_hint = "side-by-side comparison diagram"
+        elif "list" in card_type:
+            style_hint = "simple grouped icon illustration"
+        prompt = (
+            "Educational flashcard illustration. "
+            f"Main idea: {back}. "
+            f"Context: {front}. "
+            f"Topic: {topic}. "
+            f"Source excerpt: {excerpt}. "
+            "Show one clear visual scene that helps remember the answer. "
+            f"{style_hint}, high clarity, no clutter, no random characters, "
+            "no text labels unless essential, white or simple background."
+        )
+        return re.sub(r"\s+", " ", prompt).strip()[:900]
 
     def generate_image_prompt(self, card: dict) -> str:
         return self.build_image_prompt_for_card(card)
 
     def _ensure_answer_image(self, card: dict) -> dict:
         c = dict(card or {})
+        c = normalize_card_image_fields(c)
         has_extracted = bool(c.get("answer_image_path") or c.get("answer_image_url"))
         if has_extracted:
-            c["image_source_type"] = "extracted"
+            c["image_source_type"] = c.get("front_image_origin") or "source"
             return c
         if not c.get("needs_image"):
             c["image_source_type"] = c.get("image_source_type") or "none"
+            c["front_image_origin"] = c.get("front_image_origin") or "none"
             return c
         c["image_prompt"] = c.get("image_prompt") or self.build_image_prompt_for_card(c)
         generated = self.generate_card_image(c)
         if generated.get("image_path"):
             generated["answer_image_path"] = generated.get("image_path") or ""
+            generated["front_image_path"] = generated.get("image_path") or ""
+            generated["front_image_origin"] = "generated"
             generated["image_source_type"] = "generated"
             generated["answer_image_caption"] = generated.get("answer_image_caption") or "Generated from answer text"
             return generated
-        c["image_source_type"] = "recommended"
+        c["image_source_type"] = "failed"
+        c["front_image_origin"] = "failed"
         return c
 
     def generate_card_image(self, card: dict) -> dict:
@@ -377,9 +407,11 @@ class AICardPipeline:
             card["image_path"] = path or ""
             if path:
                 card["answer_image_path"] = path
+                card["front_image_path"] = path
+                card["front_image_origin"] = "generated"
                 card["image_source_type"] = "generated"
                 card["image_relevance_score"] = float(card.get("image_relevance_score") or 0.0)
-            metadata["image_status"] = status or ("Stable Diffusion недоступен" if not path else "Изображение создано")
+            metadata["image_status"] = status or ("Stable Diffusion недоступен" if not path else "Изображение сгенерировано")
         except Exception as exc:
             metadata["image_status"] = f"Stable Diffusion недоступен: {exc}"
         card["metadata"] = metadata
@@ -426,6 +458,19 @@ class AICardPipeline:
 
     def _function_or_fact_card(self, sentence: str) -> tuple[str, str, str] | None:
         sent = re.sub(r"\s+", " ", sentence).strip()
+        m_div = re.search(r"^(.+?)\s+делится\s+на\s+(.+)$", sent, flags=re.IGNORECASE)
+        if m_div:
+            subj = m_div.group(1).strip(" .,:;").lower()
+            return f"На какие части делится {subj}?", m_div.group(2).strip(), "anatomy/composition"
+        m_legs = re.search(r"^у\s+([А-ЯA-Zа-яa-z0-9\- ]{2,40})\s+(\d+|восемь|шесть|четыре|пять|семь|девять|десять)\s+ног", sent, flags=re.IGNORECASE)
+        if m_legs:
+            subj = m_legs.group(1).strip(" .,:;").lower()
+            qty = m_legs.group(2).strip(" .,:;")
+            return f"Сколько ног у {subj}?", qty.capitalize() if qty.isalpha() else qty, "range/quantity"
+        m_protect = re.search(r"^(.+?)\s+защищает\s+(.+?)\s+от\s+(.+)$", sent, flags=re.IGNORECASE)
+        if m_protect:
+            subj = m_protect.group(1).strip(" .,:;").lower()
+            return f"От чего защищает {subj}?", f"От {m_protect.group(3).strip()}", "function"
         func = re.search(r"^(.+?)\s+(?:используется|применяется|нужен|служит|предназначен)\s+для\s+(.+)$", sent, flags=re.IGNORECASE)
         if func:
             subj = func.group(1).strip(" .,:;")
@@ -440,8 +485,10 @@ class AICardPipeline:
         if not subj:
             return None
         if re.search(r"\b\d+(?:[,.]\d+)?\b", sent):
-            return f"Какой диапазон или количество указаны для {subj.lower()}?", sent, "range/quantity"
-        return f"Какой факт о {subj.lower()} подтверждён в источнике?", sent, "fact"
+            if re.search(r"(?i)сколько|восемь|девять|десять|колич", sent):
+                return f"Сколько относится к {subj.lower()}?", sent, "range/quantity"
+            return f"В каком диапазоне указаны значения для {subj.lower()}?", sent, "range/quantity"
+        return f"Что верно про {subj.lower()}?", sent, "fact"
 
     def _function_card(self, sentence: str) -> tuple[str, str] | None:
         sent = re.sub(r"\s+", " ", sentence).strip()
@@ -458,7 +505,11 @@ class AICardPipeline:
         if not subj:
             return None
         if re.search(r"\d", sent):
-            return f"Какой диапазон или количество связаны с {subj.lower()}?", sent
+            if re.search(r"(?i)размер|длина|вес|диапазон|колеб", sent):
+                if re.search(r"(?i)^размеры\s+", sent):
+                    return f"В каком диапазоне могут колебаться {subj.lower()}?", sent
+                return f"В каком диапазоне могут колебаться значения для {subj.lower()}?", sent
+            return f"Сколько указано для {subj.lower()}?", sent
         return None
 
     def _anatomy_card(self, sentence: str) -> tuple[str, str] | None:
@@ -471,10 +522,16 @@ class AICardPipeline:
         return None
 
     def _extract_focus_term(self, sentence: str) -> str:
+        phrase_match = re.match(r"^([А-ЯA-Zа-яa-z][^,.!?]{2,60})\s+(?:делится|состоит|включает|защищает|используется|служит|может|могут|имеет|имеют)\b", sentence, flags=re.IGNORECASE)
+        if phrase_match:
+            phrase = phrase_match.group(1).strip(" .,:;")
+            if len(phrase.split()) <= 4:
+                return phrase
         tokens = re.findall(r"[А-ЯA-Zа-яa-z][а-яa-z0-9\-]{2,}", sentence)
+        bad = {"которые", "который", "которая", "можно", "нужно", "размеры", "тело", "хитиновый"}
         for tok in tokens:
             low = tok.lower()
-            if low not in STOP_TERMS and low not in {"которые", "который", "которая", "можно", "нужно"}:
+            if low not in STOP_TERMS and low not in bad:
                 return tok
         return ""
 
@@ -604,6 +661,11 @@ class AICardPipeline:
                     },
                     "ai": {
                         **(card.get("metadata") or {}),
+                        "front_image_path": card.get("front_image_path") or card.get("image_path") or card.get("answer_image_path"),
+                        "front_image_url": card.get("front_image_url") or card.get("answer_image_url"),
+                        "front_image_caption": card.get("front_image_caption") or card.get("answer_image_caption"),
+                        "front_image_origin": card.get("front_image_origin") or card.get("image_source_type"),
+                        "front_image_relevance_score": card.get("front_image_relevance_score") or card.get("image_relevance_score"),
                         "answer_image_path": card.get("answer_image_path"),
                         "answer_image_url": card.get("answer_image_url"),
                         "answer_image_caption": card.get("answer_image_caption"),
@@ -617,9 +679,15 @@ class AICardPipeline:
                     "back": back,
                     "next_review": now_iso,
                     "leitner_level": 1,
-                    "front_image_path": card.get("image_path"),
+                    "front_image_path": card.get("front_image_path") or card.get("image_path") or card.get("answer_image_path"),
+                    "front_image_url": card.get("front_image_url"),
+                    "front_image_caption": card.get("front_image_caption"),
+                    "front_image_origin": card.get("front_image_origin"),
+                    "front_image_relevance_score": card.get("front_image_relevance_score"),
                     "back_image_path": None,
-                    "image_path": card.get("image_path"),
+                    "image_path": card.get("front_image_path") or card.get("image_path") or card.get("answer_image_path"),
+                    "image": card.get("front_image_path") or card.get("image_path") or card.get("answer_image_path"),
+                    "media_path": card.get("front_image_path") or card.get("image_path") or card.get("answer_image_path"),
                     "translation_shown": 1,
                     "overview_added": 1,
                     "state": "overview" if "state" in columns else "new",

@@ -23,6 +23,8 @@ BANNED_GENERIC_PATTERNS = [
     "что конкретно сказано",
     "что известно про",
     "что известно о",
+    "какой количественный факт указан",
+    "какие элементы входят в интересные факты",
 ]
 
 STOP_TERMS = {
@@ -43,6 +45,7 @@ KNOWN_TYPES = {
 }
 BOOST_TYPES = {"definition", "function", "range/quantity", "cause", "difference", "list/classification", "anatomy/composition", "fact"}
 FILLER_TOKENS = {"материал", "материале", "текст", "тексте", "факт", "указан", "указано", "указанная"}
+BAD_SUBJECTS = {"найдёшь", "это", "особенности", "интересные факты", "анатомическое", "служит", "между", "особая"}
 
 
 def _normalize_text(value: str) -> str:
@@ -254,3 +257,41 @@ def filter_bad_cards(cards: list[dict]) -> list[dict]:
     if len(strong) >= 3:
         return strong
     return [c for c in deduped if c.get("back") and c.get("quality_score", 0.0) >= 0.45]
+
+
+def is_bad_question(front: str, back: str, source_excerpt: str) -> tuple[bool, str]:
+    f = _normalize_text(front).lower()
+    b = _normalize_text(back)
+    excerpt = _normalize_text(source_excerpt).lower()
+    if not f or not b:
+        return True, "Пустой front/back"
+    if _looks_too_generic(f):
+        return True, "Слишком общий вопрос"
+    if any(x in f for x in BAD_SUBJECTS):
+        return True, "Мусорный субъект вопроса"
+    if ("материале" in f or "указан" in f) and not _has_specific_object(f, excerpt):
+        return True, "Нет конкретного объекта"
+    if _has_stop_term_as_term(f):
+        return True, "Местоимение вместо термина"
+    if _looks_like_token_garbage(f):
+        return True, "Обрывочный вопрос"
+    return False, ""
+
+
+def repair_or_drop_bad_card(card: dict) -> dict | None:
+    c = polish_card(dict(card or {}))
+    bad, reason = is_bad_question(c.get("front") or "", c.get("back") or "", c.get("source_excerpt") or "")
+    if not bad:
+        return c
+    front = c.get("front") or ""
+    front = re.sub(r"(?i)какой\s+факт\s+указан[^?]*", "", front).strip(" .,:;")
+    front = re.sub(r"(?i)что\s+конкретно\s+сказано[^?]*", "", front).strip(" .,:;")
+    if front and len(_tokens(front)) >= 3 and not _looks_too_generic(front.lower()):
+        if not front.endswith("?"):
+            front += "?"
+        c["front"] = front
+        bad2, _ = is_bad_question(c.get("front") or "", c.get("back") or "", c.get("source_excerpt") or "")
+        if not bad2:
+            return c
+    c["drop_reason"] = reason
+    return None

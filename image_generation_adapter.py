@@ -25,7 +25,19 @@ class StableDiffusionAdapter:
             if hasattr(provider, "generate"):
                 path = provider.generate(image_prompt)
             elif hasattr(provider, "generate_image"):
-                path = provider.generate_image(image_prompt, negative_prompt=negative_prompt)
+                try:
+                    path = provider.generate_image(
+                        image_prompt,
+                        negative_prompt=negative_prompt,
+                        width=512,
+                        height=512,
+                        steps=20,
+                        cfg_scale=6,
+                        batch_size=1,
+                        timeout=90,
+                    )
+                except TypeError:
+                    path = provider.generate_image(image_prompt, negative_prompt=negative_prompt)
             else:
                 return None, "Stable Diffusion провайдер не поддерживает generate/generate_image"
             return path, ("Изображение сгенерировано" if path else "Генерация завершена без файла")

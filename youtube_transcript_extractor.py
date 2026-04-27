@@ -31,6 +31,7 @@ class YouTubeTranscriptExtractor:
     @classmethod
     def fetch_transcript(cls, url: str, languages: list[str] | None = None) -> dict:
         video_id = cls.extract_video_id(url)
+        thumb_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
         result = {
             "source_type": "youtube",
             "video_id": video_id or "",
@@ -39,6 +40,7 @@ class YouTubeTranscriptExtractor:
             "language": "",
             "text": "",
             "segments": [],
+            "images": [],
             "status": "error",
             "error": "",
         }
@@ -49,7 +51,22 @@ class YouTubeTranscriptExtractor:
             from youtube_transcript_api import YouTubeTranscriptApi
             from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
         except Exception:
-            result["error"] = "Для извлечения YouTube-субтитров установите youtube-transcript-api"
+            result["error"] = "Для YouTube-субтитров установите youtube-transcript-api"
+            if thumb_url:
+                result["images"] = [
+                    {
+                        "url": thumb_url,
+                        "local_path": "",
+                        "alt": "YouTube thumbnail",
+                        "caption": "YouTube thumbnail",
+                        "context_text": "",
+                        "position": 0,
+                        "width": 0,
+                        "height": 0,
+                        "source_type": "youtube_thumbnail",
+                        "page_url": url,
+                    }
+                ]
             return result
 
         languages = languages or list(cls.DEFAULT_LANGUAGES)
@@ -74,7 +91,22 @@ class YouTubeTranscriptExtractor:
                         continue
             if transcript is None:
                 result["status"] = "no_transcript"
-                result["error"] = "Субтитры не найдены. Можно добавить fallback через Whisper/STT."
+                result["error"] = "Субтитры не найдены. STT fallback пока не подключён."
+                if thumb_url:
+                    result["images"] = [
+                        {
+                            "url": thumb_url,
+                            "local_path": "",
+                            "alt": "YouTube thumbnail",
+                            "caption": "YouTube thumbnail",
+                            "context_text": "",
+                            "position": 0,
+                            "width": 0,
+                            "height": 0,
+                            "source_type": "youtube_thumbnail",
+                            "page_url": url,
+                        }
+                    ]
                 return result
             fetched = transcript.fetch()
             segments = []
@@ -102,11 +134,41 @@ class YouTubeTranscriptExtractor:
             result["language"] = language_used
             result["segments"] = deduped
             result["text"] = " ".join(s["text"] for s in deduped).strip()
+            if thumb_url:
+                result["images"] = [
+                    {
+                        "url": thumb_url,
+                        "local_path": "",
+                        "alt": "YouTube thumbnail",
+                        "caption": "YouTube thumbnail",
+                        "context_text": "",
+                        "position": 0,
+                        "width": 0,
+                        "height": 0,
+                        "source_type": "youtube_thumbnail",
+                        "page_url": url,
+                    }
+                ]
             result["status"] = "ok"
             return result
         except (NoTranscriptFound, TranscriptsDisabled):
             result["status"] = "no_transcript"
-            result["error"] = "Субтитры не найдены. Можно добавить fallback через Whisper/STT."
+            result["error"] = "Субтитры не найдены. STT fallback пока не подключён."
+            if thumb_url:
+                result["images"] = [
+                    {
+                        "url": thumb_url,
+                        "local_path": "",
+                        "alt": "YouTube thumbnail",
+                        "caption": "YouTube thumbnail",
+                        "context_text": "",
+                        "position": 0,
+                        "width": 0,
+                        "height": 0,
+                        "source_type": "youtube_thumbnail",
+                        "page_url": url,
+                    }
+                ]
             return result
         except Exception as exc:
             result["status"] = "error"
