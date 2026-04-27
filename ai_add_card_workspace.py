@@ -9,6 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from ai_card_pipeline import AICardPipeline
 from card_preview_widget import CardPreviewWidget
+from rag_content_pipeline import RagContentPipeline
 from rag_web_search import RagWebSearch
 
 try:
@@ -150,6 +151,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.deck_id = getattr(app, "selected_deck_id", None)
         self.pipeline = AICardPipeline(app=app, deck_id=self.deck_id)
         self.web_search = RagWebSearch()
+        self.rag_pipeline = RagContentPipeline(max_chars=30000, max_sources=5)
 
         self.source_path: str | None = None
         self.generated_cards: list[dict] = []
@@ -159,6 +161,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         self._last_chat_answer = ""
         self._max_rag_chars = 30000
         self._text_context_menu = None
+        self._last_source_trace: dict = {}
 
         root = self._create_scrollable_root()
 
@@ -703,6 +706,12 @@ class AIAddCardWorkspace(tk.Toplevel):
     def _on_text_ready(self, text: str) -> None:
         self.prompt_text.delete("1.0", tk.END)
         self.prompt_text.insert("1.0", text[:12000])
+        self._last_source_trace = {
+            "source_type": "file",
+            "source_url": self.source_path or "",
+            "source_title": os.path.basename(self.source_path or ""),
+            "sources": [],
+        }
         self.status_var.set("Текст извлечён")
 
     def _on_cards_listbox_mousewheel(self, event) -> str:
@@ -752,25 +761,40 @@ class AIAddCardWorkspace(tk.Toplevel):
         return text[:240]
 
     def _search_web(self) -> None:
-        query = self._normalize_web_query(self._get_source_query_text())
+        raw_input = self._get_source_query_text()
+        query = self._normalize_web_query(raw_input)
         if not query:
             messagebox.showwarning("Поиск", "Введите короткую тему или выделите текст для поиска", parent=self)
             return
-        self.status_var.set(f"Ищу материалы: {query[:80]}")
+        if "youtube.com/" in raw_input or "youtu.be/" in raw_input:
+            self.status_var.set("Извлекаю субтитры YouTube...")
+        elif raw_input.strip().startswith(("http://", "https://")):
+            self.status_var.set("Загружаю страницу...")
+        else:
+            self.status_var.set("Поиск материалов...")
         self.run_in_background(
-            lambda: self.web_search.search_and_extract(query),
+            lambda: self.rag_pipeline.fetch_materials(raw_input or query, max_sources=5),
             on_success=self._on_web_text,
             on_error=self._on_web_error,
         )
 
-    def _on_web_text(self, text: str) -> None:
-        cleaned = (text or "").strip()
+    def _on_web_text(self, result: dict) -> None:
+        cleaned = ((result or {}).get("clean_text") or "").strip()
         if not cleaned:
-            self.status_var.set("RAG не вернул текст. Уточните запрос.")
+            err = "; ".join((result or {}).get("errors") or []) if isinstance(result, dict) else ""
+            self.status_var.set(err or "RAG не вернул текст. Уточните запрос.")
             return
+        self._last_source_trace = {
+            "source_type": result.get("source_type", "search"),
+            "source_url": ((result.get("sources") or [{}])[0]).get("url", ""),
+            "source_title": ((result.get("sources") or [{}])[0]).get("title", ""),
+            "sources": result.get("sources") or [],
+        }
         self.prompt_text.delete("1.0", tk.END)
         self.prompt_text.insert("1.0", cleaned[: self._max_rag_chars])
-        self.status_var.set(f"Материалы получены: {len(cleaned)} символов; вставлено {min(len(cleaned), self._max_rag_chars)}")
+        self.status_var.set(
+            f"Готово: {len(cleaned)} символов, {len(result.get('sources') or [])} источников"
+        )
 
     def _on_web_error(self, exc: Exception) -> None:
         logging.exception("AI workspace RAG search failed")
@@ -795,7 +819,12 @@ class AIAddCardWorkspace(tk.Toplevel):
 
         self.status_var.set("Генерирую карточки...")
         self.run_in_background(
-            lambda: self.pipeline.run_pipeline(text=text, source=self.source_path),
+            lambda: self.pipeline.run_pipeline(
+                source_text=text,
+                source_trace=self._last_source_trace,
+                options={"mode": "accurate"},
+                source=self.source_path,
+            ),
             on_success=self._on_cards_generated,
         )
 
@@ -861,6 +890,9 @@ class AIAddCardWorkspace(tk.Toplevel):
             messagebox.showwarning("Нет карточек", "Сначала сгенерируйте карточки", parent=self)
             return
         idx = self.current_card_index
+        if not self.generated_cards[idx].get("needs_image", True):
+            self.status_var.set("Для этой карточки картинка не обязательна")
+            return
 
         def worker():
             card = dict(self.generated_cards[idx])
@@ -1028,6 +1060,8 @@ class AIAddCardWorkspace(tk.Toplevel):
     def _on_saved(self, saved_count: int) -> None:
         self.status_var.set(f"Сохранено в ознакомление: {saved_count}")
         try:
+            if hasattr(self.app, "refresh_deck_counters_and_phase_tree") and callable(self.app.refresh_deck_counters_and_phase_tree):
+                self.app.refresh_deck_counters_and_phase_tree()
             if hasattr(self.app, "refresh_decks"):
                 self.app.refresh_decks()
         except Exception:
