@@ -9,7 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from ai_card_pipeline import AICardPipeline
 from card_preview_widget import CardPreviewWidget
-from rag_content_pipeline import RagContentPipeline
+from rag_content_pipeline import RagContentPipeline, normalize_card_image_fields
 from rag_web_search import RagWebSearch
 
 try:
@@ -774,18 +774,22 @@ class AIAddCardWorkspace(tk.Toplevel):
 
     def _search_web(self) -> None:
         raw_input = self._get_source_query_text()
-        query = self._normalize_web_query(raw_input)
-        if not query:
-            messagebox.showwarning("Поиск", "Введите короткую тему или выделите текст для поиска", parent=self)
+        raw_strip = (raw_input or "").strip()
+        if not raw_strip:
+            messagebox.showwarning("Поиск", "Введите URL, текст или тему", parent=self)
             return
+        query = self._normalize_web_query(raw_input)
         if "youtube.com/" in raw_input or "youtu.be/" in raw_input:
             self.status_var.set("Извлекаю субтитры YouTube...")
-        elif raw_input.strip().startswith(("http://", "https://")):
+        elif raw_strip.startswith(("http://", "https://")):
             self.status_var.set("Загружаю страницу...")
         else:
+            if not query:
+                messagebox.showwarning("Поиск", "Введите короткую тему для поиска", parent=self)
+                return
             self.status_var.set("Поиск материалов...")
         self.run_in_background(
-            lambda: self.rag_pipeline.fetch_materials(raw_input or query, max_sources=5),
+            lambda: self.rag_pipeline.fetch_materials(raw_strip if raw_strip.startswith(("http://", "https://")) else (query or raw_strip), max_sources=5),
             on_success=self._on_web_text,
             on_error=self._on_web_error,
         )
@@ -885,20 +889,25 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.status_var.set(f"Статус карточки: {self._card_image_tag(card)}")
 
     def _card_image_tag(self, card: dict) -> str:
-        source_type = str(card.get("image_source_type") or "").strip().lower()
-        if source_type == "extracted":
-            return "image: extracted"
+        c = normalize_card_image_fields(card)
+        source_type = str(c.get("front_image_origin") or c.get("image_source_type") or "").strip().lower()
+        if source_type in {"source", "extracted"}:
+            return "image: source"
         if source_type == "generated":
             return "image: generated"
-        if source_type == "recommended":
-            return "image: recommended"
+        if source_type == "source_url_not_downloaded":
+            return "image: source_url_not_downloaded"
+        if source_type == "failed":
+            return "image: failed"
         if source_type == "none":
             return "image: none"
-        if card.get("answer_image_path") or card.get("answer_image_url"):
-            return "image: extracted"
-        if card.get("image_path"):
+        if c.get("front_image_path"):
+            return "image: source"
+        if c.get("front_image_url"):
+            return "image: source_url_not_downloaded"
+        if c.get("image_path"):
             return "image: generated"
-        return "image: recommended" if card.get("needs_image") else "image: none"
+        return "image: none"
 
     def next_card(self) -> None:
         if not self.generated_cards:
@@ -1073,6 +1082,8 @@ class AIAddCardWorkspace(tk.Toplevel):
             )
             card["image_path"] = path
             card["answer_image_path"] = path
+            card["front_image_path"] = path
+            card["front_image_origin"] = "generated"
             card["image_source_type"] = "generated"
             metadata["image_status"] = f"SD: изображение создано ({os.path.basename(path)})"
             metadata["sd_url"] = str(sd_url)

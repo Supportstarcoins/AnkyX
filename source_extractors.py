@@ -2,8 +2,19 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 from html.parser import HTMLParser
 from urllib.parse import urljoin
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 
 class _HTMLStripper(HTMLParser):
@@ -13,6 +24,8 @@ class _HTMLStripper(HTMLParser):
         self.images: list[dict] = []
         self._text_window: list[str] = []
         self._position = 0
+        self._in_figure = False
+        self._figure_caption = ""
 
     def handle_data(self, data: str) -> None:
         if data:
@@ -25,7 +38,12 @@ class _HTMLStripper(HTMLParser):
                     self._text_window = self._text_window[-4:]
 
     def handle_starttag(self, tag: str, attrs) -> None:
-        if (tag or "").lower() != "img":
+        tag_low = (tag or "").lower()
+        if tag_low == "figure":
+            self._in_figure = True
+            self._figure_caption = ""
+            return
+        if tag_low != "img":
             return
         attr_map = {str(k).lower(): str(v) for k, v in (attrs or []) if k}
         src = attr_map.get("src", "").strip()
@@ -38,14 +56,113 @@ class _HTMLStripper(HTMLParser):
                 "url": src if src.startswith(("http://", "https://")) else "",
                 "local_path": src if not src.startswith(("http://", "https://")) else "",
                 "alt": attr_map.get("alt", "").strip(),
-                "caption": attr_map.get("title", "").strip(),
+                "caption": (attr_map.get("title", "").strip() or self._figure_caption.strip()),
                 "context_text": " ".join(self._text_window[-2:]).strip(),
                 "position": self._position,
                 "width": width,
                 "height": height,
-                "source_type": "web",
+                "source_type": "html_img",
             }
         )
+
+    def handle_endtag(self, tag: str) -> None:
+        if (tag or "").lower() == "figure":
+            self._in_figure = False
+            self._figure_caption = ""
+
+
+def download_image_to_media(url: str, media_dir: str, source_url: str = "", timeout: int = 20) -> dict:
+    result = {
+        "ok": False,
+        "local_path": "",
+        "url": (url or "").strip(),
+        "mime": "",
+        "width": 0,
+        "height": 0,
+        "error": "",
+    }
+    image_url = result["url"]
+    if not image_url:
+        result["error"] = "Пустой URL изображения"
+        return result
+    if requests is None:
+        result["error"] = "requests не установлен"
+        return result
+    try:
+        response = requests.get(
+            image_url,
+            timeout=timeout,
+            stream=True,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": source_url or image_url},
+        )
+    except Exception as exc:
+        result["error"] = f"Ошибка сети: {exc}"
+        return result
+    if response.status_code != 200:
+        result["error"] = f"HTTP {response.status_code}"
+        return result
+    ctype = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    result["mime"] = ctype
+    if not ctype.startswith("image/"):
+        result["error"] = f"Неверный Content-Type: {ctype or 'unknown'}"
+        return result
+    if ctype == "image/svg+xml" or image_url.lower().endswith(".svg"):
+        result["error"] = "SVG не используется как основная карточная картинка"
+        return result
+    ext_map = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }
+    ext = ext_map.get(ctype)
+    if not ext:
+        if image_url.lower().endswith((".jpg", ".jpeg")):
+            ext = ".jpg"
+        elif image_url.lower().endswith(".png"):
+            ext = ".png"
+        elif image_url.lower().endswith(".webp"):
+            ext = ".webp"
+        else:
+            result["error"] = f"Неподдерживаемый формат: {ctype or image_url}"
+            return result
+    try:
+        os.makedirs(media_dir, exist_ok=True)
+        filename = f"src_{uuid.uuid4().hex[:16]}{ext}"
+        local_path = os.path.join(media_dir, filename)
+        with open(local_path, "wb") as fh:
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    fh.write(chunk)
+    except Exception as exc:
+        result["error"] = f"Ошибка сохранения: {exc}"
+        return result
+
+    width = 0
+    height = 0
+    if Image is not None:
+        try:
+            with Image.open(local_path) as img:
+                width, height = img.size
+        except Exception as exc:
+            result["error"] = f"Повреждённый файл изображения: {exc}"
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+            return result
+    if width and height and (width < 120 or height < 120):
+        result["error"] = f"Слишком маленькое изображение: {width}x{height}"
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
+        return result
+    result["ok"] = True
+    result["local_path"] = local_path
+    result["width"] = int(width or 0)
+    result["height"] = int(height or 0)
+    return result
 
 
 def _read_text_file(path: str) -> str:

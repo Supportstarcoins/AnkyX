@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import urllib.parse
 import urllib.request
@@ -8,6 +9,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse
 
 from rag_web_search import RagWebSearch
+from source_extractors import download_image_to_media
 from youtube_transcript_extractor import YouTubeTranscriptExtractor
 
 
@@ -17,6 +19,10 @@ class _ImageHTMLParser(HTMLParser):
         self.images: list[dict] = []
         self._text_window: list[str] = []
         self._position = 0
+        self._in_figure = False
+        self._figure_caption = ""
+        self.og_images: list[str] = []
+        self.twitter_images: list[str] = []
 
     def handle_data(self, data: str) -> None:  # type: ignore[override]
         text = (data or "").strip()
@@ -28,9 +34,25 @@ class _ImageHTMLParser(HTMLParser):
             self._text_window = self._text_window[-4:]
 
     def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
-        if (tag or "").lower() != "img":
-            return
+        tag_low = (tag or "").lower()
         meta = {str(k).lower(): str(v) for k, v in (attrs or []) if k}
+        if tag_low == "figure":
+            self._in_figure = True
+            self._figure_caption = ""
+            return
+        if tag_low == "figcaption":
+            self._figure_caption = " ".join(self._text_window[-2:]).strip()
+            return
+        if tag_low == "meta":
+            prop = (meta.get("property") or meta.get("name") or "").strip().lower()
+            content = (meta.get("content") or "").strip()
+            if prop == "og:image" and content:
+                self.og_images.append(content)
+            elif prop == "twitter:image" and content:
+                self.twitter_images.append(content)
+            return
+        if tag_low != "img":
+            return
         src = (meta.get("src") or "").strip()
         if not src:
             return
@@ -39,14 +61,19 @@ class _ImageHTMLParser(HTMLParser):
                 "url": src,
                 "local_path": "",
                 "alt": (meta.get("alt") or "").strip(),
-                "caption": (meta.get("title") or "").strip(),
+                "caption": ((meta.get("title") or "").strip() or self._figure_caption),
                 "context_text": " ".join(self._text_window[-2:]).strip(),
                 "position": self._position,
                 "width": _to_int(meta.get("width")),
                 "height": _to_int(meta.get("height")),
-                "source_type": "web",
+                "source_type": "html_img",
             }
         )
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        if (tag or "").lower() == "figure":
+            self._in_figure = False
+            self._figure_caption = ""
 
 
 def _to_int(value: str | None) -> int | None:
@@ -63,9 +90,10 @@ def _keyword_tokens(value: str) -> list[str]:
 def _score_image_relevance(card: dict, image: dict) -> float:
     card_text = " ".join(
         [
+            str(card.get("topic") or ""),
+            str(card.get("front") or ""),
             str(card.get("back") or ""),
             str(card.get("source_excerpt") or ""),
-            " ".join(_keyword_tokens(str(card.get("front") or ""))),
         ]
     ).lower()
     img_text = " ".join(
@@ -81,37 +109,102 @@ def _score_image_relevance(card: dict, image: dict) -> float:
         return 0.0
     overlap = len(card_tokens & image_tokens) / max(1, len(card_tokens))
     length_bonus = 0.05 if len(str(image.get("context_text") or "")) > 40 else 0.0
-    return round(min(1.0, overlap + length_bonus), 3)
+    source_type = str(image.get("source_type") or "").lower()
+    source_bonus = 0.02 if source_type == "html_img" else 0.0
+    if source_type == "youtube_thumbnail":
+        source_bonus -= 0.05
+    position_penalty = 0.0
+    try:
+        card_pos = int(card.get("source_position") or card.get("chunk_position") or 0)
+        img_pos = int(image.get("position") or 0)
+        if card_pos > 0 and img_pos > 0:
+            distance = abs(card_pos - img_pos)
+            position_penalty = min(0.1, distance / 200.0)
+    except Exception:
+        position_penalty = 0.0
+    return round(max(0.0, min(1.0, overlap + length_bonus + source_bonus - position_penalty)), 3)
+
+
+def _is_garbage_image(image: dict) -> bool:
+    hay = " ".join(
+        [
+            str(image.get("url") or ""),
+            str(image.get("alt") or ""),
+            str(image.get("caption") or ""),
+            str(image.get("context_text") or ""),
+        ]
+    ).lower()
+    bad = ("logo", "icon", "avatar", "banner", "sprite", "tracking", "pixel", "social", "share", "favicon", "ad")
+    if any(b in hay for b in bad):
+        return True
+    w = int(image.get("width") or 0)
+    h = int(image.get("height") or 0)
+    return (w and w < 120) or (h and h < 120)
+
+
+def normalize_card_image_fields(card: dict) -> dict:
+    c = dict(card or {})
+    front_path = str(c.get("front_image_path") or "").strip()
+    if not front_path:
+        front_path = str(c.get("image_path") or c.get("answer_image_path") or "").strip()
+        if front_path:
+            c["front_image_path"] = front_path
+    c.setdefault("front_image_url", str(c.get("answer_image_url") or "").strip())
+    c.setdefault("front_image_caption", str(c.get("answer_image_caption") or "").strip())
+    c.setdefault("front_image_origin", str(c.get("image_source_type") or "none").strip() or "none")
+    c.setdefault("front_image_relevance_score", float(c.get("image_relevance_score") or 0.0))
+    c.setdefault("back_image_path", "")
+    c.setdefault("back_image_url", "")
+    c.setdefault("back_image_caption", "")
+    c.setdefault("back_image_origin", "none")
+    c.setdefault("back_image_relevance_score", 0.0)
+    if c.get("front_image_url") and not c.get("front_image_path"):
+        c["front_image_origin"] = "source_url_not_downloaded"
+    return c
+
+
+def attach_best_source_image(card: dict, images: list[dict], media_dir: str) -> dict:
+    c = normalize_card_image_fields(card)
+    if c.get("front_image_path"):
+        return c
+    best = None
+    best_score = 0.0
+    for raw in images or []:
+        if _is_garbage_image(raw):
+            continue
+        img = dict(raw or {})
+        score = _score_image_relevance(c, img)
+        if score > best_score:
+            best_score = score
+            best = img
+    if not best or best_score < 0.3:
+        c["front_image_origin"] = "none"
+        c["front_image_relevance_score"] = 0.0
+        return c
+    dl = download_image_to_media(str(best.get("url") or ""), media_dir=media_dir, source_url=str(best.get("page_url") or ""))
+    c["front_image_url"] = str(best.get("url") or "")
+    c["front_image_caption"] = str(best.get("caption") or best.get("alt") or "").strip()
+    c["front_image_relevance_score"] = float(best_score)
+    if dl.get("ok") and dl.get("local_path"):
+        c["front_image_path"] = dl["local_path"]
+        c["image_path"] = c.get("image_path") or c["front_image_path"]
+        c["front_image_origin"] = "source"
+    else:
+        c["front_image_origin"] = "source_url_not_downloaded"
+    return c
 
 
 def attach_best_source_images(cards: list[dict], images: list[dict]) -> list[dict]:
-    pool = list(images or [])
+    pool = [dict(img or {}) for img in (images or [])]
+    media_dir = os.path.join(os.getcwd(), "media", "source_images")
     out: list[dict] = []
     for card in cards or []:
-        c = dict(card or {})
-        best = None
-        best_score = 0.0
-        for img in pool:
-            score = _score_image_relevance(c, img)
-            if score > best_score:
-                best = img
-                best_score = score
-        c.setdefault("answer_image_path", "")
-        c.setdefault("answer_image_url", "")
-        c.setdefault("answer_image_caption", "")
-        c.setdefault("image_source_type", "")
-        c.setdefault("image_relevance_score", 0.0)
-        if best and best_score >= 0.12:
-            c["answer_image_path"] = str(best.get("local_path") or "")
-            c["answer_image_url"] = str(best.get("url") or "")
-            c["answer_image_caption"] = str(best.get("caption") or best.get("alt") or "").strip()
-            c["image_source_type"] = "extracted"
-            c["image_relevance_score"] = float(best_score)
-            if c["answer_image_path"]:
-                c["image_path"] = c["answer_image_path"]
-        else:
-            c["image_source_type"] = "recommended" if c.get("needs_image") else "none"
-            c["image_relevance_score"] = 0.0
+        c = attach_best_source_image(card, pool, media_dir=media_dir)
+        c["answer_image_path"] = c.get("front_image_path") or c.get("answer_image_path") or ""
+        c["answer_image_url"] = c.get("front_image_url") or c.get("answer_image_url") or ""
+        c["answer_image_caption"] = c.get("front_image_caption") or c.get("answer_image_caption") or ""
+        c["image_source_type"] = c.get("front_image_origin") or c.get("image_source_type") or "none"
+        c["image_relevance_score"] = float(c.get("front_image_relevance_score") or c.get("image_relevance_score") or 0.0)
         out.append(c)
     return out
 
@@ -137,7 +230,40 @@ def extract_images_from_web_html(url: str) -> list[dict]:
         full_url = urllib.parse.urljoin(url, str(img.get("url") or ""))
         row = dict(img)
         row["url"] = full_url
+        row["page_url"] = url
+        if _is_garbage_image(row):
+            continue
         out.append(row)
+    for img_url in parser.og_images:
+        out.append(
+            {
+                "url": urllib.parse.urljoin(url, img_url),
+                "local_path": "",
+                "alt": "",
+                "caption": "OpenGraph image",
+                "context_text": "",
+                "position": 0,
+                "width": None,
+                "height": None,
+                "source_type": "og_image",
+                "page_url": url,
+            }
+        )
+    for img_url in parser.twitter_images:
+        out.append(
+            {
+                "url": urllib.parse.urljoin(url, img_url),
+                "local_path": "",
+                "alt": "",
+                "caption": "Twitter image",
+                "context_text": "",
+                "position": 0,
+                "width": None,
+                "height": None,
+                "source_type": "twitter_image",
+                "page_url": url,
+            }
+        )
     return out
 
 
@@ -214,7 +340,7 @@ class RagContentPipeline:
             "errors": [],
         }
         if not query_or_url:
-            result["errors"].append("Пустой запрос")
+            result["errors"].append("Введите URL, текст или тему")
             return result
         if YouTubeTranscriptExtractor.is_youtube_url(query_or_url):
             yt = YouTubeTranscriptExtractor.fetch_transcript(query_or_url)
@@ -233,7 +359,11 @@ class RagContentPipeline:
                     "source_type": "youtube",
                     "text": yt.get("text", ""),
                     "clean_text": clean,
-                    "metadata": {"language": yt.get("language"), "segments": yt.get("segments", [])},
+                    "metadata": {
+                        "language": yt.get("language"),
+                        "segments": yt.get("segments", []),
+                        "images": yt.get("images", []),
+                    },
                 }
             ]
             result["status"] = "ok"

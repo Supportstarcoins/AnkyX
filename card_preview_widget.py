@@ -41,6 +41,7 @@ class CardPreviewWidget(ttk.Frame):
 
     def update_preview(self, card_data) -> None:
         self._card = dict(card_data or {})
+        self._normalize_card_images()
         side = self.side_var.get()
         text_value = self._card.get(side) or ""
         if not text_value and not self._card:
@@ -51,23 +52,30 @@ class CardPreviewWidget(ttk.Frame):
         self.text.delete("1.0", tk.END)
         self.text.insert("1.0", text_value)
 
-        image_path = self._card.get("answer_image_path") or self._card.get("image_path")
+        if side == "front":
+            image_path = self._card.get("front_image_path") or self._card.get("image_path")
+        else:
+            image_path = self._card.get("back_image_path")
         if image_path:
             self._set_image(image_path)
         else:
             status = ((self._card.get("metadata") or {}).get("image_status") or "").strip()
-            image_url = (self._card.get("answer_image_url") or "").strip()
+            image_url = (self._card.get("front_image_url") if side == "front" else self._card.get("back_image_url") or "").strip()
             msg = "Пока карточка не создана. Введите тему или загрузите источник." if not self._card else "Нет изображения (placeholder)"
             if image_url:
-                msg = f"Изображение прикреплено ссылкой:\n{image_url}"
+                msg = f"Изображение найдено, но не скачано:\n{image_url}"
             if status:
                 msg = f"{msg}\n{status}"
             self._set_placeholder(msg)
 
         if side == "front":
-            caption = (self._card.get("answer_image_caption") or "").strip()
+            caption = (self._card.get("front_image_caption") or self._card.get("answer_image_caption") or "").strip()
             if caption:
                 self.text.insert(tk.END, f"\n\nЯкорь ответа (image): {caption}")
+        if side == "back":
+            excerpt = (self._card.get("source_excerpt") or "").strip()
+            if excerpt:
+                self.text.insert(tk.END, f"\n\nИсточник: {excerpt[:240]}")
 
     def show_front(self) -> None:
         self.side_var.set("front")
@@ -99,6 +107,15 @@ class CardPreviewWidget(ttk.Frame):
             return
         self._image_ref = tk_img
         self.image_label.configure(image=tk_img, text="")
+
+    def _normalize_card_images(self) -> None:
+        if self._card.get("front_image_path"):
+            return
+        legacy = self._card.get("image_path") or self._card.get("answer_image_path")
+        if legacy:
+            self._card["front_image_path"] = legacy
+        if not self._card.get("front_image_url"):
+            self._card["front_image_url"] = self._card.get("answer_image_url") or ""
 
     def _set_placeholder(self, text: str) -> None:
         self._image_ref = None
