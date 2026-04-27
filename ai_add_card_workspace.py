@@ -843,8 +843,6 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.show_current_card()
         if self.generated_cards:
             self.status_var.set(f"Сгенерировано карточек: {len(self.generated_cards)}")
-            if self.generate_images_for_all_var.get():
-                self.generate_images_for_all_cards()
             self.auto_generate_image_after_card = False
         else:
             self.status_var.set("Карточки не сгенерированы. Попробуйте уточнить тему.")
@@ -853,7 +851,10 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.cards_listbox.delete(0, tk.END)
         for idx, card in enumerate(self.generated_cards, start=1):
             front = (card.get("front") or "").strip().replace("\n", " ")
-            self.cards_listbox.insert(tk.END, f"{idx}. {front[:90] or '(без вопроса)'}")
+            q = float(card.get("quality_score") or 0.0)
+            ctype = str(card.get("card_type") or "fact")
+            image_tag = "image recommended" if card.get("needs_image") else "image optional"
+            self.cards_listbox.insert(tk.END, f"{idx}. {front[:62] or '(без вопроса)'} | q {q:.2f} | {ctype} | {image_tag}")
 
         total = len(self.generated_cards)
         counter = f"{self.current_card_index + 1}/{total}" if total else "0/0"
@@ -872,6 +873,10 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.preview.update_preview(card)
         self.current_front_text.insert("1.0", card.get("front", ""))
         self.current_back_text.insert("1.0", card.get("back", ""))
+        if card.get("needs_image", False):
+            self.status_var.set("Для этой карточки картинка может помочь.")
+        else:
+            self.status_var.set("Для этой карточки картинка не обязательна, но доступна вручную.")
 
     def next_card(self) -> None:
         if not self.generated_cards:
@@ -899,9 +904,6 @@ class AIAddCardWorkspace(tk.Toplevel):
             messagebox.showwarning("Нет карточек", "Сначала сгенерируйте карточки", parent=self)
             return
         idx = self.current_card_index
-        if not self.generated_cards[idx].get("needs_image", True):
-            self.status_var.set("Для этой карточки картинка не обязательна")
-            return
 
         def worker():
             card = dict(self.generated_cards[idx])
@@ -909,12 +911,18 @@ class AIAddCardWorkspace(tk.Toplevel):
                 card["image_prompt"] = self.pipeline.generate_image_prompt(card)
             return self._generate_card_image_with_diagnostics(card)
 
-        self.status_var.set("Генерирую изображение...")
+        if self.generated_cards[idx].get("needs_image", False):
+            self.status_var.set("Для этой карточки картинка может помочь. Генерирую изображение...")
+        else:
+            self.status_var.set("Картинка не обязательна, но генерирую по вашему запросу...")
         self.run_in_background(worker, on_success=self._on_image_generated, on_error=self._on_image_error)
 
     def generate_images_for_all_cards(self) -> None:
         if not self.generated_cards:
             messagebox.showwarning("Нет карточек", "Сначала сгенерируйте карточки", parent=self)
+            return
+        if not self.generate_images_for_all_var.get():
+            self.status_var.set("Массовая генерация выключена: включите checkbox «Сгенерировать картинки для всех карточек».")
             return
 
         def worker():
