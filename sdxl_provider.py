@@ -40,6 +40,9 @@ class SDXLProvider:
         cfg: float,
         sampler: str,
         seed: int | None = None,
+        batch_size: int = 1,
+        batch_count: int = 1,
+        timeout: float = 90,
     ) -> str:
         if not self.api_url:
             raise SDXLProviderError("SD API URL не задан.")
@@ -55,9 +58,11 @@ class SDXLProvider:
             "cfg_scale": float(cfg),
             "sampler_name": sampler,
             "seed": int(seed) if seed is not None else -1,
+            "batch_size": max(1, int(batch_size)),
+            "n_iter": max(1, int(batch_count)),
         }
         try:
-            response = requests.post(f"{self.api_url}/sdapi/v1/txt2img", json=payload, timeout=120)
+            response = requests.post(f"{self.api_url}/sdapi/v1/txt2img", json=payload, timeout=float(timeout))
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as exc:
