@@ -157,6 +157,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.generated_cards: list[dict] = []
         self.current_card_index = 0
         self.auto_generate_image_after_card = False
+        self.generate_images_for_all_var = tk.BooleanVar(value=False)
         self._busy = False
         self._last_chat_answer = ""
         self._max_rag_chars = 30000
@@ -466,10 +467,18 @@ class AIAddCardWorkspace(tk.Toplevel):
         ttk.Button(actions_wrap, text="🔍 Найти материалы", command=self._search_web).grid(row=0, column=3, sticky="ew", padx=3, pady=3)
 
         ttk.Button(actions_wrap, text="Сгенерировать картинку", command=self.generate_image_for_current_card).grid(row=1, column=0, sticky="ew", padx=3, pady=3)
+        ttk.Button(actions_wrap, text="Сгенерировать картинки для всех", command=self.generate_images_for_all_cards).grid(row=1, column=4, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Сохранить в ознакомление", command=self.save_current_card_to_overview).grid(row=1, column=1, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Ручной редактор", command=self.open_manual_editor).grid(row=1, column=2, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Очистить", command=self.clear_workspace).grid(row=1, column=3, sticky="ew", padx=3, pady=3)
-        ttk.Button(actions_wrap, text="Отмена", command=self.destroy).grid(row=1, column=4, sticky="ew", padx=3, pady=3)
+        ttk.Checkbutton(
+            actions_wrap,
+            text="Сгенерировать картинки для всех карточек",
+            variable=self.generate_images_for_all_var,
+            onvalue=True,
+            offvalue=False,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=3, pady=(3, 0))
+        ttk.Button(actions_wrap, text="Отмена", command=self.destroy).grid(row=2, column=4, sticky="ew", padx=3, pady=3)
 
         status_row = ttk.Frame(parent)
         status_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
@@ -834,9 +843,9 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.show_current_card()
         if self.generated_cards:
             self.status_var.set(f"Сгенерировано карточек: {len(self.generated_cards)}")
-            if self.auto_generate_image_after_card:
-                self.auto_generate_image_after_card = False
-                self.generate_image_for_current_card()
+            if self.generate_images_for_all_var.get():
+                self.generate_images_for_all_cards()
+            self.auto_generate_image_after_card = False
         else:
             self.status_var.set("Карточки не сгенерированы. Попробуйте уточнить тему.")
 
@@ -902,6 +911,35 @@ class AIAddCardWorkspace(tk.Toplevel):
 
         self.status_var.set("Генерирую изображение...")
         self.run_in_background(worker, on_success=self._on_image_generated, on_error=self._on_image_error)
+
+    def generate_images_for_all_cards(self) -> None:
+        if not self.generated_cards:
+            messagebox.showwarning("Нет карточек", "Сначала сгенерируйте карточки", parent=self)
+            return
+
+        def worker():
+            cards = [dict(card or {}) for card in self.generated_cards]
+            targets = [i for i, card in enumerate(cards) if card.get("needs_image", True)]
+            total = len(targets)
+            if total == 0:
+                return cards, 0, 0
+            generated = 0
+            failed = 0
+            for done, card_idx in enumerate(targets, start=1):
+                self.after(0, lambda d=done, t=total: self.status_var.set(f"Генерирую изображение {d}/{t}..."))
+                card = cards[card_idx]
+                if not card.get("image_prompt"):
+                    card["image_prompt"] = self.pipeline.generate_image_prompt(card)
+                result = self._generate_card_image_with_diagnostics(card)
+                cards[card_idx] = result
+                if result.get("image_path"):
+                    generated += 1
+                else:
+                    failed += 1
+            return cards, generated, failed
+
+        self.status_var.set("Генерирую изображения для всех карточек...")
+        self.run_in_background(worker, on_success=self._on_all_images_generated, on_error=self._on_image_error)
 
     def _get_app_setting(self, *names, default=None):
         for name in names:
@@ -993,12 +1031,15 @@ class AIAddCardWorkspace(tk.Toplevel):
             path = provider.txt2img(
                 prompt=prompt,
                 negative_prompt=negative,
-                width=1024,
-                height=1024,
-                steps=28,
+                width=512,
+                height=512,
+                steps=20,
                 cfg=7,
                 sampler="Euler a",
                 seed=None,
+                batch_size=1,
+                batch_count=1,
+                timeout=90,
             )
             card["image_path"] = path
             metadata["image_status"] = f"SD: изображение создано ({os.path.basename(path)})"
@@ -1015,9 +1056,33 @@ class AIAddCardWorkspace(tk.Toplevel):
     def _on_image_generated(self, card) -> None:
         if self.generated_cards:
             self.generated_cards[self.current_card_index] = card
-        self.show_current_card()
+        self._refresh_current_card_preview()
         status = ((card.get("metadata") or {}).get("image_status") or "").strip()
         self.status_var.set(status or "Генерация изображения завершена")
+
+    def _on_all_images_generated(self, payload) -> None:
+        cards, generated, failed = payload
+        self.generated_cards = list(cards or [])
+        self._refresh_current_card_preview()
+        if generated == 0 and failed == 0:
+            self.status_var.set("Нет карточек, которым нужна картинка")
+            return
+        self.status_var.set(f"Готово: сгенерировано {generated}, ошибок {failed}")
+
+    def _refresh_current_card_preview(self) -> None:
+        total = len(self.generated_cards)
+        counter = f"{self.current_card_index + 1}/{total}" if total else "0/0"
+        self.cards_counter_var.set(counter)
+        self.current_front_text.delete("1.0", tk.END)
+        self.current_back_text.delete("1.0", tk.END)
+        if not total:
+            self.preview.clear()
+            return
+        self.current_card_index = max(0, min(self.current_card_index, total - 1))
+        card = self.generated_cards[self.current_card_index]
+        self.preview.update_preview(card)
+        self.current_front_text.insert("1.0", card.get("front", ""))
+        self.current_back_text.insert("1.0", card.get("back", ""))
 
     def _on_image_error(self, exc: Exception) -> None:
         logging.exception("AI workspace image generation failed")
