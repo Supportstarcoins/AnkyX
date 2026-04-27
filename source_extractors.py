@@ -82,3 +82,7 @@ def clean_extracted_text(text: str) -> str:
     text = (text or "").replace("\r", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def extract_text_from_source(source: str) -> str:
+    return clean_extracted_text(extract_text_from_path(source))
