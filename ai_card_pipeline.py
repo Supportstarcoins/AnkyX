@@ -157,10 +157,15 @@ class AICardPipeline:
             return []
         source_trace = dict((options or {}).get("source_trace") or {})
         try:
-            import requests
+            from ollama_client import OllamaClient
         except Exception as exc:
-            self.last_fallback_reason = f"requests недоступен: {exc}"
+            self.last_fallback_reason = f"OllamaClient недоступен: {exc}"
             return []
+
+        ollama = OllamaClient(
+            base_url=str(settings.get("base_url") or ""),
+            model=str(settings.get("model") or ""),
+        )
 
         cards: list[dict] = []
         for unit in knowledge_units:
@@ -170,15 +175,7 @@ class AICardPipeline:
                 {"role": "user", "content": prompt},
             ]
             try:
-                resp = requests.post(
-                    f"{settings['base_url'].rstrip('/')}/api/chat",
-                    json={"model": settings["model"], "messages": messages, "stream": False},
-                    timeout=settings.get("timeout", 45),
-                )
-                if not resp.ok:
-                    self.last_fallback_reason = f"LLM HTTP {resp.status_code}"
-                    return []
-                raw = str(((resp.json() or {}).get("message") or {}).get("content") or "").strip()
+                raw = ollama.chat(messages)
                 payload = self._extract_json_array(raw)
                 parsed = json.loads(payload)
                 if not isinstance(parsed, list):
