@@ -7,9 +7,15 @@ import requests
 
 
 class OllamaClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:11434", model: str = "llama3.1:8b") -> None:
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:11434",
+        model: str = "llama3.1:8b",
+        auto_fallback: bool = True,
+    ) -> None:
         self.base_url = self._normalize_base_url(base_url)
         self.model = model
+        self.auto_fallback = bool(auto_fallback)
 
     @staticmethod
     def _normalize_base_url(base_url: str) -> str:
@@ -39,7 +45,7 @@ class OllamaClient:
         for item in models:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name") or "").strip()
+            name = str(item.get("name") or item.get("model") or "").strip()
             if name:
                 names.append(name)
         return names
@@ -51,27 +57,37 @@ class OllamaClient:
             return True
         return model in models
 
+    def _resolve_model(self, requested_model: str) -> str:
+        available_models = self.list_models()
+        if requested_model in available_models:
+            return requested_model
+        models_preview = ", ".join(available_models[:20]) if available_models else "нет данных"
+        if self.auto_fallback and available_models:
+            return available_models[0]
+        raise RuntimeError(f"Модель '{requested_model}' не найдена. Доступные модели: {models_preview}")
+
     def chat(self, messages: list[dict[str, str]], options: dict[str, Any] | None = None) -> str:
-        if not self.is_model_available(self.model):
-            available_models = self.list_models()
-            models_preview = ", ".join(available_models[:20]) if available_models else "нет данных"
-            raise RuntimeError(f"Модель '{self.model}' не найдена в Ollama. Доступные модели: {models_preview}")
+        target_model = self._resolve_model(self.model)
 
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": target_model,
             "messages": messages,
             "stream": False,
             "options": options or {"temperature": 0.4},
         }
         endpoint = self._chat_endpoint()
-        response = requests.post(endpoint, json=payload, timeout=180)
+        timeout = int((options or {}).get("timeout") or 180)
+        response = requests.post(endpoint, json=payload, timeout=max(30, timeout))
         if response.status_code == 404:
-            body_preview = (response.text or "").strip()[:300]
-            raise RuntimeError(
-                "Ollama HTTP 404: проверьте имя модели и Ollama URL. URL должен быть "
-                "http://127.0.0.1:11434, модель должна существовать в ollama list. "
-                f"base_url={self.base_url}; model={self.model}; endpoint={endpoint}; response={body_preview}"
-            )
+            available_models = self.list_models()
+            models_preview = ", ".join(available_models[:20]) if available_models else "нет данных"
+            if self.auto_fallback and available_models:
+                payload["model"] = available_models[0]
+                response = requests.post(endpoint, json=payload, timeout=max(30, timeout))
+            if response.status_code == 404:
+                raise RuntimeError(
+                    f"Модель '{target_model}' не найдена. Доступные модели: {models_preview}"
+                )
         response.raise_for_status()
         data = response.json()
         message = data.get("message") or {}
