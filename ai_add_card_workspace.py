@@ -9,8 +9,10 @@ from tkinter import filedialog, messagebox, ttk
 
 from ai_card_pipeline import AICardPipeline
 from card_preview_widget import CardPreviewWidget
+from listening_card_pipeline import build_listening_cards
 from rag_content_pipeline import RagContentPipeline
 from rag_web_search import RagWebSearch
+from youtube_media_pipeline import YouTubeMediaPipeline
 
 try:
     from chat_bot_tab import ChatBotTab
@@ -152,6 +154,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.pipeline = AICardPipeline(app=app, deck_id=self.deck_id)
         self.web_search = RagWebSearch()
         self.rag_pipeline = RagContentPipeline(max_chars=30000, max_sources=5)
+        self.youtube_pipeline = YouTubeMediaPipeline()
 
         self.source_path: str | None = None
         self.generated_cards: list[dict] = []
@@ -163,6 +166,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         self._max_rag_chars = 30000
         self._text_context_menu = None
         self._last_source_trace: dict = {}
+        self._youtube_last_result: dict = {}
 
         root = self._create_scrollable_root()
 
@@ -458,16 +462,17 @@ class AIAddCardWorkspace(tk.Toplevel):
 
         actions_wrap = ttk.LabelFrame(parent, text="Действия", padding=8)
         actions_wrap.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        for col in range(5):
+        for col in range(6):
             actions_wrap.columnconfigure(col, weight=1)
 
         ttk.Button(actions_wrap, text="Загрузить файл", command=self._pick_file).grid(row=0, column=0, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Извлечь текст", command=self._extract_text).grid(row=0, column=1, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Сгенерировать карточки", command=self.generate_cards_from_input).grid(row=0, column=2, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="🔍 Найти материалы", command=self._search_web).grid(row=0, column=3, sticky="ew", padx=3, pady=3)
+        ttk.Button(actions_wrap, text="Скачать/извлечь речь", command=self._start_youtube_listening).grid(row=0, column=4, sticky="ew", padx=3, pady=3)
 
         ttk.Button(actions_wrap, text="Сгенерировать картинку", command=self.generate_image_for_current_card).grid(row=1, column=0, sticky="ew", padx=3, pady=3)
-        ttk.Button(actions_wrap, text="Сгенерировать картинки для всех", command=self.generate_images_for_all_cards).grid(row=1, column=4, sticky="ew", padx=3, pady=3)
+        ttk.Button(actions_wrap, text="Сгенерировать картинки для всех", command=self.generate_images_for_all_cards).grid(row=1, column=5, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Сохранить в ознакомление", command=self.save_current_card_to_overview).grid(row=1, column=1, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Ручной редактор", command=self.open_manual_editor).grid(row=1, column=2, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Очистить", command=self.clear_workspace).grid(row=1, column=3, sticky="ew", padx=3, pady=3)
@@ -478,7 +483,32 @@ class AIAddCardWorkspace(tk.Toplevel):
             onvalue=True,
             offvalue=False,
         ).grid(row=2, column=0, columnspan=3, sticky="w", padx=3, pady=(3, 0))
-        ttk.Button(actions_wrap, text="Отмена", command=self.destroy).grid(row=2, column=4, sticky="ew", padx=3, pady=3)
+        ttk.Button(actions_wrap, text="Отмена", command=self.destroy).grid(row=2, column=5, sticky="ew", padx=3, pady=3)
+
+        yt_wrap = ttk.LabelFrame(parent, text="YouTube аудирование", padding=8)
+        yt_wrap.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        yt_wrap.columnconfigure(0, weight=1)
+        yt_wrap.columnconfigure(1, weight=1)
+        yt_wrap.columnconfigure(2, weight=1)
+        self.youtube_download_video_var = tk.BooleanVar(value=False)
+        self.youtube_audio_only_var = tk.BooleanVar(value=True)
+        self.youtube_force_stt_var = tk.BooleanVar(value=False)
+        self.youtube_lang_var = tk.StringVar(value="auto")
+        self.youtube_min_clip_var = tk.IntVar(value=5)
+        self.youtube_max_clip_var = tk.IntVar(value=15)
+        ttk.Checkbutton(yt_wrap, text="Скачать видеофрагменты", variable=self.youtube_download_video_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(yt_wrap, text="Только аудио", variable=self.youtube_audio_only_var).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(yt_wrap, text="Использовать цифровой слух даже при наличии субтитров", variable=self.youtube_force_stt_var).grid(row=0, column=2, sticky="w")
+        ttk.Label(yt_wrap, text="Язык:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(yt_wrap, textvariable=self.youtube_lang_var, state="readonly", values=["auto", "en", "de", "ru"], width=10).grid(row=1, column=0, sticky="e", pady=(6, 0))
+        ttk.Label(yt_wrap, text="Длина клипа (сек):").grid(row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Spinbox(yt_wrap, from_=3, to=15, textvariable=self.youtube_min_clip_var, width=6).grid(row=1, column=1, sticky="e", pady=(6, 0))
+        ttk.Spinbox(yt_wrap, from_=5, to=25, textvariable=self.youtube_max_clip_var, width=6).grid(row=1, column=2, sticky="w", pady=(6, 0))
+        ttk.Label(
+            yt_wrap,
+            text="Скачивайте только материалы, на использование которых у вас есть право.",
+            foreground="#9ca3af",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         status_row = ttk.Frame(parent)
         status_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
@@ -775,6 +805,10 @@ class AIAddCardWorkspace(tk.Toplevel):
     def _search_web(self) -> None:
         raw_input = self._get_source_query_text()
         query = self._normalize_web_query(raw_input)
+        if YouTubeMediaPipeline and ("youtube.com/" in raw_input or "youtu.be/" in raw_input):
+            self.status_var.set("Найден YouTube URL. Можно нажать «Скачать/извлечь речь».")
+            self._start_youtube_listening(auto_from_search=True)
+            return
         if not query:
             messagebox.showwarning("Поиск", "Введите короткую тему или выделите текст для поиска", parent=self)
             return
@@ -789,6 +823,77 @@ class AIAddCardWorkspace(tk.Toplevel):
             on_success=self._on_web_text,
             on_error=self._on_web_error,
         )
+
+    def _youtube_options(self) -> dict:
+        min_sec = int(self.youtube_min_clip_var.get() if hasattr(self, "youtube_min_clip_var") else 5)
+        max_sec = int(self.youtube_max_clip_var.get() if hasattr(self, "youtube_max_clip_var") else 15)
+        if min_sec > max_sec:
+            min_sec, max_sec = max_sec, min_sec
+        return {
+            "download_video": bool(self.youtube_download_video_var.get() if hasattr(self, "youtube_download_video_var") else False),
+            "audio_only": bool(self.youtube_audio_only_var.get() if hasattr(self, "youtube_audio_only_var") else True),
+            "force_stt": bool(self.youtube_force_stt_var.get() if hasattr(self, "youtube_force_stt_var") else False),
+            "language": (self.youtube_lang_var.get() if hasattr(self, "youtube_lang_var") else "auto"),
+            "min_sec": min_sec,
+            "max_sec": max_sec,
+            "progress_cb": self._set_status_async,
+        }
+
+    def _set_status_async(self, text: str) -> None:
+        try:
+            self.after(0, lambda: self.status_var.set(str(text)))
+        except Exception:
+            pass
+
+    def _start_youtube_listening(self, auto_from_search: bool = False) -> None:
+        raw_input = self._get_source_query_text()
+        if not ("youtube.com/" in raw_input or "youtu.be/" in raw_input):
+            if not auto_from_search:
+                messagebox.showwarning("YouTube", "Вставьте YouTube URL в поле источника.", parent=self)
+            return
+
+        def worker():
+            payload = self.youtube_pipeline.process_url(raw_input.strip(), options=self._youtube_options())
+            cards = build_listening_cards(payload, options=self._youtube_options()) if payload.get("ok") else []
+            return payload, cards
+
+        self.status_var.set("Загружаю аудио...")
+        self.run_in_background(worker, on_success=self._on_youtube_ready, on_error=self._on_web_error)
+
+    def _on_youtube_ready(self, payload) -> None:
+        youtube_result, cards = payload if isinstance(payload, tuple) else ({}, [])
+        self._youtube_last_result = dict(youtube_result or {})
+        if not youtube_result.get("ok"):
+            err = "; ".join(youtube_result.get("errors") or []) or "Не удалось извлечь YouTube материалы."
+            self.status_var.set(err)
+            messagebox.showerror("YouTube", err, parent=self)
+            return
+        self.status_var.set("Создаю listening-карточки...")
+        self.generated_cards = list(cards or [])
+        self.current_card_index = 0
+        self.show_current_card()
+        self._last_source_trace = {
+            "source_type": "youtube",
+            "source_url": youtube_result.get("url") or "",
+            "source_title": youtube_result.get("title") or "",
+            "sources": [
+                {
+                    "url": youtube_result.get("url") or "",
+                    "title": youtube_result.get("title") or "",
+                    "source_type": "youtube",
+                    "metadata": {
+                        "video_id": youtube_result.get("video_id"),
+                        "segments": youtube_result.get("segments") or [],
+                    },
+                }
+            ],
+            "images": [{"url": youtube_result.get("thumbnail_path") or "", "local_path": "", "source_type": "youtube"}],
+        }
+        errors = youtube_result.get("errors") or []
+        if errors:
+            self.status_var.set(f"Готово с предупреждениями: {'; '.join(errors)}")
+        else:
+            self.status_var.set(f"Готово: listening-карточек {len(self.generated_cards)}")
 
     def _on_web_text(self, result: dict) -> None:
         cleaned = ((result or {}).get("clean_text") or "").strip()

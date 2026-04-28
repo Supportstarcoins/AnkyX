@@ -610,6 +610,15 @@ class AICardPipeline:
                         "image_source_type": card.get("image_source_type"),
                         "image_relevance_score": card.get("image_relevance_score"),
                     },
+                    "media": {
+                        "audio_path": card.get("audio_path"),
+                        "video_path": card.get("video_path"),
+                        "front_image_path": card.get("front_image_path"),
+                        "language": card.get("language"),
+                        "translation": card.get("translation"),
+                        "time_start": card.get("time_start"),
+                        "time_end": card.get("time_end"),
+                    },
                 }
                 values = {
                     "deck_id": deck_id,
@@ -617,10 +626,11 @@ class AICardPipeline:
                     "back": back,
                     "next_review": now_iso,
                     "leitner_level": 1,
-                    "front_image_path": card.get("image_path"),
+                    "front_image_path": card.get("front_image_path") or card.get("image_path"),
                     "back_image_path": None,
                     "image_path": card.get("image_path"),
                     "translation_shown": 1,
+                    "translation": card.get("translation"),
                     "overview_added": 1,
                     "state": "overview" if "state" in columns else "new",
                     "phase": 1,
@@ -633,6 +643,13 @@ class AICardPipeline:
                     "last_review": None,
                     "metadata": json.dumps(meta_payload, ensure_ascii=False),
                     "extra": json.dumps(meta_payload, ensure_ascii=False),
+                    "audio_path": card.get("audio_path"),
+                    "video_path": card.get("video_path"),
+                    "source_url": card.get("source_url"),
+                    "source_title": card.get("source_title"),
+                    "time_start": card.get("time_start"),
+                    "time_end": card.get("time_end"),
+                    "language": card.get("language"),
                 }
                 insert_cols = [c for c in values if c in columns]
                 if not insert_cols:
