@@ -9,7 +9,16 @@ import time
 from datetime import datetime
 from typing import Any
 
-from card_quality_filter import STOP_TERMS, filter_bad_cards, polish_card, repair_or_drop_bad_card, score_card
+from card_quality_filter import (
+    BANNED_GENERIC_PATTERNS,
+    STOP_TERMS,
+    dedupe_cards,
+    filter_bad_cards,
+    is_bad_question,
+    polish_card,
+    repair_or_drop_bad_card,
+    score_card,
+)
 from rag_content_pipeline import attach_best_source_images, clean_raw_text, normalize_card_image_fields
 from semantic_chunker import split_into_semantic_chunks
 
@@ -30,6 +39,8 @@ class AICardPipeline:
         self.app = app
         self.deck_id = deck_id
         self.max_cards = 24
+        self.last_generation_mode = "fallback"
+        self.last_fallback_reason = ""
 
     def run_pipeline(
         self,
@@ -55,7 +66,13 @@ class AICardPipeline:
         cleaned = clean_raw_text(html.unescape(raw_text))
         chunks = split_into_semantic_chunks(cleaned, min_words=90, max_words=320)
         units = self.extract_knowledge_units(chunks)
-        candidates = self._generate_candidates(units, source_trace=source_trace or {})
+        question_style = str(opts.get("question_style") or "creative_grounded").strip().lower()
+        candidates = self._generate_candidates(
+            units,
+            source_trace=source_trace or {},
+            source_text=cleaned,
+            options={**opts, "question_style": question_style},
+        )
         cards = self._finalize_cards(candidates, mode=mode)
         cards = attach_best_source_images(cards, extracted_images)
         cards = [normalize_card_image_fields(card) for card in cards]
@@ -118,70 +135,82 @@ class AICardPipeline:
             )
         return units
 
-    def _generate_candidates(self, units: list[dict], source_trace: dict) -> list[dict]:
+    def _generate_candidates(self, units: list[dict], source_trace: dict, source_text: str, options: dict | None = None) -> list[dict]:
+        llm_cards = self.generate_cards_with_llm(units, source_text, options=options)
+        if llm_cards:
+            self.last_generation_mode = "llm"
+            self.last_fallback_reason = ""
+            return llm_cards
+
+        self.last_generation_mode = "fallback"
         cards: list[dict] = []
+        reason = self.last_fallback_reason or "LLM недоступна"
         for unit in units:
-            llm_cards = self._generate_cards_with_llm(unit, source_trace)
-            if llm_cards:
-                cards.extend(llm_cards)
-                continue
             cards.extend(self._generate_candidates_fallback(unit, source_trace))
+        self.last_fallback_reason = reason
         return cards
 
-    def _generate_cards_with_llm(self, unit: dict, source_trace: dict) -> list[dict]:
+    def generate_cards_with_llm(self, knowledge_units: list[dict], source_text: str, options: dict | None = None) -> list[dict]:
         settings = self._get_llm_settings()
         if not settings.get("enabled"):
+            self.last_fallback_reason = "LLM отключена в настройках"
             return []
+        source_trace = dict((options or {}).get("source_trace") or {})
         try:
             import requests
-        except Exception:
-            return []
-
-        prompt = self._build_llm_prompt(unit)
-        messages = [
-            {"role": "system", "content": "Ты создаёшь флэш-карточки в строгом JSON-массиве без пояснений."},
-            {"role": "user", "content": prompt},
-        ]
-        try:
-            resp = requests.post(
-                f"{settings['base_url'].rstrip('/')}/api/chat",
-                json={"model": settings["model"], "messages": messages, "stream": False},
-                timeout=settings.get("timeout", 45),
-            )
-            if not resp.ok:
-                return []
-            raw = str(((resp.json() or {}).get("message") or {}).get("content") or "").strip()
-            payload = self._extract_json_array(raw)
-            parsed = json.loads(payload)
-            if not isinstance(parsed, list):
-                return []
-        except Exception:
+        except Exception as exc:
+            self.last_fallback_reason = f"requests недоступен: {exc}"
             return []
 
         cards: list[dict] = []
-        for item in parsed[:8]:
-            if not isinstance(item, dict):
-                continue
-            card_type = str(item.get("card_type") or "fact").strip().lower()
-            if card_type not in ALLOWED_CARD_TYPES:
-                card_type = "fact"
-            card = self._make_card(
-                item.get("front") or "",
-                item.get("back") or "",
-                card_type,
-                item.get("source_excerpt") or unit.get("source_excerpt") or "",
-                unit.get("chunk_id") or "",
-                source_trace.get("source_type") or "manual",
-                source_trace.get("source_url") or "",
-                source_trace.get("source_title") or "",
-                unit,
-                topic=item.get("topic") or unit.get("topic") or "",
-            )
-            card["explanation"] = str(item.get("explanation") or card.get("back") or "")[:240]
-            card["difficulty"] = str(item.get("difficulty") or "medium")
-            card["needs_image"] = bool(item.get("needs_image", card.get("needs_image")))
-            card["image_prompt"] = str(item.get("image_prompt") or "").strip() or self.build_image_prompt_for_card(card)
-            cards.append(card)
+        for unit in knowledge_units:
+            prompt = self._build_llm_prompt(unit, source_text=source_text, options=options)
+            messages = [
+                {"role": "system", "content": "Ты создаёшь флэш-карточки в строгом JSON-массиве без пояснений."},
+                {"role": "user", "content": prompt},
+            ]
+            try:
+                resp = requests.post(
+                    f"{settings['base_url'].rstrip('/')}/api/chat",
+                    json={"model": settings["model"], "messages": messages, "stream": False},
+                    timeout=settings.get("timeout", 45),
+                )
+                if not resp.ok:
+                    self.last_fallback_reason = f"LLM HTTP {resp.status_code}"
+                    return []
+                raw = str(((resp.json() or {}).get("message") or {}).get("content") or "").strip()
+                payload = self._extract_json_array(raw)
+                parsed = json.loads(payload)
+                if not isinstance(parsed, list):
+                    self.last_fallback_reason = "LLM вернула не массив JSON"
+                    return []
+            except Exception as exc:
+                self.last_fallback_reason = f"LLM генерация не сработала: {exc}"
+                return []
+
+            for item in parsed[:8]:
+                if not isinstance(item, dict):
+                    continue
+                card_type = str(item.get("card_type") or "fact").strip().lower()
+                if card_type not in ALLOWED_CARD_TYPES:
+                    card_type = "fact"
+                card = self._make_card(
+                    item.get("front") or "",
+                    item.get("back") or "",
+                    card_type,
+                    item.get("source_excerpt") or unit.get("source_excerpt") or "",
+                    unit.get("chunk_id") or "",
+                    source_trace.get("source_type") or "manual",
+                    source_trace.get("source_url") or "",
+                    source_trace.get("source_title") or "",
+                    unit,
+                    topic=item.get("topic") or unit.get("topic") or "",
+                )
+                card["explanation"] = str(item.get("explanation") or card.get("back") or "")[:240]
+                card["difficulty"] = str(item.get("difficulty") or "medium")
+                card["needs_image"] = bool(item.get("needs_image", card.get("needs_image")))
+                card["image_prompt"] = str(item.get("image_prompt") or "").strip() or self.build_image_prompt_for_card(card)
+                cards.append(card)
         return cards
 
     def _generate_candidates_fallback(self, unit: dict, source_trace: dict) -> list[dict]:
@@ -193,54 +222,42 @@ class AICardPipeline:
         source_url = source_trace.get("source_url") or ""
         source_title = source_trace.get("source_title") or ""
 
-        for d in unit.get("definitions", [])[:3]:
-            maybe = self._definition_card(d)
-            if maybe:
-                q, a = maybe
-                cards.append(self._make_card(q, a, "definition", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
-
-        for c in unit.get("causes", [])[:3]:
-            maybe = self._cause_card(c)
-            if maybe:
-                q, a = maybe
-                cards.append(self._make_card(q, a, "cause", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
-
         for f in unit.get("facts", [])[:6]:
-            maybe = self._function_or_fact_card(f)
+            maybe = self._safe_fallback_card(f)
             if maybe:
                 q, a, ctype = maybe
                 cards.append(self._make_card(q, a, ctype, excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
-
-        for fn in unit.get("functions", [])[:2]:
-            maybe = self._function_card(fn)
-            if maybe:
-                q, a = maybe
-                cards.append(self._make_card(q, a, "function", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
-
-        for rg in unit.get("ranges", [])[:2]:
-            maybe = self._range_card(rg)
-            if maybe:
-                q, a = maybe
-                cards.append(self._make_card(q, a, "range/quantity", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
-
-        for diff in unit.get("differences", [])[:2]:
-            maybe = self._difference_card(diff)
-            if maybe:
-                q, a = maybe
-                cards.append(self._make_card(q, a, "difference", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
-
-        for lst in unit.get("lists", [])[:2]:
-            maybe = self._list_card(lst)
-            if maybe:
-                q, a = maybe
-                cards.append(self._make_card(q, a, "list/classification", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
-
-        for an in unit.get("anatomy", [])[:2]:
-            maybe = self._anatomy_card(an)
-            if maybe:
-                q, a = maybe
-                cards.append(self._make_card(q, a, "anatomy/composition", excerpt, chunk_id, source_type, source_url, source_title, unit, topic=topic))
         return cards
+
+    def _safe_fallback_card(self, sentence: str) -> tuple[str, str, str] | None:
+        sent = re.sub(r"\s+", " ", sentence).strip()
+        m_div = re.search(r"^(.+?)\s+делится\s+на\s+(.+)$", sent, flags=re.IGNORECASE)
+        if m_div:
+            subj = m_div.group(1).strip(" .,:;")
+            if self._is_valid_subject(subj):
+                return f"На какие части делится {subj.lower()}?", f"На {m_div.group(2).strip()}", "anatomy/composition"
+        m_legs = re.search(r"^у\s+([А-ЯA-Zа-яa-z0-9\- ]{2,50})\s+(\d+|восемь|шесть|четыре|пять|семь|девять|десять)\s+ног", sent, flags=re.IGNORECASE)
+        if m_legs:
+            subj = m_legs.group(1).strip(" .,:;")
+            if self._is_valid_subject(subj):
+                qty = m_legs.group(2).strip()
+                return f"Сколько ног у {subj.lower()}?", qty.capitalize() if qty.isalpha() else qty, "range/quantity"
+        m_protect = re.search(r"^(.+?)\s+защищает\s+.+?\s+от\s+(.+)$", sent, flags=re.IGNORECASE)
+        if m_protect:
+            subj = m_protect.group(1).strip(" .,:;")
+            if self._is_valid_subject(subj):
+                return f"От чего защищает {subj.lower()}?", f"От {m_protect.group(2).strip()}", "function"
+        m_range = re.search(r"^размеры\s+(.+?)\s+могут\s+колебаться\s+от\s+(.+?)\s+до\s+(.+)$", sent, flags=re.IGNORECASE)
+        if m_range:
+            subj = f"размеры {m_range.group(1).strip()}"
+            if self._is_valid_subject(subj):
+                return f"В каком диапазоне могут колебаться {subj.lower()}?", f"От {m_range.group(2).strip()} до {m_range.group(3).strip()}", "range/quantity"
+        m_use = re.search(r"^(.+?)\s+(?:используется|применяется|служит|предназначен)\s+для\s+(.+)$", sent, flags=re.IGNORECASE)
+        if m_use:
+            subj = m_use.group(1).strip(" .,:;")
+            if self._is_valid_subject(subj):
+                return f"Для чего используется {subj.lower()}?", f"Для {m_use.group(2).strip()}", "function"
+        return None
 
     def _make_card(
         self,
@@ -308,6 +325,10 @@ class AICardPipeline:
             repaired = repair_or_drop_bad_card(c)
             if repaired and self._is_card_semantically_valid(repaired):
                 cleaned.append(repaired)
+        cleaned = [polish_card(c) for c in cleaned if not is_bad_question(str(c.get("front") or ""))]
+        cleaned = [score_card(c) for c in cleaned]
+        cleaned = dedupe_cards(cleaned)
+        cleaned = [polish_card(c) for c in cleaned if not is_bad_question(str(c.get("front") or ""))]
         if mode == "fast":
             pool = [score_card(polish_card(c)) for c in cleaned]
             strong = [c for c in pool if c.get("quality_score", 0.0) >= 0.55]
@@ -317,6 +338,7 @@ class AICardPipeline:
         filtered = filter_bad_cards(cleaned)
         if mode == "deep":
             filtered = sorted(filtered, key=lambda x: x.get("quality_score", 0.0), reverse=True)
+        filtered = [c for c in filtered if not is_bad_question(str(c.get("front") or ""))]
         return filtered
 
     def _guess_subject(self, sentence: str) -> str:
@@ -535,6 +557,17 @@ class AICardPipeline:
                 return tok
         return ""
 
+    def _is_valid_subject(self, subject: str) -> bool:
+        cleaned = re.sub(r"\s+", " ", (subject or "").strip()).lower()
+        if not cleaned:
+            return False
+        bad = STOP_TERMS | {"живут", "служат", "состоят", "защищены", "среди", "между", "особая", "условно", "данный", "которые", "пара"}
+        if cleaned in bad:
+            return False
+        if len(cleaned.split()) == 1 and len(cleaned) < 5:
+            return False
+        return True
+
     def _is_card_semantically_valid(self, card: dict) -> bool:
         front = str(card.get("front") or "").lower()
         back = str(card.get("back") or "").strip()
@@ -542,7 +575,9 @@ class AICardPipeline:
         topic = str(card.get("topic") or "").strip()
         if not front or not back or not excerpt or not topic:
             return False
-        if any(p in front for p in ("какой факт указан", "что означает термин", "какова указанная причина", "что описано в тексте", "что важно помнить", "что конкретно сказано", "что известно про")):
+        if any(p in front for p in BANNED_GENERIC_PATTERNS):
+            return False
+        if is_bad_question(front):
             return False
         tokens = re.findall(r"[а-яa-z0-9]+", front)
         if len([t for t in tokens if len(t) >= 3]) < 2:
@@ -597,26 +632,28 @@ class AICardPipeline:
                 continue
         return default
 
-    def _build_llm_prompt(self, unit: dict) -> str:
+    def _build_llm_prompt(self, unit: dict, source_text: str = "", options: dict | None = None) -> str:
+        question_style = str((options or {}).get("question_style") or "creative_grounded").strip().lower()
         return (
-            "Ты создаёшь флэш-карточки для запоминания.\n"
-            "Создавай только конкретные вопросы по фактам из текста.\n"
-            "Запрещено создавать общие вопросы:\n"
-            "- \"Какой факт указан в материале?\"\n"
-            "- \"Что конкретно сказано...?\"\n"
-            "- \"Что известно про...?\"\n"
-            "- \"Что описано в тексте?\"\n"
-            "- \"Что важно помнить?\"\n"
-            "- \"Какова указанная причина явления?\"\n"
-            "- \"Что означает термин «Это»?\"\n"
-            "Каждая карточка: один вопрос, один короткий ответ, ответ строго из source_excerpt, не более 1 факта на карточку.\n"
-            "Вопрос должен содержать конкретное понятие. Нельзя использовать местоимения как термин.\n"
-            "Если фрагмент слабый/рекламный — пропусти его.\n"
-            "Верни ТОЛЬКО JSON-массив такого вида:\n"
-            "[{\"front\":\"...\",\"back\":\"...\",\"explanation\":\"...\",\"card_type\":\"definition|function|range/quantity|cause|difference|list/classification|anatomy/composition|fact\",\"difficulty\":\"easy|medium|hard\",\"source_excerpt\":\"...\",\"topic\":\"...\",\"needs_image\":true,\"image_prompt\":\"...\"}]\n\n"
+            "Ты создаёшь качественные флэш-карточки для запоминания.\n"
+            "Твоя задача — сделать живые, конкретные и понятные вопросы по тексту.\n"
+            f"Режим вопроса: {question_style}.\n"
+            "Правила:\n"
+            "- Вопрос должен быть естественным, как у хорошего преподавателя.\n"
+            "- Вопрос должен проверять один конкретный факт.\n"
+            "- Ответ должен быть коротким.\n"
+            "- Нельзя задавать шаблонные вопросы.\n"
+            "- Нельзя писать: \"Что верно про...\", \"Какой факт указан...\", \"Сколько указано для...\".\n"
+            "- Нельзя делать вопрос из одного случайного слова.\n"
+            "- Нельзя добавлять факты не из source_excerpt.\n"
+            "- Вопрос должен быть связан с answer/back.\n"
+            "- Лучше сделать меньше карточек, но качественнее.\n"
+            "Верни JSON-массив:\n"
+            "[{\"front\":\"...\",\"back\":\"...\",\"explanation\":\"...\",\"card_type\":\"definition|fact|anatomy|function|range|cause|difference|list|process\",\"difficulty\":\"easy|medium|hard\",\"topic\":\"...\",\"source_excerpt\":\"...\",\"quality_score\":0.0,\"needs_image\":false,\"image_prompt\":\"...\"}]\n\n"
             f"topic={unit.get('topic','')}\n"
             f"chunk_id={unit.get('chunk_id','')}\n"
-            f"source_excerpt={unit.get('source_excerpt','')}"
+            f"source_excerpt={unit.get('source_excerpt','')}\n"
+            f"full_source={source_text[:1800]}"
         )
 
     def _extract_json_array(self, raw: str) -> str:

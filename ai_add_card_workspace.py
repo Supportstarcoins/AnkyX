@@ -839,12 +839,16 @@ class AIAddCardWorkspace(tk.Toplevel):
             messagebox.showwarning("Пусто", "Нет текста для генерации карточек", parent=self)
             return
 
-        self.status_var.set("Генерирую карточки...")
+        self.status_var.set("Генерация вопросов: LLM")
         self.run_in_background(
             lambda: self.pipeline.run_pipeline(
                 source_text=text,
                 source_trace=self._last_source_trace,
-                options={"mode": "accurate"},
+                options={
+                    "mode": "accurate",
+                    "question_style": "creative_grounded",
+                    "source_trace": self._last_source_trace,
+                },
                 source=self.source_path,
             ),
             on_success=self._on_cards_generated,
@@ -854,11 +858,25 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.generated_cards = list(cards or [])
         self.current_card_index = 0
         self.show_current_card()
+        generation_mode = str(getattr(self.pipeline, "last_generation_mode", "fallback"))
+        fallback_reason = str(getattr(self.pipeline, "last_fallback_reason", "") or "").strip()
         if self.generated_cards:
-            self.status_var.set(f"Сгенерировано карточек: {len(self.generated_cards)}")
+            if generation_mode == "llm":
+                self.status_var.set(f"Генерация вопросов: LLM. Сгенерировано карточек: {len(self.generated_cards)}")
+            else:
+                reason_part = f" LLM генерация не сработала: {fallback_reason}." if fallback_reason else ""
+                self.status_var.set(
+                    f"Генерация вопросов: fallback. LLM недоступна, используется fallback.{reason_part} Сгенерировано карточек: {len(self.generated_cards)}"
+                )
             self.auto_generate_image_after_card = False
         else:
-            self.status_var.set("Карточки не сгенерированы. Попробуйте уточнить тему.")
+            if generation_mode == "llm":
+                self.status_var.set("Генерация вопросов: LLM. Карточки не сгенерированы. Попробуйте уточнить тему.")
+            else:
+                reason_part = f" LLM генерация не сработала: {fallback_reason}." if fallback_reason else ""
+                self.status_var.set(
+                    f"Генерация вопросов: fallback. LLM недоступна, используется fallback.{reason_part} Карточки не сгенерированы."
+                )
 
     def show_current_card(self) -> None:
         self.cards_listbox.delete(0, tk.END)

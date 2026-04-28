@@ -6,6 +6,9 @@ STOP_TOPIC = {
     "это", "этот", "эта", "эти", "который", "которая", "которые", "такой", "такая", "такие",
     "для", "или", "как", "при", "если", "также", "очень", "можно", "нужно",
 }
+BAD_TOPIC_TOKENS = {
+    "живут", "служат", "состоят", "среди", "между", "особая", "условно", "это", "они", "он", "она", "данный", "которые", "пара",
+}
 
 
 def _word_count(text: str) -> int:
@@ -23,7 +26,7 @@ def _topic_title(text: str) -> str:
     freq: dict[str, int] = {}
     for tok in tokens:
         low = tok.lower()
-        if low in STOP_TOPIC:
+        if low in STOP_TOPIC or low in BAD_TOPIC_TOKENS:
             continue
         freq[low] = freq.get(low, 0) + 1
     if not freq:

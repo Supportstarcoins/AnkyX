@@ -4,10 +4,14 @@ import re
 from difflib import SequenceMatcher
 
 BANNED_GENERIC_PATTERNS = [
+    "что верно про",
+    "сколько указано для",
+    "какие элементы входят в",
     "какой факт указан",
     "какой факт указан в материале",
-    "что означает термин «это»",
-    "что означает термин \"это\"",
+    "что конкретно сказано",
+    "что известно про",
+    "что известно о",
     "что означает термин",
     "какова указанная причина",
     "что важно помнить",
@@ -20,9 +24,6 @@ BANNED_GENERIC_PATTERNS = [
     "что такое это",
     "что такое особенности",
     "какой факт можно выделить",
-    "что конкретно сказано",
-    "что известно про",
-    "что известно о",
     "какой количественный факт указан",
     "какие элементы входят в интересные факты",
 ]
@@ -31,6 +32,11 @@ STOP_TERMS = {
     "это", "этот", "эта", "эти", "данный", "данная", "данные",
     "такой", "такая", "такие", "который", "которая", "которые",
     "он", "она", "они", "оно",
+}
+
+BANNED_SUBJECT_TERMS = {
+    "живут", "служат", "состоят", "защищены", "найдёшь", "среди", "между",
+    "особая", "условно", "это", "они", "он", "она", "данный", "которые", "пара",
 }
 
 KNOWN_TYPES = {
@@ -56,6 +62,30 @@ def _tokens(value: str) -> list[str]:
     return re.findall(r"[а-яa-z0-9]+", (value or "").lower())
 
 
+def _extract_subject_candidate(front_low: str) -> str:
+    patterns = [
+        r"^что\s+верно\s+про\s+([^?.,!]+)",
+        r"^сколько\s+указано\s+для\s+([^?.,!]+)",
+        r"^какие\s+элементы\s+входят\s+в\s+([^?.,!]+)",
+        r"^из\s+каких\s+частей\s+состоит\s+([^?.,!]+)",
+        r"^сколько\s+ног\s+у\s+([^?.,!]+)",
+        r"^для\s+чего\s+используется\s+([^?.,!]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, front_low)
+        if m:
+            return m.group(1).strip(" \t-–—,.:;")
+    return ""
+
+
+def _contains_banned_subject(front_low: str) -> bool:
+    subject = _extract_subject_candidate(front_low)
+    if subject and subject in BANNED_SUBJECT_TERMS:
+        return True
+    toks = _tokens(front_low)
+    return any(tok in BANNED_SUBJECT_TERMS for tok in toks)
+
+
 def _looks_too_generic(front_low: str) -> bool:
     if any(p in front_low for p in BANNED_GENERIC_PATTERNS):
         return True
@@ -67,7 +97,10 @@ def _looks_too_generic(front_low: str) -> bool:
         r"^что\s+конкретно\s+сказано\b",
         r"^что\s+известно\s+про\b",
         r"^что\s+известно\s+о\b",
-        r"^что\s+означает\s+термин\s+[«\"]?это\b",
+        r'^что\s+означает\s+термин\s+[«"]?это\b',
+        r"^что\s+верно\s+про\b",
+        r"^сколько\s+указано\s+для\b",
+        r"^какие\s+элементы\s+входят\s+в\b",
     ]
     return any(re.search(p, front_low) for p in generic_forms)
 
@@ -109,10 +142,26 @@ def _front_back_too_similar(front: str, back: str) -> bool:
 
 def _has_stop_term_as_term(front: str) -> bool:
     front_low = front.lower()
-    m = re.search(r"термин\s+[«\"]?([а-яa-z-]+)", front_low)
+    m = re.search(r'термин\s+[«"]?([а-яa-z-]+)', front_low)
     if m and m.group(1) in STOP_TERMS:
         return True
     if re.search(r"что\s+такое\s+(это|этот|эта|эти|данный|он|она|они|оно)\b", front_low):
+        return True
+    return False
+
+
+def is_bad_question(front: str) -> bool:
+    normalized = _normalize_text(front)
+    if not normalized:
+        return True
+    front_low = normalized.lower()
+    if _looks_too_generic(front_low):
+        return True
+    if _contains_banned_subject(front_low):
+        return True
+    if _has_stop_term_as_term(normalized):
+        return True
+    if _looks_like_token_garbage(normalized):
         return True
     return False
 
@@ -130,10 +179,11 @@ def score_card(card: dict) -> dict:
     generic = _looks_too_generic(front_low)
     stop_term = _has_stop_term_as_term(front)
     garbage = _looks_like_token_garbage(front)
+    banned_subject = _contains_banned_subject(front_low)
     specific = _has_specific_object(front, excerpt)
 
-    if generic or stop_term or garbage:
-        score = min(score, 0.2)
+    if generic or stop_term or garbage or banned_subject:
+        score = min(score, 0.1)
 
     if len(front) < 8:
         score -= 0.25
@@ -181,8 +231,8 @@ def score_card(card: dict) -> dict:
         else:
             score -= 0.1
 
-    if generic or stop_term or garbage:
-        score = min(score, 0.2)
+    if generic or stop_term or garbage or banned_subject:
+        score = min(score, 0.1)
 
     out = dict(card)
     out["quality_score"] = max(0.0, min(1.0, round(score, 3)))
@@ -248,7 +298,8 @@ def filter_bad_cards(cards: list[dict]) -> list[dict]:
     for card in cards:
         c = polish_card(card)
         front = (c.get("front") or "").strip()
-        if _looks_too_generic(front.lower()) or _has_stop_term_as_term(front) or _looks_like_token_garbage(front):
+        if is_bad_question(front):
+            c["quality_score"] = min(float(c.get("quality_score") or 0.0), 0.1)
             continue
         hard.append(c)
     scored = [score_card(card) for card in hard]
@@ -259,39 +310,9 @@ def filter_bad_cards(cards: list[dict]) -> list[dict]:
     return [c for c in deduped if c.get("back") and c.get("quality_score", 0.0) >= 0.45]
 
 
-def is_bad_question(front: str, back: str, source_excerpt: str) -> tuple[bool, str]:
-    f = _normalize_text(front).lower()
-    b = _normalize_text(back)
-    excerpt = _normalize_text(source_excerpt).lower()
-    if not f or not b:
-        return True, "Пустой front/back"
-    if _looks_too_generic(f):
-        return True, "Слишком общий вопрос"
-    if any(x in f for x in BAD_SUBJECTS):
-        return True, "Мусорный субъект вопроса"
-    if ("материале" in f or "указан" in f) and not _has_specific_object(f, excerpt):
-        return True, "Нет конкретного объекта"
-    if _has_stop_term_as_term(f):
-        return True, "Местоимение вместо термина"
-    if _looks_like_token_garbage(f):
-        return True, "Обрывочный вопрос"
-    return False, ""
-
-
 def repair_or_drop_bad_card(card: dict) -> dict | None:
-    c = polish_card(dict(card or {}))
-    bad, reason = is_bad_question(c.get("front") or "", c.get("back") or "", c.get("source_excerpt") or "")
-    if not bad:
-        return c
-    front = c.get("front") or ""
-    front = re.sub(r"(?i)какой\s+факт\s+указан[^?]*", "", front).strip(" .,:;")
-    front = re.sub(r"(?i)что\s+конкретно\s+сказано[^?]*", "", front).strip(" .,:;")
-    if front and len(_tokens(front)) >= 3 and not _looks_too_generic(front.lower()):
-        if not front.endswith("?"):
-            front += "?"
-        c["front"] = front
-        bad2, _ = is_bad_question(c.get("front") or "", c.get("back") or "", c.get("source_excerpt") or "")
-        if not bad2:
-            return c
-    c["drop_reason"] = reason
-    return None
+    normalized = polish_card(card)
+    if is_bad_question(str(normalized.get("front") or "")):
+        normalized["quality_score"] = 0.1
+        return None
+    return normalized

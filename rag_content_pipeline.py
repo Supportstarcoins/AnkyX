@@ -126,6 +126,9 @@ def _score_image_relevance(card: dict, image: dict) -> float:
 
 
 def _is_garbage_image(image: dict) -> bool:
+    url = str(image.get("url") or "").strip().lower()
+    if url.startswith(("data:image/svg", "data:image/", "blob:", "javascript:", "about:")):
+        return True
     hay = " ".join(
         [
             str(image.get("url") or ""),
@@ -144,12 +147,17 @@ def _is_garbage_image(image: dict) -> bool:
 
 def normalize_card_image_fields(card: dict) -> dict:
     c = dict(card or {})
+    def _blocked_url(value: str) -> bool:
+        return str(value or "").strip().lower().startswith(("data:image/svg", "data:image/", "blob:", "javascript:", "about:"))
+
     front_path = str(c.get("front_image_path") or "").strip()
     if not front_path:
         front_path = str(c.get("image_path") or c.get("answer_image_path") or "").strip()
         if front_path:
             c["front_image_path"] = front_path
     c.setdefault("front_image_url", str(c.get("answer_image_url") or "").strip())
+    if _blocked_url(c.get("front_image_url")):
+        c["front_image_url"] = ""
     c.setdefault("front_image_caption", str(c.get("answer_image_caption") or "").strip())
     c.setdefault("front_image_origin", str(c.get("image_source_type") or "none").strip() or "none")
     c.setdefault("front_image_relevance_score", float(c.get("image_relevance_score") or 0.0))
@@ -228,6 +236,8 @@ def extract_images_from_web_html(url: str) -> list[dict]:
     out = []
     for img in parser.images:
         full_url = urllib.parse.urljoin(url, str(img.get("url") or ""))
+        if full_url.lower().startswith(("data:image/svg", "data:image/", "blob:", "javascript:", "about:")):
+            continue
         row = dict(img)
         row["url"] = full_url
         row["page_url"] = url

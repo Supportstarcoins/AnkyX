@@ -47,7 +47,7 @@ class _HTMLStripper(HTMLParser):
             return
         attr_map = {str(k).lower(): str(v) for k, v in (attrs or []) if k}
         src = attr_map.get("src", "").strip()
-        if not src:
+        if not src or _is_blocked_image_src(src):
             return
         width = _to_int_or_none(attr_map.get("width"))
         height = _to_int_or_none(attr_map.get("height"))
@@ -205,6 +205,9 @@ def _normalize_image_info(img: dict, default_source_type: str = "file") -> dict:
     data = dict(img or {})
     url = str(data.get("url") or "").strip()
     local_path = str(data.get("local_path") or "").strip()
+    if _is_blocked_image_src(url) or _is_blocked_image_src(local_path):
+        url = ""
+        local_path = ""
     return {
         "url": url,
         "local_path": local_path,
@@ -216,6 +219,11 @@ def _normalize_image_info(img: dict, default_source_type: str = "file") -> dict:
         "height": _to_int_or_none(str(data.get("height") or "")),
         "source_type": str(data.get("source_type") or default_source_type),
     }
+
+
+def _is_blocked_image_src(value: str) -> bool:
+    low = (value or "").strip().lower()
+    return low.startswith(("data:image/svg", "data:image/", "blob:", "javascript:", "about:"))
 
 
 def _extract_pdf_bundle(path: str) -> dict:
