@@ -151,9 +151,9 @@ class AICardPipeline:
         return cards
 
     def generate_cards_with_llm(self, knowledge_units: list[dict], source_text: str, options: dict | None = None) -> list[dict]:
-        settings = self._get_llm_settings()
+        settings = self._get_llm_settings(options=options)
         if not settings.get("enabled"):
-            self.last_fallback_reason = "LLM отключена в настройках"
+            self.last_fallback_reason = str(settings.get("error") or "LLM отключена в настройках")
             return []
         source_trace = dict((options or {}).get("source_trace") or {})
         try:
@@ -165,6 +165,7 @@ class AICardPipeline:
         ollama = OllamaClient(
             base_url=str(settings.get("base_url") or ""),
             model=str(settings.get("model") or ""),
+            auto_fallback=bool(settings.get("auto_fallback", True)),
         )
 
         cards: list[dict] = []
@@ -175,7 +176,14 @@ class AICardPipeline:
                 {"role": "user", "content": prompt},
             ]
             try:
-                raw = ollama.chat(messages)
+                raw = ollama.chat(
+                    messages,
+                    options={
+                        "temperature": float(settings.get("temperature", 0.4)),
+                        "num_predict": int(settings.get("max_tokens", 700)),
+                        "timeout": int(settings.get("timeout", 180)),
+                    },
+                )
                 payload = self._extract_json_array(raw)
                 parsed = json.loads(payload)
                 if not isinstance(parsed, list):
@@ -604,11 +612,56 @@ class AICardPipeline:
             return ""
         return max(freq.items(), key=lambda x: x[1])[0].capitalize()
 
-    def _get_llm_settings(self) -> dict:
-        model = self._read_setting("ollama_model", default="llama3.1:8b")
-        base_url = self._read_setting("ollama_url", default="http://127.0.0.1:11434")
+    def _get_llm_settings(self, options: dict | None = None) -> dict:
+        opts = dict(options or {})
+        ui_settings = dict(opts.get("llm_settings") or {})
+        provider = str(ui_settings.get("provider") or self._read_setting("llm_provider", default="ollama")).strip().lower()
+        if provider not in {"ollama", "auto"}:
+            return {"enabled": False, "error": f"Провайдер '{provider}' не поддержан в AI Workspace"}
+
+        base_url = str(
+            ui_settings.get("ollama_url")
+            or ui_settings.get("base_url")
+            or self._read_setting("ollama_url", default="http://127.0.0.1:11434")
+            or "http://127.0.0.1:11434"
+        ).strip()
+        model = str(
+            ui_settings.get("model")
+            or ui_settings.get("ollama_model")
+            or self._read_setting("ollama_model", default="")
+        ).strip()
+        timeout = int(ui_settings.get("timeout") or 180)
+        temperature = float(ui_settings.get("temperature") or 0.4)
+        max_tokens = int(ui_settings.get("max_tokens") or 700)
+        auto_fallback = bool(ui_settings.get("auto_fallback", True))
+        if not model:
+            model = str(os.getenv("XFLASH_DEFAULT_MODEL", "") or "").strip()
+
+        if not model:
+            try:
+                from ollama_client import OllamaClient
+
+                available = OllamaClient(base_url=base_url, model="", auto_fallback=True).list_models()
+            except Exception:
+                available = []
+            if available:
+                model = str(available[0])
+            else:
+                return {
+                    "enabled": False,
+                    "error": "В Ollama нет установленных моделей. Выполните: ollama pull llama3.1:8b",
+                }
         enabled = bool(base_url and model)
-        return {"enabled": enabled, "model": str(model), "base_url": str(base_url), "timeout": 45}
+        return {
+            "enabled": enabled,
+            "provider": "ollama",
+            "model": model,
+            "base_url": base_url,
+            "timeout": timeout,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "auto_fallback": auto_fallback,
+        }
 
     def _read_setting(self, name: str, default: str = "") -> str:
         for owner in (self.app, getattr(self.app, "settings", None), getattr(self.app, "llm_settings", None)):

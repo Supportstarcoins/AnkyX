@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -163,6 +164,10 @@ class AIAddCardWorkspace(tk.Toplevel):
         self._max_rag_chars = 30000
         self._text_context_menu = None
         self._last_source_trace: dict = {}
+        self._llm_settings_path = self._resolve_chatbot_settings_path()
+        self._cached_llm_settings = self._read_shared_llm_settings()
+        self.llm_summary_var = tk.StringVar(value="")
+        self.llm_runtime_status_var = tk.StringVar(value="Status: unknown")
 
         root = self._create_scrollable_root()
 
@@ -174,6 +179,8 @@ class AIAddCardWorkspace(tk.Toplevel):
         self._build_workspace_tab(workspace_tab)
         self._build_advanced_chat_tab()
         self.bind("<FocusIn>", self._sync_deck_selector_from_app, add="+")
+        self._update_llm_summary()
+        self._refresh_llm_runtime_status()
 
 
     def _create_scrollable_root(self) -> ttk.Frame:
@@ -465,6 +472,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         ttk.Button(actions_wrap, text="Извлечь текст", command=self._extract_text).grid(row=0, column=1, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Сгенерировать карточки", command=self.generate_cards_from_input).grid(row=0, column=2, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="🔍 Найти материалы", command=self._search_web).grid(row=0, column=3, sticky="ew", padx=3, pady=3)
+        ttk.Button(actions_wrap, text="⚙ Настройки LLM", command=self._open_llm_settings).grid(row=0, column=4, sticky="ew", padx=3, pady=3)
 
         ttk.Button(actions_wrap, text="Сгенерировать картинку", command=self.generate_image_for_current_card).grid(row=1, column=0, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Сгенерировать картинки для всех", command=self.generate_images_for_all_cards).grid(row=1, column=4, sticky="ew", padx=3, pady=3)
@@ -487,6 +495,8 @@ class AIAddCardWorkspace(tk.Toplevel):
         ttk.Label(status_row, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
         self.progress = ttk.Progressbar(status_row, mode="indeterminate")
         self.progress.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Label(status_row, textvariable=self.llm_summary_var).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(status_row, textvariable=self.llm_runtime_status_var).grid(row=1, column=1, sticky="e", pady=(3, 0))
 
         cards_wrap = ttk.LabelFrame(parent, text="Сгенерированные карточки", padding=8)
         cards_wrap.grid(row=5, column=0, sticky="nsew", padx=(0, 6))
@@ -839,7 +849,11 @@ class AIAddCardWorkspace(tk.Toplevel):
             messagebox.showwarning("Пусто", "Нет текста для генерации карточек", parent=self)
             return
 
-        self.status_var.set("Генерация вопросов: LLM")
+        llm_settings = self._read_shared_llm_settings()
+        model = str(llm_settings.get("model") or "").strip() or "auto"
+        self.status_var.set(f"Генерация вопросов: LLM | model={model}")
+        self._update_llm_summary()
+        self._refresh_llm_runtime_status()
         self.run_in_background(
             lambda: self.pipeline.run_pipeline(
                 source_text=text,
@@ -848,10 +862,87 @@ class AIAddCardWorkspace(tk.Toplevel):
                     "mode": "accurate",
                     "question_style": "creative_grounded",
                     "source_trace": self._last_source_trace,
+                    "llm_settings": llm_settings,
                 },
                 source=self.source_path,
             ),
             on_success=self._on_cards_generated,
+        )
+
+    def _resolve_chatbot_settings_path(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot_settings.json")
+
+    def _read_shared_llm_settings(self) -> dict:
+        payload: dict = {}
+        try:
+            if os.path.exists(self._llm_settings_path):
+                with open(self._llm_settings_path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    payload = dict(loaded)
+        except Exception:
+            logging.exception("AI workspace: failed to read chatbot_settings.json")
+        provider_raw = str(payload.get("llm_provider") or payload.get("provider") or "Ollama").strip().lower()
+        provider = "ollama" if "ollama" in provider_raw else provider_raw
+        result = {
+            "provider": provider or "ollama",
+            "ollama_url": str(payload.get("ollama_url") or os.getenv("XFLASH_OLLAMA_URL", "http://127.0.0.1:11434")).strip(),
+            "model": str(payload.get("ollama_model") or os.getenv("XFLASH_DEFAULT_MODEL", "")).strip(),
+            "timeout": int(payload.get("timeout") or 180),
+            "temperature": float(payload.get("temperature") or 0.4),
+            "max_tokens": int(payload.get("max_tokens") or 700),
+            "auto_fallback": bool(payload.get("auto_fallback", True)),
+        }
+        self._cached_llm_settings = result
+        return result
+
+    def _update_llm_summary(self) -> None:
+        settings = self._read_shared_llm_settings()
+        self.llm_summary_var.set(
+            f"LLM: {settings.get('provider', 'ollama').capitalize()} | URL: {settings.get('ollama_url') or '—'} | Model: {settings.get('model') or '—'}"
+        )
+
+    def _refresh_llm_runtime_status(self) -> None:
+        settings = dict(self._cached_llm_settings or self._read_shared_llm_settings())
+        self.llm_runtime_status_var.set("Status: checking...")
+
+        def worker() -> None:
+            status = "Status: error"
+            try:
+                from ollama_client import OllamaClient
+
+                client = OllamaClient(
+                    base_url=str(settings.get("ollama_url") or ""),
+                    model=str(settings.get("model") or ""),
+                    auto_fallback=bool(settings.get("auto_fallback", True)),
+                )
+                models = client.list_models()
+                model = str(settings.get("model") or "").strip()
+                if model and model in models:
+                    status = "Status: OK"
+                elif models:
+                    status = "Status: error (модель не найдена)"
+                else:
+                    status = "Status: error (модели отсутствуют)"
+            except Exception:
+                status = "Status: error"
+            self.after(0, lambda: self.llm_runtime_status_var.set(status))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_llm_settings(self) -> None:
+        chat_tab = getattr(self, "chat_tab", None)
+        opener = getattr(chat_tab, "_open_llm_settings", None)
+        if callable(opener):
+            opener()
+            win = getattr(chat_tab, "llm_settings_window", None)
+            if win is not None and hasattr(win, "bind"):
+                win.bind("<Destroy>", lambda _e: (self._update_llm_summary(), self._refresh_llm_runtime_status()), add="+")
+            return
+        messagebox.showinfo(
+            "Настройки LLM",
+            "Откройте вкладку «Расширенный чат» и используйте кнопку «⚙ Настройки LLM».",
+            parent=self,
         )
 
     def _on_cards_generated(self, cards) -> None:
