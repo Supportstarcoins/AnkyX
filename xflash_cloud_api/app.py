@@ -1,5 +1,6 @@
 import time
 from typing import List, Optional
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -63,6 +64,20 @@ def _count_chars(messages: List[Message]) -> int:
     return sum(len(msg.content) for msg in messages)
 
 
+def _normalize_ollama_base_url(base_url: str) -> str:
+    raw = (base_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    path = (parsed.path or "").rstrip("/")
+    for suffix in ("/api/chat", "/api"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    normalized = urlunparse((parsed.scheme or "http", parsed.netloc, path.rstrip("/"), "", "", ""))
+    return normalized.rstrip("/")
+
+
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat_endpoint(
     payload: ChatRequest, request: Request, user=Depends(require_api_key)
@@ -97,8 +112,10 @@ async def chat_endpoint(
     try:
         model_name = payload.model or settings.default_model
         max_tokens = min(payload.max_tokens or settings.max_tokens, settings.max_tokens)
+        ollama_base_url = _normalize_ollama_base_url(settings.ollama_url)
+        endpoint = f"{ollama_base_url}/api/chat"
         response = requests.post(
-            f"{settings.ollama_url.rstrip('/')}/api/chat",
+            endpoint,
             json={
                 "model": model_name,
                 "messages": [msg.dict() for msg in payload.messages],
