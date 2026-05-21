@@ -86,8 +86,47 @@ def _to_int(value: str | None) -> int | None:
 def _keyword_tokens(value: str) -> list[str]:
     return [t for t in re.findall(r"[а-яa-z0-9]{4,}", (value or "").lower())]
 
+_GENERIC_TOKENS = {
+    "anatomy", "анатомия", "biology", "биология", "organism", "организм", "system", "система", "structure", "строение",
+}
+_HUMAN_ANATOMY_TOKENS = {"human", "человек", "skeleton", "skull", "muscle", "bone", "кости", "костная", "kenhub"}
+_SPIDER_TOKENS = {"spider", "паук", "пауки", "arachnid", "паукообразные", "головогрудь", "брюшко", "хитиновый", "панцирь"}
+
+def extract_card_entities(card: dict) -> set[str]:
+    text = " ".join([str(card.get("front") or ""), str(card.get("back") or ""), str(card.get("topic") or ""), str(card.get("source_excerpt") or "")]).lower()
+    tokens = set(_keyword_tokens(text))
+    entities = {t for t in tokens if t not in _GENERIC_TOKENS}
+    if "паука" in text or "пауков" in text:
+        entities.add("паук")
+    if "тело паука" in text:
+        entities.add("тело паука")
+    return entities
+
+def image_matches_card_topic(card: dict, image: dict) -> tuple[bool, str, float]:
+    entities = extract_card_entities(card)
+    img_text_parts = [str(image.get("alt") or ""), str(image.get("caption") or ""), str(image.get("context_text") or ""), str(image.get("source_title") or "")]
+    img_text = " ".join(img_text_parts).strip().lower()
+    if not img_text:
+        return False, "no_context", 0.0
+    img_tokens = set(_keyword_tokens(img_text))
+    matched = entities & img_tokens
+    generic_matches = img_tokens & _GENERIC_TOKENS
+    card_tokens = set(_keyword_tokens(" ".join([str(card.get("front") or ""), str(card.get("back") or ""), str(card.get("topic") or ""), str(card.get("source_excerpt") or "")]).lower()))
+    card_has_human = bool(card_tokens & _HUMAN_ANATOMY_TOKENS)
+    if (img_tokens & _HUMAN_ANATOMY_TOKENS) and not card_has_human and (card_tokens & _SPIDER_TOKENS):
+        return False, "topic_mismatch", 0.0
+    if not matched and generic_matches:
+        return False, "too_generic", 0.0
+    if not matched:
+        return False, "topic_mismatch", 0.0
+    score = len(matched) / max(1, len(entities))
+    return True, "ok", round(min(1.0, score), 3)
+
 
 def _score_image_relevance(card: dict, image: dict) -> float:
+    ok, _, topic_score = image_matches_card_topic(card, image)
+    if not ok:
+        return 0.0
     card_text = " ".join(
         [
             str(card.get("topic") or ""),
@@ -122,7 +161,14 @@ def _score_image_relevance(card: dict, image: dict) -> float:
             position_penalty = min(0.1, distance / 200.0)
     except Exception:
         position_penalty = 0.0
-    return round(max(0.0, min(1.0, overlap + length_bonus + source_bonus - position_penalty)), 3)
+    same_source_bonus = 0.0
+    if card.get("source_url") and image.get("source_url") and str(card.get("source_url")) == str(image.get("source_url")):
+        same_source_bonus += 0.2
+    elif card.get("source_url") and image.get("source_url"):
+        same_source_bonus -= 0.1
+    if card.get("chunk_id") and image.get("nearest_chunk_id") and str(card.get("chunk_id")) == str(image.get("nearest_chunk_id")):
+        same_source_bonus += 0.15
+    return round(max(0.0, min(1.0, overlap + length_bonus + source_bonus + same_source_bonus + (0.35 * topic_score) - position_penalty)), 3)
 
 
 def _is_garbage_image(image: dict) -> bool:
@@ -181,15 +227,23 @@ def attach_best_source_image(card: dict, images: list[dict], media_dir: str) -> 
         if _is_garbage_image(raw):
             continue
         img = dict(raw or {})
+        ok, reason, _ = image_matches_card_topic(c, img)
+        if not ok:
+            continue
         score = _score_image_relevance(c, img)
         if score > best_score:
             best_score = score
             best = img
-    if not best or best_score < 0.3:
+    if not best or best_score < 0.45:
+        _, reason, _ = image_matches_card_topic(c, best or {})
         c["front_image_origin"] = "none"
+        c["front_image_path"] = ""
+        c["front_image_url"] = ""
+        c["front_image_caption"] = ""
+        c["image_status"] = "no_relevant_source_image" if reason in {"ok", "no_context"} else f"source_rejected_{reason}"
         c["front_image_relevance_score"] = 0.0
         return c
-    dl = download_image_to_media(str(best.get("url") or ""), media_dir=media_dir, source_url=str(best.get("page_url") or ""))
+    dl = download_image_to_media(str(best.get("url") or ""), media_dir=media_dir, source_url=str(best.get("source_url") or best.get("page_url") or ""))
     c["front_image_url"] = str(best.get("url") or "")
     c["front_image_caption"] = str(best.get("caption") or best.get("alt") or "").strip()
     c["front_image_relevance_score"] = float(best_score)
@@ -197,8 +251,10 @@ def attach_best_source_image(card: dict, images: list[dict], media_dir: str) -> 
         c["front_image_path"] = dl["local_path"]
         c["image_path"] = c.get("image_path") or c["front_image_path"]
         c["front_image_origin"] = "source"
+        c["image_status"] = f"source_attached: {c['front_image_caption']}" if c["front_image_caption"] else "source_attached"
     else:
         c["front_image_origin"] = "source_url_not_downloaded"
+        c["image_status"] = "source_url_not_downloaded"
     return c
 
 
@@ -241,6 +297,10 @@ def extract_images_from_web_html(url: str) -> list[dict]:
         row = dict(img)
         row["url"] = full_url
         row["page_url"] = url
+        row["source_url"] = url
+        row["source_title"] = ""
+        row["source_index"] = 0
+        row["nearest_chunk_id"] = None
         if _is_garbage_image(row):
             continue
         out.append(row)

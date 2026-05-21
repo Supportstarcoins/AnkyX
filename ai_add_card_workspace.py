@@ -999,6 +999,18 @@ class AIAddCardWorkspace(tk.Toplevel):
 
     def _card_image_tag(self, card: dict) -> str:
         c = normalize_card_image_fields(card)
+        status = str(c.get("image_status") or (c.get("metadata") or {}).get("image_status") or "").strip().lower()
+        if "source_rejected_topic_mismatch" in status:
+            return "Source image rejected: topic mismatch"
+        if "source_rejected_too_generic" in status:
+            return "Source image rejected: too generic"
+        if status.startswith("source_attached"):
+            caption = str(c.get("front_image_caption") or "").strip()
+            return f"Source image attached: {caption[:48]}" if caption else "Source image attached"
+        if "no_relevant_source_image" in status:
+            return "No relevant source image found"
+        if "flux" in status and ("создано" in status or "generated" in status):
+            return "FLUX image generated"
         source_type = str(c.get("front_image_origin") or c.get("image_source_type") or "").strip().lower()
         if source_type in {"source", "extracted"}:
             return "image: source"
@@ -1127,7 +1139,7 @@ class AIAddCardWorkspace(tk.Toplevel):
             metadata.update(dict(result.get("metadata") or {}))
             result["metadata"] = metadata
             if result.get("front_image_path"):
-                metadata["image_status"] = f"FLUX: изображение создано {os.path.basename(result.get('front_image_path') or '')}"
+                metadata["image_status"] = "FLUX image generated"
             elif status:
                 metadata["image_status"] = f"FLUX error: {status}"
             result["metadata"] = metadata

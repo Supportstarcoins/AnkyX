@@ -37,6 +37,8 @@ class CardPreviewWidget(ttk.Frame):
 
         self.image_label = ttk.Label(image_frame, anchor="center", justify="center", relief="groove")
         self.image_label.grid(row=0, column=0, sticky="nsew")
+        self.image_caption = ttk.Label(image_frame, anchor="w", justify="left", foreground="#666666")
+        self.image_caption.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self.clear()
 
     def update_preview(self, card_data) -> None:
@@ -70,8 +72,9 @@ class CardPreviewWidget(ttk.Frame):
 
         if side == "front":
             caption = (self._card.get("front_image_caption") or self._card.get("answer_image_caption") or "").strip()
-            if caption:
-                self.text.insert(tk.END, f"\n\nЯкорь ответа (image): {caption}")
+            self.image_caption.configure(text=caption[:180] if caption else "")
+        else:
+            self.image_caption.configure(text="")
         if side == "back":
             excerpt = (self._card.get("source_excerpt") or "").strip()
             if excerpt:
