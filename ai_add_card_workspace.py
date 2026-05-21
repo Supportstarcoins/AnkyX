@@ -167,7 +167,8 @@ class AIAddCardWorkspace(tk.Toplevel):
         self._llm_settings_path = self._resolve_chatbot_settings_path()
         self._cached_llm_settings = self._read_shared_llm_settings()
         self.llm_summary_var = tk.StringVar(value="")
-        self.llm_runtime_status_var = tk.StringVar(value="Status: unknown")
+        self.llm_runtime_status_var = tk.StringVar(value="LLM status: unknown")
+        self.image_runtime_status_var = tk.StringVar(value="Image status: unknown")
 
         root = self._create_scrollable_root()
 
@@ -472,7 +473,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         ttk.Button(actions_wrap, text="Извлечь текст", command=self._extract_text).grid(row=0, column=1, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Сгенерировать карточки", command=self.generate_cards_from_input).grid(row=0, column=2, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="🔍 Найти материалы", command=self._search_web).grid(row=0, column=3, sticky="ew", padx=3, pady=3)
-        ttk.Button(actions_wrap, text="⚙ Настройки LLM", command=self._open_llm_settings).grid(row=0, column=4, sticky="ew", padx=3, pady=3)
+        ttk.Button(actions_wrap, text="⚙ AI настройки", command=self._open_llm_settings).grid(row=0, column=4, sticky="ew", padx=3, pady=3)
 
         ttk.Button(actions_wrap, text="Сгенерировать картинку", command=self.generate_image_for_current_card).grid(row=1, column=0, sticky="ew", padx=3, pady=3)
         ttk.Button(actions_wrap, text="Сгенерировать картинки для всех", command=self.generate_images_for_all_cards).grid(row=1, column=4, sticky="ew", padx=3, pady=3)
@@ -497,6 +498,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         self.progress.grid(row=0, column=1, sticky="ew", padx=(8, 0))
         ttk.Label(status_row, textvariable=self.llm_summary_var).grid(row=1, column=0, sticky="w", pady=(3, 0))
         ttk.Label(status_row, textvariable=self.llm_runtime_status_var).grid(row=1, column=1, sticky="e", pady=(3, 0))
+        ttk.Label(status_row, textvariable=self.image_runtime_status_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         cards_wrap = ttk.LabelFrame(parent, text="Сгенерированные карточки", padding=8)
         cards_wrap.grid(row=5, column=0, sticky="nsew", padx=(0, 6))
@@ -892,6 +894,10 @@ class AIAddCardWorkspace(tk.Toplevel):
             "temperature": float(payload.get("temperature") or 0.4),
             "max_tokens": int(payload.get("max_tokens") or 700),
             "auto_fallback": bool(payload.get("auto_fallback", True)),
+            "image_provider": str(payload.get("image_provider") or os.getenv("XFLASH_IMAGE_PROVIDER", "flux_comfyui")).strip(),
+            "flux_api_url": str(payload.get("flux_api_url") or os.getenv("XFLASH_FLUX_API_URL", "http://127.0.0.1:8188")).strip(),
+            "flux_model_path": str(payload.get("flux_model_path") or os.getenv("XFLASH_FLUX_MODEL_PATH", "models/flux/flux-2-klein-4b-fp8.safetensors")).strip(),
+            "flux_output_dir": str(payload.get("flux_output_dir") or os.getenv("XFLASH_FLUX_OUTPUT_DIR", "media/generated")).strip(),
         }
         self._cached_llm_settings = result
         return result
@@ -899,15 +905,17 @@ class AIAddCardWorkspace(tk.Toplevel):
     def _update_llm_summary(self) -> None:
         settings = self._read_shared_llm_settings()
         self.llm_summary_var.set(
-            f"LLM: {settings.get('provider', 'ollama').capitalize()} | URL: {settings.get('ollama_url') or '—'} | Model: {settings.get('model') or '—'}"
+            f"AI backend | LLM: Ollama | model: {settings.get('model') or '—'} | Image: FLUX.2 Klein FP8 / ComfyUI"
         )
 
     def _refresh_llm_runtime_status(self) -> None:
         settings = dict(self._cached_llm_settings or self._read_shared_llm_settings())
-        self.llm_runtime_status_var.set("Status: checking...")
+        self.llm_runtime_status_var.set("LLM status: checking...")
+        self.image_runtime_status_var.set("Image status: checking...")
 
         def worker() -> None:
-            status = "Status: error"
+            status = "LLM status: error"
+            image_status = "Image status: error"
             try:
                 from ollama_client import OllamaClient
 
@@ -919,14 +927,25 @@ class AIAddCardWorkspace(tk.Toplevel):
                 models = client.list_models()
                 model = str(settings.get("model") or "").strip()
                 if model and model in models:
-                    status = "Status: OK"
+                    status = "LLM status: OK"
                 elif models:
-                    status = "Status: error (модель не найдена)"
+                    status = "LLM status: error (модель не найдена)"
                 else:
-                    status = "Status: error (модели отсутствуют)"
+                    status = "LLM status: error (модели отсутствуют)"
             except Exception:
-                status = "Status: error"
+                status = "LLM status: error"
+            try:
+                from flux_image_adapter import FluxImageAdapter
+                ok, msg = FluxImageAdapter(
+                    api_url=str(settings.get("flux_api_url") or "http://127.0.0.1:8188"),
+                    model_path=str(settings.get("flux_model_path") or ""),
+                    output_dir=str(settings.get("flux_output_dir") or "media/generated"),
+                ).is_available()
+                image_status = f"Image: FLUX.2 Klein FP8 / ComfyUI | status: {'OK' if ok else 'error'} ({msg})"
+            except Exception as exc:
+                image_status = f"Image: FLUX.2 Klein FP8 / ComfyUI | status: error ({exc})"
             self.after(0, lambda: self.llm_runtime_status_var.set(status))
+            self.after(0, lambda: self.image_runtime_status_var.set(image_status))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -953,7 +972,8 @@ class AIAddCardWorkspace(tk.Toplevel):
         fallback_reason = str(getattr(self.pipeline, "last_fallback_reason", "") or "").strip()
         if self.generated_cards:
             if generation_mode == "llm":
-                self.status_var.set(f"Генерация вопросов: LLM. Сгенерировано карточек: {len(self.generated_cards)}")
+                model = getattr(self.pipeline, "last_llm_model", "") or (self._cached_llm_settings or {}).get("model") or "unknown"
+                self.status_var.set(f"Генерация вопросов: LLM | model={model}. Сгенерировано карточек: {len(self.generated_cards)}")
             else:
                 reason_part = f" LLM генерация не сработала: {fallback_reason}." if fallback_reason else ""
                 self.status_var.set(
