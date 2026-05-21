@@ -49,6 +49,133 @@ except Exception:  # noqa: BLE001
     DND_FILES = None
 
 
+def enable_text_edit_shortcuts(widget: tk.Widget) -> None:
+    def _is_text_widget() -> bool:
+        return isinstance(widget, tk.Text)
+
+    def _select_all(_event=None) -> str:
+        if _is_text_widget():
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "end-1c")
+        else:
+            widget.selection_range(0, "end")
+            widget.icursor("end")
+        return "break"
+
+    def _copy(_event=None) -> str:
+        try:
+            text = widget.get("sel.first", "sel.last") if _is_text_widget() else widget.selection_get()
+            if text:
+                widget.clipboard_clear()
+                widget.clipboard_append(text)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _paste(_event=None) -> str:
+        try:
+            text = widget.clipboard_get()
+            if not text:
+                return "break"
+            if _is_text_widget():
+                widget.insert("insert", text)
+            else:
+                widget.insert(widget.index("insert"), text)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _cut(_event=None) -> str:
+        _copy()
+        try:
+            if _is_text_widget():
+                widget.delete("sel.first", "sel.last")
+            elif widget.selection_present():
+                start = widget.index("sel.first")
+                end = widget.index("sel.last")
+                widget.delete(start, end)
+        except tk.TclError:
+            pass
+        return "break"
+
+    widget.bind("<Control-a>", _select_all, add="+")
+    widget.bind("<Control-A>", _select_all, add="+")
+    widget.bind("<Control-c>", _copy, add="+")
+    widget.bind("<Control-C>", _copy, add="+")
+    widget.bind("<Control-v>", _paste, add="+")
+    widget.bind("<Control-V>", _paste, add="+")
+    widget.bind("<Control-x>", _cut, add="+")
+    widget.bind("<Control-X>", _cut, add="+")
+
+
+def attach_context_menu(widget: tk.Widget) -> None:
+    def _is_text_widget() -> bool:
+        return isinstance(widget, tk.Text)
+
+    def _select_all() -> None:
+        if _is_text_widget():
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "end-1c")
+        else:
+            widget.selection_range(0, "end")
+            widget.icursor("end")
+
+    def _copy() -> None:
+        try:
+            text = widget.get("sel.first", "sel.last") if _is_text_widget() else widget.selection_get()
+            if text:
+                widget.clipboard_clear()
+                widget.clipboard_append(text)
+        except tk.TclError:
+            pass
+
+    def _paste() -> None:
+        try:
+            text = widget.clipboard_get()
+            if not text:
+                return
+            if _is_text_widget():
+                widget.insert("insert", text)
+            else:
+                widget.insert(widget.index("insert"), text)
+        except tk.TclError:
+            pass
+
+    def _cut() -> None:
+        _copy()
+        try:
+            if _is_text_widget():
+                widget.delete("sel.first", "sel.last")
+            elif widget.selection_present():
+                start = widget.index("sel.first")
+                end = widget.index("sel.last")
+                widget.delete(start, end)
+        except tk.TclError:
+            pass
+
+    def _clear() -> None:
+        if _is_text_widget():
+            widget.delete("1.0", "end")
+        else:
+            widget.delete(0, "end")
+
+    menu = tk.Menu(widget, tearoff=False)
+    menu.add_command(label="Вырезать", command=_cut)
+    menu.add_command(label="Копировать", command=_copy)
+    menu.add_command(label="Вставить", command=_paste)
+    menu.add_separator()
+    menu.add_command(label="Выделить всё", command=_select_all)
+    menu.add_command(label="Очистить", command=_clear)
+
+    def _show_menu(event: tk.Event) -> str:
+        widget.focus_set()
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    widget.bind("<Button-3>", _show_menu, add="+")
+    widget.bind("<ButtonRelease-3>", lambda _event: "break", add="+")
+
+
 class AutoGrowText(ttk.Frame):
     def __init__(
         self,
@@ -545,6 +672,7 @@ class ChatBotTab(ttk.Frame):
         self.pending_cost = 0
         self.flux_api_url_var = tk.StringVar(value=os.getenv("XFLASH_FLUX_API_URL", self._cloud_settings.get("flux_api_url") or self.FLUX_API_URL_DEFAULT))
         self.flux_model_var = tk.StringVar(value=os.getenv("XFLASH_FLUX_MODEL_PATH", self._cloud_settings.get("flux_model_path") or self.FLUX_MODEL_DEFAULT))
+        self.flux_output_dir_var = tk.StringVar(value=os.getenv("XFLASH_FLUX_OUTPUT_DIR", self._cloud_settings.get("flux_output_dir") or "media/generated"))
         self.image_provider_var = tk.StringVar(value=os.getenv("XFLASH_IMAGE_PROVIDER", self._cloud_settings.get("image_provider") or "flux_comfyui"))
         self.sd_api_url_var = tk.StringVar(
             value=self._cloud_settings.get("legacy_sd_api_url") or self._cloud_settings.get("sd_api_url") or self.SD_API_URL_DEFAULT
@@ -571,6 +699,7 @@ class ChatBotTab(ttk.Frame):
         self.sd_api_url_var.trace_add("write", self._on_cloud_settings_change)
         self.flux_api_url_var.trace_add("write", self._on_cloud_settings_change)
         self.flux_model_var.trace_add("write", self._on_cloud_settings_change)
+        self.flux_output_dir_var.trace_add("write", self._on_cloud_settings_change)
         self.image_provider_var.trace_add("write", self._on_cloud_settings_change)
         self.sd_checkpoint_var.trace_add("write", self._on_cloud_settings_change)
         self.cloud_status_var.trace_add("write", self._on_llm_status_change)
@@ -999,7 +1128,8 @@ class ChatBotTab(ttk.Frame):
             sticky="w",
             padx=(0, 6),
         )
-        ttk.Entry(ollama_frame, textvariable=self.ollama_url_var).grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        ollama_url_entry = ttk.Entry(ollama_frame, textvariable=self.ollama_url_var)
+        ollama_url_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
 
         ttk.Label(ollama_frame, text="Модель:", style="Muted.TLabel").grid(
             row=0,
@@ -1007,7 +1137,8 @@ class ChatBotTab(ttk.Frame):
             sticky="w",
             padx=(0, 6),
         )
-        ttk.Entry(ollama_frame, textvariable=self.ollama_model_var).grid(row=0, column=3, sticky="ew")
+        ollama_model_entry = ttk.Entry(ollama_frame, textvariable=self.ollama_model_var)
+        ollama_model_entry.grid(row=0, column=3, sticky="ew")
 
         ollama_actions = ttk.Frame(ollama_frame, style="CardInner.TFrame")
         ollama_actions.grid(row=0, column=4, sticky="e", padx=(10, 0))
@@ -1023,10 +1154,12 @@ class ChatBotTab(ttk.Frame):
         cloud_frame.columnconfigure(3, weight=1)
 
         ttk.Label(cloud_frame, text="Cloud URL:", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Entry(cloud_frame, textvariable=self.cloud_url_var).grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        cloud_url_entry = ttk.Entry(cloud_frame, textvariable=self.cloud_url_var)
+        cloud_url_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
 
         ttk.Label(cloud_frame, text="API ключ:", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ttk.Entry(cloud_frame, textvariable=self.cloud_api_key_var, show="•").grid(row=0, column=3, sticky="ew")
+        cloud_api_key_entry = ttk.Entry(cloud_frame, textvariable=self.cloud_api_key_var, show="•")
+        cloud_api_key_entry.grid(row=0, column=3, sticky="ew")
 
         cloud_actions = ttk.Frame(cloud_frame, style="CardInner.TFrame")
         cloud_actions.grid(row=0, column=4, sticky="e", padx=(10, 0))
@@ -1045,18 +1178,45 @@ class ChatBotTab(ttk.Frame):
             padx=(0, 10),
         )
         ttk.Label(sd_frame, text="FLUX API URL:", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 6))
-        ttk.Entry(sd_frame, textvariable=self.flux_api_url_var).grid(row=1, column=1, sticky="ew", padx=(0, 10))
+        flux_api_url_entry = ttk.Entry(sd_frame, textvariable=self.flux_api_url_var)
+        flux_api_url_entry.grid(row=1, column=1, sticky="ew", padx=(0, 10))
         ttk.Label(sd_frame, text="FLUX model:", style="Muted.TLabel").grid(
             row=1,
             column=2,
             sticky="w",
             padx=(0, 6),
         )
-        ttk.Entry(sd_frame, textvariable=self.flux_model_var).grid(row=1, column=3, sticky="ew")
+        flux_model_wrap = ttk.Frame(sd_frame, style="CardInner.TFrame")
+        flux_model_wrap.grid(row=1, column=3, sticky="ew")
+        flux_model_wrap.columnconfigure(0, weight=1)
+        flux_model_entry = ttk.Entry(flux_model_wrap, textvariable=self.flux_model_var)
+        flux_model_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(flux_model_wrap, text="Выбрать файл...", command=self._pick_flux_model_file).grid(row=0, column=1, padx=(6, 0))
+
+        ttk.Label(sd_frame, text="FLUX output dir:", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        flux_output_wrap = ttk.Frame(sd_frame, style="CardInner.TFrame")
+        flux_output_wrap.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        flux_output_wrap.columnconfigure(0, weight=1)
+        flux_output_entry = ttk.Entry(flux_output_wrap, textvariable=self.flux_output_dir_var)
+        flux_output_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(flux_output_wrap, text="Выбрать папку...", command=self._pick_flux_output_dir).grid(row=0, column=1, padx=(6, 0))
         sd_actions = ttk.Frame(sd_frame, style="CardInner.TFrame")
         sd_actions.grid(row=1, column=4, sticky="e", padx=(10, 0))
         ttk.Button(sd_actions, text="Проверить FLUX", command=self._check_sd_connection).pack(side=tk.LEFT)
         ttk.Label(sd_actions, textvariable=self.sd_status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
+
+        editable_settings_widgets = [
+            ollama_url_entry,
+            ollama_model_entry,
+            cloud_url_entry,
+            cloud_api_key_entry,
+            flux_api_url_entry,
+            flux_model_entry,
+            flux_output_entry,
+        ]
+        for editable_widget in editable_settings_widgets:
+            enable_text_edit_shortcuts(editable_widget)
+            attach_context_menu(editable_widget)
 
         pdf_mode_frame = ttk.Frame(container, style="CardInner.TFrame", padding=6)
         pdf_mode_frame.pack(fill=tk.X, pady=(0, 6))
@@ -1514,6 +1674,7 @@ class ChatBotTab(ttk.Frame):
                         "image_provider": str(payload.get("image_provider") or "flux_comfyui"),
                         "flux_api_url": str(payload.get("flux_api_url") or ""),
                         "flux_model_path": str(payload.get("flux_model_path") or ""),
+                        "flux_output_dir": str(payload.get("flux_output_dir") or ""),
                         "legacy_sd_api_url": str(payload.get("legacy_sd_api_url") or ""),
                     }
         except Exception:  # noqa: BLE001
@@ -1528,6 +1689,7 @@ class ChatBotTab(ttk.Frame):
             "image_provider": "flux_comfyui",
             "flux_api_url": "",
             "flux_model_path": "",
+            "flux_output_dir": "",
             "legacy_sd_api_url": "",
         }
 
@@ -1543,6 +1705,7 @@ class ChatBotTab(ttk.Frame):
             "image_provider": self.image_provider_var.get().strip() or "flux_comfyui",
             "flux_api_url": self.flux_api_url_var.get().strip(),
             "flux_model_path": self.flux_model_var.get().strip(),
+            "flux_output_dir": self.flux_output_dir_var.get().strip(),
             "legacy_sd_api_url": self.sd_api_url_var.get().strip(),
         }
         try:
@@ -1621,6 +1784,28 @@ class ChatBotTab(ttk.Frame):
             self.after(0, lambda: messagebox.showinfo("FLUX", status))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _pick_flux_model_file(self) -> None:
+        selected = filedialog.askopenfilename(
+            parent=self.llm_settings_window or self,
+            title="Выберите FLUX model",
+            filetypes=[
+                ("Safetensors", "*.safetensors"),
+                ("Checkpoint", "*.ckpt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if selected:
+            self.flux_model_var.set(selected)
+
+    def _pick_flux_output_dir(self) -> None:
+        selected = filedialog.askdirectory(
+            parent=self.llm_settings_window or self,
+            title="Выберите папку для FLUX output",
+            mustexist=False,
+        )
+        if selected:
+            self.flux_output_dir_var.set(selected)
 
     def _update_cloud_status_from_error(self, exc: CloudProviderError) -> None:
         if exc.status_code == 401:
