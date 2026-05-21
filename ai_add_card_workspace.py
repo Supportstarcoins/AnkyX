@@ -799,9 +799,13 @@ class AIAddCardWorkspace(tk.Toplevel):
             if not query:
                 messagebox.showwarning("Поиск", "Введите короткую тему для поиска", parent=self)
                 return
-            self.status_var.set("Поиск материалов...")
+            self.status_var.set("RAG: ищу материалы...")
         self.run_in_background(
-            lambda: self.rag_pipeline.fetch_materials(raw_strip if raw_strip.startswith(("http://", "https://")) else (query or raw_strip), max_sources=5),
+            lambda: self.rag_pipeline.fetch_materials(
+                raw_strip if raw_strip.startswith(("http://", "https://")) else (query or raw_strip),
+                max_sources=5,
+                progress_callback=lambda msg: self.after(0, lambda m=msg: self.status_var.set(m)),
+            ),
             on_success=self._on_web_text,
             on_error=self._on_web_error,
         )
@@ -810,7 +814,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         cleaned = ((result or {}).get("clean_text") or "").strip()
         if not cleaned:
             err = "; ".join((result or {}).get("errors") or []) if isinstance(result, dict) else ""
-            self.status_var.set(err or "RAG не вернул текст. Уточните запрос.")
+            self.status_var.set(f"RAG error: {err or 'RAG не вернул текст. Уточните запрос.'}")
             return
         sources = result.get("sources") or []
         extracted_images: list[dict] = []
@@ -826,9 +830,7 @@ class AIAddCardWorkspace(tk.Toplevel):
         }
         self.prompt_text.delete("1.0", tk.END)
         self.prompt_text.insert("1.0", cleaned[: self._max_rag_chars])
-        self.status_var.set(
-            f"Готово: {len(cleaned)} символов, {len(sources)} источников, изображений: {len(extracted_images)}"
-        )
+        self.status_var.set(f"RAG: текст извлечён ({len(cleaned)} симв., источников: {len(sources)}, изображений: {len(extracted_images)})")
 
     def _on_web_error(self, exc: Exception) -> None:
         logging.exception("AI workspace RAG search failed")
