@@ -27,17 +27,55 @@ class FluxImageAdapter:
                 path = path[: -len(suffix)]
         return urlunparse((parsed.scheme or "http", parsed.netloc, path.rstrip("/"), "", "", "")).rstrip("/")
 
-    def is_available(self) -> tuple[bool, str]:
-        model_file = Path(self.model_path)
-        if not model_file.exists():
-            return False, f"FLUX model file not found: {self.model_path}"
+    def _model_info(self) -> dict[str, Any]:
+        value = (self.model_path or "").strip()
+        path_obj = Path(value) if value else Path("")
+        is_full_path = bool(value) and (path_obj.is_absolute() or any(sep in value for sep in ("/", "\\")))
+        exists = path_obj.exists() if is_full_path else None
+        comfy_model_name = path_obj.name if is_full_path else value
+        return {
+            "flux_model_path": value,
+            "flux_model_name": comfy_model_name,
+            "model_value_kind": "full_path" if is_full_path else "model_name",
+            "local_file_exists": exists,
+        }
+
+    def get_diagnostics(self) -> dict[str, Any]:
+        diag = {
+            "flux_api_url": self.api_url,
+            "output_dir": self.output_dir,
+            "system_stats": None,
+            "exception": "",
+        }
+        diag.update(self._model_info())
         try:
             r = requests.get(f"{self.api_url}/system_stats", timeout=8)
-            if r.ok:
-                return True, "FLUX: OK"
-        except requests.RequestException:
-            pass
-        return False, f"FLUX/ComfyUI недоступен: проверьте {self.api_url}"
+            body: Any
+            try:
+                body = r.json()
+            except ValueError:
+                body = (r.text or "")[:1000]
+            diag["system_stats"] = {"ok": r.ok, "status_code": r.status_code, "body": body}
+            if not r.ok:
+                return diag
+        except Exception as exc:  # noqa: BLE001
+            diag["exception"] = repr(exc)
+            return diag
+
+        if diag["model_value_kind"] == "full_path" and not diag["local_file_exists"]:
+            diag["exception"] = f"model file not found: {diag['flux_model_path']}"
+        return diag
+
+    def is_available(self) -> tuple[bool, str]:
+        diag = self.get_diagnostics()
+        if diag["system_stats"] is None:
+            return False, f"FLUX: FAIL — ComfyUI unavailable: {diag['flux_api_url']} ({diag['exception'] or 'no response'})"
+        if not (diag["system_stats"] or {}).get("ok"):
+            st = diag["system_stats"] or {}
+            return False, f"FLUX: FAIL — GET /system_stats returned {st.get('status_code')}"
+        if diag["model_value_kind"] == "full_path" and not diag["local_file_exists"]:
+            return False, f"FLUX: FAIL — model file not found: {diag['flux_model_path']}"
+        return True, "FLUX: OK"
 
     def _workflow(self, prompt: str, negative_prompt: str, options: dict[str, Any]) -> dict[str, Any]:
         seed = int(options.get("seed", int(time.time()) % 2_147_483_647))
@@ -45,7 +83,8 @@ class FluxImageAdapter:
         height = int(options.get("height", 768))
         steps = int(options.get("steps", 24))
         cfg = float(options.get("cfg", 4.0))
-        ckpt_name = options.get("comfy_model_name") or os.path.basename(self.model_path)
+        model_info = self._model_info()
+        ckpt_name = options.get("comfy_model_name") or model_info["flux_model_name"]
         return {
             "3": {"inputs": {"seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "euler", "scheduler": "normal", "denoise": 1, "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0]}, "class_type": "KSampler"},
             "4": {"inputs": {"ckpt_name": ckpt_name}, "class_type": "CheckpointLoaderSimple"},
