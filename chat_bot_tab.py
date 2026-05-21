@@ -1769,19 +1769,37 @@ class ChatBotTab(ttk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _check_sd_connection(self) -> None:
-        api_url = self.sd_api_url_var.get().strip() or self.SD_API_URL_DEFAULT
+        api_url = self.flux_api_url_var.get().strip() or self.FLUX_API_URL_DEFAULT
+        model_path = self.flux_model_var.get().strip() or self.FLUX_MODEL_DEFAULT
+        output_dir = self.flux_output_dir_var.get().strip() or "media/generated"
         self.sd_status_var.set("FLUX: проверка...")
 
         def worker() -> None:
-            ok = False
             try:
                 from flux_image_adapter import FluxImageAdapter
-                ok, msg = FluxImageAdapter(api_url=api_url, model_path=self.flux_model_var.get().strip() or self.FLUX_MODEL_DEFAULT).is_available()
-            except SDAPIError:
-                ok = False
-            status = "FLUX: OK" if ok else "FLUX: FAIL"
-            self.after(0, lambda: self.sd_status_var.set(status))
-            self.after(0, lambda: messagebox.showinfo("FLUX", status))
+
+                adapter = FluxImageAdapter(api_url=api_url, model_path=model_path, output_dir=output_dir)
+                ok, msg = adapter.is_available()
+                diag = adapter.get_diagnostics()
+                details = [
+                    msg,
+                    f"flux_api_url: {diag.get('flux_api_url')}",
+                    f"GET /system_stats: {json.dumps(diag.get('system_stats'), ensure_ascii=False, default=str)}",
+                    f"flux_model_path: {diag.get('flux_model_path')}",
+                    f"flux_model_name: {diag.get('flux_model_name')}",
+                    f"model_value_kind: {diag.get('model_value_kind')}",
+                    f"local_file_exists: {diag.get('local_file_exists')}",
+                    f"output_dir: {diag.get('output_dir')}",
+                ]
+                if diag.get("exception"):
+                    details.append(f"exception: {diag.get('exception')}")
+                status = msg
+                popup_text = "\n".join(details)
+            except Exception as exc:  # noqa: BLE001
+                status = f"FLUX: FAIL — {exc}"
+                popup_text = f"{status}\nexception: {repr(exc)}"
+            self.after(0, lambda s=status: self.sd_status_var.set(s))
+            self.after(0, lambda t=popup_text: messagebox.showinfo("FLUX", t))
 
         threading.Thread(target=worker, daemon=True).start()
 
