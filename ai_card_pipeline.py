@@ -294,7 +294,7 @@ class AICardPipeline:
             "time_end": unit.get("time_end"),
             "image_prompt": "",
             "needs_image": False,
-            "negative_prompt": "text, watermark, logo, blurry, low quality, extra letters",
+            "negative_prompt": "blurry, low quality, chaotic composition, watermark, logo, unreadable text, random letters, distorted anatomy, extra limbs, messy background, duplicated subjects",
             "image_path": "",
             "answer_image_path": "",
             "answer_image_url": "",
@@ -374,17 +374,17 @@ class AICardPipeline:
         card_type = str(card.get("card_type") or "").lower()
         style_hint = "clean simple diagram style, one main subject"
         if "anatom" in card_type:
-            style_hint = "clean educational anatomy diagram, clear body parts, simple labels optional"
+            style_hint = "clean educational anatomy diagram, clear body structure, simple labels if needed, high clarity"
         elif card_type in {"process", "cause"}:
-            style_hint = "step-by-step simple educational diagram"
+            style_hint = "simple step-by-step educational diagram"
         elif "difference" in card_type:
             style_hint = "side-by-side comparison diagram"
         elif "list" in card_type:
-            style_hint = "simple grouped icon illustration"
+            style_hint = "simple grouped icon illustration, clear visual categories"
         prompt = (
-            "Educational flashcard illustration. "
+            "Educational flashcard illustration, clean visual memory anchor, one clear subject, simple composition, high clarity, useful for remembering the answer. "
             f"Main idea: {back}. "
-            f"Context: {front}. "
+            f"Context/question: {front}. "
             f"Topic: {topic}. "
             f"Source excerpt: {excerpt}. "
             "Show one clear visual scene that helps remember the answer. "
@@ -423,24 +423,15 @@ class AICardPipeline:
     def generate_card_image(self, card: dict) -> dict:
         card = dict(card)
         metadata = dict(card.get("metadata") or {})
-        from image_generation_adapter import StableDiffusionAdapter
+        from image_generation_adapter import ImageGenerationAdapter
 
         try:
-            adapter = StableDiffusionAdapter(app=self.app)
-            path, status = adapter.generate_image(
-                card.get("image_prompt") or self.build_image_prompt_for_card(card),
-                card.get("negative_prompt") or "text, watermark, logo, blurry, low quality",
-            )
-            card["image_path"] = path or ""
-            if path:
-                card["answer_image_path"] = path
-                card["front_image_path"] = path
-                card["front_image_origin"] = "generated"
-                card["image_source_type"] = "generated"
-                card["image_relevance_score"] = float(card.get("image_relevance_score") or 0.0)
-            metadata["image_status"] = status or ("Stable Diffusion недоступен" if not path else "Изображение сгенерировано")
+            settings = getattr(self.app, "llm_settings", None) if self.app is not None else None
+            card = ImageGenerationAdapter(settings=settings, app=self.app).generate_card_image(card)
+            metadata = dict(card.get("metadata") or {})
+            metadata["image_status"] = card.get("image_status") or metadata.get("image_status") or "Image generation finished"
         except Exception as exc:
-            metadata["image_status"] = f"Stable Diffusion недоступен: {exc}"
+            metadata["image_status"] = f"FLUX error: {exc}"
         card["metadata"] = metadata
         return card
 

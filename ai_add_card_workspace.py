@@ -1052,9 +1052,9 @@ class AIAddCardWorkspace(tk.Toplevel):
             return self._generate_card_image_with_diagnostics(card)
 
         if self.generated_cards[idx].get("needs_image", False):
-            self.status_var.set("Для этой карточки картинка может помочь. Генерирую изображение...")
+            self.status_var.set("FLUX: генерирую изображение...")
         else:
-            self.status_var.set("Картинка не обязательна, но генерирую по вашему запросу...")
+            self.status_var.set("FLUX: генерирую изображение...")
         self.run_in_background(worker, on_success=self._on_image_generated, on_error=self._on_image_error)
 
     def generate_images_for_all_cards(self) -> None:
@@ -1074,7 +1074,7 @@ class AIAddCardWorkspace(tk.Toplevel):
             generated = 0
             failed = 0
             for done, card_idx in enumerate(targets, start=1):
-                self.after(0, lambda d=done, t=total: self.status_var.set(f"Генерирую изображение {d}/{t}..."))
+                self.after(0, lambda d=done, t=total: self.status_var.set(f"FLUX: генерирую изображение {d}/{t}..."))
                 card = cards[card_idx]
                 if not card.get("image_prompt"):
                     card["image_prompt"] = self.pipeline.generate_image_prompt(card)
@@ -1086,7 +1086,7 @@ class AIAddCardWorkspace(tk.Toplevel):
                     failed += 1
             return cards, generated, failed
 
-        self.status_var.set("Генерирую изображения для всех карточек...")
+        self.status_var.set("FLUX: генерирую изображения для всех карточек...")
         self.run_in_background(worker, on_success=self._on_all_images_generated, on_error=self._on_image_error)
 
     def _get_app_setting(self, *names, default=None):
@@ -1117,93 +1117,25 @@ class AIAddCardWorkspace(tk.Toplevel):
         return model
 
     def _generate_card_image_with_diagnostics(self, card: dict) -> dict:
-        """Generate an image and keep a useful status in card['metadata'].
-
-        First use the normal pipeline. If it only returns a placeholder/no image,
-        try a direct SDXLProvider call with the URL/model from settings or sane
-        defaults. This makes the AI workspace behave like the old manual editor.
-        """
         metadata = dict(card.get("metadata") or {})
         try:
-            result = self.pipeline.generate_card_image(dict(card))
-            if result and result.get("image_path"):
-                return result
-            if result:
-                card = result
-                metadata = dict(card.get("metadata") or {})
-        except Exception as exc:
-            metadata["image_status"] = f"Pipeline SD ошибка: {exc}"
-            card["metadata"] = metadata
+            from image_generation_adapter import ImageGenerationAdapter
 
-        prompt = (card.get("image_prompt") or card.get("back") or card.get("front") or "").strip()
-        if not prompt:
-            metadata["image_status"] = "Нет image_prompt для Stable Diffusion"
-            card["metadata"] = metadata
-            return card
-
-        try:
-            from sdxl_provider import SDXLProvider  # type: ignore
+            settings = getattr(self.app, "llm_settings", None) if self.app is not None else None
+            result = ImageGenerationAdapter(settings=settings, app=self.app).generate_card_image(dict(card), options={"force_generate": True})
+            status = result.get("image_status") or ((result.get("metadata") or {}).get("image_status") or "")
+            metadata.update(dict(result.get("metadata") or {}))
+            result["metadata"] = metadata
+            if result.get("front_image_path"):
+                metadata["image_status"] = f"FLUX: изображение создано {os.path.basename(result.get('front_image_path') or '')}"
+            elif status:
+                metadata["image_status"] = f"FLUX error: {status}"
+            result["metadata"] = metadata
+            return result
         except Exception as exc:
-            metadata["image_status"] = (
-                "Stable Diffusion недоступен: sdxl_provider.py не найден или не импортируется. "
-                f"{exc}"
-            )
+            metadata["image_status"] = f"FLUX error: {exc}"
             card["metadata"] = metadata
             return card
-
-        sd_url = self._get_app_setting(
-            "sd_api_url",
-            "sd_url",
-            "stable_diffusion_url",
-            "stable_diffusion_api_url",
-            default="http://127.0.0.1:7860",
-        )
-        sd_model = self._normalize_sd_model_name(
-            self._get_app_setting(
-                "sd_model",
-                "sd_checkpoint",
-                "sd_model_checkpoint",
-                "stable_diffusion_model",
-                default="sd_xl_base_1.0.safetensors",
-            )
-        )
-        negative = card.get("negative_prompt") or "text, watermark, logo, blurry, low quality, bad anatomy, extra letters"
-
-        try:
-            provider = SDXLProvider(str(sd_url))
-            try:
-                provider.ensure_model(sd_model)
-            except Exception as exc:
-                # Continue: some providers can generate with the already selected model.
-                metadata["sd_model_warning"] = f"Не удалось переключить модель {sd_model}: {exc}"
-            path = provider.txt2img(
-                prompt=prompt,
-                negative_prompt=negative,
-                width=512,
-                height=512,
-                steps=20,
-                cfg=7,
-                sampler="Euler a",
-                seed=None,
-                batch_size=1,
-                batch_count=1,
-                timeout=90,
-            )
-            card["image_path"] = path
-            card["answer_image_path"] = path
-            card["front_image_path"] = path
-            card["front_image_origin"] = "generated"
-            card["image_source_type"] = "generated"
-            metadata["image_status"] = f"SD: изображение создано ({os.path.basename(path)})"
-            metadata["sd_url"] = str(sd_url)
-            metadata["sd_model"] = sd_model
-        except Exception as exc:
-            metadata["image_status"] = (
-                "Stable Diffusion не сработал. Проверьте, что AUTOMATIC1111 запущен с --api, "
-                f"URL={sd_url}, модель={sd_model}. Ошибка: {exc}"
-            )
-        card["metadata"] = metadata
-        return card
 
     def _on_image_generated(self, card) -> None:
         if self.generated_cards:
@@ -1238,10 +1170,10 @@ class AIAddCardWorkspace(tk.Toplevel):
 
     def _on_image_error(self, exc: Exception) -> None:
         logging.exception("AI workspace image generation failed")
-        self.status_var.set("Stable Diffusion ошибка")
+        self.status_var.set("FLUX error")
         try:
             messagebox.showerror(
-                "Stable Diffusion",
+                "FLUX",
                 "Не удалось сгенерировать изображение.\n\n"
                 f"Причина: {exc}\n\n"
                 "Проверьте: AUTOMATIC1111 запущен с --api, URL http://127.0.0.1:7860 доступен, "

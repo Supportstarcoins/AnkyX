@@ -487,6 +487,8 @@ class ChatBotTab(ttk.Frame):
     OLLAMA_URL_DEFAULT = "http://127.0.0.1:11434"
     OLLAMA_MODEL_DEFAULT = "xflash-llama31"
     SD_API_URL_DEFAULT = "http://127.0.0.1:7860"
+    FLUX_API_URL_DEFAULT = "http://127.0.0.1:8188"
+    FLUX_MODEL_DEFAULT = "models/flux/flux-2-klein-4b-fp8.safetensors"
     SD_CHECKPOINT_DEFAULT = "sd_xl_base_1.0.safetensors"
     SD_NEGATIVE_PROMPT_DEFAULT = "text, watermark, logo, low quality, blurry, deformed, bad anatomy, extra limbs, caption"
 
@@ -541,13 +543,16 @@ class ChatBotTab(ttk.Frame):
         self.foreign_sentences_var = tk.IntVar(value=2)
         self._chat_pending_save_cost = 0
         self.pending_cost = 0
+        self.flux_api_url_var = tk.StringVar(value=os.getenv("XFLASH_FLUX_API_URL", self._cloud_settings.get("flux_api_url") or self.FLUX_API_URL_DEFAULT))
+        self.flux_model_var = tk.StringVar(value=os.getenv("XFLASH_FLUX_MODEL_PATH", self._cloud_settings.get("flux_model_path") or self.FLUX_MODEL_DEFAULT))
+        self.image_provider_var = tk.StringVar(value=os.getenv("XFLASH_IMAGE_PROVIDER", self._cloud_settings.get("image_provider") or "flux_comfyui"))
         self.sd_api_url_var = tk.StringVar(
-            value=self._cloud_settings.get("sd_api_url") or self.SD_API_URL_DEFAULT
+            value=self._cloud_settings.get("legacy_sd_api_url") or self._cloud_settings.get("sd_api_url") or self.SD_API_URL_DEFAULT
         )
         self.sd_checkpoint_var = tk.StringVar(
             value=self._cloud_settings.get("sd_checkpoint") or self.SD_CHECKPOINT_DEFAULT
         )
-        self.sd_status_var = tk.StringVar(value="SD: —")
+        self.sd_status_var = tk.StringVar(value="FLUX: —")
 
         self._ensure_chat_tables()
         self._build_ui()
@@ -564,6 +569,9 @@ class ChatBotTab(ttk.Frame):
         self.ollama_url_var.trace_add("write", self._on_ollama_settings_change)
         self.ollama_model_var.trace_add("write", self._on_ollama_settings_change)
         self.sd_api_url_var.trace_add("write", self._on_cloud_settings_change)
+        self.flux_api_url_var.trace_add("write", self._on_cloud_settings_change)
+        self.flux_model_var.trace_add("write", self._on_cloud_settings_change)
+        self.image_provider_var.trace_add("write", self._on_cloud_settings_change)
         self.sd_checkpoint_var.trace_add("write", self._on_cloud_settings_change)
         self.cloud_status_var.trace_add("write", self._on_llm_status_change)
         self.ollama_status_var.trace_add("write", self._on_llm_status_change)
@@ -1030,24 +1038,24 @@ class ChatBotTab(ttk.Frame):
         sd_frame.columnconfigure(1, weight=1)
         sd_frame.columnconfigure(3, weight=1)
 
-        ttk.Checkbutton(sd_frame, text="Stable Diffusion (AUTOMATIC1111 txt2img)", variable=self.sd_enabled).grid(
+        ttk.Checkbutton(sd_frame, text="Image backend: FLUX.2 Klein FP8 / ComfyUI", variable=self.sd_enabled).grid(
             row=0,
             column=0,
             sticky="w",
             padx=(0, 10),
         )
-        ttk.Label(sd_frame, text="SD API URL:", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 6))
-        ttk.Entry(sd_frame, textvariable=self.sd_api_url_var).grid(row=1, column=1, sticky="ew", padx=(0, 10))
-        ttk.Label(sd_frame, text="SD Model (checkpoint):", style="Muted.TLabel").grid(
+        ttk.Label(sd_frame, text="FLUX API URL:", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(sd_frame, textvariable=self.flux_api_url_var).grid(row=1, column=1, sticky="ew", padx=(0, 10))
+        ttk.Label(sd_frame, text="FLUX model:", style="Muted.TLabel").grid(
             row=1,
             column=2,
             sticky="w",
             padx=(0, 6),
         )
-        ttk.Entry(sd_frame, textvariable=self.sd_checkpoint_var).grid(row=1, column=3, sticky="ew")
+        ttk.Entry(sd_frame, textvariable=self.flux_model_var).grid(row=1, column=3, sticky="ew")
         sd_actions = ttk.Frame(sd_frame, style="CardInner.TFrame")
         sd_actions.grid(row=1, column=4, sticky="e", padx=(10, 0))
-        ttk.Button(sd_actions, text="Проверить SD", command=self._check_sd_connection).pack(side=tk.LEFT)
+        ttk.Button(sd_actions, text="Проверить FLUX", command=self._check_sd_connection).pack(side=tk.LEFT)
         ttk.Label(sd_actions, textvariable=self.sd_status_var, style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
 
         pdf_mode_frame = ttk.Frame(container, style="CardInner.TFrame", padding=6)
@@ -1503,6 +1511,10 @@ class ChatBotTab(ttk.Frame):
                         "ollama_model": str(payload.get("ollama_model") or ""),
                         "sd_api_url": str(payload.get("sd_api_url") or ""),
                         "sd_checkpoint": str(payload.get("sd_checkpoint") or ""),
+                        "image_provider": str(payload.get("image_provider") or "flux_comfyui"),
+                        "flux_api_url": str(payload.get("flux_api_url") or ""),
+                        "flux_model_path": str(payload.get("flux_model_path") or ""),
+                        "legacy_sd_api_url": str(payload.get("legacy_sd_api_url") or ""),
                     }
         except Exception:  # noqa: BLE001
             logging.exception("Failed to load cloud settings")
@@ -1513,6 +1525,10 @@ class ChatBotTab(ttk.Frame):
             "ollama_model": "",
             "sd_api_url": "",
             "sd_checkpoint": "",
+            "image_provider": "flux_comfyui",
+            "flux_api_url": "",
+            "flux_model_path": "",
+            "legacy_sd_api_url": "",
         }
 
     def _save_cloud_settings(self) -> None:
@@ -1524,6 +1540,10 @@ class ChatBotTab(ttk.Frame):
             "ollama_model": self.ollama_model_var.get().strip(),
             "sd_api_url": self.sd_api_url_var.get().strip(),
             "sd_checkpoint": self.sd_checkpoint_var.get().strip(),
+            "image_provider": self.image_provider_var.get().strip() or "flux_comfyui",
+            "flux_api_url": self.flux_api_url_var.get().strip(),
+            "flux_model_path": self.flux_model_var.get().strip(),
+            "legacy_sd_api_url": self.sd_api_url_var.get().strip(),
         }
         try:
             with open(self._cloud_settings_path, "w", encoding="utf-8") as handle:
@@ -1587,17 +1607,18 @@ class ChatBotTab(ttk.Frame):
 
     def _check_sd_connection(self) -> None:
         api_url = self.sd_api_url_var.get().strip() or self.SD_API_URL_DEFAULT
-        self.sd_status_var.set("SD: проверка...")
+        self.sd_status_var.set("FLUX: проверка...")
 
         def worker() -> None:
             ok = False
             try:
-                ok = SDAPIClient(api_url).health()
+                from flux_image_adapter import FluxImageAdapter
+                ok, msg = FluxImageAdapter(api_url=api_url, model_path=self.flux_model_var.get().strip() or self.FLUX_MODEL_DEFAULT).is_available()
             except SDAPIError:
                 ok = False
-            status = "SD: OK" if ok else "SD: FAIL"
+            status = "FLUX: OK" if ok else "FLUX: FAIL"
             self.after(0, lambda: self.sd_status_var.set(status))
-            self.after(0, lambda: messagebox.showinfo("Stable Diffusion", status))
+            self.after(0, lambda: messagebox.showinfo("FLUX", status))
 
         threading.Thread(target=worker, daemon=True).start()
 
