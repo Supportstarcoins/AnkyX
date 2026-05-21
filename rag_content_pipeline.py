@@ -9,7 +9,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse
 
 from rag_web_search import RagWebSearch
-from source_extractors import download_image_to_media
+from source_extractors import download_image_to_media, extract_text_from_url
 from youtube_transcript_extractor import YouTubeTranscriptExtractor
 
 
@@ -399,7 +399,27 @@ class RagContentPipeline:
         self.max_sources = max_sources
         self.search = RagWebSearch(max_pages=max_sources, max_chars=max_chars)
 
-    def fetch_materials(self, query_or_url: str, max_sources: int = 5) -> dict:
+    def _build_query_variations(self, topic: str) -> list[str]:
+        base = re.sub(r"\s+", " ", (topic or "").strip())
+        if not base:
+            return []
+        vars = [base, f"{base} строение", f"{base} анатомия", f"{base} определение факты"]
+        words = [w for w in re.findall(r"[а-яa-z0-9]+", base.lower()) if len(w) >= 3]
+        if words:
+            head = words[-1]
+            vars.extend([f"анатомия {head}", f"строение тела {head}", f"{head} строение тела"])
+            if head == "тигра":
+                vars.extend(["tiger anatomy", "tiger body structure"])
+        seen = set()
+        out = []
+        for v in vars:
+            k = v.lower().strip()
+            if k and k not in seen:
+                seen.add(k)
+                out.append(v.strip())
+        return out[:8]
+
+    def fetch_materials(self, query_or_url: str, max_sources: int = 5, progress_callback=None) -> dict:
         query_or_url = (query_or_url or "").strip()
         result = {
             "query": query_or_url,
@@ -408,6 +428,7 @@ class RagContentPipeline:
             "sources": [],
             "status": "error",
             "errors": [],
+            "debug": {"query_variations": [], "urls": [], "url_results": []},
         }
         if not query_or_url:
             result["errors"].append("Введите URL, текст или тему")
@@ -441,8 +462,10 @@ class RagContentPipeline:
         if self._is_url(query_or_url):
             result["source_type"] = "web"
             try:
-                page = self.search.fetch_page_text(query_or_url)
-                clean = clean_raw_text(page.get("text", ""))
+                extracted = extract_text_from_url(query_or_url, min_chars=250)
+                if not extracted.get("ok"):
+                    raise RuntimeError(str(extracted.get("error") or "web extract failed"))
+                clean = clean_raw_text(extracted.get("text", ""))
                 try:
                     web_images = extract_images_from_web_html(query_or_url)
                 except Exception:
@@ -451,9 +474,9 @@ class RagContentPipeline:
                 result["sources"] = [
                     {
                         "url": query_or_url,
-                        "title": page.get("title", ""),
+                        "title": extracted.get("title", ""),
                         "source_type": "web",
-                        "text": page.get("text", ""),
+                        "text": extracted.get("text", ""),
                         "clean_text": clean,
                         "metadata": {"images": web_images},
                     }
@@ -465,35 +488,77 @@ class RagContentPipeline:
 
         result["source_type"] = "search"
         try:
-            urls = self.search._duckduckgo_urls(query_or_url)[: max(1, max_sources)]
+            if progress_callback:
+                progress_callback("RAG: ищу материалы...")
+            queries = self._build_query_variations(query_or_url)
+            result["debug"]["query_variations"] = list(queries)
+            all_urls: list[str] = []
+            for q in queries:
+                all_urls.extend(self.search._duckduckgo_urls(q))
+            # wikipedia fallback urls
+            wiki_queries = [f"site:ru.wikipedia.org {query_or_url}", f"википедия {query_or_url}"]
+            for q in wiki_queries:
+                all_urls.extend(self.search._duckduckgo_urls(q))
+            urls = []
+            for u in all_urls:
+                if u not in urls:
+                    urls.append(u)
+            urls = urls[: max(1, max_sources * 3)]
+            result["debug"]["urls"] = list(urls)
+            if progress_callback:
+                progress_callback(f"RAG: найдено URL: {len(urls)}")
             combined: list[str] = []
-            for url in urls:
+            opened = 0
+            success = 0
+            min_chars = 250 if len(query_or_url) <= 40 else 500
+            for idx, url in enumerate(urls, start=1):
+                if progress_callback:
+                    progress_callback(f"RAG: извлекаю текст {idx}/{len(urls)}...")
+                opened += 1
                 try:
-                    page = self.search.fetch_page_text(url)
-                    clean = clean_raw_text(page.get("text", ""))
+                    extracted = extract_text_from_url(url, min_chars=min_chars)
+                    if not extracted.get("ok"):
+                        raise RuntimeError(str(extracted.get("error") or "empty article"))
+                    clean = clean_raw_text(extracted.get("text", ""))
                     try:
                         web_images = extract_images_from_web_html(url)
                     except Exception:
                         web_images = []
-                    if len(clean) < 300:
+                    if len(clean) < min_chars:
                         continue
+                    success += 1
                     result["sources"].append(
                         {
                             "url": url,
-                            "title": page.get("title", ""),
+                            "title": extracted.get("title", ""),
                             "source_type": "web",
-                            "text": page.get("text", ""),
+                            "text": extracted.get("text", ""),
                             "clean_text": clean,
                             "metadata": {"images": web_images},
                         }
                     )
-                    combined.append(f"# {page.get('title', url)}\n{clean}")
+                    result["debug"]["url_results"].append({"url": url, "ok": True, "text_len": len(clean)})
+                    combined.append(f"[Источник: {extracted.get('title', url)}]\n{clean}")
                 except Exception as exc:
                     result["errors"].append(f"{url}: {exc}")
+                    result["debug"]["url_results"].append({"url": url, "ok": False, "error": str(exc)})
+            if progress_callback:
+                progress_callback(f"RAG: успешно извлечено источников: {success}")
+            # wikipedia content fallback only if no text yet
+            if not combined:
+                for wq in [f"https://ru.wikipedia.org/wiki/{urllib.parse.quote(query_or_url.replace(' ', '_'))}"]:
+                    extracted = extract_text_from_url(wq, min_chars=250)
+                    if extracted.get("ok"):
+                        txt = clean_raw_text(extracted.get("text", ""))
+                        if txt:
+                            result["sources"].append({"url": wq, "title": extracted.get("title", "Wikipedia"), "source_type": "wikipedia", "text": extracted.get("text", ""), "clean_text": txt, "metadata": {"images": []}})
+                            combined.append(f"[Источник: {extracted.get('title', 'Wikipedia')}]\n{txt}")
+                            break
             result["clean_text"] = clean_raw_text("\n\n".join(combined))[: self.max_chars]
             result["status"] = "ok" if result["clean_text"] else "error"
-            if not result["clean_text"] and not result["errors"]:
-                result["errors"].append("Не удалось извлечь текст из найденных страниц")
+            if not result["clean_text"]:
+                first_err = ", ".join([str(x.get("error")) for x in result["debug"]["url_results"] if not x.get("ok")][:5])
+                result["errors"].append(f"Не удалось извлечь текст: найдено {len(urls)} URL, открыто {opened}, успешно {success}. Ошибки: {first_err or 'n/a'}")
         except Exception as exc:
             result["errors"].append(str(exc))
         return result

@@ -10,6 +10,18 @@ try:
     import requests
 except Exception:
     requests = None
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+try:
+    from readability import Document
+except Exception:
+    Document = None
+try:
+    import trafilatura
+except Exception:
+    trafilatura = None
 
 try:
     from PIL import Image
@@ -262,6 +274,104 @@ def _extract_pdf_bundle(path: str) -> dict:
                     )
                 )
     return {"text": "\n".join(text_parts), "images": images}
+
+
+def extract_text_from_url(url: str, min_chars: int = 500, timeout: int = 18) -> dict:
+    out = {"ok": False, "url": (url or "").strip(), "title": "", "text": "", "images": [], "error": ""}
+    if not out["url"]:
+        out["error"] = "Пустой URL"
+        return out
+    if requests is None:
+        out["error"] = "requests не установлен"
+        return out
+    try:
+        resp = requests.get(
+            out["url"],
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+                "Accept-Language": "ru,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+    except Exception as exc:
+        out["error"] = f"timeout/network: {exc}"
+        return out
+    if int(resp.status_code or 0) >= 400:
+        out["error"] = f"HTTP {resp.status_code}"
+        return out
+    ctype = str(resp.headers.get("Content-Type") or "").lower()
+    if "html" not in ctype and "xml" not in ctype:
+        out["error"] = f"unsupported content-type: {ctype or 'unknown'}"
+        return out
+    try:
+        if not resp.encoding or str(resp.encoding).lower() == "iso-8859-1":
+            resp.encoding = resp.apparent_encoding or "utf-8"
+    except Exception:
+        pass
+    html_text = resp.text or ""
+    if len(html_text.strip()) < 80:
+        out["error"] = "empty html"
+        return out
+    text = ""
+    title = ""
+    if trafilatura is not None:
+        try:
+            tf = trafilatura.extract(html_text, include_comments=False, include_tables=False, favor_precision=True)
+            if tf:
+                text = tf.strip()
+        except Exception:
+            pass
+    if not text and Document is not None:
+        try:
+            rd = Document(html_text)
+            title = (rd.short_title() or "").strip()
+            html_text = rd.summary() or html_text
+        except Exception:
+            pass
+    if BeautifulSoup is None:
+        out["error"] = "Для лучшего парсинга установите beautifulsoup4"
+        return out
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        for tag in soup.select("script,style,nav,footer,header,aside,form,noscript,svg"):
+            tag.decompose()
+        if not title:
+            title = (soup.title.get_text(" ", strip=True) if soup.title else "").strip()
+        container = soup.find("article") or soup.find("main") or soup.body or soup
+        lines: list[str] = []
+        for el in container.find_all(["h1", "h2", "h3", "p", "li"]):
+            row = re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip(" \t-–—|•")
+            if row:
+                lines.append(row)
+        text_fallback = "\n".join(lines)
+    except Exception as exc:
+        out["error"] = f"parse error: {exc}"
+        return out
+    merged = (text + "\n" + text_fallback).strip()
+    seen: set[str] = set()
+    clean_lines: list[str] = []
+    bad = re.compile(r"(?i)(cookie|поделиться|читайте также|captcha|access denied|404|реклама|menu|подпис|subscribe)")
+    for line in merged.splitlines():
+        row = re.sub(r"https?://\S+|www\.\S+", " ", line or "")
+        row = re.sub(r"\s+", " ", row).strip()
+        if not row or bad.search(row):
+            continue
+        if len(row) < 20 and not re.match(r"^(h1|h2|h3)\b", row.lower()):
+            continue
+        key = re.sub(r"\W+", "", row.lower())[:180]
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_lines.append(row)
+    final_text = "\n".join(clean_lines).strip()
+    if len(final_text) < int(min_chars or 500):
+        out["error"] = f"empty article (<{min_chars})"
+        return out
+    out["ok"] = True
+    out["title"] = title or out["url"]
+    out["text"] = final_text
+    return out
 
 
 def extract_text_from_path(path: str) -> str:
