@@ -42,7 +42,7 @@ class ImageGenerationAdapter:
         self.flux_output_dir = os.getenv("XFLASH_FLUX_OUTPUT_DIR", s.get("flux_output_dir", "media/generated"))
         self.legacy_sd_api_url = s.get("legacy_sd_api_url", s.get("sd_api_url", "http://127.0.0.1:7860"))
         self.legacy_sd_checkpoint = s.get("legacy_sd_checkpoint", s.get("sd_checkpoint", "sd_xl_base_1.0.safetensors"))
-        self.enable_legacy_fallback = bool(s.get("enable_legacy_fallback", True))
+        self.enable_legacy_fallback = bool(s.get("enable_legacy_sd_fallback", s.get("enable_legacy_fallback", True)))
 
     def generate_card_image(self, card: dict, options: dict | None = None) -> dict:
         c = dict(card or {})
@@ -68,6 +68,8 @@ class ImageGenerationAdapter:
                 result = {"ok": True, "image_path": path, "provider": "legacy_sd_auto1111", "error": ""}
             else:
                 result["error"] = result.get("error") or status
+        elif not result.get("ok") and not self.enable_legacy_fallback:
+            result["error"] = result.get("error") or "FLUX error: fallback в legacy SD отключен"
 
         c["image_prompt"] = prompt
         c["image_provider"] = result.get("provider") or self.image_provider

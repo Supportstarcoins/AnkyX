@@ -7,15 +7,25 @@ import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
 
 class FluxImageAdapter:
     def __init__(self, api_url: str = "http://127.0.0.1:8188", model_path: str = "", output_dir: str = "media/generated"):
-        self.api_url = (api_url or "http://127.0.0.1:8188").rstrip("/")
+        self.api_url = self._normalize_api_url(api_url or "http://127.0.0.1:8188")
         self.model_path = model_path or "models/flux/flux-2-klein-4b-fp8.safetensors"
         self.output_dir = output_dir or "media/generated"
+
+    @staticmethod
+    def _normalize_api_url(api_url: str) -> str:
+        parsed = urlparse(api_url if "://" in api_url else f"http://{api_url}")
+        path = (parsed.path or "").rstrip("/")
+        for suffix in ("/api", "/prompt", "/system_stats", "/view"):
+            if path.endswith(suffix):
+                path = path[: -len(suffix)]
+        return urlunparse((parsed.scheme or "http", parsed.netloc, path.rstrip("/"), "", "", "")).rstrip("/")
 
     def is_available(self) -> tuple[bool, str]:
         model_file = Path(self.model_path)

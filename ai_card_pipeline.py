@@ -41,6 +41,7 @@ class AICardPipeline:
         self.max_cards = 24
         self.last_generation_mode = "fallback"
         self.last_fallback_reason = ""
+        self.last_llm_model = ""
 
     def run_pipeline(
         self,
@@ -169,6 +170,7 @@ class AICardPipeline:
         )
 
         cards: list[dict] = []
+        self.last_llm_model = str(settings.get("model") or "").strip()
         for unit in knowledge_units:
             prompt = self._build_llm_prompt(unit, source_text=source_text, options=options)
             messages = [
@@ -178,13 +180,15 @@ class AICardPipeline:
             try:
                 raw = ollama.chat(
                     messages,
+                    model=str(settings.get("model") or ""),
                     options={
                         "temperature": float(settings.get("temperature", 0.4)),
                         "num_predict": int(settings.get("max_tokens", 700)),
                         "timeout": int(settings.get("timeout", 180)),
                     },
                 )
-                payload = self._extract_json_array(raw)
+                message = ((raw.get("message") or {}).get("content") or "") if isinstance(raw, dict) else ""
+                payload = self._extract_json_array(str(message))
                 parsed = json.loads(payload)
                 if not isinstance(parsed, list):
                     self.last_fallback_reason = "LLM вернула не массив JSON"

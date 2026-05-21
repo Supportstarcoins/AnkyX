@@ -523,7 +523,7 @@ class ChatBotTab(ttk.Frame):
         self.cloud_api_key_var = tk.StringVar(value=self._cloud_settings.get("api_key", ""))
         self.cloud_status_var = tk.StringVar(value="Cloud: —")
         default_ollama_url = os.getenv("XFLASH_OLLAMA_URL", self.OLLAMA_URL_DEFAULT)
-        default_ollama_model = os.getenv("XFLASH_OLLAMA_MODEL", self.OLLAMA_MODEL_DEFAULT)
+        default_ollama_model = os.getenv("XFLASH_DEFAULT_MODEL", os.getenv("XFLASH_OLLAMA_MODEL", self.OLLAMA_MODEL_DEFAULT))
         self.ollama_url_var = tk.StringVar(value=self._cloud_settings.get("ollama_url") or default_ollama_url)
         self.ollama_model_var = tk.StringVar(value=self._cloud_settings.get("ollama_model") or default_ollama_model)
         self.ollama_status_var = tk.StringVar(value="Ollama: —")
@@ -2232,12 +2232,13 @@ class ChatBotTab(ttk.Frame):
                 preview_text = text[:3500] if text else ' '
                 ollama = OllamaClient(
                     base_url=self.ollama_url_var.get().strip() or self.OLLAMA_URL_DEFAULT,
-                    model=self.ollama_model_var.get().strip() or 'llama3.1:8b',
+                    model=self.ollama_model_var.get().strip() or default_ollama_model,
                 )
-                summary = ollama.chat([
+                summary_obj = ollama.chat([
                     {'role': 'system', 'content': 'Ты аналитик. Выдели общий смысл, главные темы, 5-10 ключевых тезисов. Без воды.'},
                     {'role': 'user', 'content': preview_text},
                 ])
+                summary = str((summary_obj.get("message") or {}).get("content") or "")
                 known_words = set()
                 if not mode_native:
                     known_words = load_known_words(lang)
